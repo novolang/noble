@@ -1,0 +1,238 @@
+// smp_bond.nv — the security database.
+//
+// A bond is the record a pairing with bonding leaves behind ([Vol 3]
+// Part C, Section 9.4; [Vol 3] Part H, Section 2.3.1: "Security
+// Properties of the key generated in phase 2 under which the keys are  (comment-gate: allow)
+// distributed shall be stored in the security database").  The
+// Peripheral keeps the LTK it answers an LE Long Term Key Request with,
+// the EDIV and Rand that identify it in LE legacy pairing, the keys the
+// Central distributed, and the security properties of all of them.
+//
+// `SmpBondStore` is the interface the program implements over its own
+// storage: flash on a board, a file or memory on a PC.  `SmpBondTable`
+// is an implementation in memory with a fixed number of entries.  The
+// pairing procedure (smp_responder.nv) never calls a store: the
+// program looks a bond up when a connection starts and hands it in,
+// and stores the bond a pairing reports.
+//
+// Every key and address is least significant octet first, the order
+// the Security Manager commands and HCI carry them in.
+
+use std.test
+use smp_keys
+
+// One bonded device.
+//
+// `peer_address_type` and `peer_address` are the peer's Identity
+// Address when it distributed one (Identity Address Information,
+// [Vol 3] Part H, Section 3.6.5), and otherwise the address it
+// connected from.  `peer_irk` and `peer_csrk` are empty when the peer
+// did not distribute them; an all-zero IRK means the peer has no valid
+// Resolvable Private Address (Section 3.6.4).  `peer_sign_counter` is
+// the last SignCounter verified with `peer_csrk`, -1 while the peer has
+// signed nothing yet: the first signed command of a device carries
+// SignCounter 0, so 0 cannot stand for "none" (Section 2.4.5).
+//
+// `ltk`, `ediv` and `rand` are the key the Peripheral answers the LE
+// Long Term Key Request event with: the LTK of LE Secure Connections
+// with EDIV and Rand zero (Section 2.4.4), or the LTK, EDIV and Rand the
+// Peripheral distributed in LE legacy pairing (Section 2.4.2.3).  `ltk`
+// is empty when there is none.  `peer_ltk`, `peer_ediv` and
+// `peer_rand` are an LTK the Central distributed in LE legacy pairing,
+// for a later connection with the roles reversed.  `local_csrk` is the
+// CSRK the Peripheral distributed.
+//
+// `key_size` is the negotiated encryption key size in octets,
+// `authenticated` says the keys have Authenticated MITM protection and
+// `secure_connections` that they came from LE Secure Connections
+// pairing (Section 2.3.1).
+pub struct SmpBond
+    peer_address_type: Int
+    peer_address: [u8]
+    peer_irk: [u8]
+    peer_csrk: [u8]
+    peer_sign_counter: Int
+    peer_ltk: [u8]
+    peer_ediv: Int
+    peer_rand: [u8]
+    ltk: [u8]
+    ediv: Int
+    rand: [u8]
+    local_csrk: [u8]
+    key_size: Int
+    authenticated: Bool
+    secure_connections: Bool
+
+// The LE security mode 1 level the bond's keys give an encrypted link
+// ([Vol 3] Part C, Section 10.2.1): 2 unauthenticated, 3 authenticated,
+// 4 authenticated LE Secure Connections with a 128-bit key.
+pub @tier(embedded)
+@no_alloc
+fn security_level(bond: SmpBond) -> Int
+    if not bond.authenticated
+        2
+    else if bond.secure_connections and bond.key_size == 16
+        4
+    else
+        3
+
+// True when `peer_irk` is present and not all zeros.
+pub @tier(embedded)
+@no_alloc
+fn has_peer_irk(bond: SmpBond) -> Bool
+    list.len(bond.peer_irk) == 16 and not smp_keys.is_all_zero(bond.peer_irk)
+
+// True when the device that connected from `address_type`, `address`
+// is the bonded device: the same address and type, or a Resolvable
+// Private Address the peer's IRK resolves ([Vol 6] Part B, Section
+// 1.3.2.3).  A random address type is 1.
+@tier(embedded)
+fn matches(bond: SmpBond, address_type: Int, address: [u8]) -> Bool
+    if bond.peer_address_type == address_type and smp_keys.equal_ct(bond.peer_address, address)
+        true
+    else if address_type == 1 and has_peer_irk(bond)
+        smp_keys.resolves(bond.peer_irk, address)
+    else
+        false
+
+// The interface to the program's security database.
+pub trait SmpBondStore
+    // The bond of the device connecting from `address_type`, `address`,
+    // resolving a Resolvable Private Address with the stored IRKs.
+    fn find(self, address_type: Int, address: [u8]) -> ?SmpBond
+    // Store `bond`, replacing a bond with the same identity.
+    fn save(var self, bond: SmpBond)
+    // Remove the bond of the device with this identity, if any.
+    fn forget(var self, address_type: Int, address: [u8])
+
+// A security database in memory, holding at most `capacity` bonds.  A
+// new bond with no room left replaces the oldest.
+pub struct SmpBondTable
+    var bonds: [SmpBond]
+    capacity: Int
+
+// An empty bond table that holds `capacity` bonds.
+pub fn new_bond_table(capacity: Int) -> SmpBondTable
+    SmpBondTable { bonds: [], capacity: capacity }
+
+fn same_identity(a: SmpBond, address_type: Int, address: [u8]) -> Bool
+    a.peer_address_type == address_type and smp_keys.equal_ct(a.peer_address, address)
+
+impl SmpBondStore for SmpBondTable
+    fn find(self, address_type: Int, address: [u8]) -> ?SmpBond
+        for b in self.bonds
+            if matches(b, address_type, address)
+                return Some(b)
+        None
+
+    fn save(var self, bond: SmpBond)
+        var kept: [SmpBond] = []
+        for b in self.bonds
+            if not same_identity(b, bond.peer_address_type, bond.peer_address)
+                list.push(kept, b)
+        if list.len(kept) >= self.capacity
+            kept = kept[list.len(kept) - self.capacity + 1:]
+        list.push(kept, bond)
+        self.bonds = kept
+
+    fn forget(var self, address_type: Int, address: [u8])
+        var kept: [SmpBond] = []
+        for b in self.bonds
+            if not same_identity(b, address_type, address)
+                list.push(kept, b)
+        self.bonds = kept
+
+// ── Resolving list ──────────────────────────────────────────────────
+//
+// The parameters of the LE Add Device To Resolving List command
+// ([Vol 4] Part E, Section 7.8.38): Peer_Identity_Address_Type,
+// Peer_Identity_Address, Peer_IRK and Local_IRK.  A bond whose peer
+// distributed no IRK gives no entry.
+
+struct ResolvingListEntry
+    peer_identity_address_type: Int
+    peer_identity_address: [u8]
+    peer_irk: [u8]
+    local_irk: [u8]
+
+@satisfies("REQ-BLE-PRIV-007")
+fn resolving_list_entry(bond: SmpBond, local_irk: [u8]) -> ?ResolvingListEntry
+    if list.len(bond.peer_irk) != 16
+        return None
+    Some(ResolvingListEntry {
+        peer_identity_address_type: bond.peer_address_type,
+        peer_identity_address: bond.peer_address,
+        peer_irk: bond.peer_irk,
+        local_irk: local_irk })
+
+// The entries of every bond in `table`.
+pub fn resolving_list(table: SmpBondTable, local_irk: [u8]) -> [ResolvingListEntry]
+    var out: [ResolvingListEntry] = []
+    for b in table.bonds
+        let entry = resolving_list_entry(b, local_irk)
+        if entry != None
+            list.push(out, entry!)
+    out
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+fn hex(text: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_hex(text)!)
+
+fn test_bond(address: [u8], irk: [u8]) -> SmpBond
+    SmpBond {
+        peer_address_type: 1, peer_address: address, peer_irk: irk, peer_csrk: [],
+        peer_sign_counter: -1, peer_ltk: [], peer_ediv: 0, peer_rand: [],
+        ltk: hex("00112233445566778899aabbccddeeff"), ediv: 0x1234, rand: hex("0102030405060708"),
+        local_csrk: [], key_size: 16, authenticated: true, secure_connections: true }
+
+@test
+fn test_table_finds_by_identity_and_by_resolvable_private_address()
+    let irk = smp_keys.reversed(hex("ec0234a357c8ad05341010a60a397d9b"))
+    var table = new_bond_table(2)
+    table.save(test_bond(hex("c00102030405"), irk))
+    test.assert(table.find(1, hex("c00102030405")) != None)
+    test.assert(table.find(0, hex("c00102030405")) == None)
+    let rpa = smp_keys.resolvable_private_address(irk, hex("708194"))
+    let found = table.find(1, rpa)
+    test.assert(found != None)
+    test.assert_eq(found!.ediv, 0x1234)
+    test.assert(table.find(1, hex("aabbccddee44")) == None)
+
+@test
+fn test_table_replaces_the_same_identity_and_drops_the_oldest()
+    var table = new_bond_table(2)
+    table.save(test_bond(hex("c00000000001"), []))
+    table.save(test_bond(hex("c00000000002"), []))
+    table.save(test_bond(hex("c00000000002"), []))
+    test.assert_eq(list.len(table.bonds), 2)
+    table.save(test_bond(hex("c00000000003"), []))
+    test.assert_eq(list.len(table.bonds), 2)
+    test.assert(table.find(1, hex("c00000000001")) == None)
+    table.forget(1, hex("c00000000002"))
+    test.assert_eq(list.len(table.bonds), 1)
+
+@test
+fn test_resolving_list_takes_bonds_with_an_irk()
+    var table = new_bond_table(4)
+    table.save(test_bond(hex("c00000000001"), hex("0102030405060708090a0b0c0d0e0f10")))
+    table.save(test_bond(hex("c00000000002"), []))
+    let entries = resolving_list(table, hex("ffeeddccbbaa99887766554433221100"))
+    test.assert_eq(list.len(entries), 1)
+    test.assert_eq(entries[0].peer_identity_address[5] as Int, 0x01)
+    test.assert_eq(entries[0].local_irk[0] as Int, 0xff)
+
+@test
+fn test_security_level_follows_the_properties()
+    var b = test_bond(hex("c00000000001"), [])
+    test.assert_eq(security_level(b), 4)
+    let short = SmpBond {
+        peer_address_type: 1, peer_address: b.peer_address, peer_irk: [], peer_csrk: [],
+        peer_sign_counter: -1, peer_ltk: [], peer_ediv: 0, peer_rand: [], ltk: b.ltk, ediv: 0,
+        rand: [], local_csrk: [], key_size: 7, authenticated: true, secure_connections: true }
+    test.assert_eq(security_level(short), 3)
+    let unauth = SmpBond {
+        peer_address_type: 1, peer_address: b.peer_address, peer_irk: [], peer_csrk: [],
+        peer_sign_counter: -1, peer_ltk: [], peer_ediv: 0, peer_rand: [], ltk: b.ltk, ediv: 0,
+        rand: [], local_csrk: [], key_size: 16, authenticated: false, secure_connections: true }
+    test.assert_eq(security_level(unauth), 2)

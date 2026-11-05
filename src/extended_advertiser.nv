@@ -1,0 +1,830 @@
+// extended_advertiser.nv — the Host side of extended
+// advertising and of periodic advertising.
+//
+// Extended advertising is how an advertising set carries more than the
+// 31 octets of the legacy advertising data, more than one PHY, and a
+// periodic advertising train beside it ([Vol 6] Part B, Section 2.3.4).
+// A set is created by the LE Set Extended Advertising Parameters command
+// ([Vol 4] Part E, Section 7.8.53) and lives until it is removed or the
+// Controller is reset; its Advertising_Handle, 0x00 to 0xEF, is chosen
+// by the Host.  Everything else about it — the data, the scan response,
+// the periodic advertising — is set on that handle, and the LE Set
+// Extended Advertising Enable command (Section 7.8.56) starts and stops
+// it.  `advertiser.nv` is the legacy engine the Host uses when the
+// tester asks for none of this; the two are alternatives, not layers:
+// once a legacy advertising command has been issued since the last reset
+// a Controller that has the LE Feature (Extended Advertising) answers
+// the extended ones with Command Disallowed ([Vol 4] Part E, Section
+// 3.1.1), so a program picks one for the session and resets between.
+//
+// Periodic advertising belongs to an advertising set.  The LE Set
+// Periodic Advertising Parameters command ([Vol 4] Part E, Section
+// 7.8.61) gives the set a periodic advertising interval and properties,
+// the LE Set Periodic Advertising Data command (Section 7.8.62) gives it
+// the data of the AUX_SYNC_IND PDU, and the LE Set Periodic Advertising
+// Enable command (Section 7.8.63) starts the train.  A set that carries
+// periodic advertising shall not be connectable, scannable, legacy or
+// anonymous (Section 7.8.53), which is what `non_connectable_parameters`
+// below builds: an extended, undirected, non-connectable and
+// non-scannable set that keeps the advertiser's address in its PDUs.
+//
+// The Periodic Advertising Synchronization Transfer procedure
+// ([Vol 3] Part C, Section 9.5.4) moves the synchronization information
+// of a train over an LE connection, and the side that sends it differs
+// with the role:
+//
+//   * a Periodic Advertiser hands over the train of its own advertising
+//     set, with the LE Periodic Advertising Set Info Transfer command
+//     ([Vol 4] Part E, Section 7.8.90), which names an
+//     Advertising_Handle;
+//   * a device synchronized to somebody else's train hands that one
+//     over, with the LE Periodic Advertising Sync Transfer command
+//     (Section 7.8.89), which names a Sync_Handle;
+//   * the receiving side says what it will do with what it is sent, with
+//     the LE Set Periodic Advertising Sync Transfer Parameters command
+//     (Section 7.8.91): Mode 0x01 takes the transfer and keeps periodic
+//     advertising reports off, Mode 0x02 takes it and turns them on.
+//
+// The module builds the HCI Command packets those operations take and
+// performs no I/O; the program that owns the transport sends them.  The
+// commands carry the parameters the AutoPTS project's BTP GAP commands
+// give (autopts doc/btp_gap.txt), so the decisions they leave open — the
+// advertising interval of a periodic advertising set, the PHYs it
+// advertises on, the service data of a transfer — are made here, once,
+// and are the subject of the module's tests.
+//
+// Periodic Advertising with Responses is the same train with subevents
+// and response slots ([Vol 4] Part E, Sections 7.8.61 [v2] and 7.8.125).
+// It differs from the plain train in three ways this module owns:
+//
+//   * its parameters go out in the twelve-octet [v2] form of the LE Set
+//     Periodic Advertising Parameters command, which is the first form
+//     plus Num_Subevents and the four parameters that describe the
+//     subevents;
+//   * it carries no periodic advertising data.  The data of a periodic
+//     event is split across its subevents, and the Controller asks the
+//     Host for the data of each subevent with the LE Periodic
+//     Advertising Subevent Data Request event, which the Host answers
+//     with the LE Set Periodic Advertising Subevent Data command.  The
+//     LE Set Periodic Advertising Data command is answered Command
+//     Disallowed on a train with responses (measured on the rig's
+//     SoftDevice Controller, autopts/controller/README.md);
+//   * the enable path is the same two commands as the plain train's.
+//
+// Nothing about a train with responses says what its subevents carry, so
+// the Host decides, and what it decides is `subevent_data_default`: the
+// same Shortened Local Name record the project's plain train carries,
+// which is what the tester's TSPX_periodic_advertising_data names.
+
+use std.test
+use bd_addr
+use hci_commands
+use hci_frame
+use gap
+use hci_codec
+
+// The advertising set this Host uses.  The Controller has one supported
+// at a time (the Zephyr hci_uart firmware the rig runs sets
+// BT_EXT_ADV_MAX_ADV_SET to 1, autopts/controller/README.md), and one is
+// all a Broadcaster, a Periodic Advertiser or a Peripheral needs here.
+pub const ADVERTISING_HANDLE = 0x00
+
+// A start or stop that lasts until it is asked for again: Duration 0x0000
+// in 10 ms units and Max_Extended_Advertising_Events 0x00 both mean no
+// limit ([Vol 4] Part E, Section 7.8.56).
+const NO_DURATION = 0x0000
+
+const NO_MAX_EVENTS = 0x00
+
+// The primary advertising interval of a periodic advertising set, in
+// 0.625 ms units: 100 ms, what `advertiser.nv` advertises at.  The
+// periodic advertising interval is the one the tester gives with BTP
+// Configure Periodic Advertising and is what a lower tester synchronizes
+// to; the primary interval only decides how often the AUX_ADV_IND that
+// carries the SyncInfo is repeated.
+const PRIMARY_INTERVAL_UNITS = 0x00A0
+
+// Why `make_periodic_advertising` refuses its arguments.
+const ERR_PERIODIC_INTERVAL_OUT_OF_RANGE = "the periodic advertising interval is outside 7.5 ms to 81.91875 s"
+
+const ERR_PERIODIC_INTERVAL_MIN_ABOVE_MAX = "the periodic advertising interval minimum is above the maximum"
+
+const ERR_PERIODIC_DATA_TOO_LONG = "the periodic advertising data is longer than the one operation that carries it"
+
+// ── Advertising set parameters ──────────────────────────────────────
+
+// The peer address an undirected set carries: all zeros, which the
+// Controller ignores ([Vol 4] Part E, Section 7.8.53).
+const NO_PEER_ADDRESS: [u8] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+
+// The LE Set Extended Advertising Parameters command for a
+// non-connectable and non-scannable extended set that keeps the
+// advertiser's address: the event properties are all clear, the primary
+// PHY is LE 1M and the secondary one, which carries the auxiliary PDUs
+// and the advertising data, is LE 2M.  This is the set a periodic
+// advertising train rides.
+//
+// The command names no address: Own_Address_Type 0x01 takes the address
+// the LE Set Advertising Set Random Address command gave this set, and
+// an undirected set carries the all-zero peer address whatever its own
+// address is.  It is therefore the first command of an advertising set
+// and can be sent before any address has been drawn.
+pub @tier(embedded)
+fn periodic_set_parameters_command() -> HciCmdMsg
+    cmd(hci_commands.opcode_le_set_extended_advertising_parameters(),
+        hci_commands.build_le_set_extended_advertising_parameters(
+            ADVERTISING_HANDLE,
+            0x0000,
+            PRIMARY_INTERVAL_UNITS, PRIMARY_INTERVAL_UNITS,
+            hci_commands.ADV_CHANNEL_MAP_ALL,
+            hci_commands.OWN_ADDR_TYPE_RANDOM,
+            0x00, NO_PEER_ADDRESS,
+            hci_commands.ADV_FILTER_NONE,
+            hci_commands.ADV_TX_POWER_NO_PREFERENCE,
+            hci_commands.LE_PHY_1M,
+            0x00,
+            hci_commands.LE_PHY_2M,
+            0x00,
+            0x00))
+
+// The LE Set Extended Advertising Parameters command for the modes
+// `advertiser.nv` does with the legacy commands: undirected, connectable
+// and scannable, on the LE 1M primary PHY, with data on the LE 1M
+// secondary PHY.  Table 7.3's 0b00000000_00010011 is the legacy ADV_IND,
+// and 0b00000000_00010010 the legacy ADV_SCAN_IND of a non-connectable
+// advertiser with scan response data ([Vol 4] Part E, Section 7.8.53).
+//
+// A legacy PDU carries 31 octets of data at most, so data above that
+// (`legacy` false) needs an extended PDU, and so does a connectable set without
+// a scan response (`btp_hci.needs_legacy_pdu`): the set has no legacy bit and,
+// because an extended PDU is connectable or scannable but not both, a
+// connectable set is not scannable.  The Unicast Server advertises its ASCS
+// Service Data that way ([BAP] 3.5.3).
+pub @tier(embedded)
+fn advertising_set_parameters_command(connectable: Bool, has_scan_response: Bool, legacy: Bool) -> HciCmdMsg
+    let properties = if not legacy
+        if connectable
+            hci_commands.ADV_EVENT_PROP_CONNECTABLE
+        else if has_scan_response
+            hci_commands.ADV_EVENT_PROP_SCANNABLE
+        else
+            0
+    else if connectable
+        hci_commands.ADV_EVENT_PROP_CONNECTABLE | hci_commands.ADV_EVENT_PROP_SCANNABLE | hci_commands.ADV_EVENT_PROP_LEGACY
+    else if has_scan_response
+        hci_commands.ADV_EVENT_PROP_SCANNABLE | hci_commands.ADV_EVENT_PROP_LEGACY
+    else
+        hci_commands.ADV_EVENT_PROP_LEGACY
+    cmd(hci_commands.opcode_le_set_extended_advertising_parameters(),
+        hci_commands.build_le_set_extended_advertising_parameters(
+            ADVERTISING_HANDLE,
+            properties,
+            PRIMARY_INTERVAL_UNITS, PRIMARY_INTERVAL_UNITS,
+            hci_commands.ADV_CHANNEL_MAP_ALL,
+            hci_commands.OWN_ADDR_TYPE_RANDOM,
+            0x00, NO_PEER_ADDRESS,
+            hci_commands.ADV_FILTER_NONE,
+            hci_commands.ADV_TX_POWER_NO_PREFERENCE,
+            hci_commands.LE_PHY_1M,
+            0x00,
+            hci_commands.LE_PHY_1M,
+            0x00,
+            0x00))
+
+// ── The advertising data of an extended set ─────────────────────────
+
+// The advertising data an extended advertising set carries: the Flags AD
+// type for `flags` followed by the Complete Local Name `name`, the same
+// two records `advertiser.nv` puts in the legacy data block, and the
+// Periodic Advertising Synchronizability mode the tester asks for is
+// carried by the periodic advertising, not by this.  `None` when name
+// does not fit the 31 octets the Flags record leaves, which is the same
+// limit as the legacy advertising data block.
+@tier(embedded)
+fn advertising_data(flags: Int, name: [u8]) -> ?[u8]
+    let ad = gap.build_flags_and_name_ad(flags, name)
+    if list.len(ad) > hci_commands.ADV_DATA_MAX_LEN
+        None
+    else
+        Some(ad)
+
+// ── Periodic advertising ────────────────────────────────────────────
+
+// The five subevent parameters a train with responses carries ([Vol 4]
+// Part E, Section 7.8.61 [v2]): how many subevents a periodic
+// advertising event is split into, how long each lasts in 1.25 ms
+// units, how long after the advertising packet of a subevent its first
+// response slot starts in 1.25 ms units, how far apart two response
+// slots are in 0.125 ms units, and how many of them a subevent has.
+struct PawrSubevents
+    num_subevents: Int
+    subevent_interval: Int
+    response_slot_delay: Int
+    response_slot_spacing: Int
+    num_response_slots: Int
+
+// One periodic advertising train: the advertising interval the tester
+// configured, in the 1.25 ms units of the command, whether the TxPower
+// field goes in the AUX_SYNC_IND PDU, and the data it carries.  A train
+// that carries responses has `responses` and no data of its own: the
+// data of its periodic events is subevent data, which the Host sends
+// when the Controller asks for it.
+struct PeriodicAdvertising
+    interval_min: Int
+    interval_max: Int
+    include_tx_power: Bool
+    data: [u8]
+    responses: ?PawrSubevents
+
+// The train for a pair of intervals in 1.25 ms units, an Include TX Power
+// flag and the data `set_data_commands` will send, or what is wrong with
+// them.
+pub @tier(embedded)
+fn make_periodic_advertising(interval_min: Int, interval_max: Int, include_tx_power: Bool, data: [u8]) -> Result<PeriodicAdvertising, Str>
+    let min_ok = interval_min >= hci_commands.PERIODIC_INTERVAL_RANGE_MIN and interval_min <= hci_commands.PERIODIC_INTERVAL_RANGE_MAX
+    let max_ok = interval_max >= hci_commands.PERIODIC_INTERVAL_RANGE_MIN and interval_max <= hci_commands.PERIODIC_INTERVAL_RANGE_MAX
+    if not min_ok or not max_ok
+        Err(ERR_PERIODIC_INTERVAL_OUT_OF_RANGE)
+    else if interval_min > interval_max
+        Err(ERR_PERIODIC_INTERVAL_MIN_ABOVE_MAX)
+    else if list.len(data) > 255
+        Err(ERR_PERIODIC_DATA_TOO_LONG)
+    else
+        Ok(PeriodicAdvertising {
+            interval_min: interval_min,
+            interval_max: interval_max,
+            include_tx_power: include_tx_power,
+            data: data,
+            responses: None })
+
+// The Periodic_Advertising_Properties of the train: Include TxPower
+// (bit 0) or nothing ([Vol 4] Part E, Section 7.8.61).
+@tier(embedded)
+@no_alloc
+fn periodic_properties(p: PeriodicAdvertising) -> Int
+    if p.include_tx_power
+        hci_commands.PERIODIC_ADV_PROP_INCLUDE_TX_POWER
+    else
+        0x0000
+
+@tier(embedded)
+fn cmd(opcode: Int, params: [u8]) -> HciCmdMsg
+    HciCmdMsg { opcode: opcode, params: params }
+
+// The commands that give `p` to the advertising set, in order: the LE
+// Set Periodic Advertising Parameters command and, when there is data,
+// the LE Set Periodic Advertising Data command that carries the whole of
+// it in one operation.  The LE Set Extended Advertising Parameters
+// command that created the set goes before these and the address step
+// between them, because this is what the Controller needs in that order
+// (`configure_periodic_advertising` below assembles the three).
+pub @tier(embedded)
+fn periodic_advertising_commands(p: PeriodicAdvertising) -> [HciCmdMsg]
+    var out: [HciCmdMsg] = [cmd(hci_commands.opcode_le_set_periodic_advertising_parameters(),
+                                hci_commands.build_le_set_periodic_advertising_parameters(ADVERTISING_HANDLE, p.interval_min, p.interval_max, periodic_properties(p)))]
+    if list.len(p.data) > 0
+        match hci_commands.build_le_set_periodic_advertising_data(ADVERTISING_HANDLE, hci_commands.EXT_ADV_DATA_COMPLETE, p.data)
+            None    => ()
+            Some(d) => list.push(out, cmd(hci_commands.opcode_le_set_periodic_advertising_data(), d))
+    out
+
+// The LE Set Periodic Advertising Data command for a new `data`, or None
+// when it cannot be sent as one operation.  Periodic advertising data may
+// be replaced while the train runs (Section 7.8.62).
+pub @tier(embedded)
+fn set_data_command(data: [u8]) -> ?HciCmdMsg
+    match hci_commands.build_le_set_periodic_advertising_data(ADVERTISING_HANDLE, hci_commands.EXT_ADV_DATA_COMPLETE, data)
+        None    => None
+        Some(d) => Some(cmd(hci_commands.opcode_le_set_periodic_advertising_data(), d))
+
+// The commands that put the set into Periodic Advertising mode, in
+// order: the LE Set Extended Advertising Enable command for the set and
+// then the LE Set Periodic Advertising Enable command.  Both are needed
+// — the periodic advertising of a set that is not enabled waits for it
+// (Section 7.8.63).  This is the order the Zephyr host enables the two
+// in, and it is the order the Controller's own state machine expects:
+// the periodic advertising of a set is created with the set's
+// parameters and only runs once the set does.
+pub @tier(embedded)
+fn start_commands() -> [HciCmdMsg]
+    [cmd(hci_commands.opcode_le_set_extended_advertising_enable(),
+         hci_commands.build_le_set_extended_advertising_enable(true, ADVERTISING_HANDLE, NO_DURATION, NO_MAX_EVENTS)),
+     cmd(hci_commands.opcode_le_set_periodic_advertising_enable(),
+         hci_commands.build_le_set_periodic_advertising_enable(true, ADVERTISING_HANDLE))]
+
+// The commands that leave Periodic Advertising mode, in order: the
+// periodic advertising first, so the train stops before the set that
+// carries it, then the set.
+pub @tier(embedded)
+fn stop_commands() -> [HciCmdMsg]
+    [cmd(hci_commands.opcode_le_set_periodic_advertising_enable(),
+         hci_commands.build_le_set_periodic_advertising_enable(false, ADVERTISING_HANDLE)),
+     cmd(hci_commands.opcode_le_set_extended_advertising_enable(),
+         hci_commands.build_le_set_extended_advertising_enable(false, ADVERTISING_HANDLE, NO_DURATION, NO_MAX_EVENTS))]
+
+// The LE Set Extended Advertising Enable command that starts or stops the
+// advertising set on its own, for the Broadcast mode of BTP Set Extended
+// Advertising plus Start Advertising, where there is no periodic
+// advertising to start with it.
+pub @tier(embedded)
+fn advertising_enable_command(enable: Bool) -> HciCmdMsg
+    cmd(hci_commands.opcode_le_set_extended_advertising_enable(),
+        hci_commands.build_le_set_extended_advertising_enable(enable, ADVERTISING_HANDLE, NO_DURATION, NO_MAX_EVENTS))
+
+// ── Periodic Advertising Synchronization Transfer ───────────────────
+
+// The Mode of the LE Set Periodic Advertising Sync Transfer Parameters
+// command that a BTP Transfer Receive Flags value asks for: bit 0 is
+// "Reports Disabled", so a transfer whose reports are disabled is Mode
+// 0x01 and one whose reports are enabled is Mode 0x02 ([Vol 4] Part E,
+// Section 7.8.91; doc/btp_gap.txt, Periodic Advertising Transfer
+// Receive).
+const TRANSFER_FLAG_REPORTS_DISABLED = 0x01
+
+@tier(embedded)
+@no_alloc
+fn transfer_mode(flags: Int) -> Int
+    if (flags & TRANSFER_FLAG_REPORTS_DISABLED) != 0
+        hci_commands.PERIODIC_TRANSFER_NO_REPORTS
+    else
+        hci_commands.PERIODIC_TRANSFER_REPORTS
+
+// The command with which the receiving side states what it will do with
+// the synchronization information the peer of `connection_handle` sends:
+// the LE Set Periodic Advertising Sync Transfer Parameters command, with
+// the mode `transfer_mode` gives, `skip` periodic advertising packets it
+// may skip and a synchronization timeout in 10 ms units.
+pub @tier(embedded)
+fn receive_transfer_command(connection_handle: Int, flags: Int, skip: Int, sync_timeout: Int) -> HciCmdMsg
+    cmd(hci_commands.opcode_le_set_periodic_advertising_sync_transfer_parameters(),
+        hci_commands.build_le_set_periodic_advertising_sync_transfer_parameters(connection_handle, transfer_mode(flags), skip, sync_timeout, hci_commands.PERIODIC_TRANSFER_CTE_ANY))
+
+// The command with which a Periodic Advertiser hands the train of its own
+// advertising set to the peer of `connection_handle`: the LE Periodic
+// Advertising Set Info Transfer command, which names the
+// Advertising_Handle and not a Sync_Handle ([Vol 4] Part E, Section
+// 7.8.90).
+pub @tier(embedded)
+fn set_info_transfer_command(connection_handle: Int, service_data: Int) -> HciCmdMsg
+    cmd(hci_commands.opcode_le_periodic_advertising_set_info_transfer(),
+        hci_commands.build_le_periodic_advertising_set_info_transfer(connection_handle, service_data, ADVERTISING_HANDLE))
+
+// The command with which the device hands over a train it is synchronized
+// to rather than one it advertises.
+pub @tier(embedded)
+fn sync_transfer_command(connection_handle: Int, service_data: Int, sync_handle: Int) -> HciCmdMsg
+    cmd(hci_commands.opcode_le_periodic_advertising_sync_transfer(),
+        hci_commands.build_le_periodic_advertising_sync_transfer(connection_handle, service_data, sync_handle))
+
+// ── Periodic advertising with responses ─────────────────────────────
+
+// Why `make_pawr_advertising` refuses its arguments.
+const ERR_SUBEVENTS_OUT_OF_RANGE = "the subevent count is outside 1 to 128"
+
+const ERR_SUBEVENT_INTERVAL_OUT_OF_RANGE = "the subevent interval is outside 7.5 ms to 318.75 ms"
+
+const ERR_SUBEVENT_INTERVAL_ABOVE_INTERVAL_MIN = "the subevent interval is longer than the periodic advertising interval minimum divided by the subevent count"
+
+const ERR_RESPONSE_SLOT_DELAY_OUT_OF_RANGE = "the response slot delay is outside 1.25 ms to 317.5 ms"
+
+const ERR_RESPONSE_SLOT_DELAY_ABOVE_SUBEVENT_INTERVAL = "the response slot delay is not below the subevent interval"
+
+const ERR_RESPONSE_SLOT_SPACING_OUT_OF_RANGE = "the response slot spacing is outside 0.25 ms to 31.875 ms"
+
+const ERR_RESPONSE_SLOTS_OUT_OF_RANGE = "the response slot count is outside 1 to 255"
+
+// The train with responses those parameters make, or what is wrong with
+// them.  The ranges are those of the command, which are also the ones
+// the rig's SoftDevice Controller enforces: it answers Invalid HCI
+// Command Parameters (0x12) below a Subevent_Interval of 0x06 and below
+// a Response_Slot_Delay of 0x01, and above the minimum interval divided
+// by the subevent count (measured 2026-10-13,
+// autopts/controller/README.md).
+pub @tier(embedded)
+fn make_pawr_advertising(interval_min: Int, interval_max: Int, num_subevents: Int, subevent_interval: Int, response_slot_delay: Int, response_slot_spacing: Int, num_response_slots: Int) -> Result<PeriodicAdvertising, Str>
+    let min_ok = interval_min >= hci_commands.PERIODIC_INTERVAL_RANGE_MIN and interval_min <= hci_commands.PERIODIC_INTERVAL_RANGE_MAX
+    let max_ok = interval_max >= hci_commands.PERIODIC_INTERVAL_RANGE_MIN and interval_max <= hci_commands.PERIODIC_INTERVAL_RANGE_MAX
+    if not min_ok or not max_ok
+        Err(ERR_PERIODIC_INTERVAL_OUT_OF_RANGE)
+    else if interval_min > interval_max
+        Err(ERR_PERIODIC_INTERVAL_MIN_ABOVE_MAX)
+    else if num_subevents < 1 or num_subevents > hci_commands.PAWR_SUBEVENTS_RANGE_MAX
+        Err(ERR_SUBEVENTS_OUT_OF_RANGE)
+    else if subevent_interval < hci_commands.PAWR_SUBEVENT_INTERVAL_MIN
+        Err(ERR_SUBEVENT_INTERVAL_OUT_OF_RANGE)
+    else if subevent_interval > interval_min / num_subevents
+        Err(ERR_SUBEVENT_INTERVAL_ABOVE_INTERVAL_MIN)
+    else if response_slot_delay < hci_commands.PAWR_RESPONSE_SLOT_DELAY_MIN or response_slot_delay > hci_commands.PAWR_RESPONSE_SLOT_DELAY_MAX
+        Err(ERR_RESPONSE_SLOT_DELAY_OUT_OF_RANGE)
+    else if response_slot_delay >= subevent_interval
+        Err(ERR_RESPONSE_SLOT_DELAY_ABOVE_SUBEVENT_INTERVAL)
+    else if response_slot_spacing < hci_commands.PAWR_RESPONSE_SLOT_SPACING_MIN
+        Err(ERR_RESPONSE_SLOT_SPACING_OUT_OF_RANGE)
+    else if num_response_slots < 1
+        Err(ERR_RESPONSE_SLOTS_OUT_OF_RANGE)
+    else
+        Ok(PeriodicAdvertising {
+            interval_min: interval_min,
+            interval_max: interval_max,
+            include_tx_power: false,
+            data: [],
+            responses: Some(PawrSubevents {
+                num_subevents: num_subevents,
+                subevent_interval: subevent_interval,
+                response_slot_delay: response_slot_delay,
+                response_slot_spacing: response_slot_spacing,
+                num_response_slots: num_response_slots }) })
+
+// The subevents of a train that carries responses, or None for a train
+// that carries none.
+@tier(embedded)
+fn subevents_of(p: PeriodicAdvertising) -> ?PawrSubevents
+    p.responses
+
+// The LE Set Periodic Advertising Parameters command [v2] that gives the
+// advertising set `p`, for a train that carries responses.  The
+// properties are 0x0000: a train with responses carries no TxPower field
+// — the rig's SoftDevice Controller answers Include TxPower on one
+// Unsupported Feature or Parameter Value (0x11), measured 2026-10-13.
+// `None` when `p` carries no responses and the first form is the one to
+// send.
+pub @satisfies("REQ-BLE-HCI-056")
+@tier(embedded)
+fn pawr_parameters_command(p: PeriodicAdvertising) -> ?HciCmdMsg
+    match subevents_of(p)
+        None => None
+        Some(s) =>
+            Some(cmd(hci_commands.opcode_le_set_periodic_advertising_parameters_v2(),
+                     hci_commands.build_le_set_periodic_advertising_parameters_v2(
+                         ADVERTISING_HANDLE,
+                         p.interval_min, p.interval_max,
+                         0x0000,
+                         s.num_subevents, s.subevent_interval,
+                         s.response_slot_delay, s.response_slot_spacing,
+                         s.num_response_slots)))
+
+// The advertising data every subevent of this Host's train carries: the
+// Shortened Local Name record, which is what the tester's
+// TSPX_periodic_advertising_data names and what a Lower Tester reading
+// the train looks for.
+@satisfies("REQ-BLE-HCI-056")
+@tier(embedded)
+fn subevent_data_default() -> [u8]
+    tester_periodic_data()
+
+// The LE Set Periodic Advertising Subevent Data command that answers
+// `request` for the train `p`: one subevent element for every subevent
+// the Controller asked for, each carrying `subevent_data_default` and
+// naming every response slot of the train.  The Controller numbers the
+// subevents it asks for from `subevent_start` and wraps past the last
+// one of the train, so the answer wraps the same way ([Vol 4] Part E,
+// Section 7.8.125).  `None` for a train with no responses, and for a
+// request whose count is not one command — a Controller asks for no more
+// subevents than the command's 0x0F holds.
+pub @satisfies("REQ-BLE-HCI-056")
+@tier(embedded)
+fn pawr_subevent_data_command(p: PeriodicAdvertising, request: PawrSubeventRequest) -> ?HciCmdMsg
+    match subevents_of(p)
+        None => None
+        Some(s) =>
+            if request.subevent_data_count < 1 or request.subevent_data_count > hci_commands.PAWR_SUBEVENTS_MAX
+                None
+            else
+                var subevents: [hci_commands.PawrSubevent] = []
+                for i in 0..request.subevent_data_count
+                    let index = (request.subevent_start + i) % s.num_subevents
+                    list.push(subevents, hci_commands.PawrSubevent {
+                        subevent: index,
+                        response_slot_start: 0x00,
+                        response_slot_count: s.num_response_slots,
+                        data: subevent_data_default() })
+                match hci_commands.build_le_set_periodic_advertising_subevent_data(ADVERTISING_HANDLE, subevents)
+                    None    => None
+                    Some(d) => Some(cmd(hci_commands.opcode_le_set_periodic_advertising_subevent_data(), d))
+
+// ── Formatting ──────────────────────────────────────────────────────
+
+// The name of one extended or periodic advertising command, for the
+// program's console.  The names are those of the [Vol 4] Part E section
+// headings.
+@tier(embedded)
+fn command_name(opcode: Int) -> Str
+    match opcode
+        n if n == hci_commands.opcode_le_set_advertising_set_random_address() => "HCI_LE_Set_Advertising_Set_Random_Address"
+        n if n == hci_commands.opcode_le_set_extended_advertising_parameters() => "HCI_LE_Set_Extended_Advertising_Parameters"
+        n if n == hci_commands.opcode_le_set_extended_advertising_data() => "HCI_LE_Set_Extended_Advertising_Data"
+        n if n == hci_commands.opcode_le_set_extended_scan_response_data() => "HCI_LE_Set_Extended_Scan_Response_Data"
+        n if n == hci_commands.opcode_le_set_extended_advertising_enable() => "HCI_LE_Set_Extended_Advertising_Enable"
+        n if n == hci_commands.opcode_le_read_maximum_advertising_data_length() => "HCI_LE_Read_Maximum_Advertising_Data_Length"
+        n if n == hci_commands.opcode_le_read_number_of_supported_advertising_sets() => "HCI_LE_Read_Number_of_Supported_Advertising_Sets"
+        n if n == hci_commands.opcode_le_remove_advertising_set() => "HCI_LE_Remove_Advertising_Set"
+        n if n == hci_commands.opcode_le_clear_advertising_sets() => "HCI_LE_Clear_Advertising_Sets"
+        n if n == hci_commands.opcode_le_set_periodic_advertising_parameters() => "HCI_LE_Set_Periodic_Advertising_Parameters"
+        n if n == hci_commands.opcode_le_set_periodic_advertising_data() => "HCI_LE_Set_Periodic_Advertising_Data"
+        n if n == hci_commands.opcode_le_set_periodic_advertising_enable() => "HCI_LE_Set_Periodic_Advertising_Enable"
+        n if n == hci_commands.opcode_le_set_periodic_advertising_receive_enable() => "HCI_LE_Set_Periodic_Advertising_Receive_Enable"
+        n if n == hci_commands.opcode_le_periodic_advertising_sync_transfer() => "HCI_LE_Periodic_Advertising_Sync_Transfer"
+        n if n == hci_commands.opcode_le_periodic_advertising_set_info_transfer() => "HCI_LE_Periodic_Advertising_Set_Info_Transfer"
+        n if n == hci_commands.opcode_le_set_periodic_advertising_sync_transfer_parameters() => "HCI_LE_Set_Periodic_Advertising_Sync_Transfer_Parameters"
+        n if n == hci_commands.opcode_le_set_default_periodic_advertising_sync_transfer_parameters() => "HCI_LE_Set_Default_Periodic_Advertising_Sync_Transfer_Parameters"
+        _ => ""
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+// "PADV_Tester" as ASCII bytes, the shortened name the AutoPTS project
+// advertises periodically (autopts/ptsprojects/zephyr/gap.py,
+// `periodic_data`).
+@tier(embedded)
+fn tester_periodic_name() -> [u8]
+    ['P', 'A', 'D', 'V', '_', 'T', 'e', 's', 't', 'e', 'r']
+
+// The AD structure that name makes: Length 12, AD type 0x08 (Shortened
+// Local Name) and the eleven octets of the name, which is what
+// autopts/wid/gap.py builds for WID 300.
+@tier(embedded)
+fn tester_periodic_data() -> [u8]
+    var out: [u8] = [0x0C, 0x08]
+    list.append(out, tester_periodic_name())
+    out
+
+@tier(app)
+fn test_address() -> [u8]
+    [0x01, 0x4F, 0x56, 0x4F, 0x4E, 0xC0]
+
+// The bytes of `cmd` as space-separated hex pairs.
+@tier(app)
+fn hex_bytes(pkt: [u8]) -> Str
+    var out = ""
+    for i in 0..list.len(pkt)
+        if i > 0
+            out = out + " "
+        out = out + bd_addr.hex_byte(pkt[i] as Int)
+    out
+
+@test
+@satisfies("REQ-BLE-HCI-051")
+fn test_periodic_set_parameters_bytes()
+    let c = periodic_set_parameters_command()
+    test.assert_eq(c.opcode, 0x2036)
+    test.assert_eq(list.len(c.params), 25)
+    // Handle 00, properties 0000, 100 ms primary intervals, all three
+    // channels, random own address, no peer, no filter, no TX power
+    // preference, LE 1M primary and LE 2M secondary PHY, SID 0.
+    test.assert_eq(hex_bytes(c.params), "00 00 00 A0 00 00 A0 00 00 07 01 00 00 00 00 00 00 00 00 7F 01 00 02 00 00")
+
+@test
+@satisfies("REQ-BLE-HCI-051")
+fn test_set_parameters_follow_the_legacy_types()
+    let undirected = advertising_set_parameters_command(true, true, true)
+    test.assert_eq(undirected.opcode, 0x2036)
+    // 0b00000000_00010011: legacy ADV_IND, connectable and scannable.
+    test.assert_eq(undirected.params[1] as Int, 0x13)
+    test.assert_eq(undirected.params[2] as Int, 0x00)
+    let scannable = advertising_set_parameters_command(false, true, true)
+    // 0b00000000_00010010: legacy ADV_SCAN_IND.
+    test.assert_eq(scannable.params[1] as Int, 0x12)
+    let plain = advertising_set_parameters_command(false, false, true)
+    // 0b00000000_00010000: legacy ADV_NONCONN_IND.
+    test.assert_eq(plain.params[1] as Int, 0x10)
+    test.assert_eq(plain.params[2] as Int, 0x00)
+    // The legacy types put the data on the LE 1M secondary PHY, which is
+    // what a legacy PDU has.
+    test.assert_eq(undirected.params[22] as Int, hci_commands.LE_PHY_1M)
+
+@test
+@satisfies("REQ-BLE-HCI-051")
+fn test_advertising_data_is_the_flags_and_name()
+    let flags = gap.ad_flags_for(GeneralDiscoverable, true)
+    match advertising_data(flags, ['N', 'o', 'v', 'o'])
+        None    => test.fail("a four-octet name fits")
+        Some(ad) => test.assert_eq(hex_bytes(ad), "02 01 06 05 09 4E 6F 76 6F")
+    var long: [u8] = []
+    for _ in 0..27
+        list.push(long, 'A')
+    test.assert(advertising_data(flags, long) == None)
+
+@test
+fn test_make_periodic_advertising_accepts_and_refuses()
+    let data = tester_periodic_data()
+    match make_periodic_advertising(150, 200, false, data)
+        Err(_) => test.fail("150 to 200 units are accepted")
+        Ok(p) =>
+            test.assert_eq(p.interval_min, 150)
+            test.assert_eq(p.interval_max, 200)
+            test.assert_eq(p.include_tx_power, false)
+            test.assert_eq(list.len(p.data), 13)
+    match make_periodic_advertising(0x0005, 200, false, data)
+        Err(e) => test.assert_eq(e, ERR_PERIODIC_INTERVAL_OUT_OF_RANGE)
+        Ok(_)  => test.fail("5 units is below the 7.5 ms floor")
+    match make_periodic_advertising(150, 0x10000, false, data)
+        Err(e) => test.assert_eq(e, ERR_PERIODIC_INTERVAL_OUT_OF_RANGE)
+        Ok(_)  => test.fail("65536 units is above the ceiling")
+    match make_periodic_advertising(200, 150, false, data)
+        Err(e) => test.assert_eq(e, ERR_PERIODIC_INTERVAL_MIN_ABOVE_MAX)
+        Ok(_)  => test.fail("a minimum above the maximum is refused")
+    var huge: [u8] = []
+    for _ in 0..256
+        list.push(huge, 0x00)
+    match make_periodic_advertising(150, 200, false, huge)
+        Err(e) => test.assert_eq(e, ERR_PERIODIC_DATA_TOO_LONG)
+        Ok(_)  => test.fail("256 octets do not fit one operation")
+
+@test
+@satisfies("REQ-BLE-HCI-052")
+fn test_periodic_advertising_commands_in_order()
+    match make_periodic_advertising(150, 200, true, tester_periodic_data())
+        Err(_) => test.fail("150 to 200 units are accepted")
+        Ok(p) =>
+            test.assert_eq(periodic_properties(p), hci_commands.PERIODIC_ADV_PROP_INCLUDE_TX_POWER)
+            let cmds = periodic_advertising_commands(p)
+            test.assert_eq(list.len(cmds), 2)
+            test.assert_eq(cmds[0].opcode, 0x203E)
+            // Seven octets: the properties field is two octets wide, and
+            // a Controller reads the length off the command
+            // ([Vol 4] Part E, Section 7.8.61).
+            test.assert_eq(hex_bytes(cmds[0].params), "00 96 00 C8 00 01 00")
+            test.assert_eq(cmds[1].opcode, 0x203F)
+            test.assert_eq(cmds[1].params[1] as Int, hci_commands.EXT_ADV_DATA_COMPLETE)
+            test.assert_eq(cmds[1].params[2] as Int, 13)
+            test.assert_eq(hex_bytes(cmds[1].params[3:8]), "0C 08 50 41 44")
+    match make_periodic_advertising(150, 200, false, [])
+        Err(_) => test.fail("an empty data block is a train with no data")
+        Ok(p) =>
+            test.assert_eq(periodic_properties(p), 0x0000)
+            // With no data there is nothing to set and no second command.
+            test.assert_eq(list.len(periodic_advertising_commands(p)), 1)
+
+@test
+@satisfies("REQ-BLE-HCI-052")
+fn test_start_and_stop_commands()
+    let start = start_commands()
+    test.assert_eq(list.len(start), 2)
+    // The set is enabled first and the train that rides it second.
+    test.assert_eq(start[0].opcode, 0x2039)
+    test.assert_eq(hex_bytes(start[0].params), "01 01 00 00 00 00")
+    test.assert_eq(start[1].opcode, 0x2040)
+    test.assert_eq(hex_bytes(start[1].params), "01 00")
+    let stop = stop_commands()
+    test.assert_eq(list.len(stop), 2)
+    // The train stops before the set that carries it.
+    test.assert_eq(stop[0].opcode, 0x2040)
+    test.assert_eq(hex_bytes(stop[0].params), "00 00")
+    test.assert_eq(stop[1].opcode, 0x2039)
+    test.assert_eq(hex_bytes(stop[1].params), "00 01 00 00 00 00")
+    test.assert_eq(hex_bytes(advertising_enable_command(true).params), "01 01 00 00 00 00")
+    test.assert_eq(hex_bytes(advertising_enable_command(false).params), "00 01 00 00 00 00")
+
+@test
+@satisfies("REQ-BLE-HCI-052")
+fn test_set_data_command_carries_the_whole_block()
+    match set_data_command(tester_periodic_data())
+        None    => test.fail("thirteen octets fit one operation")
+        Some(c) =>
+            test.assert_eq(c.opcode, 0x203F)
+            test.assert_eq(list.len(c.params), 16)
+            test.assert_eq(c.params[0] as Int, ADVERTISING_HANDLE)
+            test.assert_eq(c.params[2] as Int, 13)
+    var huge: [u8] = []
+    for _ in 0..256
+        list.push(huge, 0x00)
+    test.assert(set_data_command(huge) == None)
+
+@test
+@satisfies("REQ-BLE-HCI-053")
+@satisfies("REQ-BLE-HCI-054")
+fn test_transfer_commands()
+    // Reports Disabled, the "without listening" of GAP/PADV/PASE/BV-03-C.
+    test.assert_eq(transfer_mode(0x01), hci_commands.PERIODIC_TRANSFER_NO_REPORTS)
+    test.assert_eq(transfer_mode(0x00), hci_commands.PERIODIC_TRANSFER_REPORTS)
+    let listen = receive_transfer_command(0x0E41, 0x00, 0x0000, 0x01F4)
+    test.assert_eq(listen.opcode, 0x205C)
+    test.assert_eq(hex_bytes(listen.params), "41 0E 02 00 00 F4 01 00")
+    let quiet = receive_transfer_command(0x0E41, 0x01, 0x0000, 0x01F4)
+    test.assert_eq(hex_bytes(quiet.params), "41 0E 01 00 00 F4 01 00")
+    let info = set_info_transfer_command(0x0E41, 0x0000)
+    test.assert_eq(info.opcode, 0x205B)
+    test.assert_eq(hex_bytes(info.params), "41 0E 00 00 00")
+    let sync = sync_transfer_command(0x0E41, 0x1234, 0x0005)
+    test.assert_eq(sync.opcode, 0x205A)
+    test.assert_eq(hex_bytes(sync.params), "41 0E 34 12 05 00")
+
+@test
+fn test_command_names()
+    test.assert_eq(command_name(0x2036), "HCI_LE_Set_Extended_Advertising_Parameters")
+    test.assert_eq(command_name(0x2039), "HCI_LE_Set_Extended_Advertising_Enable")
+    test.assert_eq(command_name(0x203E), "HCI_LE_Set_Periodic_Advertising_Parameters")
+    test.assert_eq(command_name(0x2040), "HCI_LE_Set_Periodic_Advertising_Enable")
+    test.assert_eq(command_name(0x205B), "HCI_LE_Periodic_Advertising_Set_Info_Transfer")
+    test.assert_eq(command_name(0x205C), "HCI_LE_Set_Periodic_Advertising_Sync_Transfer_Parameters")
+    test.assert_eq(command_name(0x2099), "")
+
+@test
+@satisfies("REQ-BLE-HCI-056")
+fn test_make_pawr_advertising_accepts_and_refuses()
+    // The AutoPTS project's own numbers: 150 to 200 units, 10 subevents,
+    // subevent interval 15, response slot delay 1, response slot spacing
+    // 4 and 5 response slots.
+    match make_pawr_advertising(150, 200, 10, 15, 1, 4, 5)
+        Err(e) => test.assert_eq(e, "the framework's numbers are accepted")
+        Ok(p) =>
+            test.assert_eq(p.interval_min, 150)
+            test.assert_eq(p.include_tx_power, false)
+            match subevents_of(p)
+                None    => test.fail("a train with responses carries its subevents")
+                Some(s) =>
+                    test.assert_eq(s.num_subevents, 10)
+                    test.assert_eq(s.subevent_interval, 15)
+                    test.assert_eq(s.response_slot_delay, 1)
+                    test.assert_eq(s.response_slot_spacing, 4)
+                    test.assert_eq(s.num_response_slots, 5)
+    match make_pawr_advertising(0x0005, 200, 10, 15, 1, 4, 5)
+        Err(e) => test.assert_eq(e, ERR_PERIODIC_INTERVAL_OUT_OF_RANGE)
+        Ok(_)  => test.fail("5 units is below the 7.5 ms floor")
+    match make_pawr_advertising(200, 150, 10, 15, 1, 4, 5)
+        Err(e) => test.assert_eq(e, ERR_PERIODIC_INTERVAL_MIN_ABOVE_MAX)
+        Ok(_)  => test.fail("a minimum above the maximum is refused")
+    match make_pawr_advertising(150, 200, 0, 15, 1, 4, 5)
+        Err(e) => test.assert_eq(e, ERR_SUBEVENTS_OUT_OF_RANGE)
+        Ok(_)  => test.fail("no subevent is not a train with responses")
+    match make_pawr_advertising(150, 200, 0x81, 15, 1, 4, 5)
+        Err(e) => test.assert_eq(e, ERR_SUBEVENTS_OUT_OF_RANGE)
+        Ok(_)  => test.fail("129 subevents are above the 0x80 the field holds")
+    match make_pawr_advertising(150, 200, 10, 0x05, 1, 4, 5)
+        Err(e) => test.assert_eq(e, ERR_SUBEVENT_INTERVAL_OUT_OF_RANGE)
+        Ok(_)  => test.fail("5 units of subevent interval is below the floor")
+    // 16 units is above 150 divided by 10, which is 15.
+    match make_pawr_advertising(150, 200, 10, 16, 1, 4, 5)
+        Err(e) => test.assert_eq(e, ERR_SUBEVENT_INTERVAL_ABOVE_INTERVAL_MIN)
+        Ok(_)  => test.fail("a subevent interval above the quotient is refused")
+    match make_pawr_advertising(150, 200, 10, 15, 0, 4, 5)
+        Err(e) => test.assert_eq(e, ERR_RESPONSE_SLOT_DELAY_OUT_OF_RANGE)
+        Ok(_)  => test.fail("no response slot delay is refused")
+    match make_pawr_advertising(150, 200, 10, 15, 15, 4, 5)
+        Err(e) => test.assert_eq(e, ERR_RESPONSE_SLOT_DELAY_ABOVE_SUBEVENT_INTERVAL)
+        Ok(_)  => test.fail("a delay as long as the subevent is refused")
+    match make_pawr_advertising(150, 200, 10, 15, 1, 1, 5)
+        Err(e) => test.assert_eq(e, ERR_RESPONSE_SLOT_SPACING_OUT_OF_RANGE)
+        Ok(_)  => test.fail("1 unit of spacing is below the floor")
+    match make_pawr_advertising(150, 200, 10, 15, 1, 4, 0)
+        Err(e) => test.assert_eq(e, ERR_RESPONSE_SLOTS_OUT_OF_RANGE)
+        Ok(_)  => test.fail("no response slot is refused")
+
+@test
+@satisfies("REQ-BLE-HCI-056")
+fn test_pawr_parameters_command_bytes()
+    match make_pawr_advertising(150, 200, 10, 15, 1, 4, 5)
+        Err(_) => test.fail("the framework's numbers are accepted")
+        Ok(p) =>
+            match pawr_parameters_command(p)
+                None => test.fail("a train with responses has the [v2] parameters")
+                Some(c) =>
+                    test.assert_eq(c.opcode, 0x2086)
+                    // Twelve octets: the four of the first form and the
+                    // five subevent parameters, with the properties
+                    // between them.
+                    test.assert_eq(list.len(c.params), 12)
+                    test.assert_eq(hex_bytes(c.params), "00 96 00 C8 00 00 00 0A 0F 01 04 05")
+    // A plain train has none: its parameters are the first form's.
+    match make_periodic_advertising(150, 200, false, [])
+        Err(_) => test.fail("the plain train's numbers are accepted")
+        Ok(p)  => test.assert(pawr_parameters_command(p) == None)
+
+@test
+@satisfies("REQ-BLE-HCI-056")
+fn test_pawr_subevent_data_answers_a_request()
+    match make_pawr_advertising(150, 200, 10, 15, 1, 4, 5)
+        Err(_) => test.fail("the framework's numbers are accepted")
+        Ok(p) =>
+            // The rig's Controller asks for three subevents at a time and
+            // wraps past the last of the ten.
+            let request = PawrSubeventRequest { advertising_handle: 0x00, subevent_start: 0x09, subevent_data_count: 0x03 }
+            match pawr_subevent_data_command(p, request)
+                None => test.fail("three subevents fit one command")
+                Some(c) =>
+                    test.assert_eq(c.opcode, 0x2082)
+                    test.assert_eq(c.params[0] as Int, ADVERTISING_HANDLE)
+                    test.assert_eq(c.params[1] as Int, 3)
+                    // Subevents 9, 0 and 1 in that order, each element its four
+                    // fields and then the thirteen octets of the record, with
+                    // every response slot of the train.
+                    test.assert_eq(list.len(c.params), 2 + 3 * (4 + 13))
+                    let stride = 4 + 13
+                    let order: [Int] = [9, 0, 1]
+                    for k in 0..3
+                        let at = 2 + k * stride
+                        test.assert_eq(c.params[at] as Int, order[k])
+                        test.assert_eq(c.params[at + 1] as Int, 0x00)
+                        test.assert_eq(c.params[at + 2] as Int, 5)
+                        test.assert_eq(c.params[at + 3] as Int, 13)
+                        test.assert_eq(c.params[at + 4] as Int, 0x0C)
+                        test.assert_eq(c.params[at + 5] as Int, 0x08)
+            // A request for no subevent has no answer, and one above the
+            // 0x0F the command holds has none either.
+            let none = PawrSubeventRequest { advertising_handle: 0x00, subevent_start: 0x00, subevent_data_count: 0x00 }
+            test.assert(pawr_subevent_data_command(p, none) == None)
+            let many = PawrSubeventRequest { advertising_handle: 0x00, subevent_start: 0x00, subevent_data_count: 0x10 }
+            test.assert(pawr_subevent_data_command(p, many) == None)
+
+@test
+fn test_subevent_data_default_is_the_project_record()
+    test.assert_eq(hex_bytes(subevent_data_default()), "0C 08 50 41 44 56 5F 54 65 73 74 65 72")

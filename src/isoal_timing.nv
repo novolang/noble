@@ -1,0 +1,385 @@
+// isoal_timing.nv -- the timing rules of the Isochronous
+// Adaptation Layer.
+//
+// [Vol 6] Part G, Section 3 says how an SDU's timing is carried over an
+// isochronous transport: the Time_Offset of a framed PDU, the transport
+// latency of a CIG or a BIG, and the SDU synchronization reference a
+// receiving Controller gives an SDU, from the anchor point of the event that
+// carried it.  The functions here are those formulae, in microseconds and in
+// integers, so that a Host can check the latency a Controller reports against
+// the one it asked for, derive the time an SDU is presented at, and
+// configure a stream whose bandwidth the Link Layer rules require
+// ([Vol 6] Part G, Sections 2.1 and 2.2).
+//
+// Times are microseconds.  The ISO_Interval of an HCI command or event is in
+// units of 1.25 ms; `iso_interval_us` converts it.  `framing` is the Framing
+// parameter of the HCI commands: 0 unframed PDUs, 1 framed PDUs in
+// Segmentable mode, 2 framed PDUs in Unsegmented mode
+// (`hci_commands.ISO_FRAMING_*`).  A function that has an SDU_Interval
+// parameter divides by it only after it has checked that it is positive and
+// answers -1 otherwise.
+//
+// Satisfies: REQ-BLE-ISO-007.
+
+use std.test
+use hci_commands
+
+// The ISO_Interval of the HCI commands and events is in units of 1.25 ms.
+const ISO_INTERVAL_UNIT_US = 1250
+
+// The largest drift of the SDU timing from the configured SDU_Interval,
+// 100 ppm ([Vol 6] Part G, Section 2.2), as a numerator over a denominator.
+const MAX_DRIFT_PPM = 100
+
+const PPM = 1000000
+
+@satisfies("REQ-BLE-ISO-007")
+@tier(embedded)
+@no_alloc
+fn iso_interval_us(units: Int) -> Int
+    units * ISO_INTERVAL_UNIT_US
+
+// Framing_Delay: the SDU_Interval in Segmentable mode and zero in
+// Unsegmented mode ([Vol 6] Part G, Section 3.2.1).  A stream of unframed
+// PDUs has no such delay.
+@satisfies("REQ-BLE-ISO-007")
+@tier(embedded)
+@no_alloc
+fn framing_delay(framing: Int, sdu_interval: Int) -> Int
+    if framing == hci_commands.ISO_FRAMING_FRAMED_SEGMENTABLE
+        sdu_interval
+    else
+        0
+
+// The delay that framing adds to the path of an SDU when its creation is
+// not synchronized to the transport: one SDU interval plus one isochronous
+// interval in Segmentable mode, one isochronous interval in Unsegmented
+// mode, none for unframed PDUs.  A 10.6 ms SDU interval over a 10 ms
+// isochronous interval adds 20.6 ms in Segmentable mode and 10 ms in
+// Unsegmented mode ([Vol 6] Part G, Section 3.2.2, the example).
+@satisfies("REQ-BLE-ISO-007")
+@tier(embedded)
+@no_alloc
+fn framing_added_delay(framing: Int, iso_interval: Int, sdu_interval: Int) -> Int
+    if framing == hci_commands.ISO_FRAMING_UNFRAMED
+        0
+    else
+        framing_delay(framing, sdu_interval) + iso_interval
+
+// The Transport_Latency of one direction of a CIS, from the CIG_Sync_Delay
+// and the flush timeout `ft` of that direction (Sections 3.2.1 and 3.2.2).
+// Framed PDUs: CIG_Sync_Delay + FT x ISO_Interval + Framing_Delay.  Unframed
+// PDUs: CIG_Sync_Delay + (FT - 1) x ISO_Interval + (USPI - 1) x SDU_Interval,
+// which is CIG_Sync_Delay + FT x ISO_Interval - SDU_Interval when the SDU
+// interval divides the isochronous interval, as unframed PDUs require.
+@satisfies("REQ-BLE-ISO-007")
+@tier(embedded)
+@no_alloc
+fn cis_transport_latency(framing: Int, cig_sync_delay: Int, ft: Int, iso_interval: Int, sdu_interval: Int) -> Int
+    if sdu_interval <= 0
+        return -1
+    if framing == hci_commands.ISO_FRAMING_UNFRAMED
+        cig_sync_delay + ft * iso_interval - sdu_interval
+    else
+        cig_sync_delay + ft * iso_interval + framing_delay(framing, sdu_interval)
+
+// The Transport_Latency of a BIG, from the BIG_Sync_Delay and the NSE, BN,
+// IRC and PTO of its BISes (Sections 3.2.1 and 3.2.2).  Framed PDUs:
+// BIG_Sync_Delay + PTO x (NSE / BN - IRC) x ISO_Interval + ISO_Interval +
+// Framing_Delay.  Unframed PDUs: BIG_Sync_Delay + (PTO x (NSE / BN - IRC) +
+// 1) x ISO_Interval - SDU_Interval.  NSE / BN is a whole number: a BIG has
+// an NSE that is a multiple of BN ([Vol 4] Part E, Section 7.8.104).
+@satisfies("REQ-BLE-ISO-007")
+@tier(embedded)
+@no_alloc
+fn big_transport_latency(framing: Int, big_sync_delay: Int, pto: Int, nse: Int, bn: Int, irc: Int, iso_interval: Int, sdu_interval: Int) -> Int
+    if sdu_interval <= 0 or bn <= 0
+        return -1
+    let pre = pto * (nse / bn - irc)
+    if framing == hci_commands.ISO_FRAMING_UNFRAMED
+        big_sync_delay + (pre + 1) * iso_interval - sdu_interval
+    else
+        big_sync_delay + pre * iso_interval + iso_interval + framing_delay(framing, sdu_interval)
+
+// The CIS reference anchor point a receiver derives from the time `y` at
+// which it received the PDU, when the PDU came in subevent `p` (counted
+// from 1) of the CIS event `n` events after the first one the payload could
+// have used: Y1 = Y - (p - 1) x Sub_Interval - n x ISO_Interval (Section
+// 3.2.1, the example).
+@satisfies("REQ-BLE-ISO-007")
+@tier(embedded)
+@no_alloc
+fn cis_reference_anchor(y: Int, p: Int, sub_interval: Int, n: Int, iso_interval: Int) -> Int
+    y - (p - 1) * sub_interval - n * iso_interval
+
+// The SDU_Synchronization_Reference of an SDU sent from the Central to the
+// Peripheral in a CIS, from the CIS reference anchor point (Sections 3.2.1
+// and 3.2.2).  Framed PDUs: anchor + CIS_Sync_Delay + Framing_Delay_C + FT x
+// ISO_Interval - Time_Offset, with the Time_Offset of the SDU's first
+// segment.  Unframed PDUs: anchor + CIS_Sync_Delay + (FT - 1) x ISO_Interval
+// for the first SDU of a burst, and one SDU_Interval more for each later
+// SDU with the same anchor point; `index` counts the SDUs of the burst from
+// 0, and `time_offset` is not used.
+@satisfies("REQ-BLE-ISO-007")
+@tier(embedded)
+@no_alloc
+fn cis_sync_reference_c_to_p(framing: Int, anchor: Int, cis_sync_delay: Int, ft: Int, iso_interval: Int, sdu_interval: Int, time_offset: Int, index: Int) -> Int
+    if sdu_interval <= 0 or index < 0
+        return -1
+    if framing == hci_commands.ISO_FRAMING_UNFRAMED
+        anchor + cis_sync_delay + (ft - 1) * iso_interval + index * sdu_interval
+    else
+        anchor + cis_sync_delay + framing_delay(framing, sdu_interval) + ft * iso_interval - time_offset
+
+// The same for an SDU sent from the Peripheral to the Central.  Framed
+// PDUs: anchor + CIS_Sync_Delay - CIG_Sync_Delay - Time_Offset.  Unframed
+// PDUs: anchor + CIS_Sync_Delay - CIG_Sync_Delay + SDU_Interval -
+// ISO_Interval, plus one SDU_Interval for each later SDU of the burst.
+@satisfies("REQ-BLE-ISO-007")
+@tier(embedded)
+@no_alloc
+fn cis_sync_reference_p_to_c(framing: Int, anchor: Int, cis_sync_delay: Int, cig_sync_delay: Int, iso_interval: Int, sdu_interval: Int, time_offset: Int, index: Int) -> Int
+    if sdu_interval <= 0 or index < 0
+        return -1
+    if framing == hci_commands.ISO_FRAMING_UNFRAMED
+        anchor + cis_sync_delay - cig_sync_delay + sdu_interval - iso_interval + index * sdu_interval
+    else
+        anchor + cis_sync_delay - cig_sync_delay - time_offset
+
+// The SDU_Synchronization_Reference of an SDU received in a BIS, from the BIG
+// reference anchor point.  Framed PDUs: anchor + BIG_Sync_Delay +
+// ISO_Interval + Framing_Delay_B - Time_Offset.  Unframed PDUs: anchor +
+// BIG_Sync_Delay, plus one SDU_Interval for each later SDU of the burst.
+@satisfies("REQ-BLE-ISO-007")
+@tier(embedded)
+@no_alloc
+fn bis_sync_reference(framing: Int, anchor: Int, big_sync_delay: Int, iso_interval: Int, sdu_interval: Int, time_offset: Int, index: Int) -> Int
+    if sdu_interval <= 0 or index < 0
+        return -1
+    if framing == hci_commands.ISO_FRAMING_UNFRAMED
+        anchor + big_sync_delay + index * sdu_interval
+    else
+        anchor + big_sync_delay + iso_interval + framing_delay(framing, sdu_interval) - time_offset
+
+// ── The parameters unframed and framed PDUs need ────────────────────
+
+// USPI, the number of SDUs scheduled per ISO_Interval: ISO_Interval /
+// SDU_Interval, which has to be a whole number for unframed PDUs ([Vol 6]
+// Part G, Section 2.1).  0 when it is not, and for an SDU_Interval that is
+// not positive.
+@satisfies("REQ-BLE-ISO-007")
+@tier(embedded)
+@no_alloc
+fn unframed_uspi(iso_interval: Int, sdu_interval: Int) -> Int
+    if sdu_interval <= 0 or iso_interval < sdu_interval or iso_interval % sdu_interval != 0
+        0
+    else
+        iso_interval / sdu_interval
+
+// UPPS, the number of PDUs each SDU is divided into: at least Max_SDU /
+// Max_PDU, rounded up (Section 2.1).  0 for a Max_PDU that is not positive.
+@satisfies("REQ-BLE-ISO-007")
+@tier(embedded)
+@no_alloc
+fn unframed_upps(max_sdu: Int, max_pdu: Int) -> Int
+    if max_pdu <= 0 or max_sdu < 0
+        0
+    else if max_sdu == 0
+        1
+    else
+        (max_sdu + max_pdu - 1) / max_pdu
+
+// The burst number unframed PDUs need: BN = UPPS x USPI (Section 2.1).  0
+// when USPI is not a whole number.
+@satisfies("REQ-BLE-ISO-007")
+@tier(embedded)
+@no_alloc
+fn unframed_bn(iso_interval: Int, sdu_interval: Int, max_sdu: Int, max_pdu: Int) -> Int
+    unframed_upps(max_sdu, max_pdu) * unframed_uspi(iso_interval, sdu_interval)
+
+// Whether BN, Max_PDU and ISO_Interval carry the data of framed PDUs in
+// Segmentable mode, with room for the headers and the allowed drift:
+// BN x (Max_PDU - 2) >= F x 5 + F x Max_SDU, where F = (1 + MaxDrift) x
+// ISO_Interval / SDU_Interval and MaxDrift is 100 ppm (Section 2.2).  The
+// comparison is made with F as a fraction, so nothing is rounded.
+@satisfies("REQ-BLE-ISO-007")
+@tier(embedded)
+@no_alloc
+fn segmentable_bandwidth_ok(bn: Int, max_pdu: Int, iso_interval: Int, sdu_interval: Int, max_sdu: Int) -> Bool
+    if sdu_interval <= 0 or bn <= 0 or max_pdu <= 2
+        return false
+    let f_num = iso_interval * (PPM + MAX_DRIFT_PPM)
+    let f_den = sdu_interval * PPM
+    bn * (max_pdu - 2) * f_den >= f_num * (5 + max_sdu)
+
+// The Max_PDU Unsegmented mode needs: the SDUs a PDU may have to carry,
+// ISO_Interval / SDU_Interval with the drift allowed, shared over BN PDUs
+// and rounded up to whole SDUs, each taking its 5 octets of header and
+// Time_Offset and its data (Section 2.2).  40-octet SDUs every 10 ms over a
+// 7.5 ms isochronous interval with BN = 1 need 45 octets, the
+// specification's example.  0 for a parameter that is not positive.
+@satisfies("REQ-BLE-ISO-007")
+@tier(embedded)
+@no_alloc
+fn unsegmented_max_pdu(iso_interval: Int, sdu_interval: Int, bn: Int, max_sdu: Int) -> Int
+    if sdu_interval <= 0 or bn <= 0 or iso_interval <= 0 or max_sdu < 0
+        return 0
+    let num = iso_interval * (PPM + MAX_DRIFT_PPM)
+    let den = sdu_interval * PPM
+    // ceil(F / BN) with F = num / den, in whole numbers.
+    let per_pdu = (num + den * bn - 1) / (den * bn)
+    per_pdu * (5 + max_sdu)
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+@test
+@satisfies("REQ-BLE-ISO-007")
+fn test_the_iso_interval_unit_is_1_25_ms()
+    test.assert_eq(iso_interval_us(8), 10000)
+    test.assert_eq(iso_interval_us(0x0C80), 4000000)
+    test.assert_eq(iso_interval_us(4), 5000)
+
+@test
+@satisfies("REQ-BLE-ISO-007")
+fn test_framing_adds_a_delay_that_part_g_gives_in_an_example()
+    // SDU interval 10.6 ms, isochronous interval 10 ms: 20.6 ms in
+    // Segmentable mode, 10 ms in Unsegmented mode, nothing for unframed.
+    test.assert_eq(framing_added_delay(hci_commands.ISO_FRAMING_FRAMED_SEGMENTABLE, 10000, 10600), 20600)
+    test.assert_eq(framing_added_delay(hci_commands.ISO_FRAMING_FRAMED_UNSEGMENTED, 10000, 10600), 10000)
+    test.assert_eq(framing_added_delay(hci_commands.ISO_FRAMING_UNFRAMED, 10000, 10600), 0)
+    test.assert_eq(framing_delay(hci_commands.ISO_FRAMING_FRAMED_SEGMENTABLE, 10600), 10600)
+    test.assert_eq(framing_delay(hci_commands.ISO_FRAMING_FRAMED_UNSEGMENTED, 10600), 0)
+    test.assert_eq(framing_delay(hci_commands.ISO_FRAMING_UNFRAMED, 10600), 0)
+
+@test
+@satisfies("REQ-BLE-ISO-007")
+fn test_cis_transport_latency_of_framed_and_unframed_pdus()
+    // CIG_Sync_Delay 2500, FT 3, ISO_Interval 10000, SDU_Interval 10000.
+    test.assert_eq(cis_transport_latency(hci_commands.ISO_FRAMING_FRAMED_SEGMENTABLE, 2500, 3, 10000, 10000), 2500 + 30000 + 10000)
+    test.assert_eq(cis_transport_latency(hci_commands.ISO_FRAMING_FRAMED_UNSEGMENTED, 2500, 3, 10000, 10000), 2500 + 30000)
+    test.assert_eq(cis_transport_latency(hci_commands.ISO_FRAMING_UNFRAMED, 2500, 3, 10000, 10000), 2500 + 30000 - 10000)
+    // Unframed, 10 ms SDUs over a 20 ms interval: 10 ms more than the same
+    // stream with equal intervals, as the specification's example says.
+    test.assert_eq(cis_transport_latency(hci_commands.ISO_FRAMING_UNFRAMED, 2500, 3, 20000, 10000), 2500 + 2 * 20000 + 10000)
+    test.assert_eq(cis_transport_latency(hci_commands.ISO_FRAMING_UNFRAMED, 2500, 3, 10000, 0), -1)
+
+@test
+@satisfies("REQ-BLE-ISO-007")
+fn test_the_simplified_unframed_latency_equals_the_formula_with_uspi()
+    for iso in [10000, 20000, 30000]
+        for sdu in [10000, 5000, 2500]
+            if iso % sdu == 0
+                let uspi = iso / sdu
+                for ft in [1, 2, 5]
+                    test.assert_eq(cis_transport_latency(hci_commands.ISO_FRAMING_UNFRAMED, 777, ft, iso, sdu), 777 + (ft - 1) * iso + (uspi - 1) * sdu)
+
+@test
+@satisfies("REQ-BLE-ISO-007")
+fn test_big_transport_latency_of_framed_and_unframed_pdus()
+    // BIG_Sync_Delay 4000, PTO 1, NSE 4, BN 2, IRC 1: PTO x (NSE / BN - IRC) = 1.
+    test.assert_eq(big_transport_latency(hci_commands.ISO_FRAMING_FRAMED_SEGMENTABLE, 4000, 1, 4, 2, 1, 10000, 10000), 4000 + 10000 + 10000 + 10000)
+    test.assert_eq(big_transport_latency(hci_commands.ISO_FRAMING_FRAMED_UNSEGMENTED, 4000, 1, 4, 2, 1, 10000, 10000), 4000 + 10000 + 10000)
+    test.assert_eq(big_transport_latency(hci_commands.ISO_FRAMING_UNFRAMED, 4000, 1, 4, 2, 1, 10000, 10000), 4000 + 2 * 10000 - 10000)
+    // No pre-transmission: PTO 0.
+    test.assert_eq(big_transport_latency(hci_commands.ISO_FRAMING_UNFRAMED, 4000, 0, 4, 2, 1, 10000, 10000), 4000 + 10000 - 10000)
+    test.assert_eq(big_transport_latency(hci_commands.ISO_FRAMING_UNFRAMED, 4000, 0, 4, 0, 1, 10000, 10000), -1)
+    test.assert_eq(big_transport_latency(hci_commands.ISO_FRAMING_UNFRAMED, 4000, 0, 4, 2, 1, 10000, 0), -1)
+    // The unframed simplification agrees with the formula with USPI.
+    let full = 4000 + 1 * (4 / 2 - 1) * 20000 + (2 - 1) * 10000
+    test.assert_eq(big_transport_latency(hci_commands.ISO_FRAMING_UNFRAMED, 4000, 1, 4, 2, 1, 20000, 10000), full)
+
+@test
+@satisfies("REQ-BLE-ISO-007")
+fn test_the_worked_example_of_part_g_gives_the_synchronization_reference()
+    // [Vol 6] Part G, Section 3.2.1: the first potential transmission is
+    // 6.123 ms after the SDU's reference time, so the Time_Offset is 6123
+    // (0x0017EB).  The PDU is received in subevent p = 2 of the CIS event
+    // n = 1 after that, at time Y.
+    let sub = 1500
+    let iso = 10000
+    let y = 1000000
+    let y1 = cis_reference_anchor(y, 2, sub, 1, iso)
+    test.assert_eq(y1, y - 1500 - 10000)
+    // Y2 = Y1 + CIS_Sync_Delay + SDU_Interval_C_To_P + FT x ISO_Interval -
+    // 6123, for Segmentable mode, where Framing_Delay_C is the SDU interval.
+    let y2 = cis_sync_reference_c_to_p(hci_commands.ISO_FRAMING_FRAMED_SEGMENTABLE, y1, 3000, 2, iso, 10000, 6123, 0)
+    test.assert_eq(y2, y1 + 3000 + 10000 + 2 * iso - 6123)
+    // Unsegmented mode has no framing delay.
+    let u = cis_sync_reference_c_to_p(hci_commands.ISO_FRAMING_FRAMED_UNSEGMENTED, y1, 3000, 2, iso, 10000, 6123, 0)
+    test.assert_eq(u, y1 + 3000 + 2 * iso - 6123)
+    test.assert_eq(y2 - u, 10000)
+
+@test
+@satisfies("REQ-BLE-ISO-007")
+fn test_cis_synchronization_references_of_both_directions()
+    let anchor = 500000
+    // Unframed, Central to Peripheral: anchor + CIS_Sync_Delay + (FT - 1) x
+    // ISO_Interval, and later SDUs of the burst one SDU interval apart.
+    test.assert_eq(cis_sync_reference_c_to_p(hci_commands.ISO_FRAMING_UNFRAMED, anchor, 3000, 3, 20000, 10000, 0, 0), anchor + 3000 + 2 * 20000)
+    test.assert_eq(cis_sync_reference_c_to_p(hci_commands.ISO_FRAMING_UNFRAMED, anchor, 3000, 3, 20000, 10000, 0, 1), anchor + 3000 + 2 * 20000 + 10000)
+    // Unframed, Peripheral to Central.
+    test.assert_eq(cis_sync_reference_p_to_c(hci_commands.ISO_FRAMING_UNFRAMED, anchor, 3000, 1000, 20000, 10000, 0, 0), anchor + 3000 - 1000 + 10000 - 20000)
+    test.assert_eq(cis_sync_reference_p_to_c(hci_commands.ISO_FRAMING_UNFRAMED, anchor, 3000, 1000, 20000, 10000, 0, 1), anchor + 3000 - 1000 + 10000 - 20000 + 10000)
+    // Framed, Peripheral to Central: the Time_Offset is subtracted.
+    test.assert_eq(cis_sync_reference_p_to_c(hci_commands.ISO_FRAMING_FRAMED_SEGMENTABLE, anchor, 3000, 1000, 20000, 10000, 4000, 0), anchor + 3000 - 1000 - 4000)
+    test.assert_eq(cis_sync_reference_p_to_c(hci_commands.ISO_FRAMING_FRAMED_UNSEGMENTED, anchor, 3000, 1000, 20000, 10000, 4000, 0), anchor + 3000 - 1000 - 4000)
+    // A zero SDU interval or a negative index is refused.
+    test.assert_eq(cis_sync_reference_c_to_p(hci_commands.ISO_FRAMING_UNFRAMED, anchor, 3000, 3, 20000, 0, 0, 0), -1)
+    test.assert_eq(cis_sync_reference_p_to_c(hci_commands.ISO_FRAMING_UNFRAMED, anchor, 3000, 1000, 20000, 10000, 0, -1), -1)
+
+@test
+@satisfies("REQ-BLE-ISO-007")
+fn test_bis_synchronization_reference()
+    // Unframed: anchor + BIG_Sync_Delay; framed: anchor + BIG_Sync_Delay +
+    // ISO_Interval + Framing_Delay_B - Time_Offset.
+    test.assert_eq(bis_sync_reference(hci_commands.ISO_FRAMING_UNFRAMED, 700000, 4000, 10000, 10000, 0, 0), 704000)
+    test.assert_eq(bis_sync_reference(hci_commands.ISO_FRAMING_UNFRAMED, 700000, 4000, 20000, 10000, 0, 1), 714000)
+    test.assert_eq(bis_sync_reference(hci_commands.ISO_FRAMING_FRAMED_SEGMENTABLE, 700000, 4000, 10000, 10000, 2500, 0), 700000 + 4000 + 10000 + 10000 - 2500)
+    test.assert_eq(bis_sync_reference(hci_commands.ISO_FRAMING_FRAMED_UNSEGMENTED, 700000, 4000, 10000, 10000, 2500, 0), 700000 + 4000 + 10000 - 2500)
+    test.assert_eq(bis_sync_reference(hci_commands.ISO_FRAMING_UNFRAMED, 700000, 4000, 10000, 0, 0, 0), -1)
+
+@test
+@satisfies("REQ-BLE-ISO-007")
+fn test_unframed_pdus_need_a_whole_number_of_sdus_per_interval()
+    test.assert_eq(unframed_uspi(20000, 10000), 2)
+    test.assert_eq(unframed_uspi(10000, 10000), 1)
+    // 7.5 ms over 10 ms, and 10 ms over 7.5 ms: not whole.
+    test.assert_eq(unframed_uspi(7500, 10000), 0)
+    test.assert_eq(unframed_uspi(10000, 7500), 0)
+    test.assert_eq(unframed_uspi(10000, 0), 0)
+    // UPPS is Max_SDU / Max_PDU rounded up, at least 1.
+    test.assert_eq(unframed_upps(100, 100), 1)
+    test.assert_eq(unframed_upps(101, 100), 2)
+    test.assert_eq(unframed_upps(0, 100), 1)
+    test.assert_eq(unframed_upps(100, 0), 0)
+    // BN = UPPS x USPI.
+    test.assert_eq(unframed_bn(20000, 10000, 100, 60), 4)
+    test.assert_eq(unframed_bn(7500, 10000, 100, 60), 0)
+
+@test
+@satisfies("REQ-BLE-ISO-007")
+fn test_segmentable_bandwidth_requirement()
+    // 40-octet SDUs every 10 ms over 10 ms, BN 1: F = 1.0001, so BN x
+    // (Max_PDU - 2) has to reach 1.0001 x 45 = 45.0045, which takes 46
+    // octets of payload and a Max_PDU of 48; 47 fails by the drift alone.
+    test.assert(segmentable_bandwidth_ok(1, 48, 10000, 10000, 40))
+    test.assert(not segmentable_bandwidth_ok(1, 47, 10000, 10000, 40))
+    // Twice the interval needs twice the room, or BN 2.
+    test.assert(not segmentable_bandwidth_ok(1, 48, 20000, 10000, 40))
+    test.assert(segmentable_bandwidth_ok(2, 48, 20000, 10000, 40))
+    test.assert(not segmentable_bandwidth_ok(2, 47, 20000, 10000, 40))
+    test.assert(not segmentable_bandwidth_ok(0, 100, 10000, 10000, 40))
+    test.assert(not segmentable_bandwidth_ok(1, 2, 10000, 10000, 40))
+    test.assert(not segmentable_bandwidth_ok(1, 100, 10000, 0, 40))
+
+@test
+@satisfies("REQ-BLE-ISO-007")
+fn test_unsegmented_max_pdu_is_the_example_of_part_g()
+    // 40-octet SDUs at 10 ms intervals over a 7.5 ms ISO interval, BN 1: 45.
+    test.assert_eq(unsegmented_max_pdu(7500, 10000, 1, 40), 45)
+    // A 20 ms interval has two SDUs per event and the drift may bring a
+    // third: over BN 1 a PDU holds three, over BN 2 two.
+    test.assert_eq(unsegmented_max_pdu(20000, 10000, 1, 40), 45 * 3)
+    test.assert_eq(unsegmented_max_pdu(20000, 10000, 2, 40), 45 * 2)
+    test.assert_eq(unsegmented_max_pdu(10000, 0, 1, 40), 0)
+    test.assert_eq(unsegmented_max_pdu(10000, 10000, 0, 40), 0)

@@ -1,0 +1,564 @@
+// wire.nv — the integer encodings the measurement and
+// control point values of the profile services share.
+//
+// Every multi-octet field of a GATT characteristic is little-endian, least
+// significant octet first ([Vol 3] Part F, Section 3.2.1).  A signed field
+// is two's complement.
+
+use std.test
+
+// Append the low `octets` octets of `v`, least significant first.  A
+// negative `v` appends its two's complement.
+pub fn put(var out: [u8], v: Int, octets: Int)
+    for k in 0..octets
+        list.push(out, ((v >>> (8 * k)) & 0xFF) as u8)
+
+// `v` limited to `lo..hi`.
+pub fn clamp(v: Int, lo: Int, hi: Int) -> Int
+    if v < lo then lo else if v > hi then hi else v
+
+// The `octets`-octet unsigned integer at `i`, or 0 where `b` is too short.
+pub fn get(b: [u8], i: Int, octets: Int) -> Int
+    if i + octets > list.len(b)
+        return 0
+    var v = 0
+    for k in 0..octets
+        v = v | ((b[i + k] as Int) << (8 * k))
+    v
+
+// The `octets`-octet two's complement integer at `i`.
+pub fn get_signed(b: [u8], i: Int, octets: Int) -> Int
+    let v = get(b, i, octets)
+    let top = 1 << (8 * octets - 1)
+    if v >= top then v - (top << 1) else v
+
+// The octets of `v`, each element taken modulo 256.
+pub fn octets(v: [Int]) -> [u8]
+    var out: [u8] = []
+    for x in v
+        list.push(out, x as u8)
+    out
+
+// The octets of the string `s`, for a characteristic that holds text.
+pub fn text(s: Str) -> [u8]
+    var out: [u8] = []
+    for i in 0..str.len(s)
+        list.push(out, str.byte_at(s, i) as u8)
+    out
+
+// The Date Time of [GSS] 3.70, seven octets on the wire: the year as two
+// octets, then the month, the day, the hours, the minutes and the seconds as
+// one octet each.  A year, month or day of 0 is "not known".
+pub @value
+struct DateTime
+    year: u16
+    month: u8
+    day: u8
+    hours: u8
+    minutes: u8
+    seconds: u8
+
+// The Date Time of the six parts.  A part wider than its field keeps its low
+// octets, as `put` writes them.
+pub @tier(embedded)
+@no_alloc
+fn date_time(year: Int, month: Int, day: Int, hours: Int, minutes: Int, seconds: Int) -> DateTime
+    DateTime { year: year as u16, month: month as u8, day: day as u8, hours: hours as u8, minutes: minutes as u8, seconds: seconds as u8 }
+
+// The Date Time with every part 0.
+pub @tier(embedded)
+@no_alloc
+fn date_time_unknown() -> DateTime
+    DateTime { year: 0, month: 0, day: 0, hours: 0, minutes: 0, seconds: 0 }
+
+// Append the seven octets of `t`.
+pub @tier(app)
+fn put_date_time(var out: [u8], t: DateTime)
+    put(var out, t.year as Int, 2)
+    put(var out, t.month as Int, 1)
+    put(var out, t.day as Int, 1)
+    put(var out, t.hours as Int, 1)
+    put(var out, t.minutes as Int, 1)
+    put(var out, t.seconds as Int, 1)
+
+// The Date Time at `i`, with 0 in every part where `b` is too short.
+pub @tier(embedded)
+@no_alloc
+fn get_date_time(b: [u8], i: Int) -> DateTime
+    date_time(get(b, i, 2), get(b, i + 2, 1), get(b, i + 3, 1), get(b, i + 4, 1), get(b, i + 5, 1), get(b, i + 6, 1))
+
+// Whether `t` is a Date Time of [GSS] 3.70: a year of 1582 to 9999 or 0 for
+// unknown, a month of 1 to 12 or 0, a day of 1 to 31 or 0, and the time of
+// day, hours 0 to 23, minutes 0 to 59, seconds 0 to 59.
+pub @tier(embedded)
+@no_alloc
+fn date_time_valid(t: DateTime) -> Bool
+    if t.year != 0 and (t.year < 1582 or t.year > 9999)
+        return false
+    t.month <= 12 and t.day <= 31 and t.hours <= 23 and t.minutes <= 59 and t.seconds <= 59
+
+// Whether `t` is a Date Time with a known year, month and day.
+pub @tier(embedded)
+@no_alloc
+fn date_time_known(t: DateTime) -> Bool
+    t.year != 0 and t.month != 0 and t.day != 0 and date_time_valid(t)
+
+// ── IEEE 11073-20601 FLOAT and SFLOAT ───────────────────────────────
+//
+// The health services carry a decimal number as a signed mantissa and a
+// signed power of ten: value = mantissa * 10^exponent.  The 32-bit FLOAT
+// ([GSS] medfloat32) has a 24-bit mantissa in bits 0-23 and an 8-bit exponent
+// in bits 24-31; the 16-bit SFLOAT (medfloat16) has a 12-bit mantissa in bits
+// 0-11 and a 4-bit exponent in bits 12-15.  Both are two's complement.  The
+// five mantissas next to the most negative and the most positive one are
+// reserved for the special values of [GSS] Table 2.1, so a number has a
+// mantissa of -(2^23 - 3) to 2^23 - 3 (FLOAT) or -2045 to 2045 (SFLOAT).
+//
+// A raw value is the unsigned Int of its octets, as `put` writes it and `get`
+// reads it: `put(out, float(364, -1), 4)` appends the temperature 36.4.
+
+// The raw 32-bit FLOAT that stands for NaN ([GSS] Table 2.1).
+pub const FLOAT_NAN = 0x007FFFFF
+// The raw 32-bit FLOAT that stands for +INFINITY ([GSS] Table 2.1).
+pub const FLOAT_POSITIVE_INFINITY = 0x007FFFFE
+// The raw 32-bit FLOAT that stands for NRes (not at this resolution) ([GSS] Table 2.1).
+pub const FLOAT_NRES = 0x00800000
+// The raw 32-bit FLOAT that stands for the reserved value ([GSS] Table 2.1).
+pub const FLOAT_RESERVED = 0x00800001
+// The raw 32-bit FLOAT that stands for -INFINITY ([GSS] Table 2.1).
+pub const FLOAT_NEGATIVE_INFINITY = 0x00800002
+
+// The raw 16-bit SFLOAT that stands for NaN ([GSS] Table 2.1).
+pub const SFLOAT_NAN = 0x07FF
+// The raw 16-bit SFLOAT that stands for +INFINITY ([GSS] Table 2.1).
+pub const SFLOAT_POSITIVE_INFINITY = 0x07FE
+// The raw 16-bit SFLOAT that stands for NRes (not at this resolution) ([GSS] Table 2.1).
+pub const SFLOAT_NRES = 0x0800
+// The raw 16-bit SFLOAT that stands for the reserved value ([GSS] Table 2.1).
+pub const SFLOAT_RESERVED = 0x0801
+// The raw 16-bit SFLOAT that stands for -INFINITY ([GSS] Table 2.1).
+pub const SFLOAT_NEGATIVE_INFINITY = 0x0802
+
+// The largest mantissa of a FLOAT that is a number.
+pub const FLOAT_MANTISSA_MAX = 8388605
+const FLOAT_EXPONENT_MIN = -128
+const FLOAT_EXPONENT_MAX = 127
+const SFLOAT_MANTISSA_MAX = 2045
+const SFLOAT_EXPONENT_MIN = -8
+const SFLOAT_EXPONENT_MAX = 7
+
+// What a raw FLOAT or SFLOAT holds, as `float_kind` and `sfloat_kind` answer.
+pub const KIND_NUMBER = 0
+// The raw FLOAT or SFLOAT is NaN.
+pub const KIND_NAN = 1
+// The raw FLOAT or SFLOAT is +INFINITY.
+pub const KIND_POSITIVE_INFINITY = 2
+// The raw FLOAT or SFLOAT is -INFINITY.
+pub const KIND_NEGATIVE_INFINITY = 3
+// The raw FLOAT or SFLOAT is NRes (not at this resolution).
+pub const KIND_NRES = 4
+// The raw FLOAT or SFLOAT is the reserved value.
+pub const KIND_RESERVED = 5
+
+// 10^n for n of 0 to 18, the powers an Int holds.
+@tier(embedded)
+@no_alloc
+fn pow10(n: Int) -> Int
+    var p = 1
+    for _ in 0..n
+        p = p * 10
+    p
+
+@tier(embedded)
+@no_alloc
+fn magnitude(v: Int) -> Int
+    if v < 0 then -v else v
+
+// `m` divided by 10^k and rounded to the nearest integer, halves away from
+// zero; 0 for a k above 18, where nothing of `m` is left.
+@tier(embedded)
+@no_alloc
+fn drop_digits(m: Int, k: Int) -> Int
+    if k > 18
+        return 0
+    let d = pow10(k)
+    let q = (magnitude(m) + d / 2) / d
+    if m < 0 then -q else q
+
+// The number of digits `mantissa * 10^exponent` loses to fit a mantissa of at
+// most `limit` and an exponent of at least `exponent_min`.  Each is rounded
+// once, from the original mantissa, so 2044.49 becomes 2044, not 2045.
+@tier(embedded)
+@no_alloc
+fn digits_lost(mantissa: Int, exponent: Int, limit: Int, exponent_min: Int) -> Int
+    let first = if exponent < exponent_min then exponent_min - exponent else 0
+    for step in 0..19
+        let k = first + step
+        if k > 18 or magnitude(drop_digits(mantissa, k)) <= limit
+            return k
+    19
+
+// `value` in the `bits` low bits, two's complement.
+@tier(embedded)
+@no_alloc
+fn field(value: Int, bits: Int) -> Int
+    value & ((1 << bits) - 1)
+
+// The low `bits` bits of `raw` read as a two's complement number.
+@tier(embedded)
+@no_alloc
+fn signed_field(raw: Int, bits: Int) -> Int
+    let v = field(raw, bits)
+    if v >= (1 << (bits - 1)) then v - (1 << bits) else v
+
+// The FLOAT of `mantissa * 10^exponent`.  A mantissa that is too large for 24
+// bits loses its low digits (rounded once, halves away from zero) and the
+// exponent grows by as many; an exponent below -128 does the same; an
+// exponent above 127 multiplies the mantissa by ten as often as that fits.
+// A number that does not fit then is the positive or the negative infinity,
+// and one that rounds to zero, or zero itself, is 0.
+pub @tier(embedded)
+@no_alloc
+fn float(mantissa: Int, exponent: Int) -> Int
+    if mantissa == 0
+        return 0
+    let k = digits_lost(mantissa, exponent, FLOAT_MANTISSA_MAX, FLOAT_EXPONENT_MIN)
+    let m = drop_digits(mantissa, k)
+    if m == 0
+        return 0
+    let e = exponent + k
+    if e > FLOAT_EXPONENT_MAX
+        let j = e - FLOAT_EXPONENT_MAX
+        if j > 18 or magnitude(m) > FLOAT_MANTISSA_MAX / pow10(j)
+            return if m < 0 then FLOAT_NEGATIVE_INFINITY else FLOAT_POSITIVE_INFINITY
+        return (field(FLOAT_EXPONENT_MAX, 8) << 24) | field(m * pow10(j), 24)
+    (field(e, 8) << 24) | field(m, 24)
+
+// The SFLOAT of `mantissa * 10^exponent`, brought into range as `float` does,
+// with a 12-bit mantissa and an exponent of -8 to 7.
+pub @tier(embedded)
+@no_alloc
+fn sfloat(mantissa: Int, exponent: Int) -> Int
+    if mantissa == 0
+        return 0
+    let k = digits_lost(mantissa, exponent, SFLOAT_MANTISSA_MAX, SFLOAT_EXPONENT_MIN)
+    let m = drop_digits(mantissa, k)
+    if m == 0
+        return 0
+    let e = exponent + k
+    if e > SFLOAT_EXPONENT_MAX
+        let j = e - SFLOAT_EXPONENT_MAX
+        if j > 18 or magnitude(m) > SFLOAT_MANTISSA_MAX / pow10(j)
+            return if m < 0 then SFLOAT_NEGATIVE_INFINITY else SFLOAT_POSITIVE_INFINITY
+        return (field(SFLOAT_EXPONENT_MAX, 4) << 12) | field(m * pow10(j), 12)
+    (field(e, 4) << 12) | field(m, 12)
+
+// What the 32-bit `raw` holds: a number or one of the five special values.
+// The special values are told by the mantissa; the exponent is not looked at.
+pub @tier(embedded)
+@no_alloc
+fn float_kind(raw: Int) -> Int
+    let m = field(raw, 24)
+    if m == FLOAT_NAN
+        return KIND_NAN
+    if m == FLOAT_POSITIVE_INFINITY
+        return KIND_POSITIVE_INFINITY
+    if m == FLOAT_NEGATIVE_INFINITY
+        return KIND_NEGATIVE_INFINITY
+    if m == FLOAT_NRES
+        return KIND_NRES
+    if m == FLOAT_RESERVED
+        return KIND_RESERVED
+    KIND_NUMBER
+
+// What the 16-bit `raw` holds.
+pub @tier(embedded)
+@no_alloc
+fn sfloat_kind(raw: Int) -> Int
+    let m = field(raw, 12)
+    if m == SFLOAT_NAN
+        return KIND_NAN
+    if m == SFLOAT_POSITIVE_INFINITY
+        return KIND_POSITIVE_INFINITY
+    if m == SFLOAT_NEGATIVE_INFINITY
+        return KIND_NEGATIVE_INFINITY
+    if m == SFLOAT_NRES
+        return KIND_NRES
+    if m == SFLOAT_RESERVED
+        return KIND_RESERVED
+    KIND_NUMBER
+
+// The signed mantissa and the signed exponent of a FLOAT or an SFLOAT.
+pub @tier(embedded)
+@no_alloc
+fn float_mantissa(raw: Int) -> Int
+    signed_field(raw, 24)
+
+@tier(embedded)
+@no_alloc
+fn float_exponent(raw: Int) -> Int
+    signed_field(raw >>> 24, 8)
+
+// The signed 12-bit mantissa of the raw SFLOAT `raw`.
+pub @tier(embedded)
+@no_alloc
+fn sfloat_mantissa(raw: Int) -> Int
+    signed_field(raw, 12)
+
+// The signed 4-bit exponent of the raw SFLOAT `raw`.
+pub @tier(embedded)
+@no_alloc
+fn sfloat_exponent(raw: Int) -> Int
+    signed_field(raw >>> 12, 4)
+
+// `mantissa * 10^exponent` times 10^decimals as an integer, rounded once, halves
+// away from zero: 36.4 with one decimal is 364, with none 36.  A result beyond
+// 10^15 is limited to it, and one below 10^-18 is 0.
+@tier(embedded)
+@no_alloc
+fn scaled(mantissa: Int, exponent: Int, decimals: Int) -> Int
+    let shift = exponent + decimals
+    if shift < 0
+        return drop_digits(mantissa, -shift)
+    if mantissa == 0
+        return 0
+    if shift > 15
+        return if mantissa < 0 then -1000000000000000 else 1000000000000000
+    clamp(mantissa * pow10(shift), -1000000000000000, 1000000000000000)
+
+// The number the FLOAT `raw` holds times 10^decimals; 0 for a special value,
+// which `float_kind` tells apart.
+pub @tier(embedded)
+@no_alloc
+fn float_scaled(raw: Int, decimals: Int) -> Int
+    if float_kind(raw) != KIND_NUMBER
+        return 0
+    scaled(float_mantissa(raw), float_exponent(raw), decimals)
+
+// The same for an SFLOAT.
+pub @tier(embedded)
+@no_alloc
+fn sfloat_scaled(raw: Int, decimals: Int) -> Int
+    if sfloat_kind(raw) != KIND_NUMBER
+        return 0
+    scaled(sfloat_mantissa(raw), sfloat_exponent(raw), decimals)
+
+@test
+fn test_text_is_the_octets_of_a_string()
+    test.assert_eq(text("Ann"), octets([0x41, 0x6E, 0x6E]))
+    test.assert_eq(list.len(text("")), 0)
+
+@test
+fn test_put_writes_little_endian()
+    var out: [u8] = []
+    put(var out, 0x0102, 2)
+    put(var out, 0x030405, 3)
+    put(var out, 0x06070809, 4)
+    test.assert_eq(out, octets([0x02, 0x01, 0x05, 0x04, 0x03, 0x09, 0x08, 0x07, 0x06]))
+
+@test
+fn test_negative_values_are_twos_complement()
+    var out: [u8] = []
+    put(var out, -2, 2)
+    test.assert_eq(out, octets([0xFE, 0xFF]))
+    test.assert_eq(get_signed(out, 0, 2), -2)
+    test.assert_eq(get_signed(octets([0x7F, 0x00]), 0, 2), 127)
+    test.assert_eq(get_signed(octets([0x00, 0x80]), 0, 2), -32768)
+    test.assert_eq(get(out, 0, 2), 0xFFFE)
+
+@test
+fn test_get_past_the_end_is_zero()
+    test.assert_eq(get(octets([1, 2]), 1, 2), 0)
+    test.assert_eq(get(octets([1, 2, 3, 4]), 0, 4), 0x04030201)
+
+@test
+fn test_clamp()
+    test.assert_eq(clamp(5, 0, 3), 3)
+    test.assert_eq(clamp(-5, 0, 3), 0)
+    test.assert_eq(clamp(2, 0, 3), 2)
+
+@test
+fn test_date_time_is_seven_octets_and_unknown_parts_are_zero()
+    var out: [u8] = []
+    put_date_time(var out, date_time(2026, 10, 27, 13, 5, 9))
+    test.assert_eq(out, octets([0xEA, 0x07, 10, 27, 13, 5, 9]))
+    test.assert(date_time_valid(date_time(2026, 10, 27, 13, 5, 9)))
+    test.assert(date_time_valid(date_time(1582, 1, 1, 0, 0, 0)))
+    test.assert(date_time_valid(date_time(9999, 12, 31, 23, 59, 59)))
+    // 0 means not known for the year, the month and the day.
+    test.assert(date_time_valid(date_time(0, 0, 0, 12, 0, 0)))
+    test.assert(date_time_valid(date_time_unknown()))
+    test.assert(not date_time_valid(date_time(1581, 1, 1, 0, 0, 0)))
+    test.assert(not date_time_valid(date_time(10000, 1, 1, 0, 0, 0)))
+    test.assert(not date_time_valid(date_time(2026, 13, 1, 0, 0, 0)))
+    test.assert(not date_time_valid(date_time(2026, 1, 32, 0, 0, 0)))
+    test.assert(not date_time_valid(date_time(2026, 1, 1, 24, 0, 0)))
+    test.assert(not date_time_valid(date_time(2026, 1, 1, 0, 60, 0)))
+    test.assert(not date_time_valid(date_time(2026, 1, 1, 0, 0, 60)))
+    test.assert(not date_time_valid(date_time(2026, 255, 1, 0, 0, 0)))
+
+@test
+fn test_a_date_time_is_read_from_its_seven_octets()
+    let t = get_date_time(octets([0xEA, 0x07, 10, 27, 13, 5, 9, 0xAA]), 0)
+    test.assert_eq(t.year as Int, 2026)
+    test.assert_eq(t.month as Int, 10)
+    test.assert_eq(t.day as Int, 27)
+    test.assert_eq(t.hours as Int, 13)
+    test.assert_eq(t.minutes as Int, 5)
+    test.assert_eq(t.seconds as Int, 9)
+    // At an offset, and a value that is too short reads as unknown.
+    test.assert_eq(get_date_time(octets([0, 0xEA, 0x07, 10, 27, 13, 5, 9]), 1).day as Int, 27)
+    test.assert_eq(get_date_time(octets([0xEA]), 0).year as Int, 0)
+    test.assert_eq(get_date_time(octets([0xEA, 0x07, 10]), 0).day as Int, 0)
+    // A part wider than its field keeps its low octets.
+    test.assert_eq(date_time(0x10000 + 2026, 266, 1, 0, 0, 0).year as Int, 2026)
+    test.assert_eq(date_time(2026, 266, 1, 0, 0, 0).month as Int, 10)
+
+@test
+fn test_a_known_date_time_has_a_year_a_month_and_a_day()
+    test.assert(date_time_known(date_time(2026, 10, 27, 0, 0, 0)))
+    test.assert(not date_time_known(date_time(0, 10, 27, 0, 0, 0)))
+    test.assert(not date_time_known(date_time(2026, 0, 27, 0, 0, 0)))
+    test.assert(not date_time_known(date_time(2026, 10, 0, 0, 0, 0)))
+    test.assert(not date_time_known(date_time(2026, 13, 27, 0, 0, 0)))
+    test.assert(not date_time_known(date_time_unknown()))
+
+@test
+fn test_float_of_a_body_temperature_has_the_known_octets()
+    // 36.4 is mantissa 364 and exponent -1: 0xFF00016C, octets 6C 01 00 FF.
+    test.assert_eq(float(364, -1), 0xFF00016C)
+    var out: [u8] = []
+    put(var out, float(364, -1), 4)
+    test.assert_eq(out, octets([0x6C, 0x01, 0x00, 0xFF]))
+    let raw = get(out, 0, 4)
+    test.assert_eq(float_mantissa(raw), 364)
+    test.assert_eq(float_exponent(raw), -1)
+    test.assert_eq(float_kind(raw), KIND_NUMBER)
+    test.assert_eq(float_scaled(raw, 1), 364)
+    test.assert_eq(float_scaled(raw, 0), 36)
+    test.assert_eq(float_scaled(raw, 3), 36400)
+    // A negative number is the two's complement of its mantissa.
+    test.assert_eq(float(-364, -1), 0xFFFFFE94)
+    test.assert_eq(float_mantissa(0xFFFFFE94), -364)
+    test.assert_eq(float_scaled(0xFFFFFE94, 1), -364)
+    // Zero is 0 whatever exponent it came with.
+    test.assert_eq(float(0, 5), 0)
+    test.assert_eq(float(0, -128), 0)
+
+@test
+fn test_sfloat_of_whole_and_tenth_values_has_the_known_octets()
+    test.assert_eq(sfloat(98, 0), 0x0062)
+    test.assert_eq(sfloat(725, -1), 0xF2D5)
+    test.assert_eq(sfloat(-1, 0), 0x0FFF)
+    test.assert_eq(sfloat(0, -3), 0)
+    var out: [u8] = []
+    put(var out, sfloat(725, -1), 2)
+    test.assert_eq(out, octets([0xD5, 0xF2]))
+    let raw = get(out, 0, 2)
+    test.assert_eq(sfloat_mantissa(raw), 725)
+    test.assert_eq(sfloat_exponent(raw), -1)
+    test.assert_eq(sfloat_scaled(raw, 1), 725)
+    // 72.5 with no decimals rounds away from zero, in both signs.
+    test.assert_eq(sfloat_scaled(raw, 0), 73)
+    test.assert_eq(sfloat_scaled(sfloat(-725, -1), 0), -73)
+    test.assert_eq(sfloat_scaled(sfloat(724, -1), 0), 72)
+
+@test
+fn test_the_special_values_are_the_five_of_the_table()
+    test.assert_eq(FLOAT_NAN, 0x007FFFFF)
+    test.assert_eq(FLOAT_POSITIVE_INFINITY, 0x007FFFFE)
+    test.assert_eq(FLOAT_NRES, 0x00800000)
+    test.assert_eq(FLOAT_RESERVED, 0x00800001)
+    test.assert_eq(FLOAT_NEGATIVE_INFINITY, 0x00800002)
+    test.assert_eq(SFLOAT_NAN, 0x07FF)
+    test.assert_eq(SFLOAT_POSITIVE_INFINITY, 0x07FE)
+    test.assert_eq(SFLOAT_NRES, 0x0800)
+    test.assert_eq(SFLOAT_RESERVED, 0x0801)
+    test.assert_eq(SFLOAT_NEGATIVE_INFINITY, 0x0802)
+    test.assert_eq(float_kind(FLOAT_NAN), KIND_NAN)
+    test.assert_eq(float_kind(FLOAT_POSITIVE_INFINITY), KIND_POSITIVE_INFINITY)
+    test.assert_eq(float_kind(FLOAT_NEGATIVE_INFINITY), KIND_NEGATIVE_INFINITY)
+    test.assert_eq(float_kind(FLOAT_NRES), KIND_NRES)
+    test.assert_eq(float_kind(FLOAT_RESERVED), KIND_RESERVED)
+    test.assert_eq(sfloat_kind(SFLOAT_NAN), KIND_NAN)
+    test.assert_eq(sfloat_kind(SFLOAT_POSITIVE_INFINITY), KIND_POSITIVE_INFINITY)
+    test.assert_eq(sfloat_kind(SFLOAT_NEGATIVE_INFINITY), KIND_NEGATIVE_INFINITY)
+    test.assert_eq(sfloat_kind(SFLOAT_NRES), KIND_NRES)
+    test.assert_eq(sfloat_kind(SFLOAT_RESERVED), KIND_RESERVED)
+    // A special value is a special value with any exponent, and has no scaled number.
+    test.assert_eq(float_kind(0x05000000 | FLOAT_NAN), KIND_NAN)
+    test.assert_eq(sfloat_kind(0x3000 | SFLOAT_NRES), KIND_NRES)
+    test.assert_eq(float_scaled(FLOAT_NAN, 2), 0)
+    test.assert_eq(sfloat_scaled(SFLOAT_POSITIVE_INFINITY, 0), 0)
+    // The mantissas next to the specials are numbers.
+    test.assert_eq(float_kind(0x007FFFFD), KIND_NUMBER)
+    test.assert_eq(float_kind(0x00800003), KIND_NUMBER)
+    test.assert_eq(sfloat_kind(0x07FD), KIND_NUMBER)
+    test.assert_eq(sfloat_kind(0x0803), KIND_NUMBER)
+
+@test
+fn test_the_largest_and_smallest_mantissas_are_kept()
+    test.assert_eq(float(8388605, 0), 0x007FFFFD)
+    test.assert_eq(float(-8388605, 0), 0x00800003)
+    test.assert_eq(float_mantissa(0x00800003), -8388605)
+    test.assert_eq(sfloat(2045, 0), 0x07FD)
+    test.assert_eq(sfloat(-2045, 0), 0x0803)
+    test.assert_eq(sfloat_mantissa(0x0803), -2045)
+
+@test
+fn test_a_mantissa_too_large_loses_digits_and_is_rounded_once_away_from_zero()
+    // 8388606 would be the +infinity mantissa: one digit goes, 838860.6 -> 838861.
+    test.assert_eq(float(8388606, 0), 0x010CCCCD)
+    test.assert_eq(float(-8388606, 0), 0x01F33333)
+    test.assert_eq(sfloat(2046, 0), 0x10CD)
+    test.assert_eq(sfloat(-2046, 0), 0x1F33)
+    // 205.5 -> 206 and -205.5 -> -206: halves go away from zero.
+    test.assert_eq(sfloat(2055, 0), 0x10CE)
+    test.assert_eq(sfloat(-2055, 0), 0x1F32)
+    // 2044.49 is 2044, not 2045 as a digit-by-digit rounding would give.
+    test.assert_eq(sfloat(204449, 0), 0x27FC)
+    test.assert_eq(sfloat(204450, 0), 0x27FD)
+    // Several digits go at once, and the exponent grows by as many.
+    test.assert_eq(sfloat(30000000, 0), 0x512C)
+    test.assert_eq(float(123456789, 0), 0x0212D688)
+    test.assert_eq(float_scaled(float(123456789, 0), 0), 123456800)
+
+@test
+fn test_an_exponent_below_the_smallest_loses_digits_and_may_leave_zero()
+    // 0.5 at exponent -9 is 5 * 10^-9 -> one digit goes, 0.5 -> 1, exponent -8.
+    test.assert_eq(sfloat(5, -9), 0x8001)
+    test.assert_eq(sfloat(4, -9), 0)
+    test.assert_eq(sfloat(123, -10), 0x8001)
+    test.assert_eq(float(15, -129), 0x80000002)
+    test.assert_eq(float(1, -129), 0)
+    test.assert_eq(float(-15, -129), 0x80FFFFFE)
+
+@test
+fn test_an_exponent_above_the_largest_multiplies_while_it_fits_and_then_is_infinity()
+    test.assert_eq(sfloat(1, 8), 0x700A)
+    test.assert_eq(sfloat(2, 9), 0x70C8)
+    test.assert_eq(sfloat(1, 10), 0x73E8)
+    test.assert_eq(sfloat(3, 10), SFLOAT_POSITIVE_INFINITY)
+    test.assert_eq(sfloat(-3, 10), SFLOAT_NEGATIVE_INFINITY)
+    test.assert_eq(sfloat(1, 40), SFLOAT_POSITIVE_INFINITY)
+    // 2046 * 10^7 rounds to 205 * 10^8, which does not fit exponent 7 either.
+    test.assert_eq(sfloat(20460000000, 0), SFLOAT_POSITIVE_INFINITY)
+    test.assert_eq(sfloat(-20460000000, 0), SFLOAT_NEGATIVE_INFINITY)
+    test.assert_eq(float(1, 128), 0x7F00000A)
+    test.assert_eq(float(5, 128), 0x7F000032)
+    test.assert_eq(float(1, 200), FLOAT_POSITIVE_INFINITY)
+    test.assert_eq(float(-1, 200), FLOAT_NEGATIVE_INFINITY)
+    test.assert_eq(float(9, 134), FLOAT_POSITIVE_INFINITY)
+
+@test
+fn test_scaled_rounds_once_and_limits_the_result()
+    test.assert_eq(scaled(1445, -2, 1), 145)
+    test.assert_eq(scaled(1445, -2, 0), 14)
+    test.assert_eq(scaled(1450, -2, 0), 15)
+    test.assert_eq(scaled(-1450, -2, 0), -15)
+    test.assert_eq(scaled(7, 2, 0), 700)
+    test.assert_eq(scaled(0, 40, 0), 0)
+    test.assert_eq(scaled(5, 40, 0), 1000000000000000)
+    test.assert_eq(scaled(-5, 40, 0), -1000000000000000)
+    test.assert_eq(scaled(1, -19, 0), 0)
+    test.assert_eq(float_scaled(float(5, 100), 2), 1000000000000000)

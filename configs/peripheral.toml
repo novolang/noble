@@ -1,0 +1,32 @@
+# The Host core's part of the profile configs/peripheral.toml of orbit/ble, for the tests of this package (tests/ and src/ run with
+# `novo test --config configs/peripheral.toml`).  orbit/ble/configs/peripheral.toml holds the same [noble] section; tests/orbit/test_ble_config_equals_limits.sh holds the two to each other.
+
+[noble]
+max_att_mtu = 23
+acl_octets = 31
+max_attributes = 32
+max_value_bytes = 224
+max_uuid128 = 2
+max_cccd = 8
+max_bearers = 1
+max_coc_channels = 0
+max_bonds = 1
+max_cis = 0
+max_big = 0
+max_bis = 0
+iso_sdu_octets = 0
+iso_buffers = 0
+max_ases = 0
+max_aics = 0
+max_vocs = 0
+max_presets = 0
+max_set_size = 0
+sequenced_slots = 0
+hci_buffer_octets = 68
+max_client_links = 0
+client_bearers = 0
+client_cache_records = 0
+client_queue = 0
+client_value_bytes = 0
+max_bcast_sources = 0
+max_bas = 1

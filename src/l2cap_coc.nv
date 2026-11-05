@@ -1,0 +1,2039 @@
+// l2cap_coc.nv — the connection-oriented L2CAP channels of one
+// LE-U logical link: LE Credit Based Flow Control mode ([Vol 3] Part A,
+// Section 10.1) and Enhanced Credit Based Flow Control mode (Section
+// 10.2).
+//
+// A channel is created by an exchange of signaling packets on the LE
+// signaling channel, CID 0x0005: L2CAP_LE_CREDIT_BASED_CONNECTION_REQ
+// (code 0x14) and _RSP (code 0x15) for one channel (Sections 4.22 and
+// 4.23), or L2CAP_CREDIT_BASED_CONNECTION_REQ (0x17) and _RSP (0x18) for
+// up to five channels (Sections 4.25 and 4.26).  Each endpoint names its
+// own Source CID for the channel, and the two CIDs are its two endpoints:
+// a K-frame is sent to the peer's CID.  The CIDs come from the
+// dynamically allocated range of an LE-U logical link, 0x0040 to 0x007F
+// (Table 2.3), and no two channels of the link share one.
+//
+// At creation each side gives the other a count of credits: the number of
+// K-frames it may send on the channel before the next grant.  A K-frame
+// spends one credit (Section 10.1); the receiver gives credits back with
+// L2CAP_FLOW_CONTROL_CREDIT_IND (code 0x16, Section 4.24) and a credit
+// count above 65535 ends the channel.  The SDU a K-frame carries is
+// bounded by the receiver's MTU and its PDU by the receiver's MPS
+// (Section 3.4.3): the first K-frame of an SDU holds the SDU Length field
+// and then as much of the SDU as MPS - 2 octets, every further K-frame as
+// much as MPS octets.
+//
+// A channel ends with L2CAP_DISCONNECTION_REQ and _RSP (codes 0x06 and
+// 0x07, Sections 4.6 and 4.7): the side that asks names the peer's CID as
+// the Destination CID and its own as the Source CID.  A Destination CID
+// the receiver does not know is answered with L2CAP_COMMAND_REJECT_RSP,
+// Invalid CID in request (Section 4.1); one that is known but whose Source
+// CID does not match the channel is discarded silently (Section 4.6).
+//
+// The module is the channel table of one logical link and nothing else: it
+// performs no I/O, holds no clock and knows nothing of HCI.  It answers
+// what it receives with the packets and K-frames to send, each with the
+// CID it goes to, and reports what happened to the upper layer as
+// `CocEvent` values.  The caller writes the packets, so one implementation
+// serves the PC program and a device image alike.
+//
+// Chosen where the specification leaves a choice: a signaling request this
+// Host sends is not retransmitted, so no RTX timer runs (Section 6.2.1);
+// a case that needed the retransmission would show it as a response that
+// never comes.  The signaling Identifier of what this module sends comes
+// from its own counter, and the one of the connection parameter update
+// request from `le_link.nv`; responses are matched by their code as
+// well as their Identifier (Section 4).
+//
+// Satisfies: REQ-BLE-L2CAP-008 (connection request), -009 (connection
+// response), -010 (flow control credit), -011 and -012 (disconnection),
+// -013 (MPS), -014 (SDU segmentation), -015 (SDU reassembly), -023 (one
+// K-frame per credit), -026 (K-frame boundary errors).
+
+use std.test
+use l2cap
+
+// ── Result values ───────────────────────────────────────────────────
+//
+// The Result field of L2CAP_LE_CREDIT_BASED_CONNECTION_RSP ([Vol 3]
+// Part A, Table 4.16).  The enhanced response of Table 4.17 uses the same
+// values with the meanings its own table gives them: 0x0004, 0x0009 and
+// 0x000A speak of some connections refused rather than all.
+
+const RESULT_SUCCESS = 0x0000
+// The connection result LE_PSM not supported.
+pub const RESULT_SPSM_NOT_SUPPORTED = 0x0002
+const RESULT_NO_RESOURCES = 0x0004
+const RESULT_INSUFFICIENT_AUTHENTICATION = 0x0005
+const RESULT_INSUFFICIENT_AUTHORIZATION = 0x0006
+const RESULT_KEY_SIZE_TOO_SHORT = 0x0007
+const RESULT_INSUFFICIENT_ENCRYPTION = 0x0008
+const RESULT_INVALID_SOURCE_CID = 0x0009
+const RESULT_SOURCE_CID_ALLOCATED = 0x000A
+const RESULT_UNACCEPTABLE_PARAMETERS = 0x000B
+
+// The Result field of L2CAP_CREDIT_BASED_RECONFIGURE_RSP (Table 4.18).
+const RECONFIGURE_SUCCESS = 0x0000
+const RECONFIGURE_MTU_REDUCED = 0x0001
+const RECONFIGURE_MPS_REDUCED = 0x0002
+const RECONFIGURE_INVALID_CID = 0x0003
+const RECONFIGURE_UNACCEPTABLE = 0x0004
+
+// The Response of the first Listen command for a PSM, when the PSM is
+// listened on and the connection accepted (auto-pts doc/btp_l2cap.txt,
+// Listen): the service's own value, not an L2CAP Result.  This Host bases
+// the answer to a connection request on the PSM on it, which the BTP
+// document allows, so `listen_result` maps the other values; 0x00 accepts.
+pub const LISTEN_SUCCESS = 0x00
+
+// ── CIDs and sizes ──────────────────────────────────────────────────
+
+// The null CID ([Vol 3] Part A, Section 2.1) and the dynamically
+// allocated CIDs of an LE-U logical link (Table 2.3).
+const CID_NONE = 0x0000
+const CID_FIRST_DYNAMIC = 0x0040
+const CID_LAST_DYNAMIC = 0x007F
+
+// The smallest MTU and MPS an LE Credit Based channel may be created with,
+// and the smallest of an Enhanced Credit Based one ([Vol 3] Part A,
+// Sections 4.22 and 4.25).
+const MIN_MTU = 23
+const MIN_MPS = 23
+const MIN_MTU_ENHANCED = 64
+const MIN_MPS_ENHANCED = 64
+
+// The largest credit count either side may hold ([Vol 3] Part A,
+// Section 10.1).
+const MAX_CREDITS = 65535
+
+// The most Source CIDs an L2CAP_CREDIT_BASED_CONNECTION_REQ may carry
+// (Section 4.25) and the most channels this Host keeps on one link.
+pub const MAX_SCIDS = 5
+const MAX_CHANNELS = 5
+
+// The credits a channel is created with, in the Request and in the
+// Response alike.  The value is this Host's choice within 0 to 65535 for
+// LE Credit Based mode and 1 to 65535 for Enhanced Credit Based mode
+// (Sections 4.22 and 4.25).
+const INITIAL_CREDITS = 10
+
+// The largest number of K-frames one flush sends.  The loop behind it ends
+// when the credits or the queued SDUs run out; the bound keeps a single
+// call bounded and a later call continues where this one stopped.
+const MAX_FLUSH_FRAMES = 128
+
+// ── The channel table ───────────────────────────────────────────────
+
+// One channel.  `id` is its number towards the upper layer, the smallest
+// one not in use; `local_cid` and `remote_cid` are its two endpoints on
+// this logical link, this Host's own and the peer's.  `mtu` and `mps` are
+// what this Host may receive, `peer_mtu` and `peer_mps` what the peer may
+// receive; `credits` counts the K-frames the peer may still send and
+// `peer_credits` the K-frames this Host may still send.  `owed` counts the
+// credits that received K-frames spent and that were not given back yet,
+// which `hold_credits` keeps until the upper layer asks for them.  `rx`
+// holds the SDU being reassembled and `rx_want` its announced length, -1
+// when no SDU is open; `tx` holds the SDUs the upper layer asked to send
+// and `tx_at` how many octets of the first one have gone out.  While the
+// channel is `connecting`, `request_id` is the Identifier of the request
+// that opened it, which the response must carry ([Vol 3] Part A, Section 4).
+pub struct CocChannel
+    id: Int
+    local_cid: Int
+    var remote_cid: Int
+    psm: Int
+    var mtu: Int
+    var mps: Int
+    var peer_mtu: Int
+    var peer_mps: Int
+    var credits: Int
+    var peer_credits: Int
+    var owed: Int
+    hold_credits: Bool
+    enhanced: Bool
+    var connecting: Bool
+    request_id: Int
+    var disconnecting: Bool
+    var rx: [u8]
+    var rx_want: Int
+    var tx: [[u8]]
+    var tx_at: Int
+
+// A PSM the upper layer listens on, as the last Listen command named it.
+struct CocListener
+    psm: Int
+    transport: Int
+    mtu: Int
+    response: Int
+
+// What the channel table reports to the upper layer: a channel is up, a
+// channel is gone with the Result of the exchange that ended it, an SDU
+// arrived, or the peer renegotiated the MTU and MPS it receives.
+enum CocEvent
+    Connected(id: Int, psm: Int)
+    Disconnected(id: Int, psm: Int, result: Int)
+    DataReceived(id: Int, sdu: [u8])
+    Reconfigured(id: Int, mtu: Int, mps: Int)
+
+// One packet to send: `payload` on `cid` — a signaling packet on the LE
+// signaling channel, or a K-frame on one of the channel's CIDs.
+pub struct CocOut
+    cid: Int
+    payload: [u8]
+
+// The channel table of one logical link, its listeners, what it has to
+// report to the upper layer, and the counter behind the Identifiers of the
+// signaling packets it sends (Section 4: a command of one channel table
+// uses a different Identifier for each successive request, never 0x00).
+pub struct CocState
+    var channels: [CocChannel]
+    var listeners: [CocListener]
+    var events: [CocEvent]
+    var identifier: Int
+    var reconfiguring: [Int]
+    var reconfigure_mtu: Int
+    var reconfigure_mps: Int
+
+// The credit based channel state of a link: no channel, no listener and no event.
+pub fn new_state() -> CocState
+    CocState { channels: [], listeners: [], events: [], identifier: 0, reconfiguring: [], reconfigure_mtu: 0, reconfigure_mps: 0 }
+
+// Take what happened since the last call, in order.
+fn take_events(var state: CocState) -> [CocEvent]
+    let events = state.events[:]
+    state.events = []
+    events
+
+// The next signaling Identifier, never 0x00 ([Vol 3] Part A, Section 4).
+fn next_identifier(var state: CocState) -> Int
+    let next = if state.identifier >= 0xFF then 1 else state.identifier + 1
+    state.identifier = next
+    next
+
+// The index of the channel with this number towards the upper layer, or
+// -1.  A write into a channel goes through a `var` name holding the
+// element of this index, which is what reaches the table.
+pub fn index_of(state: CocState, id: Int) -> Int
+    for i in 0..list.len(state.channels)
+        if state.channels[i].id == id
+            return i
+    -1
+
+// The index of the channel whose own endpoint is `cid`, or -1.
+fn index_of_cid(state: CocState, cid: Int) -> Int
+    for i in 0..list.len(state.channels)
+        if state.channels[i].local_cid == cid
+            return i
+    -1
+
+// The index of the channel whose peer endpoint is `cid`, or -1: the
+// channel a signaling packet of the peer names, since the CID such a
+// packet carries is the peer's own endpoint of it ([Vol 3] Part A,
+// Section 4.24).
+fn index_of_remote_cid(state: CocState, cid: Int) -> Int
+    for i in 0..list.len(state.channels)
+        if state.channels[i].remote_cid == cid
+            return i
+    -1
+
+// The channel with the local CID `id`, or None when the link has none.
+pub fn channel_of(state: CocState, id: Int) -> ?CocChannel
+    let i = index_of(state, id)
+    if i < 0
+        None
+    else
+        Some(state.channels[i])
+
+// The channels of `psm` that are up, in the order the table created them:
+// the ones an upper layer that serves a listened PSM has to serve now.
+// An ATT bearer of the Enhanced ATT PSM is one such channel ([Vol 3]
+// Part G, Section 5.3), and the connection and disconnection reports of
+// the others stay in `events` for the upper layer that reads them there.
+pub fn channels_of_psm(state: CocState, psm: Int) -> [CocChannel]
+    var out: [CocChannel] = []
+    for c in state.channels
+        if c.psm == psm and not c.connecting and not c.disconnecting
+            list.push(out, c)
+    out
+
+// The number towards the upper layer of the channel whose own endpoint is
+// `cid`, or -1: what an upper layer that met a channel by the CID of a
+// B-frame needs to name it.
+fn id_of_local_cid(state: CocState, cid: Int) -> Int
+    let i = index_of_cid(state, cid)
+    if i < 0 then -1 else state.channels[i].id
+
+// Take the SDU the table reported for the channel `id`, or None when no
+// SDU did: what an upper layer that serves the channel's data takes for
+// itself.  Every other event, a connection or disconnection report among
+// them, stays for `take_events`.
+pub fn take_data(var state: CocState, id: Int) -> ?[u8]
+    var rest: [CocEvent] = []
+    var found: ?[u8] = None
+    var taken = false
+    for e in state.events
+        match e
+            CocEvent.DataReceived(channel, sdu) =>
+                if channel == id and not taken
+                    found = Some(sdu)
+                    taken = true
+                else
+                    list.push(rest, e)
+            _ => list.push(rest, e)
+    state.events = rest
+    found
+
+fn has_remote_cid(state: CocState, cid: Int) -> Bool
+    for c in state.channels
+        if c.remote_cid == cid
+            return true
+    false
+
+fn has_id(state: CocState, id: Int) -> Bool
+    for c in state.channels
+        if c.id == id
+            return true
+    false
+
+// A CID from the dynamically allocated range that no channel of this link
+// uses ([Vol 3] Part A, Table 2.3 and Section 4.22).
+fn free_local_cid(state: CocState) -> Int
+    var cid = CID_FIRST_DYNAMIC
+    for _ in 0..(CID_LAST_DYNAMIC - CID_FIRST_DYNAMIC + 1)
+        var used = false
+        for c in state.channels
+            if c.local_cid == cid
+                used = true
+        if not used
+            return cid
+        cid = cid + 1
+    CID_NONE
+
+// The smallest channel number the upper layer does not hold.
+fn free_id(state: CocState) -> Int
+    var id = 0
+    for _ in 0..MAX_CHANNELS
+        if not has_id(state, id)
+            return id
+        id = id + 1
+    -1
+
+// How many channels the table holds.
+fn count(state: CocState) -> Int
+    list.len(state.channels)
+
+// The numbers of the channels whose request is still out, in the order
+// they were created: what the upper layer gets back from `connect`.
+fn connecting_ids(state: CocState) -> [Int]
+    var ids: [Int] = []
+    for c in state.channels
+        if c.connecting
+            list.push(ids, c.id)
+    ids
+
+// True when the channel `id` is open.
+pub fn is_connected(state: CocState, id: Int) -> Bool
+    match channel_of(state, id)
+        None    => false
+        Some(c) => not c.connecting and not c.disconnecting
+
+// Drop the channel at `i` from the table and report it gone with `result`.
+fn remove(var state: CocState, i: Int, result: Int)
+    let c = state.channels[i]
+    var rest: [CocChannel] = []
+    for j in 0..list.len(state.channels)
+        if j != i
+            list.push(rest, state.channels[j])
+    state.channels = rest
+    let _ = list.push(state.events, CocEvent.Disconnected(c.id, c.psm, result))
+
+// Every channel of the link is gone: the connection ended ([Vol 3] Part A,
+// Section 6; REQ-BLE-L2CAP-024).
+fn drop_all(var state: CocState)
+    for c in state.channels
+        if not c.connecting
+            list.push(state.events, CocEvent.Disconnected(c.id, c.psm, RESULT_SUCCESS))
+    state.channels = []
+
+// ── Listeners ───────────────────────────────────────────────────────
+
+// Listen on `psm` from now on, with the MTU and the response the last
+// Listen command named.
+pub fn listen(var state: CocState, psm: Int, transport: Int, mtu: Int, response: Int)
+    var rest: [CocListener] = []
+    for i in 0..list.len(state.listeners)
+        if state.listeners[i].psm != psm
+            list.push(rest, state.listeners[i])
+    list.push(rest, CocListener { psm: psm, transport: transport, mtu: mtu, response: response })
+    state.listeners = rest
+
+fn listener_for(state: CocState, psm: Int) -> ?CocListener
+    for l in state.listeners
+        if l.psm == psm
+            return Some(l)
+    None
+
+// The Result a request on a listened PSM is answered with: the response
+// the Listen command set, as an L2CAP Result ([Vol 3] Part A, Table 4.16).
+fn listen_result(response: Int) -> Int
+    if response == LISTEN_SUCCESS
+        RESULT_SUCCESS
+    else if response == 0x01
+        RESULT_INSUFFICIENT_AUTHENTICATION
+    else if response == 0x02
+        RESULT_INSUFFICIENT_AUTHORIZATION
+    else if response == 0x03
+        RESULT_KEY_SIZE_TOO_SHORT
+    else
+        RESULT_INSUFFICIENT_ENCRYPTION
+
+// ── Packets ─────────────────────────────────────────────────────────
+
+fn le16(v: Int) -> [u8]
+    [(v & 0xFF) as u8, ((v >>> 8) & 0xFF) as u8]
+
+fn read_le16(b: [u8], at: Int) -> Int
+    (b[at] as Int) | ((b[at + 1] as Int) << 8)
+
+// One signaling packet: Code, Identifier, Data Length and Data.
+fn signal(code: Int, identifier: Int, body: [u8]) -> CocOut
+    var data: [u8] = [code as u8, identifier as u8]
+    list.append(data, le16(list.len(body)))
+    list.append(data, body)
+    CocOut { cid: l2cap.CID_LE_SIGNALING, payload: data }
+
+// The Data of a signaling packet ([Vol 3] Part A, Section 4): empty when
+// the buffer is not correctly formed, which the caller answers with
+// L2CAP_COMMAND_REJECT_RSP, Command not understood.
+fn signaling_data(payload: [u8]) -> [u8]
+    let n = list.len(payload)
+    if n < l2cap.SIGNALING_HEADER_LEN
+        return []
+    if read_le16(payload, 2) != n - l2cap.SIGNALING_HEADER_LEN
+        return []
+    payload[l2cap.SIGNALING_HEADER_LEN:n]
+
+// L2CAP_LE_CREDIT_BASED_CONNECTION_RSP ([Vol 3] Part A, Section 4.23).
+// The Destination CID, MTU, MPS and Initial Credits are ignored by the
+// receiver when the Result refuses the connection, and are sent as zero
+// then.
+fn build_connection_rsp(identifier: Int, local_cid: Int, mtu: Int, mps: Int, credits: Int, result: Int) -> CocOut
+    var body: [u8] = []
+    if result == RESULT_SUCCESS
+        list.append(body, le16(local_cid))
+        list.append(body, le16(mtu))
+        list.append(body, le16(mps))
+        list.append(body, le16(credits))
+    else
+        list.append(body, le16(CID_NONE))
+        list.append(body, le16(0))
+        list.append(body, le16(0))
+        list.append(body, le16(0))
+    list.append(body, le16(result))
+    signal(l2cap.CODE_LE_CREDIT_BASED_CONNECTION_RSP, identifier, body)
+
+// L2CAP_FLOW_CONTROL_CREDIT_IND ([Vol 3] Part A, Section 4.24): the CID
+// "represents the source channel endpoint of the device sending the
+// L2CAP_FLOW_CONTROL_CREDIT_IND packet", so it is this Host's own endpoint
+// of the channel -- the CID the peer addresses its K-frames to.  The
+// credit value is between 1 and 65535.  One command serves both modes:
+// "A device shall send an L2CAP_FLOW_CONTROL_CREDIT_IND packet when it is
+// capable of receiving additional K-frames ... in LE Credit Based Flow
+// Control mode and Enhanced Credit Based Flow Control mode", and the
+// signaling codes of Section 4 hold no other credit command (0x19 is
+// L2CAP_CREDIT_BASED_RECONFIGURE_REQ, Section 4.27), so a channel of the
+// GATT feature's Enhanced ATT bearer, which is an Enhanced Credit Based
+// one, carries this same code.
+fn build_credit_ind(identifier: Int, local_cid: Int, credits: Int) -> CocOut
+    var body = le16(local_cid)
+    list.append(body, le16(credits))
+    signal(l2cap.CODE_FLOW_CONTROL_CREDIT_IND, identifier, body)
+
+// L2CAP_DISCONNECTION_REQ and _RSP ([Vol 3] Part A, Sections 4.6 and 4.7):
+// the Destination CID is the peer's endpoint of the channel, the Source
+// CID this Host's.
+fn build_disconnection(code: Int, identifier: Int, destination_cid: Int, source_cid: Int) -> CocOut
+    var body = le16(destination_cid)
+    list.append(body, le16(source_cid))
+    signal(code, identifier, body)
+
+// ── Creating a channel from this side ───────────────────────────────
+
+fn new_channel(id: Int, local_cid: Int, remote_cid: Int, psm: Int, mtu: Int, mps: Int, peer_mtu: Int, peer_mps: Int, peer_credits: Int, hold_credits: Bool, enhanced: Bool, connecting: Bool, request_id: Int) -> CocChannel
+    CocChannel {
+        id: id,
+        local_cid: local_cid,
+        remote_cid: remote_cid,
+        psm: psm,
+        mtu: mtu,
+        mps: mps,
+        peer_mtu: peer_mtu,
+        peer_mps: peer_mps,
+        credits: INITIAL_CREDITS,
+        peer_credits: peer_credits,
+        owed: 0,
+        hold_credits: hold_credits,
+        enhanced: enhanced,
+        connecting: connecting,
+        request_id: request_id,
+        disconnecting: false,
+        rx: [],
+        rx_want: -1,
+        tx: [],
+        tx_at: 0 }
+
+// Send L2CAP_LE_CREDIT_BASED_CONNECTION_REQ or L2CAP_CREDIT_BASED_
+// CONNECTION_REQ for `num` channels on `psm` ([Vol 3] Part A, Sections
+// 4.22 and 4.25), or None when the table has no room for them.  The
+// channels stay `connecting` until the peer's response arrives; the upper
+// layer already has their numbers.
+fn connect(var state: CocState, psm: Int, mtu: Int, num: Int, ecfc: Bool, hold_credit: Bool) -> ?[CocOut]
+    let want = if num < 1 then 1 else (if num > MAX_SCIDS then MAX_SCIDS else num)
+    let many = ecfc or want > 1
+    let mtu_wanted = if many and mtu < MIN_MTU_ENHANCED then MIN_MTU_ENHANCED else mtu
+    let mps_wanted = if many and mtu_wanted < MIN_MPS_ENHANCED then MIN_MPS_ENHANCED else mtu_wanted
+    if count(state) + want > MAX_CHANNELS
+        return None
+    var cids: [Int] = []
+    let identifier = next_identifier(state)
+    for _ in 0..want
+        let cid = free_local_cid(state)
+        let id = free_id(state)
+        if cid == CID_NONE or id < 0
+            return None
+        list.push(state.channels, new_channel(id, cid, CID_NONE, psm, mtu_wanted, mps_wanted, 0, 0, 0, hold_credit, many, true, identifier))
+        list.push(cids, cid)
+    var body: [u8] = []
+    if many
+        list.append(body, le16(psm))
+        list.append(body, le16(mtu_wanted))
+        list.append(body, le16(mps_wanted))
+        list.append(body, le16(INITIAL_CREDITS))
+        for cid in cids
+            list.append(body, le16(cid))
+    else
+        list.append(body, le16(psm))
+        list.append(body, le16(cids[0]))
+        list.append(body, le16(mtu_wanted))
+        list.append(body, le16(mps_wanted))
+        list.append(body, le16(INITIAL_CREDITS))
+    let code = if many then l2cap.CODE_CREDIT_BASED_CONNECTION_REQ else l2cap.CODE_LE_CREDIT_BASED_CONNECTION_REQ
+    Some([signal(code, identifier, body)])
+
+// Create a channel that answers a request from the peer: its endpoint is a
+// free CID of this link and its number the smallest the upper layer does
+// not hold.  The answer is its index in the table, or -1 when the table is
+// full.
+fn accept_channel(var state: CocState, remote_cid: Int, psm: Int, mtu: Int, mps: Int, peer_mtu: Int, peer_mps: Int, peer_credits: Int, hold_credits: Bool, enhanced: Bool) -> Int
+    let cid = free_local_cid(state)
+    let id = free_id(state)
+    if cid == CID_NONE or id < 0
+        return -1
+    list.push(state.channels, new_channel(id, cid, remote_cid, psm, mtu, mps, peer_mtu, peer_mps, peer_credits, hold_credits, enhanced, false, 0))
+    list.len(state.channels) - 1
+
+// ── Requests from the peer ──────────────────────────────────────────
+
+// The Result a request on `psm` for `remote_cid` is answered with, before
+// any channel is created ([Vol 3] Part A, Table 4.16 and Section 4.22).
+fn connection_result(state: CocState, psm: Int, remote_cid: Int, mtu: Int, mps: Int, enhanced: Bool, peer_credits: Int) -> Int
+    let min_mtu = if enhanced then MIN_MTU_ENHANCED else MIN_MTU
+    let min_mps = if enhanced then MIN_MPS_ENHANCED else MIN_MPS
+    match listener_for(state, psm)
+        None => RESULT_SPSM_NOT_SUPPORTED
+        Some(l) =>
+            let asked = listen_result(l.response)
+            if asked != RESULT_SUCCESS
+                asked
+            else if remote_cid < CID_FIRST_DYNAMIC or remote_cid > CID_LAST_DYNAMIC
+                RESULT_INVALID_SOURCE_CID
+            else if has_remote_cid(state, remote_cid)
+                RESULT_SOURCE_CID_ALLOCATED
+            else if mtu < min_mtu or mps < min_mps
+                RESULT_UNACCEPTABLE_PARAMETERS
+            else if peer_credits > MAX_CREDITS
+                RESULT_UNACCEPTABLE_PARAMETERS
+            else
+                RESULT_SUCCESS
+
+// The MTU this Host offers on a channel of a listened PSM: the listener's,
+// at least the smallest the mode allows ([Vol 3] Part A, Sections 4.22 and
+// 4.25).
+fn offered_mtu(state: CocState, psm: Int, enhanced: Bool) -> Int
+    let floor = if enhanced then MIN_MTU_ENHANCED else MIN_MTU
+    match listener_for(state, psm)
+        None    => floor
+        Some(l) => if l.mtu < floor then floor else l.mtu
+
+// L2CAP_LE_CREDIT_BASED_CONNECTION_REQ: SPSM, Source CID, MTU, MPS and
+// Initial Credits ([Vol 3] Part A, Section 4.22).
+fn le_connection_request(var state: CocState, identifier: Int, data: [u8]) -> [CocOut]
+    if list.len(data) != 10
+        return [signal(l2cap.CODE_COMMAND_REJECT_RSP, identifier, le16(l2cap.REJECT_COMMAND_NOT_UNDERSTOOD))]
+    let psm = read_le16(data, 0)
+    let remote_cid = read_le16(data, 2)
+    let mtu = read_le16(data, 4)
+    let mps = read_le16(data, 6)
+    let credits = read_le16(data, 8)
+    let result = connection_result(state, psm, remote_cid, mtu, mps, false, 0)
+    if result != RESULT_SUCCESS
+        return [build_connection_rsp(identifier, CID_NONE, 0, 0, 0, result)]
+    let size = offered_mtu(state, psm, false)
+    let i = accept_channel(var state, remote_cid, psm, size, size, mtu, mps, credits, false, false)
+    if i < 0
+        return [build_connection_rsp(identifier, CID_NONE, 0, 0, 0, RESULT_NO_RESOURCES)]
+    let c = state.channels[i]
+    list.push(state.events, CocEvent.Connected(c.id, psm))
+    [build_connection_rsp(identifier, c.local_cid, c.mtu, c.mps, INITIAL_CREDITS, RESULT_SUCCESS)]
+
+// L2CAP_CREDIT_BASED_CONNECTION_REQ: SPSM, MTU, MPS, Initial Credits and
+// the Source CIDs ([Vol 3] Part A, Section 4.25).  A Source CID the Host
+// cannot take is answered with a Destination CID of 0x0000, and the Result
+// names whether all or only some of the connections were refused.
+fn enhanced_connection_request(var state: CocState, identifier: Int, data: [u8]) -> [CocOut]
+    let n = list.len(data)
+    if n < 10 or (n - 8) % 2 != 0 or (n - 8) / 2 > MAX_SCIDS
+        return [signal(l2cap.CODE_COMMAND_REJECT_RSP, identifier, le16(l2cap.REJECT_COMMAND_NOT_UNDERSTOOD))]
+    let psm = read_le16(data, 0)
+    let mtu = read_le16(data, 2)
+    let mps = read_le16(data, 4)
+    let credits = read_le16(data, 6)
+    let want = (n - 8) / 2
+    let size = offered_mtu(state, psm, true)
+    var destination: [Int] = []
+    var refused = 0
+    var created = 0
+    var partial = RESULT_NO_RESOURCES
+    for i in 0..want
+        let remote_cid = read_le16(data, 8 + 2 * i)
+        let result = connection_result(state, psm, remote_cid, mtu, mps, true, credits)
+        if result != RESULT_SUCCESS
+            list.push(destination, CID_NONE)
+            refused = refused + 1
+            if result == RESULT_SOURCE_CID_ALLOCATED or result == RESULT_INVALID_SOURCE_CID
+                partial = result
+            continue
+        let i = accept_channel(var state, remote_cid, psm, size, size, mtu, mps, credits, false, true)
+        if i < 0
+            list.push(destination, CID_NONE)
+            refused = refused + 1
+            partial = RESULT_NO_RESOURCES
+        else
+            let c = state.channels[i]
+            list.push(state.events, CocEvent.Connected(c.id, psm))
+            list.push(destination, c.local_cid)
+            created = created + 1
+    let result = if created == 0
+        connection_result(state, psm, read_le16(data, 8), mtu, mps, true, credits)
+    else if refused > 0
+        partial
+    else
+        RESULT_SUCCESS
+    // The Result, MTU, MPS and Initial Credits of an "all refused" answer
+    // are those of the first Source CID, so the answer says which refusal
+    // the Host means ([Vol 3] Part A, Table 4.17).
+    let answer_mtu = if created > 0 then size else 0
+    let answer_credits = if created > 0 then INITIAL_CREDITS else 0
+    [enhanced_connection_rsp(identifier, answer_mtu, answer_mtu, answer_credits, result, destination)]
+
+// L2CAP_CREDIT_BASED_CONNECTION_RSP ([Vol 3] Part A, Section 4.26): MTU,
+// MPS, Initial Credits, Result and one Destination CID per Source CID of
+// the request, in the order of the request.
+fn enhanced_connection_rsp(identifier: Int, mtu: Int, mps: Int, credits: Int, result: Int, destination: [Int]) -> CocOut
+    var body = le16(mtu)
+    list.append(body, le16(mps))
+    list.append(body, le16(credits))
+    list.append(body, le16(result))
+    for cid in destination
+        list.append(body, le16(cid))
+    signal(l2cap.CODE_CREDIT_BASED_CONNECTION_RSP, identifier, body)
+
+// ── Responses from the peer ─────────────────────────────────────────
+
+// L2CAP_LE_CREDIT_BASED_CONNECTION_RSP: the peer answered a request of
+// this Host's ([Vol 3] Part A, Section 4.23).
+fn le_connection_response(var state: CocState, identifier: Int, data: [u8]) -> [CocOut]
+    if list.len(data) != 10
+        return []
+    let remote_cid = read_le16(data, 0)
+    let peer_mtu = read_le16(data, 2)
+    let peer_mps = read_le16(data, 4)
+    let peer_credits = read_le16(data, 6)
+    let result = read_le16(data, 8)
+    let i = pending_index(state, identifier, false)
+    if i < 0
+        return []
+    var c = state.channels[i]
+    if result == RESULT_SUCCESS and peer_mps < MIN_MPS
+        // A channel is established on receipt of a successful result, and
+        // no implementation supports an MPS below 23 octets ([Vol 3] Part A,
+        // Section 4.23): the channel is dropped and the peer is asked to
+        // end it, so the segmenter never sees the value.
+        c.remote_cid = remote_cid
+        return end_channel(var state, i, RESULT_UNACCEPTABLE_PARAMETERS)
+    if result == RESULT_SUCCESS
+        c.remote_cid = remote_cid
+        c.peer_mtu = peer_mtu
+        c.peer_mps = peer_mps
+        c.peer_credits = peer_credits
+        c.connecting = false
+        list.push(state.events, CocEvent.Connected(c.id, c.psm))
+    else
+        remove(var state, i, result)
+    []
+
+// The index of the first channel whose request, an Enhanced one or an LE
+// one as `enhanced` says, is still out under `identifier`: the channel a
+// response with that Identifier answers, or -1 when no such request is
+// out.
+fn pending_index(state: CocState, identifier: Int, enhanced: Bool) -> Int
+    for i in 0..list.len(state.channels)
+        let c = state.channels[i]
+        if c.connecting and c.request_id == identifier and c.enhanced == enhanced
+            return i
+    -1
+
+// L2CAP_CREDIT_BASED_CONNECTION_RSP: one Destination CID per Source CID of
+// the request, in order; a Destination CID of 0x0000 is a channel that was
+// not created ([Vol 3] Part A, Section 4.26).
+fn enhanced_connection_response(var state: CocState, identifier: Int, data: [u8]) -> [CocOut]
+    if list.len(data) < 8
+        return []
+    let peer_mtu = read_le16(data, 0)
+    let peer_mps = read_le16(data, 2)
+    let peer_credits = read_le16(data, 4)
+    let result = read_le16(data, 6)
+    let n = (list.len(data) - 8) / 2
+    // The channels of the request are the connecting ones, in the order
+    // their Source CIDs were sent, and the Destination CIDs answer them in
+    // the same order ([Vol 3] Part A, Section 4.26).
+    var pending: [Int] = []
+    for i in 0..list.len(state.channels)
+        let c = state.channels[i]
+        if c.connecting and c.request_id == identifier and c.enhanced
+            list.push(pending, i)
+    // A Destination CID of 0x0000 leaves that channel uncreated; the
+    // refusal reason is the Result of the response for the whole request.
+    var refused: [Int] = []
+    var unacceptable: [Int] = []
+    var out: [CocOut] = []
+    // A response that lists fewer Destination CIDs than the request had
+    // Source CIDs leaves the missing ones uncreated as well.
+    for i in 0..list.len(pending)
+        let remote_cid = if i < n then read_le16(data, 8 + 2 * i) else CID_NONE
+        if remote_cid != CID_NONE and accepts_partly(result) and peer_mps < MIN_MPS_ENHANCED
+            // The peer holds the channel open with an MPS below the 64
+            // octets an Enhanced Credit Based channel supports ([Vol 3]
+            // Part A, Section 4.26): it is dropped here and the peer
+            // is asked to end it.
+            let local_cid = state.channels[pending[i]].local_cid
+            list.push(out, build_disconnection(l2cap.CODE_DISCONNECTION_REQ, next_identifier(state), remote_cid, local_cid))
+            list.push(unacceptable, local_cid)
+        else if remote_cid != CID_NONE and accepts_partly(result)
+            var c = state.channels[pending[i]]
+            c.remote_cid = remote_cid
+            c.peer_mtu = peer_mtu
+            c.peer_mps = peer_mps
+            c.peer_credits = peer_credits
+            c.connecting = false
+            list.push(state.events, CocEvent.Connected(c.id, c.psm))
+        else
+            list.push(refused, state.channels[pending[i]].local_cid)
+    drop_local_cids(var state, refused, if result == RESULT_SUCCESS then RESULT_NO_RESOURCES else result)
+    drop_local_cids(var state, unacceptable, RESULT_UNACCEPTABLE_PARAMETERS)
+    out
+
+// Whether a Result of L2CAP_CREDIT_BASED_CONNECTION_RSP leaves the
+// channels with a Destination CID established: the "all successful" and
+// "some refused" values of Table 4.17 do, the "all refused" ones do not.
+fn accepts_partly(result: Int) -> Bool
+    if result == RESULT_SUCCESS
+        true
+    else if result == RESULT_NO_RESOURCES
+        true
+    else if result == RESULT_INVALID_SOURCE_CID
+        true
+    else
+        result == RESULT_SOURCE_CID_ALLOCATED
+
+fn holds(cids: [Int], cid: Int) -> Bool
+    for c in cids
+        if c == cid
+            return true
+    false
+
+// Drop the channels whose own endpoints are in `cids`, and report each gone
+// with `result`.
+fn drop_local_cids(var state: CocState, cids: [Int], result: Int)
+    var kept: [CocChannel] = []
+    for i in 0..list.len(state.channels)
+        let c = state.channels[i]
+        if holds(cids, c.local_cid)
+            list.push(state.events, CocEvent.Disconnected(c.id, c.psm, result))
+        else
+            list.push(kept, c)
+    state.channels = kept
+
+// L2CAP_FLOW_CONTROL_CREDIT_IND: the peer grants this Host credits
+// ([Vol 3] Part A, Section 4.24).  The CID the peer sends is its own
+// endpoint of the channel -- "a received L2CAP_FLOW_CONTROL_CREDIT_IND
+// packet with a given CID (0x0042) would provide credits for the
+// receiving device's destination CID (0x0042)" -- so the channel is the
+// one whose peer endpoint is that CID, which is the CID this Host sends
+// its K-frames to.  The credits come due on what the channel held back
+// ([Vol 3] Part A, Section 10.1): the queued SDUs go out now, in order,
+// as far as the new allowance reaches.  A credit count above 65535 ends
+// the channel and a credit of zero is ignored (Section 10.1).
+fn flow_control_credit(var state: CocState, data: [u8]) -> [CocOut]
+    if list.len(data) != 4
+        return []
+    let cid = read_le16(data, 0)
+    let credits = read_le16(data, 2)
+    let i = index_of_remote_cid(state, cid)
+    if i < 0
+        return []
+    var c = state.channels[i]
+    if c.connecting or credits == 0
+        return []
+    if c.peer_credits + credits > MAX_CREDITS
+        return end_channel(var state, i, RESULT_SUCCESS)
+    c.peer_credits = c.peer_credits + credits
+    flush(state, i)
+
+// L2CAP_CREDIT_BASED_RECONFIGURE_REQ: the peer states the MTU and MPS it
+// can receive on its own channels ([Vol 3] Part A, Section 4.27).  Its
+// Destination CIDs "represent the channel endpoints on the device sending
+// the ... packet", so each is the peer's endpoint of a channel of this
+// Host's -- what this module holds as the channel's `remote_cid`.
+fn reconfigure_request(var state: CocState, identifier: Int, data: [u8]) -> [CocOut]
+    let n = list.len(data)
+    if n < 6 or (n - 4) % 2 != 0 or (n - 4) / 2 > MAX_SCIDS
+        return [signal(l2cap.CODE_COMMAND_REJECT_RSP, identifier, le16(l2cap.REJECT_COMMAND_NOT_UNDERSTOOD))]
+    let mtu = read_le16(data, 0)
+    let mps = read_le16(data, 2)
+    let want = (n - 4) / 2
+    if mtu < MIN_MTU or mps < MIN_MPS_ENHANCED
+        // Other unacceptable parameters: no channel may receive an SDU
+        // smaller than the smallest MTU, or a PDU smaller than the smallest
+        // MPS of an Enhanced Credit Based channel ([Vol 3] Part A,
+        // Table 4.18).
+        return [signal(l2cap.CODE_CREDIT_BASED_RECONFIGURE_RSP, identifier, le16(RECONFIGURE_UNACCEPTABLE))]
+    var result = RECONFIGURE_SUCCESS
+    var channels: [Int] = []
+    for i in 0..want
+        let cid = read_le16(data, 4 + 2 * i)
+        let j = index_of_remote_cid(state, cid)
+        if j < 0
+            if result == RECONFIGURE_SUCCESS
+                result = RECONFIGURE_INVALID_CID
+        else
+            list.push(channels, j)
+            if mtu < state.channels[j].peer_mtu and result == RECONFIGURE_SUCCESS
+                result = RECONFIGURE_MTU_REDUCED
+            else if mps < state.channels[j].peer_mps and want > 1 and result == RECONFIGURE_SUCCESS
+                result = RECONFIGURE_MPS_REDUCED
+    if result == RECONFIGURE_SUCCESS
+        for i in channels
+            var c = state.channels[i]
+            c.peer_mtu = mtu
+            c.peer_mps = mps
+            list.push(state.events, CocEvent.Reconfigured(c.id, mtu, mps))
+    [signal(l2cap.CODE_CREDIT_BASED_RECONFIGURE_RSP, identifier, le16(result))]
+
+// ── Signaling ───────────────────────────────────────────────────────
+
+// Whether a signaling code concerns the channel table: the connection
+// requests and responses of both modes, the credit indication, the two
+// disconnections and the reconfiguration of the enhanced mode ([Vol 3]
+// Part A, Table 4.2).
+fn is_coc_code(code: Int) -> Bool
+    if code == l2cap.CODE_LE_CREDIT_BASED_CONNECTION_REQ
+        true
+    else if code == l2cap.CODE_LE_CREDIT_BASED_CONNECTION_RSP
+        true
+    else if code == l2cap.CODE_FLOW_CONTROL_CREDIT_IND
+        true
+    else if code == l2cap.CODE_CREDIT_BASED_CONNECTION_REQ
+        true
+    else if code == l2cap.CODE_CREDIT_BASED_CONNECTION_RSP
+        true
+    else if code == l2cap.CODE_CREDIT_BASED_RECONFIGURE_REQ
+        true
+    else if code == l2cap.CODE_CREDIT_BASED_RECONFIGURE_RSP
+        true
+    else if code == l2cap.CODE_DISCONNECTION_REQ
+        true
+    else
+        code == l2cap.CODE_DISCONNECTION_RSP
+
+// Take one signaling packet of the LE signaling channel that concerns the
+// channel table, and answer it.  `code` and `identifier` are the packet's
+// own; `data` its Data, which `signaling_data` reads.
+pub fn receive_signaling(var state: CocState, code: Int, identifier: Int, data: [u8]) -> [CocOut]
+    if code == l2cap.CODE_LE_CREDIT_BASED_CONNECTION_REQ
+        le_connection_request(var state, identifier, data)
+    else if code == l2cap.CODE_LE_CREDIT_BASED_CONNECTION_RSP
+        le_connection_response(var state, identifier, data)
+    else if code == l2cap.CODE_FLOW_CONTROL_CREDIT_IND
+        flow_control_credit(var state, data)
+    else if code == l2cap.CODE_CREDIT_BASED_CONNECTION_REQ
+        enhanced_connection_request(var state, identifier, data)
+    else if code == l2cap.CODE_CREDIT_BASED_CONNECTION_RSP
+        enhanced_connection_response(var state, identifier, data)
+    else if code == l2cap.CODE_CREDIT_BASED_RECONFIGURE_REQ
+        reconfigure_request(var state, identifier, data)
+    else if code == l2cap.CODE_CREDIT_BASED_RECONFIGURE_RSP
+        reconfigure_response(var state, data)
+    else if code == l2cap.CODE_DISCONNECTION_REQ
+        disconnection_request(var state, identifier, data)
+    else if code == l2cap.CODE_DISCONNECTION_RSP
+        disconnection_response(var state, data)
+    else
+        []
+
+// L2CAP_DISCONNECTION_REQ: the peer ends a channel ([Vol 3] Part A,
+// Section 4.6).
+fn disconnection_request(var state: CocState, identifier: Int, data: [u8]) -> [CocOut]
+    if list.len(data) != 4
+        return [signal(l2cap.CODE_COMMAND_REJECT_RSP, identifier, le16(l2cap.REJECT_COMMAND_NOT_UNDERSTOOD))]
+    let destination_cid = read_le16(data, 0)
+    let source_cid = read_le16(data, 2)
+    let i = index_of_cid(state, destination_cid)
+    if i < 0
+        // The reason data of Invalid CID in request is the two CIDs of the
+        // request, as the sender of the reject saw them ([Vol 3] Part A,
+        // Section 4.1).
+        return [CocOut { cid: l2cap.CID_LE_SIGNALING, payload: l2cap.build_command_reject_invalid_cid(identifier, destination_cid, source_cid) }]
+    if state.channels[i].remote_cid != source_cid
+        // The CIDs do not name one channel; the request is discarded
+        // silently ([Vol 3] Part A, Section 4.6).
+        return []
+    remove(var state, i, RESULT_SUCCESS)
+    [build_disconnection(l2cap.CODE_DISCONNECTION_RSP, identifier, source_cid, destination_cid)]
+
+// L2CAP_DISCONNECTION_RSP: a channel this Host asked to end is gone
+// ([Vol 3] Part A, Section 4.7).
+fn disconnection_response(var state: CocState, data: [u8]) -> [CocOut]
+    if list.len(data) != 4
+        return []
+    let source_cid = read_le16(data, 2)
+    for i in 0..list.len(state.channels)
+        if state.channels[i].disconnecting and state.channels[i].local_cid == source_cid
+            remove(var state, i, RESULT_SUCCESS)
+            return []
+    []
+
+// ── K-frames ────────────────────────────────────────────────────────
+
+// Take one K-frame on `cid`, the destination CID of its B-frame ([Vol 3]
+// Part A, Section 3.4).  A channel whose credit count is zero, an SDU
+// Length above the MTU, a PDU above the MPS, and segments that run past
+// the announced SDU length each end the channel (Section 3.4.3), and so
+// does a credit count above 65535 (Section 10.1).
+pub fn receive_k_frame(var state: CocState, cid: Int, payload: [u8]) -> [CocOut]
+    let i = index_of_cid(state, cid)
+    if i < 0
+        return []
+    var c = state.channels[i]
+    if c.connecting or c.disconnecting
+        return []
+    if c.credits <= 0
+        return end_channel(var state, i, RESULT_SUCCESS)
+    // The frame that opens an SDU also carries its 2-octet SDU Length
+    // field, and that field does not count against the MPS: with an MTU
+    // equal to the MPS, an SDU of exactly the MPS octets is otherwise
+    // impossible to send, which is the shape PTS's L2CAP/LE/CFC/BV-32-C
+    // fixes (it sends 122 octets of frame for an SDU of 120 with the MPS
+    // announced as 120).  A continuation frame carries data only and is
+    // bounded by the MPS itself ([Vol 3] Part A, Section 3.4.2).
+    let limit = if c.rx_want < 0 then c.mps + 2 else c.mps
+    if list.len(payload) > limit
+        return end_channel(var state, i, RESULT_SUCCESS)
+    c.credits = c.credits - 1
+    c.owed = c.owed + 1
+    var out = assemble(var state, i, payload)
+    // The frame can have ended the channel, in which case no credit is
+    // owed for it.
+    if index_of_cid(state, cid) < 0
+        return out
+    if not c.hold_credits and c.owed > 0
+        list.push(out, build_credit_ind(next_identifier(state), c.local_cid, c.owed))
+        c.credits = c.credits + c.owed
+        c.owed = 0
+    out
+
+// Add one K-frame's octets to the SDU being reassembled and report the SDU
+// when it is whole.  The first K-frame of an SDU holds its length.
+fn assemble(var state: CocState, i: Int, payload: [u8]) -> [CocOut]
+    var c = state.channels[i]
+    if c.rx_want < 0
+        if list.len(payload) < 2
+            return end_channel(var state, i, RESULT_SUCCESS)
+        let want = read_le16(payload, 0)
+        if want > c.mtu
+            return end_channel(var state, i, RESULT_SUCCESS)
+        c.rx = []
+        c.rx_want = want
+        list.append(c.rx, payload[2:list.len(payload)])
+    else
+        list.append(c.rx, payload)
+    if list.len(c.rx) > c.rx_want
+        return end_channel(var state, i, RESULT_SUCCESS)
+    if list.len(c.rx) == c.rx_want
+        let sdu = c.rx[:]
+        c.rx = []
+        c.rx_want = -1
+        list.push(state.events, CocEvent.DataReceived(c.id, sdu))
+    []
+
+// ── Sending ─────────────────────────────────────────────────────────
+
+// Send as many K-frames of the queued SDUs as the peer's credits allow,
+// each spending one credit and carrying at most the peer's MPS octets
+// ([Vol 3] Part A, Section 3.4.3).
+fn flush(var state: CocState, index: Int) -> [CocOut]
+    var c = state.channels[index]
+    var out: [CocOut] = []
+    for _ in 0..MAX_FLUSH_FRAMES
+        if c.peer_credits <= 0 or list.len(c.tx) == 0
+            return out
+        let sdu = c.tx[0]
+        let n = list.len(sdu)
+        var payload: [u8] = []
+        if c.tx_at == 0
+            list.push(payload, (n & 0xFF) as u8)
+            list.push(payload, ((n >>> 8) & 0xFF) as u8)
+            let room = c.peer_mps - 2
+            let end = if n < room then n else room
+            list.append(payload, sdu[0:end])
+            c.tx_at = end
+        else
+            let start = c.tx_at
+            let end = if start + c.peer_mps < n then start + c.peer_mps else n
+            list.append(payload, sdu[start:end])
+            c.tx_at = end
+        list.push(out, CocOut { cid: c.remote_cid, payload: payload })
+        c.peer_credits = c.peer_credits - 1
+        if c.tx_at >= n
+            var rest: [[u8]] = []
+            for k in 0..list.len(c.tx)
+                if k > 0
+                    list.push(rest, c.tx[k])
+            c.tx = rest
+            c.tx_at = 0
+    out
+
+// Send the SDU `sdu` on the channel `id`: its K-frames go now as far as the
+// peer's credits reach and wait otherwise.  None when there is no such
+// channel, the channel is not up, or the SDU is longer than the peer's MTU
+// ([Vol 3] Part A, Section 3.4.2).
+pub fn send_sdu(var state: CocState, id: Int, sdu: [u8]) -> ?[CocOut]
+    let i = index_of(state, id)
+    if i < 0
+        return None
+    var c = state.channels[i]
+    if c.connecting or c.disconnecting or list.len(sdu) > c.peer_mtu
+        return None
+    list.push(c.tx, sdu[:])
+    Some(flush(state, i))
+
+// Give the peer the credits that received K-frames spent, at least one
+// ([Vol 3] Part A, Section 4.24).  None when there is no such channel.
+fn return_credits(var state: CocState, id: Int) -> ?[CocOut]
+    let i = index_of(state, id)
+    if i < 0
+        return None
+    var c = state.channels[i]
+    if c.connecting or c.disconnecting
+        return None
+    let credits = if c.owed > 0 then c.owed else 1
+    c.owed = 0
+    c.credits = c.credits + credits
+    Some([build_credit_ind(next_identifier(state), c.local_cid, credits)])
+
+// Ask the peer to end the channel: L2CAP_DISCONNECTION_REQ names the
+// peer's CID as the Destination CID ([Vol 3] Part A, Section 4.6).  The
+// channel is dropped when the response arrives.
+pub fn disconnect(var state: CocState, id: Int) -> ?[CocOut]
+    let i = index_of(state, id)
+    if i < 0
+        return None
+    var c = state.channels[i]
+    if c.connecting or c.disconnecting
+        return None
+    c.disconnecting = true
+    Some([build_disconnection(l2cap.CODE_DISCONNECTION_REQ, next_identifier(state), c.remote_cid, c.local_cid)])
+
+// Ask the peer to accept the MTU and MPS `mtu` and `mps` this Host can
+// receive on the channels `ids`, which must be up:
+// L2CAP_CREDIT_BASED_RECONFIGURE_REQ names this Host's own endpoints as
+// the Destination CIDs ([Vol 3] Part A, Section 4.27).  None when a
+// number is not a channel of the table or no channel is named.
+fn reconfigure(var state: CocState, ids: [Int], mtu: Int, mps: Int) -> ?[CocOut]
+    if list.len(ids) == 0 or list.len(ids) > MAX_SCIDS
+        return None
+    var local: [Int] = []
+    for id in ids
+        let i = index_of(state, id)
+        if i < 0
+            return None
+        let c = state.channels[i]
+        if c.connecting or c.disconnecting
+            return None
+        list.push(local, c.local_cid)
+    var body = le16(mtu)
+    list.append(body, le16(mps))
+    for cid in local
+        list.append(body, le16(cid))
+    state.reconfiguring = local
+    state.reconfigure_mtu = mtu
+    state.reconfigure_mps = mps
+    Some([signal(l2cap.CODE_CREDIT_BASED_RECONFIGURE_REQ, next_identifier(state), body)])
+
+// L2CAP_CREDIT_BASED_RECONFIGURE_RSP: the peer answered a request of this
+// Host's ([Vol 3] Part A, Section 4.28).  The channels take the new MTU
+// and MPS on a successful result, which is what they may receive.
+fn reconfigure_response(var state: CocState, data: [u8]) -> [CocOut]
+    if list.len(data) != 2
+        return []
+    let result = read_le16(data, 0)
+    if result != RECONFIGURE_SUCCESS
+        state.reconfiguring = []
+        return []
+    for cid in state.reconfiguring
+        let i = index_of_cid(state, cid)
+        if i >= 0
+            var c = state.channels[i]
+            c.mtu = state.reconfigure_mtu
+            c.mps = state.reconfigure_mps
+            list.push(state.events, CocEvent.Reconfigured(c.id, c.peer_mtu, c.peer_mps))
+    state.reconfiguring = []
+    []
+
+// End a channel because of the frame that arrived on it, or because a
+// credit count passed 65535 ([Vol 3] Part A, Section 10.1): the channel is
+// dropped at once and the peer is asked to end it.
+fn end_channel(var state: CocState, i: Int, result: Int) -> [CocOut]
+    let c = state.channels[i]
+    let request = build_disconnection(l2cap.CODE_DISCONNECTION_REQ, next_identifier(state), c.remote_cid, c.local_cid)
+    remove(var state, i, result)
+    [request]
+
+// ── Tests ───────────────────────────────────────────────────────────
+//
+// The packets of these tests are built here from the field layouts of
+// [Vol 3] Part A, Sections 4.22 to 4.28, so a change in the module's own
+// builders cannot make a test agree with it by construction.
+
+const TEST_PSM = 0x0080
+const TEST_OTHER_PSM = 0x0081
+
+fn bytes_eq(a: [u8], b: [u8]) -> Bool
+    if list.len(a) != list.len(b)
+        return false
+    for i in 0..list.len(a)
+        if a[i] != b[i]
+            return false
+    true
+
+fn bytes_of(v: Int) -> [u8]
+    [(v & 0xFF) as u8, ((v >>> 8) & 0xFF) as u8]
+
+// A table that listens on one PSM with the MTU and the response the last
+// Listen command named.
+fn listening(response: Int) -> CocState
+    var state = new_state()
+    listen(var state, TEST_PSM, 0x01, 120, response)
+    state
+
+// L2CAP_LE_CREDIT_BASED_CONNECTION_REQ: SPSM, SCID, MTU, MPS, Initial
+// Credits.
+fn le_request(psm: Int, scid: Int, mtu: Int, mps: Int, credits: Int) -> [u8]
+    var body: [u8] = []
+    list.append(body, bytes_of(psm))
+    list.append(body, bytes_of(scid))
+    list.append(body, bytes_of(mtu))
+    list.append(body, bytes_of(mps))
+    list.append(body, bytes_of(credits))
+    body
+
+// L2CAP_LE_CREDIT_BASED_CONNECTION_RSP: DCID, MTU, MPS, Initial Credits,
+// Result.
+fn le_response(dcid: Int, mtu: Int, mps: Int, credits: Int, result: Int) -> [u8]
+    var body: [u8] = []
+    list.append(body, bytes_of(dcid))
+    list.append(body, bytes_of(mtu))
+    list.append(body, bytes_of(mps))
+    list.append(body, bytes_of(credits))
+    list.append(body, bytes_of(result))
+    body
+
+// L2CAP_CREDIT_BASED_CONNECTION_REQ: SPSM, MTU, MPS, Initial Credits, then
+// one Source CID per channel.
+fn enhanced_request(psm: Int, mtu: Int, mps: Int, credits: Int, scids: [Int]) -> [u8]
+    var body: [u8] = []
+    list.append(body, bytes_of(psm))
+    list.append(body, bytes_of(mtu))
+    list.append(body, bytes_of(mps))
+    list.append(body, bytes_of(credits))
+    for scid in scids
+        list.append(body, bytes_of(scid))
+    body
+
+// The first K-frame of an SDU of `length` octets whose first `octets`
+// follow the SDU Length field.
+fn k_frame(length: Int, octets: [u8]) -> [u8]
+    var payload = bytes_of(length)
+    list.append(payload, octets)
+    payload
+
+// A channel accepted from the peer with an MPS of 23 and 4 credits, its
+// connection event taken.
+fn accepting() -> CocState
+    var state = listening(LISTEN_SUCCESS)
+    let _ = receive_signaling(var state, l2cap.CODE_LE_CREDIT_BASED_CONNECTION_REQ, 0x01, le_request(TEST_PSM, 0x0044, 672, 23, 4))
+    let _ = take_events(var state)
+    state
+
+// ── Accepting and refusing connection requests ──────────────────────
+
+@test
+@satisfies("REQ-BLE-L2CAP-008")
+@satisfies("REQ-BLE-L2CAP-009")
+fn test_accepts_a_connection_request_on_a_listened_psm()
+    var state = listening(LISTEN_SUCCESS)
+    let out = receive_signaling(var state, l2cap.CODE_LE_CREDIT_BASED_CONNECTION_REQ, 0x07, le_request(TEST_PSM, 0x0042, 672, 23, 2))
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0].cid, l2cap.CID_LE_SIGNALING)
+    // Code 0x15, Identifier 0x07, Data Length 10: DCID, MTU, MPS, Initial
+    // Credits, Result.
+    test.assert_eq(out[0].payload[0] as Int, 0x15)
+    test.assert_eq(out[0].payload[1] as Int, 0x07)
+    test.assert_eq(read_le16(out[0].payload, 2), 10)
+    test.assert_eq(read_le16(out[0].payload, 4), 0x0040)   // this Host's CID
+    test.assert_eq(read_le16(out[0].payload, 6), 120)      // the listener's MTU
+    test.assert_eq(read_le16(out[0].payload, 8), 120)      // the same MPS
+    test.assert_eq(read_le16(out[0].payload, 10), INITIAL_CREDITS)
+    test.assert_eq(read_le16(out[0].payload, 12), RESULT_SUCCESS)
+    let events = take_events(var state)
+    test.assert_eq(list.len(events), 1)
+    match events[0]
+        CocEvent.Connected(id, psm) =>
+            test.assert_eq(id, 0)
+            test.assert_eq(psm, TEST_PSM)
+        _ => test.fail("the channel is up")
+    test.assert_eq(is_connected(state, 0), true)
+    match channel_of(state, 0)
+        None    => test.fail("the channel is in the table")
+        Some(c) =>
+            test.assert_eq(c.local_cid, 0x0040)
+            test.assert_eq(c.remote_cid, 0x0042)
+            test.assert_eq(c.peer_mtu, 672)
+            test.assert_eq(c.peer_mps, 23)
+            test.assert_eq(c.peer_credits, 2)
+
+@test
+@satisfies("REQ-BLE-L2CAP-009")
+fn test_refuses_a_request_on_a_psm_nobody_listens_on()
+    var state = listening(LISTEN_SUCCESS)
+    let out = receive_signaling(var state, l2cap.CODE_LE_CREDIT_BASED_CONNECTION_REQ, 0x08, le_request(TEST_OTHER_PSM, 0x0042, 672, 23, 2))
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(read_le16(out[0].payload, 12), RESULT_SPSM_NOT_SUPPORTED)
+    test.assert_eq(list.len(take_events(var state)), 0)
+    test.assert_eq(count(state), 0)
+
+@test
+@satisfies("REQ-BLE-L2CAP-009")
+fn test_refuses_with_the_response_the_listen_named()
+    // The Listen command of L2CAP/LE/CFC/BV-11-C asks for insufficient
+    // authentication in the answer (doc/btp_l2cap.txt, Listen).
+    var state = listening(0x01)
+    let out = receive_signaling(var state, l2cap.CODE_LE_CREDIT_BASED_CONNECTION_REQ, 0x09, le_request(TEST_PSM, 0x0042, 672, 23, 2))
+    test.assert_eq(read_le16(out[0].payload, 12), RESULT_INSUFFICIENT_AUTHENTICATION)
+    test.assert_eq(count(state), 0)
+
+@test
+@satisfies("REQ-BLE-L2CAP-009")
+fn test_refuses_an_invalid_or_taken_source_cid()
+    var state = listening(LISTEN_SUCCESS)
+    // A Source CID outside the dynamically allocated range of an LE-U
+    // logical link ([Vol 3] Part A, Table 2.3).
+    let out = receive_signaling(var state, l2cap.CODE_LE_CREDIT_BASED_CONNECTION_REQ, 0x01, le_request(TEST_PSM, 0x0001, 672, 23, 2))
+    test.assert_eq(read_le16(out[0].payload, 12), RESULT_INVALID_SOURCE_CID)
+    // One already in use by a channel of this link.
+    let first = receive_signaling(var state, l2cap.CODE_LE_CREDIT_BASED_CONNECTION_REQ, 0x02, le_request(TEST_PSM, 0x0042, 672, 23, 2))
+    test.assert_eq(read_le16(first[0].payload, 12), RESULT_SUCCESS)
+    let again = receive_signaling(var state, l2cap.CODE_LE_CREDIT_BASED_CONNECTION_REQ, 0x03, le_request(TEST_PSM, 0x0042, 672, 23, 2))
+    test.assert_eq(read_le16(again[0].payload, 12), RESULT_SOURCE_CID_ALLOCATED)
+    test.assert_eq(count(state), 1)
+
+@test
+@satisfies("REQ-BLE-L2CAP-009")
+fn test_refuses_unacceptable_mtu_and_mps()
+    var state = listening(LISTEN_SUCCESS)
+    // An MTU below the smallest an implementation supports, 23 octets.
+    let out = receive_signaling(var state, l2cap.CODE_LE_CREDIT_BASED_CONNECTION_REQ, 0x04, le_request(TEST_PSM, 0x0042, 22, 23, 2))
+    test.assert_eq(read_le16(out[0].payload, 12), RESULT_UNACCEPTABLE_PARAMETERS)
+    let out2 = receive_signaling(var state, l2cap.CODE_LE_CREDIT_BASED_CONNECTION_REQ, 0x05, le_request(TEST_PSM, 0x0042, 672, 22, 2))
+    test.assert_eq(read_le16(out2[0].payload, 12), RESULT_UNACCEPTABLE_PARAMETERS)
+
+@test
+@satisfies("REQ-BLE-L2CAP-008")
+fn test_the_connection_request_a_caller_sends()
+    var state = new_state()
+    match connect(state, TEST_PSM, 120, 1, false, false)
+        None    => test.fail("the request goes out")
+        Some(out) =>
+            test.assert_eq(list.len(out), 1)
+            test.assert_eq(out[0].cid, l2cap.CID_LE_SIGNALING)
+            test.assert_eq(out[0].payload[0] as Int, 0x14)
+            test.assert_eq(out[0].payload[1] as Int, 1)
+            test.assert_eq(read_le16(out[0].payload, 2), 10)
+            test.assert_eq(read_le16(out[0].payload, 4), TEST_PSM)
+            test.assert_eq(read_le16(out[0].payload, 6), 0x0040)
+            test.assert_eq(read_le16(out[0].payload, 8), 120)
+            test.assert_eq(read_le16(out[0].payload, 10), 120)
+            test.assert_eq(read_le16(out[0].payload, 12), INITIAL_CREDITS)
+    // The channel waits for the response: the upper layer has its number,
+    // and not a connected channel yet.
+    test.assert_eq(count(state), 1)
+    test.assert_eq(is_connected(state, 0), false)
+
+@test
+@satisfies("REQ-BLE-L2CAP-008")
+fn test_the_response_makes_the_channel_ready_and_a_refusal_reports_it()
+    var state = new_state()
+    let _ = connect(state, TEST_PSM, 120, 1, false, false)
+    let out = receive_signaling(var state, l2cap.CODE_LE_CREDIT_BASED_CONNECTION_RSP, 0x01, le_response(0x0044, 672, 23, 3, RESULT_SUCCESS))
+    test.assert_eq(list.len(out), 0)
+    test.assert_eq(is_connected(state, 0), true)
+    match channel_of(state, 0)
+        None    => test.fail("the channel is in the table")
+        Some(c) =>
+            test.assert_eq(c.remote_cid, 0x0044)
+            test.assert_eq(c.peer_mtu, 672)
+            test.assert_eq(c.peer_mps, 23)
+            test.assert_eq(c.peer_credits, 3)
+    match take_events(var state)[0]
+        CocEvent.Connected(id, psm) =>
+            test.assert_eq(id, 0)
+            test.assert_eq(psm, TEST_PSM)
+        _ => test.fail("the channel is up")
+    // A refusal reports the channel gone with the Result of the response.
+    var refused = new_state()
+    let _ = connect(refused, TEST_PSM, 120, 1, false, false)
+    let _ = receive_signaling(var refused, l2cap.CODE_LE_CREDIT_BASED_CONNECTION_RSP, 0x01, le_response(0, 0, 0, 0, RESULT_SPSM_NOT_SUPPORTED))
+    test.assert_eq(count(refused), 0)
+    match take_events(var refused)[0]
+        CocEvent.Disconnected(id, _, result) =>
+            test.assert_eq(id, 0)
+            test.assert_eq(result, RESULT_SPSM_NOT_SUPPORTED)
+        _ => test.fail("the channel is gone")
+
+// A successful response whose MPS is below the minimum is not taken: the
+// channel is dropped and the peer is asked to end it, so no segment ever
+// has a negative size.
+@test
+@satisfies("REQ-BLE-L2CAP-013")
+fn test_a_response_with_an_mps_below_the_minimum_drops_the_channel()
+    for mps in [0, 1, 2, 22]
+        var state = new_state()
+        let _ = connect(state, TEST_PSM, 120, 1, false, false)
+        let out = receive_signaling(var state, l2cap.CODE_LE_CREDIT_BASED_CONNECTION_RSP, 0x01, le_response(0x0044, 672, mps, 3, RESULT_SUCCESS))
+        test.assert_eq(count(state), 0)
+        test.assert_eq(list.len(out), 1)
+        test.assert_eq(out[0].payload[0] as Int, l2cap.CODE_DISCONNECTION_REQ)
+        test.assert_eq(read_le16(out[0].payload, 4), 0x0044)
+        match take_events(var state)[0]
+            CocEvent.Disconnected(_, _, result) => test.assert_eq(result, RESULT_UNACCEPTABLE_PARAMETERS)
+            _ => test.fail("the channel is gone")
+    // 23 is the smallest an LE Credit Based channel is created with.
+    var ok = new_state()
+    let _ = connect(ok, TEST_PSM, 120, 1, false, false)
+    let _ = receive_signaling(var ok, l2cap.CODE_LE_CREDIT_BASED_CONNECTION_RSP, 0x01, le_response(0x0044, 672, 23, 3, RESULT_SUCCESS))
+    test.assert_eq(is_connected(ok, 0), true)
+
+@test
+@satisfies("REQ-BLE-L2CAP-013")
+fn test_an_enhanced_response_with_an_mps_below_the_minimum_drops_the_channels()
+    var state = new_state()
+    let _ = connect(state, TEST_PSM, 96, 2, true, false)
+    var body: [u8] = []
+    list.append(body, bytes_of(128))
+    list.append(body, bytes_of(63))
+    list.append(body, bytes_of(4))
+    list.append(body, bytes_of(RESULT_SUCCESS))
+    list.append(body, bytes_of(0x0050))
+    list.append(body, bytes_of(CID_NONE))
+    let out = receive_signaling(var state, l2cap.CODE_CREDIT_BASED_CONNECTION_RSP, 0x01, body)
+    test.assert_eq(count(state), 0)
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0].payload[0] as Int, l2cap.CODE_DISCONNECTION_REQ)
+    test.assert_eq(read_le16(out[0].payload, 4), 0x0050)
+
+@test
+@satisfies("REQ-BLE-L2CAP-013")
+fn test_a_reconfigure_request_with_an_mps_below_the_minimum_is_refused()
+    var state = accepting()
+    var body: [u8] = []
+    list.append(body, bytes_of(1000))
+    list.append(body, bytes_of(63))
+    list.append(body, bytes_of(0x0044))
+    let out = receive_signaling(var state, l2cap.CODE_CREDIT_BASED_RECONFIGURE_REQ, 0x15, body)
+    test.assert_eq(read_le16(out[0].payload, 4), RECONFIGURE_UNACCEPTABLE)
+    match channel_of(state, 0)
+        None    => test.fail("the channel is in the table")
+        Some(c) => test.assert_eq(c.peer_mps, 23)
+
+// A response answers the request whose Identifier it carries ([Vol 3] Part
+// A, Section 4): another Identifier, or a response of the other mode,
+// completes nothing.
+@test
+@satisfies("REQ-BLE-L2CAP-008")
+fn test_a_response_completes_only_the_request_with_its_identifier()
+    var state = new_state()
+    let _ = connect(state, TEST_PSM, 120, 1, false, false)
+    let _ = receive_signaling(var state, l2cap.CODE_LE_CREDIT_BASED_CONNECTION_RSP, 0x07, le_response(0x0044, 672, 23, 3, RESULT_SUCCESS))
+    test.assert_eq(is_connected(state, 0), false)
+    test.assert_eq(count(state), 1)
+    // An Enhanced response with the Identifier of an LE request.
+    var body: [u8] = []
+    list.append(body, bytes_of(128))
+    list.append(body, bytes_of(128))
+    list.append(body, bytes_of(4))
+    list.append(body, bytes_of(RESULT_SUCCESS))
+    list.append(body, bytes_of(0x0050))
+    let _ = receive_signaling(var state, l2cap.CODE_CREDIT_BASED_CONNECTION_RSP, 0x01, body)
+    test.assert_eq(is_connected(state, 0), false)
+    test.assert_eq(count(state), 1)
+    // And an LE response with the Identifier of an Enhanced request.
+    var enhanced = new_state()
+    let _ = connect(enhanced, TEST_PSM, 96, 2, true, false)
+    let _ = receive_signaling(var enhanced, l2cap.CODE_LE_CREDIT_BASED_CONNECTION_RSP, 0x01, le_response(0x0044, 672, 23, 3, RESULT_SUCCESS))
+    test.assert_eq(count(enhanced), 2)
+    test.assert_eq(is_connected(enhanced, 0), false)
+    let _ = receive_signaling(var state, l2cap.CODE_LE_CREDIT_BASED_CONNECTION_RSP, 0x01, le_response(0x0044, 672, 23, 3, RESULT_SUCCESS))
+    test.assert_eq(is_connected(state, 0), true)
+
+// Two requests are out at once, and each response completes its own.
+@test
+@satisfies("REQ-BLE-L2CAP-008")
+fn test_two_requests_out_at_once_are_answered_by_identifier()
+    var state = new_state()
+    let _ = connect(state, TEST_PSM, 120, 1, false, false)
+    let _ = connect(state, TEST_OTHER_PSM, 120, 1, false, false)
+    let _ = receive_signaling(var state, l2cap.CODE_LE_CREDIT_BASED_CONNECTION_RSP, 0x02, le_response(0x0045, 672, 23, 3, RESULT_SUCCESS))
+    test.assert_eq(is_connected(state, 0), false)
+    test.assert_eq(is_connected(state, 1), true)
+    match channel_of(state, 1)
+        None    => test.fail("the second channel is in the table")
+        Some(c) => test.assert_eq(c.remote_cid, 0x0045)
+
+// A response that names fewer Destination CIDs than the request had Source
+// CIDs does not leave the rest waiting.
+@test
+@satisfies("REQ-BLE-L2CAP-009")
+fn test_an_enhanced_response_with_too_few_destination_cids_ends_the_rest()
+    var state = new_state()
+    let _ = connect(state, TEST_PSM, 96, 2, true, false)
+    var body: [u8] = []
+    list.append(body, bytes_of(128))
+    list.append(body, bytes_of(128))
+    list.append(body, bytes_of(4))
+    list.append(body, bytes_of(RESULT_SUCCESS))
+    list.append(body, bytes_of(0x0050))
+    let _ = receive_signaling(var state, l2cap.CODE_CREDIT_BASED_CONNECTION_RSP, 0x01, body)
+    test.assert_eq(is_connected(state, 0), true)
+    test.assert_eq(count(state), 1)
+
+// ── SDU segmentation and reassembly ─────────────────────────────────
+
+@test
+@satisfies("REQ-BLE-L2CAP-014")
+fn test_segments_an_sdu_into_k_frames()
+    var state = accepting()
+    // The peer's MPS is 23, so the first frame carries 2 + 21 octets of
+    // the SDU and every further one 23 ([Vol 3] Part A, Section 3.4.3).
+    var sdu: [u8] = []
+    for i in 0..60
+        list.push(sdu, i as u8)
+    let out = match send_sdu(var state, 0, sdu)
+        None    => []
+        Some(o) => o
+    test.assert_eq(list.len(out), 3)
+    test.assert_eq(out[0].cid, 0x0044)
+    test.assert_eq(list.len(out[0].payload), 23)
+    test.assert_eq(read_le16(out[0].payload, 0), 60)
+    test.assert_eq(list.len(out[1].payload), 23)
+    test.assert_eq(list.len(out[2].payload), 16)   // 60 - 44 octets left
+    test.assert_eq(out[2].payload[0] as Int, 44)   // the SDU's 45th octet
+    // Every frame spent one of the peer's credits.
+    match channel_of(state, 0)
+        None => test.fail("the channel is in the table")
+        Some(c) => test.assert_eq(c.peer_credits, 1)
+
+@test
+@satisfies("REQ-BLE-L2CAP-014")
+fn test_a_send_waits_for_credits_and_a_credit_indication_releases_it()
+    var state = accepting()
+    // Two octets of SDU fit in one K-frame, so four sends fill the four
+    // credits of the peer.
+    let _ = send_sdu(var state, 0, [0x01, 0x01])
+    let _ = send_sdu(var state, 0, [0x02, 0x02])
+    let _ = send_sdu(var state, 0, [0x03, 0x03])
+    let _ = send_sdu(var state, 0, [0x04, 0x04])
+    let out = match send_sdu(var state, 0, [0x05, 0x05])
+        None    => []
+        Some(o) => o
+    test.assert_eq(list.len(out), 0)
+    // One credit releases exactly one K-frame ([Vol 3] Part A,
+    // Section 10.1).  The CID the peer sends is its own endpoint of the
+    // channel, 0x0044 -- "the source channel endpoint of the device
+    // sending the L2CAP_FLOW_CONTROL_CREDIT_IND packet" (Section 4.24) --
+    // and the credits are this Host's to send to it.
+    var one: [u8] = bytes_of(0x0044)
+    list.append(one, bytes_of(1))
+    let released = receive_signaling(var state, l2cap.CODE_FLOW_CONTROL_CREDIT_IND, 0x00, one)
+    test.assert_eq(list.len(released), 1)
+    test.assert_eq(read_le16(released[0].payload, 0), 2)   // the SDU Length
+    test.assert_eq(released[0].payload[2] as Int, 0x05)    // the SDU itself
+    match channel_of(state, 0)
+        None => test.fail("the channel is in the table")
+        Some(c) => test.assert_eq(c.peer_credits, 0)
+
+// A grant releases everything the channel held back, in order, and only
+// that channel: the case the EATT rig run caught was a grant that named
+// the peer's endpoint of the channel and was answered with nothing at all,
+// so the answers that had run out of credits were never sent
+// (GATT/SR/GAR/BV-11-C).
+@test
+@satisfies("REQ-BLE-L2CAP-010")
+fn test_a_credit_top_up_flushes_what_the_last_credits_held_back()
+    var state = listening(LISTEN_SUCCESS)
+    // Two channels of one connection, each created with one credit of the
+    // peer's.
+    let _ = receive_signaling(var state, l2cap.CODE_CREDIT_BASED_CONNECTION_REQ, 0x11, enhanced_request(TEST_PSM, 128, 128, 1, [0x0042, 0x0043]))
+    let _ = take_events(var state)
+    var first: [CocOut] = []
+    match send_sdu(var state, 0, [0x01])
+        None    => test.fail("the first SDU goes out")
+        Some(o) => first = o[:]
+    test.assert_eq(list.len(first), 1)
+    // The credit is spent, so the next two SDUs wait.
+    var waited: [CocOut] = []
+    match send_sdu(var state, 0, [0x02])
+        None      => test.fail("the channel takes the SDU")
+        Some(out) => waited = out[:]
+    test.assert_eq(list.len(waited), 0)
+    match send_sdu(var state, 0, [0x03])
+        None      => test.fail("the channel takes the SDU")
+        Some(out) => waited = out[:]
+    test.assert_eq(list.len(waited), 0)
+    // The peer grants two credits on the first channel, naming its own
+    // endpoint of it, 0x0042: the two SDUs held back go out in order.
+    var grant = bytes_of(0x0042)
+    list.append(grant, bytes_of(2))
+    let out = receive_signaling(var state, l2cap.CODE_FLOW_CONTROL_CREDIT_IND, 0x00, grant)
+    test.assert_eq(list.len(out), 2)
+    test.assert_eq(out[0].cid, 0x0042)
+    test.assert_eq(list.len(out[0].payload), 3)
+    test.assert_eq(out[0].payload[2] as Int, 0x02)
+    test.assert_eq(out[1].payload[2] as Int, 0x03)
+    // The other channel of the connection is untouched by that grant: it
+    // has its own credit, and its second SDU waits for its own.
+    var second_first: [CocOut] = []
+    match send_sdu(var state, 1, [0x04])
+        None    => test.fail("the second channel takes the SDU")
+        Some(o) => second_first = o[:]
+    test.assert_eq(list.len(second_first), 1)
+    var second_waited: [CocOut] = []
+    match send_sdu(var state, 1, [0x05])
+        None      => test.fail("the second channel takes the SDU")
+        Some(out) => second_waited = out[:]
+    test.assert_eq(list.len(second_waited), 0)
+    // A CID this Host owns is not an endpoint the peer may name: a grant
+    // that carries it releases nothing (Section 4.24).
+    var wrong = bytes_of(0x0040)
+    list.append(wrong, bytes_of(4))
+    test.assert_eq(list.len(receive_signaling(var state, l2cap.CODE_FLOW_CONTROL_CREDIT_IND, 0x01, wrong)), 0)
+    match channel_of(state, 1)
+        None    => test.fail("the channel is in the table")
+        Some(c) => test.assert_eq(c.peer_credits, 0)
+    // And the peer's own CID of that channel releases it.
+    var right = bytes_of(0x0043)
+    list.append(right, bytes_of(1))
+    let again = receive_signaling(var state, l2cap.CODE_FLOW_CONTROL_CREDIT_IND, 0x02, right)
+    test.assert_eq(list.len(again), 1)
+    test.assert_eq(again[0].cid, 0x0043)
+    test.assert_eq(again[0].payload[2] as Int, 0x05)
+
+@test
+@satisfies("REQ-BLE-L2CAP-015")
+fn test_reassembles_a_segmented_sdu()
+    var state = accepting()
+    // Two K-frames of one 30-octet SDU: the first with the SDU Length,
+    // the second with the rest.
+    var sdu: [u8] = []
+    for i in 0..30
+        list.push(sdu, i as u8)
+    let first = k_frame(30, sdu[0:21])
+    let second = sdu[21:30]
+    let out1 = receive_k_frame(var state, 0x0040, first)
+    test.assert_eq(list.len(out1), 1)     // the credit given back
+    test.assert_eq(list.len(take_events(var state)), 0)
+    let _ = receive_k_frame(var state, 0x0040, second)
+    let events = take_events(var state)
+    test.assert_eq(list.len(events), 1)
+    match events[0]
+        CocEvent.DataReceived(id, got) =>
+            test.assert_eq(id, 0)
+            test.assert_eq(bytes_eq(got, sdu), true)
+        _ => test.fail("the SDU is reported")
+
+@test
+@satisfies("REQ-BLE-L2CAP-010")
+fn test_gives_credits_back_as_frames_arrive()
+    var state = accepting()
+    let out = receive_k_frame(var state, 0x0040, k_frame(1, [0x11]))
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0].payload[0] as Int, 0x16)
+    test.assert_eq(read_le16(out[0].payload, 4), 0x0040)
+    test.assert_eq(read_le16(out[0].payload, 6), 1)
+    match channel_of(state, 0)
+        None => test.fail("the channel is in the table")
+        Some(c) =>
+            test.assert_eq(c.credits, INITIAL_CREDITS)   // given back
+            test.assert_eq(c.owed, 0)
+
+@test
+@satisfies("REQ-BLE-L2CAP-010")
+fn test_held_credits_wait_for_the_upper_layer()
+    var state = new_state()
+    let _ = connect(state, TEST_PSM, 120, 1, false, true)
+    let _ = receive_signaling(var state, l2cap.CODE_LE_CREDIT_BASED_CONNECTION_RSP, 0x01, le_response(0x0044, 672, 23, 4, RESULT_SUCCESS))
+    let _ = receive_k_frame(var state, 0x0040, k_frame(1, [0x11]))
+    match channel_of(state, 0)
+        None => test.fail("the channel is in the table")
+        Some(c) =>
+            test.assert_eq(c.owed, 1)
+            test.assert_eq(c.credits, INITIAL_CREDITS - 1)
+    let out = match return_credits(var state, 0)
+        None    => []
+        Some(o) => o
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(read_le16(out[0].payload, 6), 1)
+    match channel_of(state, 0)
+        None => test.fail("the channel is in the table")
+        Some(c) => test.assert_eq(c.credits, INITIAL_CREDITS)
+
+@test
+@satisfies("REQ-BLE-L2CAP-026")
+fn test_k_frame_errors_end_the_channel()
+    // An SDU Length above the MTU (L2CAP/LE/CFC/BV-26-C).
+    var state = accepting()
+    let out = receive_k_frame(var state, 0x0040, [(121 & 0xFF) as u8, ((121 >>> 8) & 0xFF) as u8, 0x00])
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0].payload[0] as Int, 0x06)      // L2CAP_DISCONNECTION_REQ
+    test.assert_eq(read_le16(out[0].payload, 4), 0x0044)
+    test.assert_eq(read_le16(out[0].payload, 6), 0x0040)
+    test.assert_eq(count(state), 0)
+    // A payload above the MPS this Host receives (BV-27-C: PTS sends
+    // 132 octets of L2CAP payload).  The frame that opens an SDU may
+    // carry the MPS plus its 2-octet SDU Length field, so the boundary
+    // this checks is 123.
+    var mps_state = accepting()
+    var big: [u8] = bytes_of(0x0020)
+    for _ in 0..121
+        list.push(big, 0x00)
+    let mps_out = receive_k_frame(var mps_state, 0x0040, big)
+    test.assert_eq(list.len(mps_out), 1)
+    test.assert_eq(mps_out[0].payload[0] as Int, 0x06)
+    test.assert_eq(count(mps_state), 0)
+    // Segments past the announced SDU length (BV-28-C).
+    var sum_state = accepting()
+    let _ = receive_k_frame(var sum_state, 0x0040, k_frame(2, [0x01, 0x02]))
+    let sum_out = receive_k_frame(var sum_state, 0x0040, [0x03, 0x04, 0x05])
+    test.assert_eq(list.len(sum_out), 1)
+    test.assert_eq(sum_out[0].payload[0] as Int, 0x06)
+    test.assert_eq(count(sum_state), 0)
+    // A first frame with room for the SDU Length field but no field.
+    var short_state = accepting()
+    let short_out = receive_k_frame(var short_state, 0x0040, [0x01])
+    test.assert_eq(list.len(short_out), 1)
+    test.assert_eq(count(short_state), 0)
+
+@test
+@satisfies("REQ-BLE-L2CAP-026")
+fn test_an_sdu_of_exactly_the_mps_is_accepted()
+    // L2CAP/LE/CFC/BV-32-C: the SDU Length field does not count against
+    // the MPS of the frame that carries it, so an SDU of exactly the
+    // MPS arrives as one frame of MPS + 2 octets — the shape PTS sends,
+    // 122 octets for an SDU of 120 with the MPS announced as 120.
+    var state = accepting()
+    var sdu: [u8] = []
+    for i in 0..120
+        list.push(sdu, i as u8)
+    let _ = receive_k_frame(var state, 0x0040, k_frame(120, sdu))
+    let events = take_events(var state)
+    test.assert_eq(list.len(events), 1)
+    match events[0]
+        CocEvent.DataReceived(_, got) => test.assert_eq(bytes_eq(got, sdu), true)
+        _ => test.fail("the SDU is reported")
+    test.assert_eq(count(state), 1)
+    // A single frame above MPS + 2 still ends the channel.
+    var over = accepting()
+    var big_sdu: [u8] = [0x78, 0x00]
+    for _ in 0..121
+        list.push(big_sdu, 0x00)
+    let out = receive_k_frame(var over, 0x0040, big_sdu)
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0].payload[0] as Int, 0x06)     // L2CAP_DISCONNECTION_REQ
+    test.assert_eq(count(over), 0)
+    // A continuation frame above the MPS likewise: the frame that opens
+    // the SDU is within the MTU, the one that continues it is not
+    // within the MPS.
+    var cont = accepting()
+    let _ = receive_k_frame(var cont, 0x0040, k_frame(100, []))
+    var tail: [u8] = []
+    for _ in 0..121
+        list.push(tail, 0x00)
+    let cont_out = receive_k_frame(var cont, 0x0040, tail)
+    test.assert_eq(list.len(cont_out), 1)
+    test.assert_eq(cont_out[0].payload[0] as Int, 0x06)
+    test.assert_eq(count(cont), 0)
+
+@test
+@satisfies("REQ-BLE-L2CAP-026")
+fn test_a_frame_without_credits_ends_the_channel()
+    // L2CAP/ECFC/BI-02-C: a K-frame past the granted credits ends the
+    // channel while the channel holds its credits back.  A channel that
+    // gives them back as the frames arrive ends nothing, which is the
+    // other alternative that case allows (the test above).
+    var state = new_state()
+    let _ = connect(state, TEST_PSM, 120, 1, false, true)
+    let _ = receive_signaling(var state, l2cap.CODE_LE_CREDIT_BASED_CONNECTION_RSP, 0x01, le_response(0x0044, 672, 23, 4, RESULT_SUCCESS))
+    for _ in 0..INITIAL_CREDITS
+        let _ = receive_k_frame(var state, 0x0040, k_frame(1, [0x11]))
+    let out = receive_k_frame(var state, 0x0040, k_frame(1, [0x11]))
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0].payload[0] as Int, 0x06)
+    test.assert_eq(count(state), 0)
+
+@test
+@satisfies("REQ-BLE-L2CAP-010")
+fn test_credits_above_the_maximum_end_the_channel()
+    // L2CAP/LE/CFC/BI-01-C: a credit count above 65535 ends the channel
+    // ([Vol 3] Part A, Section 10.1).
+    var state = accepting()
+    var body: [u8] = bytes_of(0x0044)
+    list.append(body, bytes_of(65535))
+    let out = receive_signaling(var state, l2cap.CODE_FLOW_CONTROL_CREDIT_IND, 0x02, body)
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0].payload[0] as Int, 0x06)
+    test.assert_eq(count(state), 0)
+    // A credit of zero is ignored.
+    var zero_state = accepting()
+    var zero: [u8] = bytes_of(0x0044)
+    list.append(zero, bytes_of(0))
+    let ignored = receive_signaling(var zero_state, l2cap.CODE_FLOW_CONTROL_CREDIT_IND, 0x03, zero)
+    test.assert_eq(list.len(ignored), 0)
+    test.assert_eq(count(zero_state), 1)
+
+// ── Disconnection ───────────────────────────────────────────────────
+
+@test
+@satisfies("REQ-BLE-L2CAP-011")
+@satisfies("REQ-BLE-L2CAP-012")
+fn test_the_caller_ends_a_channel_and_the_peer_answers()
+    var state = accepting()
+    let out = match disconnect(state, 0)
+        None    => []
+        Some(o) => o
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0].payload[0] as Int, 0x06)
+    test.assert_eq(read_le16(out[0].payload, 4), 0x0044)   // the peer's CID
+    test.assert_eq(read_le16(out[0].payload, 6), 0x0040)   // this Host's
+    test.assert_eq(is_connected(state, 0), false)
+    test.assert_eq(count(state), 1)                        // until the answer
+    let _ = receive_signaling(var state, l2cap.CODE_DISCONNECTION_RSP, 0x05, [0x44, 0x00, 0x40, 0x00])
+    test.assert_eq(count(state), 0)
+    match take_events(var state)[0]
+        CocEvent.Disconnected(id, _, _) => test.assert_eq(id, 0)
+        _ => test.fail("the channel is gone")
+
+@test
+@satisfies("REQ-BLE-L2CAP-011")
+@satisfies("REQ-BLE-L2CAP-012")
+fn test_the_peer_ends_a_channel()
+    var state = accepting()
+    let _ = take_events(var state)
+    let out = receive_signaling(var state, l2cap.CODE_DISCONNECTION_REQ, 0x0A, [0x40, 0x00, 0x44, 0x00])
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0].payload[0] as Int, 0x07)      // L2CAP_DISCONNECTION_RSP
+    test.assert_eq(out[0].payload[1] as Int, 0x0A)
+    test.assert_eq(read_le16(out[0].payload, 4), 0x0044)
+    test.assert_eq(read_le16(out[0].payload, 6), 0x0040)
+    test.assert_eq(count(state), 0)
+
+@test
+@satisfies("REQ-BLE-L2CAP-011")
+fn test_a_disconnection_for_an_unknown_cid_is_rejected()
+    // L2CAP/LE/CFC/BV-23-C: a Destination CID the receiver does not know
+    // is answered with L2CAP_COMMAND_REJECT_RSP, Invalid CID in request.
+    var state = accepting()
+    let out = receive_signaling(var state, l2cap.CODE_DISCONNECTION_REQ, 0x0B, [0x77, 0x00, 0x44, 0x00])
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0].payload[0] as Int, 0x01)
+    test.assert_eq(read_le16(out[0].payload, 4), l2cap.REJECT_INVALID_CID)
+    test.assert_eq(count(state), 1)
+    // A request whose Source CID does not match the channel is discarded.
+    let stray = receive_signaling(var state, l2cap.CODE_DISCONNECTION_REQ, 0x0C, [0x40, 0x00, 0x45, 0x00])
+    test.assert_eq(list.len(stray), 0)
+    test.assert_eq(count(state), 1)
+
+// ── Enhanced Credit Based Flow Control ──────────────────────────────
+
+@test
+@satisfies("REQ-BLE-L2CAP-009")
+fn test_an_enhanced_request_creates_two_channels()
+    // L2CAP/COS/ECFC/BV-03-C: two channels in one request, and the
+    // interleaved K-frames of both are reported.
+    var state = listening(LISTEN_SUCCESS)
+    let out = receive_signaling(var state, l2cap.CODE_CREDIT_BASED_CONNECTION_REQ, 0x11, enhanced_request(TEST_PSM, 128, 128, 2, [0x0042, 0x0043]))
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0].payload[0] as Int, 0x18)
+    test.assert_eq(read_le16(out[0].payload, 2), 12)   // MTU, MPS, credits, result and two CIDs
+    test.assert_eq(read_le16(out[0].payload, 4), 120)  // the listener's MTU
+    test.assert_eq(read_le16(out[0].payload, 6), 120)  // the same MPS
+    test.assert_eq(read_le16(out[0].payload, 8), INITIAL_CREDITS)
+    test.assert_eq(read_le16(out[0].payload, 10), RESULT_SUCCESS)
+    test.assert_eq(read_le16(out[0].payload, 12), 0x0040)
+    test.assert_eq(read_le16(out[0].payload, 14), 0x0041)
+    let events = take_events(var state)
+    test.assert_eq(list.len(events), 2)
+    match events[0]
+        CocEvent.Connected(id, _) => test.assert_eq(id, 0)
+        _ => test.fail("the first channel is up")
+    match events[1]
+        CocEvent.Connected(id, _) => test.assert_eq(id, 1)
+        _ => test.fail("the second channel is up")
+    let _ = receive_k_frame(var state, 0x0040, k_frame(1, [0x0A]))
+    let _ = receive_k_frame(var state, 0x0041, k_frame(1, [0x0B]))
+    let got = take_events(var state)
+    test.assert_eq(list.len(got), 2)
+    match got[0]
+        CocEvent.DataReceived(id, sdu) =>
+            test.assert_eq(id, 0)
+            test.assert_eq(sdu[0] as Int, 0x0A)
+        _ => test.fail("the first SDU is reported")
+    match got[1]
+        CocEvent.DataReceived(id, sdu) =>
+            test.assert_eq(id, 1)
+            test.assert_eq(sdu[0] as Int, 0x0B)
+        _ => test.fail("the second SDU is reported")
+
+@test
+@satisfies("REQ-BLE-L2CAP-009")
+fn test_an_enhanced_request_refuses_only_the_cids_it_cannot_take()
+    var state = listening(LISTEN_SUCCESS)
+    let out = receive_signaling(var state, l2cap.CODE_CREDIT_BASED_CONNECTION_REQ, 0x12, enhanced_request(TEST_PSM, 128, 128, 2, [0x0042, 0x0001]))
+    test.assert_eq(list.len(out), 1)
+    // Some refused: the Result names it, and the refused channel has no
+    // Destination CID ([Vol 3] Part A, Section 4.26).
+    test.assert_eq(read_le16(out[0].payload, 10), RESULT_INVALID_SOURCE_CID)
+    test.assert_eq(read_le16(out[0].payload, 12), 0x0040)
+    test.assert_eq(read_le16(out[0].payload, 14), CID_NONE)
+    test.assert_eq(count(state), 1)
+
+@test
+@satisfies("REQ-BLE-L2CAP-008")
+fn test_an_enhanced_request_of_the_caller_creates_both_channels()
+    var state = new_state()
+    match connect(state, TEST_PSM, 96, 2, true, false)
+        None    => test.fail("the request goes out")
+        Some(out) =>
+            test.assert_eq(list.len(out), 1)
+            test.assert_eq(out[0].payload[0] as Int, 0x17)
+            test.assert_eq(read_le16(out[0].payload, 2), 12)
+            test.assert_eq(read_le16(out[0].payload, 4), TEST_PSM)
+            test.assert_eq(read_le16(out[0].payload, 6), 96)
+            test.assert_eq(read_le16(out[0].payload, 8), 96)
+            test.assert_eq(read_le16(out[0].payload, 10), INITIAL_CREDITS)
+            test.assert_eq(read_le16(out[0].payload, 12), 0x0040)
+            test.assert_eq(read_le16(out[0].payload, 14), 0x0041)
+    var body: [u8] = []
+    list.append(body, bytes_of(128))
+    list.append(body, bytes_of(128))
+    list.append(body, bytes_of(4))
+    list.append(body, bytes_of(RESULT_SUCCESS))
+    list.append(body, bytes_of(0x0050))
+    list.append(body, bytes_of(0x0051))
+    let _ = receive_signaling(var state, l2cap.CODE_CREDIT_BASED_CONNECTION_RSP, 0x01, body)
+    test.assert_eq(is_connected(state, 0), true)
+    test.assert_eq(is_connected(state, 1), true)
+    match channel_of(state, 1)
+        None    => test.fail("the second channel is in the table")
+        Some(c) =>
+            test.assert_eq(c.remote_cid, 0x0051)
+            test.assert_eq(c.peer_credits, 4)
+
+@test
+@satisfies("REQ-BLE-L2CAP-009")
+fn test_an_enhanced_response_leaves_an_unanswerable_channel_gone()
+    var state = new_state()
+    let _ = connect(state, TEST_PSM, 96, 2, true, false)
+    var body: [u8] = []
+    list.append(body, bytes_of(128))
+    list.append(body, bytes_of(128))
+    list.append(body, bytes_of(4))
+    list.append(body, bytes_of(RESULT_NO_RESOURCES))
+    list.append(body, bytes_of(0x0050))
+    list.append(body, bytes_of(CID_NONE))
+    let _ = receive_signaling(var state, l2cap.CODE_CREDIT_BASED_CONNECTION_RSP, 0x01, body)
+    test.assert_eq(is_connected(state, 0), true)
+    test.assert_eq(count(state), 1)
+    match take_events(var state)[1]
+        CocEvent.Disconnected(id, _, result) =>
+            test.assert_eq(id, 1)
+            test.assert_eq(result, RESULT_NO_RESOURCES)
+        _ => test.fail("the refused channel is gone")
+
+@test
+@satisfies("REQ-BLE-L2CAP-009")
+fn test_a_reconfigure_request_updates_what_the_peer_receives()
+    var state = accepting()
+    // The peer states larger values than the 672 and 23 the channel was
+    // created with; a reduction is what Table 4.18 refuses.  The
+    // Destination CID it names is its own endpoint of the channel,
+    // 0x0044 ([Vol 3] Part A, Section 4.27).
+    var body: [u8] = []
+    list.append(body, bytes_of(1000))
+    list.append(body, bytes_of(1000))
+    list.append(body, bytes_of(0x0044))
+    let out = receive_signaling(var state, l2cap.CODE_CREDIT_BASED_RECONFIGURE_REQ, 0x15, body)
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0].payload[0] as Int, 0x1A)
+    test.assert_eq(read_le16(out[0].payload, 4), RECONFIGURE_SUCCESS)
+    match channel_of(state, 0)
+        None    => test.fail("the channel is in the table")
+        Some(c) =>
+            test.assert_eq(c.peer_mtu, 1000)
+            test.assert_eq(c.peer_mps, 1000)
+    match take_events(var state)[0]
+        CocEvent.Reconfigured(id, mtu, mps) =>
+            test.assert_eq(id, 0)
+            test.assert_eq(mtu, 1000)
+            test.assert_eq(mps, 1000)
+        _ => test.fail("the new sizes are reported")
+    // A reduction of the MTU is refused ([Vol 3] Part A, Table 4.18).
+    var smaller: [u8] = []
+    list.append(smaller, bytes_of(500))
+    list.append(smaller, bytes_of(500))
+    list.append(smaller, bytes_of(0x0044))
+    let reduced = receive_signaling(var state, l2cap.CODE_CREDIT_BASED_RECONFIGURE_REQ, 0x17, smaller)
+    test.assert_eq(read_le16(reduced[0].payload, 4), RECONFIGURE_MTU_REDUCED)
+    // A Destination CID the table does not know is refused, and so is one
+    // of this Host's own endpoints, which is not the peer's to name.
+    var other = accepting()
+    let bad = receive_signaling(var other, l2cap.CODE_CREDIT_BASED_RECONFIGURE_REQ, 0x16, [0x00, 0x01, 0x40, 0x00, 0x77, 0x00])
+    test.assert_eq(read_le16(bad[0].payload, 4), RECONFIGURE_INVALID_CID)
+    var mine = accepting()
+    let own = receive_signaling(var mine, l2cap.CODE_CREDIT_BASED_RECONFIGURE_REQ, 0x18, [0xE8, 0x03, 0xE8, 0x03, 0x40, 0x00])
+    test.assert_eq(read_le16(own[0].payload, 4), RECONFIGURE_INVALID_CID)
+
+// ── The link ends ───────────────────────────────────────────────────
+
+@test
+@satisfies("REQ-BLE-L2CAP-024")
+fn test_the_end_of_the_connection_ends_the_channels()
+    var state = accepting()
+    let _ = take_events(var state)
+    drop_all(var state)
+    test.assert_eq(count(state), 0)
+    match take_events(var state)[0]
+        CocEvent.Disconnected(id, psm, _) =>
+            test.assert_eq(id, 0)
+            test.assert_eq(psm, TEST_PSM)
+        _ => test.fail("the channel is gone")
+    // A K-frame after that is not this link's.
+    let out = receive_k_frame(var state, 0x0040, k_frame(1, [0x11]))
+    test.assert_eq(list.len(out), 0)
+
+@test
+fn test_signaling_codes_of_the_table()
+    test.assert(is_coc_code(l2cap.CODE_LE_CREDIT_BASED_CONNECTION_REQ))
+    test.assert(is_coc_code(l2cap.CODE_FLOW_CONTROL_CREDIT_IND))
+    test.assert(is_coc_code(l2cap.CODE_DISCONNECTION_RSP))
+    test.assert(not is_coc_code(l2cap.CODE_CONNECTION_PARAMETER_UPDATE_REQ))
+    test.assert(not is_coc_code(l2cap.CODE_COMMAND_REJECT_RSP))
+
+@test
+fn test_a_signaling_packet_of_the_table_is_read_as_its_data()
+    let out = signal(l2cap.CODE_LE_CREDIT_BASED_CONNECTION_REQ, 0x21, le_request(TEST_PSM, 0x0042, 672, 23, 2))
+    test.assert_eq(out.payload[0] as Int, 0x14)
+    test.assert_eq(out.payload[1] as Int, 0x21)
+    test.assert_eq(read_le16(out.payload, 2), 10)
+    test.assert_eq(bytes_eq(signaling_data(out.payload), le_request(TEST_PSM, 0x0042, 672, 23, 2)), true)
+    // A Data Length that disagrees with the body is not correctly formed.
+    test.assert_eq(list.len(signaling_data([0x14, 0x01, 0x0B, 0x00])), 0)
+
+// ── What an upper layer that serves a channel needs ─────────────────
+
+@test
+fn test_the_channels_of_a_psm_are_the_ones_that_are_up()
+    var state = listening(LISTEN_SUCCESS)
+    test.assert_eq(list.len(channels_of_psm(state, TEST_PSM)), 0)
+    let _ = receive_signaling(var state, l2cap.CODE_LE_CREDIT_BASED_CONNECTION_REQ, 0x01, le_request(TEST_PSM, 0x0042, 672, 23, 2))
+    let _ = receive_signaling(var state, l2cap.CODE_LE_CREDIT_BASED_CONNECTION_REQ, 0x02, le_request(TEST_PSM, 0x0043, 672, 23, 2))
+    let up = channels_of_psm(state, TEST_PSM)
+    test.assert_eq(list.len(up), 2)
+    test.assert_eq(up[0].id, 0)
+    test.assert_eq(up[1].id, 1)
+    test.assert_eq(list.len(channels_of_psm(state, TEST_OTHER_PSM)), 0)
+    // A channel whose request is still out is not up, and neither is one
+    // the answer refused.
+    var connecting = new_state()
+    let _ = connect(connecting, TEST_PSM, 120, 1, false, false)
+    test.assert_eq(list.len(channels_of_psm(connecting, TEST_PSM)), 0)
+    let _ = receive_signaling(var connecting, l2cap.CODE_LE_CREDIT_BASED_CONNECTION_RSP, 0x01, le_response(0x0044, 672, 23, 1, RESULT_SUCCESS))
+    test.assert_eq(list.len(channels_of_psm(connecting, TEST_PSM)), 1)
+    // The end of the connection takes them with it ([Vol 3] Part A,
+    // Section 6).
+    drop_all(var state)
+    test.assert_eq(list.len(channels_of_psm(state, TEST_PSM)), 0)
+
+@test
+fn test_the_number_of_a_channel_is_read_from_its_cid()
+    let state = accepting()
+    test.assert_eq(id_of_local_cid(state, 0x0040), 0)
+    test.assert_eq(id_of_local_cid(state, 0x0044), -1)
+
+@test
+fn test_the_sdu_of_one_channel_is_taken_alone()
+    var state = listening(LISTEN_SUCCESS)
+    let _ = receive_signaling(var state, l2cap.CODE_CREDIT_BASED_CONNECTION_REQ, 0x11, enhanced_request(TEST_PSM, 128, 128, 2, [0x0042, 0x0043]))
+    let _ = take_events(var state)
+    let _ = receive_k_frame(var state, 0x0040, k_frame(1, [0x0A]))
+    let _ = receive_k_frame(var state, 0x0041, k_frame(1, [0x0B]))
+    // The SDU of one channel is the one taken; the other stays for
+    // `take_events`.
+    match take_data(var state, 0)
+        None    => test.fail("the first SDU is taken")
+        Some(sdu) => test.assert_eq(sdu[0] as Int, 0x0A)
+    match take_data(var state, 0)
+        None    => ()
+        Some(_) => test.fail("the first SDU is taken once")
+    let events = take_events(var state)
+    test.assert_eq(list.len(events), 1)
+    match events[0]
+        CocEvent.DataReceived(id, sdu) =>
+            test.assert_eq(id, 1)
+            test.assert_eq(sdu[0] as Int, 0x0B)
+        _ => test.fail("the second SDU is still reported")
+    // A connection report is never taken by `take_data`.
+    var other = listening(LISTEN_SUCCESS)
+    let _ = receive_signaling(var other, l2cap.CODE_LE_CREDIT_BASED_CONNECTION_REQ, 0x12, le_request(TEST_PSM, 0x0042, 672, 23, 2))
+    match take_data(var other, 0)
+        None    => ()
+        Some(_) => test.fail("a connection report is not an SDU")
+    test.assert_eq(list.len(take_events(var other)), 1)

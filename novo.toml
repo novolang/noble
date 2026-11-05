@@ -1,0 +1,359 @@
+[package]
+name        = "noble"
+version     = "0.1.0"
+description = "The Host of the noble Bluetooth Low Energy stack, written to Core 6.3: the HCI session, the link table, L2CAP and credit based channels, ATT, the GATT server and client, GAP and the advertisers, the Security Manager and bonding, privacy, and the isochronous transport.  Talks to a Controller only through the noble-hci seam."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "networking"
+layer       = "host"
+tags        = ["bluetooth", "ble", "host", "gatt", "att", "l2cap", "smp", "gap", "isochronous", "embedded"]
+repository  = "https://github.com/novolang/noble"
+maintainers = ["novo-lang"]
+novo        = ">= 0.23.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and effect-checks every module under `src/` and writes no binary.
+
+# The embedded tier of orbit/ble, whose images (the co-resident Host and Controller on the nRF52, the one-chip nRF54 images and
+# the PC Hosts) link this package.  The Host and the HCI package stay buildable for the embedded tier.
+[tier]
+tier   = "embedded"
+target = "nrf52832-dk"
+
+# The modules were written as the embedded tier of orbit/ble and keep their `@tier(embedded)` marks.  Some of their functions
+# build a list, a boxed struct or call `list.append`, which the embedded tier refuses (E4000); orbit/ble carries the same findings
+# under the same knob (owner decision 2026-11-04), and the package reports them as warnings until the Host is written over
+# fixed-capacity buffers or the tier of the Host stack is decided.
+sibling_check = "warn"
+
+[docs.pages]
+"README.md"      = "The Host of the noble stack"
+"docs/noble.md"  = "Modules, configuration and the HCI seam"
+
+[publish]
+coverage_floor = 0
+
+[dependencies]
+noble-hci = { path = "../noble-hci" }
+# The software AES-128, AES-CMAC and P-256 the Security Manager and the Database Hash use.
+crypto-ble-ecc = { path = "../crypto-ble-ecc" }
+
+# Package configuration (docs/config.md).  One [config.<key>] table for each limit of the Host core, with the `device` profile
+# as the default.  A consumer writes a [noble] section in its config file; the generated module is `noble_config`, read in the
+# sources as `noble_config.MAX_CONNECTIONS`, and `limits.nv` holds what is derived from the keys.  The keys keep the names they had
+# in the schema of orbit/ble, where the section was [ble].  The ranges are the checks of the former generator where it had one;
+# otherwise they are the lowest and highest value a profile builds, widened to the Core bound where the Core Specification states one.
+#
+# The storage the keys add up to is stated by `bytes`, `bytes_expr`, `floor` and `floor_when`, one term for each record the Host
+# declares, so that `novo config explain` prints the figure `src/budget.nv` recomputes.  A term sits on the key whose absence makes
+# it zero; the storage that exists whatever the keys say (the link registry, the transport rings, the database scalars) and the
+# storage of a group of features sits on `max_connections`, `max_attributes` and the like, which are never 0.
+#
+# A cost formula and a relation read only the keys of their own schema.  The keys of the audio roles and the services whose storage
+# is a product of a key of the core therefore stay in this schema until the packages of the roles exist: `max_ases`, `max_aics`,
+# `max_vocs`, `max_presets`, `max_set_size`, `max_unicast_streams`, `max_bcast_sources`, `max_bcast_sinks`, `max_gaf_clients`,
+# `max_ctl_instances`, `max_has_cache` and `max_bas`.  The keys whose storage reads no core key (the BTP faces, the Unicast Client,
+# the Broadcast Assistant, the content control servers, the HID Service) and the Host's RAM budget are in the schema of orbit/ble.
+[config.max_connections]
+type    = "int"
+default = 1
+min     = 1
+max     = 4
+bytes_expr = "1664 + max_connections * ((max_att_mtu + 4 + 15) / 8 * 8) + max_connections * 52 + max_connections * (((max_attributes + 7) / 8 + 7) / 8 * 8) + min(1, max_aics + max_vocs + max_presets + max_set_size) * (256 + max_connections * (48 + (max_presets + 15) / 8 * 8))"
+doc     = "simultaneous LE links, both roles"
+
+[config.max_att_mtu]
+type    = "int"
+default = 247
+min     = 23
+max     = 517
+unit    = "bytes"
+doc     = "the largest ATT_MTU offered"
+
+[config.acl_octets]
+type    = "int"
+default = 255
+min     = 31
+max     = 255
+unit    = "bytes"
+doc     = "one HCI ACL data packet buffer: the controller's LE_ACL_Data_Packet_Length plus the 4 octet HCI header"
+
+[config.acl_buffers]
+type    = "int"
+default = 3
+min     = 1
+max     = 16
+unit    = "buffers"
+bytes_expr = "(acl_buffers + max_connections) * (((acl_octets + 15) / 8 * 8) + 8) + 8"
+doc     = "controller ACL buffers, from LE Read Buffer Size"
+
+[config.max_attributes]
+type    = "int"
+default = 128
+min     = 32
+max     = 256
+unit    = "slots"
+bytes_expr = "6 * (((max_attributes) * 2 + 15) / 8 * 8) + 4 * ((max_attributes + 15) / 8 * 8) + 16"
+doc     = "slots in the shared GATT database"
+
+[config.max_value_bytes]
+type    = "int"
+default = 1024
+min     = 224
+max     = 8192
+unit    = "bytes"
+bytes_expr = "(max_value_bytes + 15) / 8 * 8"
+doc     = "octets of attribute values stored in the database"
+
+[config.max_uuid128]
+type    = "int"
+default = 8
+min     = 2
+max     = 32
+bytes_expr = "((max_uuid128) * 24 + 15) / 8 * 8"
+doc     = "128-bit UUIDs the database keeps"
+
+[config.max_cccd]
+type    = "int"
+default = 24
+min     = 8
+max     = 64
+bytes_expr = "max_connections * (((max_cccd) * 2 + 15) / 8 * 8)"
+doc     = "client Characteristic Configuration descriptors per link"
+
+[config.max_prepared_bytes]
+type    = "int"
+default = 0
+min     = 0
+max     = 512
+unit    = "bytes"
+bytes_expr = "max_connections * ((max_prepared_bytes + 15) / 8 * 8)"
+doc     = "prepare queue per link, 0 refuses queued writes"
+
+[config.max_bearers]
+type    = "int"
+default = 3
+min     = 1
+max     = 5
+bytes_expr = "max_connections * max_bearers * 24"
+doc     = "ATT bearers per link, the unenhanced one and the EATT channels"
+
+[config.max_coc_channels]
+type    = "int"
+default = 4
+min     = 0
+max     = 8
+bytes_expr = "max_coc_channels * (((max_att_mtu + 4 + 15) / 8 * 8) + 64)"
+doc     = "L2CAP credit based channels in total"
+
+[config.max_bonds]
+type    = "int"
+default = 4
+min     = 1
+max     = 8
+bytes_expr = "8 + max_bonds * (128 + ((max_cccd) * 2 + 15) / 8 * 8)"
+doc     = "bonded peers kept"
+
+[config.max_pairing]
+type    = "int"
+default = 1
+min     = 1
+max     = 2
+bytes = 700
+doc     = "pairings in progress at once"
+
+[config.max_cis]
+type    = "int"
+default = 2
+min     = 0
+max     = 4
+bytes_expr = "max_cis * (3 * ((iso_sdu_octets + 15) / 8 * 8) + 48)"
+doc     = "connected isochronous streams in total"
+
+[config.max_big]
+type    = "int"
+default = 1
+min     = 0
+max     = 2
+bytes_expr = "min(1, max_cis + max_bis) * max_big * 24"
+doc     = "broadcast isochronous groups in total, both roles"
+
+[config.max_bis]
+type    = "int"
+default = 2
+min     = 0
+max     = 4
+bytes_expr = "max_bis * (3 * ((iso_sdu_octets + 15) / 8 * 8) + 8)"
+doc     = "broadcast isochronous streams in total, over all groups"
+
+[config.iso_sdu_octets]
+type    = "int"
+default = 310
+min     = 0
+max     = 4095
+unit    = "bytes"
+doc     = "one ISO SDU buffer"
+
+[config.iso_buffers]
+type    = "int"
+default = 3
+min     = 0
+max     = 16
+unit    = "buffers"
+doc     = "controller ISO buffers, from LE Read Buffer Size v2"
+
+[config.max_ases]
+type    = "int"
+default = 2
+min     = 0
+max     = 4
+bytes_expr = "max_connections * max_ases * 116"
+doc     = "ASEs per link"
+
+[config.max_aics]
+type    = "int"
+default = 3
+min     = 0
+max     = 4
+bytes_expr = "max_aics * 96"
+doc     = "audio Input Control Service instances"
+
+[config.max_vocs]
+type    = "int"
+default = 2
+min     = 0
+max     = 4
+bytes_expr = "max_vocs * 96"
+doc     = "volume Offset Control Service instances"
+
+[config.max_presets]
+type    = "int"
+default = 8
+min     = 0
+max     = 16
+bytes_expr = "max_presets * 56"
+doc     = "hearing aid presets of the Hearing Access Service"
+
+[config.max_set_size]
+type    = "int"
+default = 4
+min     = 0
+max     = 8
+doc     = "members of a Coordinated Set, the largest Coordinated Set Size and Set Member Rank"
+
+[config.sequenced_slots]
+type    = "int"
+default = 4
+min     = 0
+max     = 8
+unit    = "slots"
+bytes_expr = "sequenced_slots * ((max_att_mtu + 4 + 15) / 8 * 8) + 8"
+doc     = "slots for notifications whose order must be kept"
+
+[config.hci_buffer_octets]
+type    = "int"
+default = 257
+min     = 68
+max     = 257
+unit    = "bytes"
+bytes_expr = "2 * ((hci_buffer_octets + 15) / 8 * 8)"
+doc     = "one HCI event or command buffer"
+
+[config.max_client_links]
+type    = "int"
+default = 2
+min     = 0
+max     = 4
+bytes_expr = "5 * (((max_client_links) * 8 + 15) / 8 * 8) + (max_client_links * 16 + 15) / 8 * 8 + 2 * ((max_client_links * client_cache_records + 15) / 8 * 8) + 3 * (((max_client_links * client_cache_records) * 2 + 15) / 8 * 8) + 2 * (((max_client_links * client_cache_records) * 8 + 15) / 8 * 8) + (((max_client_links * client_bearers) * 41) * 8 + 15) / 8 * 8 + (((max_client_links * client_bearers) * client_queue * 10) * 8 + 15) / 8 * 8 + 2 * (((max_client_links * client_bearers) * client_value_bytes + 15) / 8 * 8) + ((max_client_links * client_bearers) * max_att_mtu + 15) / 8 * 8 + min(max_connections, max_client_links) * 96"
+doc     = "links the GATT client engine serves at once, 0 for none"
+
+[config.client_bearers]
+type    = "int"
+default = 2
+min     = 0
+max     = 3
+doc     = "ATT bearers per client link, the unenhanced one and the EATT channels"
+
+[config.client_cache_records]
+type    = "int"
+default = 24
+min     = 0
+max     = 128
+doc     = "discovery records kept per client link"
+
+[config.client_queue]
+type    = "int"
+default = 4
+min     = 0
+max     = 8
+unit    = "slots"
+doc     = "requests queued per client bearer"
+
+[config.client_value_bytes]
+type    = "int"
+default = 256
+min     = 0
+max     = 512
+unit    = "bytes"
+doc     = "octets of the value buffer and of the payload buffer of a client bearer"
+
+[config.max_bcast_sources]
+type    = "int"
+default = 2
+min     = 0
+max     = 4
+bytes_expr = "max_bcast_sources * (1744 + ((max_bis) * 8 + 15) / 8 * 8) + 3280 + ((max_bis) * 8 + 15) / 8 * 8 + max_bis * 824 + ((max_bcast_sources) * 8 + 15) / 8 * 8 + 592"
+doc     = "broadcast Audio Streams the Broadcast Source holds at once, 0 for none"
+
+[config.max_unicast_streams]
+type    = "int"
+default = 0
+min     = 0
+max     = 4
+bytes_expr = "max_unicast_streams * (128 + (iso_sdu_octets + 15) / 8 * 8) + 512"
+doc     = "connected isochronous streams the Unicast Server holds at once, 0 for none"
+
+[config.max_bcast_sinks]
+type    = "int"
+default = 0
+min     = 0
+max     = 4
+bytes_expr = "max_bcast_sinks * (1536 + 3 * (((max_bis) * 8 + 15) / 8 * 8)) + 768"
+doc     = "broadcast Receive States the Scan Delegator and the Broadcast Sink hold at once, 0 for none"
+
+[config.max_gaf_clients]
+type    = "int"
+default = 0
+min     = 0
+max     = 4
+bytes_expr = "max_gaf_clients * (1200 + ((max_ctl_instances * 17) * 8 + 15) / 8 * 8) + 256 + max_set_size * 48 + 128 + 512"
+doc     = "links the control clients (Volume Controller, Microphone Controller, Set Coordinator, CAP Commander) keep state for, 0 for none"
+
+[config.max_ctl_instances]
+type    = "int"
+default = 0
+min     = 0
+max     = 8
+min_when = [{ when = "max_gaf_clients", min = 3 }]
+doc     = "service instances the control clients keep for each link"
+
+[config.max_bas]
+type    = "int"
+default = 2
+min     = 1
+max     = 4
+bytes_expr = "((max_connections * max_bas) * 8 + 15) / 8 * 8 + 2 * (((max_connections) * 8 + 15) / 8 * 8)"
+doc     = "battery Service instances"
+
+[config.max_has_cache]
+type    = "int"
+default = 0
+min     = 0
+max     = 16
+bytes_expr = "min(1, max_gaf_clients) * (max_gaf_clients * (1816 + ((max_has_cache * 3) * 8 + 15) / 8 * 8 + (max_has_cache * 40 + 15) / 8 * 8) + 640)"
+doc     = "preset records the Hearing Aid Remote Controller caches for each link, 0 for no Remote Controller"
+
+[config.hci_rx_flow_control]
+type            = "bool"
+default         = true
+reason_required = true
+doc             = "on when the Host turns Controller-to-Host flow control on for ACL data (Set Controller To Host Flow Control) and returns its buffers in batches with Host Number Of Completed Packets, off when it does not; a Controller that does not list the commands is sent neither; a file that turns it off gives the reason"

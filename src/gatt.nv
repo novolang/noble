@@ -1,0 +1,510 @@
+// gatt.nv — GATT client procedures (read subset).
+//
+// On top of `att`, GATT defines higher-level procedures over
+// the same opcode set.  This module is the *client* discovery + read
+// helpers — the ATT server (att_server.nv) is the *peer* side
+// that responds.  Both sides use the same wire codec.
+//
+// Procedures implemented:
+//
+//   discover_all_primary_services  → READ_BY_GROUP_TYPE 0x2800
+//   discover_characteristics       → READ_BY_TYPE       0x2803
+//   read_characteristic_value      → READ_REQ
+//
+// `tests/integration_gatt_tests.nv` walks the discover →
+// characteristic-read sequence end-to-end against the server
+// running over the HciRam transport.
+//
+// Satisfies: REQ-BLE-GATT-CL-001 (primary service discovery
+// procedure shape), -002 (characteristic discovery shape),
+// -003 (characteristic read).
+
+use std.test
+use std.bits
+use att
+
+// ── Standard GATT type UUIDs ────────────────────────────────────────
+
+const GATT_PRIMARY_SERVICE = 0x2800
+const GATT_CHARACTERISTIC = 0x2803
+const GATT_CCCD_UUID = 0x2902  // Client Characteristic Config Desc
+
+// CCCD value bits — Vol 3 Part G §3.3.3.3.
+const CCCD_OFF = 0x0000
+const CCCD_NOTIFY = 0x0001
+const CCCD_INDICATE = 0x0002
+// CCCD_NOTIFY | CCCD_INDICATE = 0x0003 (peer can subscribe to both
+// at once on the same characteristic).
+
+// ── Procedure: discover all primary services ────────────────────────
+//
+// Build the ATT_READ_BY_GROUP_TYPE_REQ that the central sends
+// to walk the peripheral's primary-service table.  Caller
+// re-issues with start = (last end_group + 1) until they get
+// ATTRIBUTE_NOT_FOUND back.
+@satisfies("REQ-BLE-GATT-CL-001")
+@tier(embedded)
+fn build_discover_primary_services_req(start: Int, end: Int) -> [u8]
+    [
+        att.ATT_OP_READ_BY_GROUP_TYPE_REQ,
+        (start & 0xFF) as u8,
+        ((start >>> 8) & 0xFF) as u8,
+        (end & 0xFF) as u8,
+        ((end >>> 8) & 0xFF) as u8,
+        (GATT_PRIMARY_SERVICE & 0xFF) as u8,
+        ((GATT_PRIMARY_SERVICE >>> 8) & 0xFF) as u8]
+
+// ── Procedure: discover characteristics within a service ────────────
+@satisfies("REQ-BLE-GATT-CL-002")
+@tier(embedded)
+fn build_discover_characteristics_req(start: Int, end: Int) -> [u8]
+    [
+        att.ATT_OP_READ_BY_TYPE_REQ,
+        (start & 0xFF) as u8,
+        ((start >>> 8) & 0xFF) as u8,
+        (end & 0xFF) as u8,
+        ((end >>> 8) & 0xFF) as u8,
+        (GATT_CHARACTERISTIC & 0xFF) as u8,
+        ((GATT_CHARACTERISTIC >>> 8) & 0xFF) as u8]
+
+// ── Procedure: read a characteristic value by handle ────────────────
+@satisfies("REQ-BLE-GATT-CL-003")
+@tier(embedded)
+fn build_read_characteristic_value_req(handle: Int) -> [u8]
+    [
+        att.ATT_OP_READ_REQ,
+        (handle & 0xFF) as u8,
+        ((handle >>> 8) & 0xFF) as u8]
+
+// ── Response decoding ───────────────────────────────────────────────
+//
+// `discover_primary_services` returns a sequence of triplets
+// (handle, end_group, value).  Helpers extract the per-triplet
+// fields by index.
+
+@satisfies("REQ-BLE-GATT-CL-001")
+@tier(embedded)
+fn primary_services_rsp_triplet_len(rsp: [u8]) -> Int
+    if list.len(rsp) < 2
+        -1
+    else if rsp[0] as Int != att.ATT_OP_READ_BY_GROUP_TYPE_RSP
+        -1
+    else
+        rsp[1] as Int
+
+@satisfies("REQ-BLE-GATT-CL-001")
+@tier(embedded)
+fn primary_services_rsp_count(rsp: [u8]) -> Int
+    let tlen = primary_services_rsp_triplet_len(rsp)
+    if tlen <= 0
+        -1
+    else
+        let body = list.len(rsp) - 2
+        body / tlen
+
+@satisfies("REQ-BLE-GATT-CL-001")
+@tier(embedded)
+fn primary_services_rsp_handle_at(rsp: [u8], idx: Int) -> Int
+    let tlen = primary_services_rsp_triplet_len(rsp)
+    if tlen < 0
+        -1
+    else
+        let off = 2 + idx * tlen
+        if off + 1 >= list.len(rsp)
+            -1
+        else
+            (rsp[off] as Int) | ((rsp[off + 1] as Int) << 8)
+
+@satisfies("REQ-BLE-GATT-CL-001")
+@tier(embedded)
+fn primary_services_rsp_end_group_at(rsp: [u8], idx: Int) -> Int
+    let tlen = primary_services_rsp_triplet_len(rsp)
+    if tlen < 0
+        -1
+    else
+        let off = 2 + idx * tlen + 2
+        if off + 1 >= list.len(rsp)
+            -1
+        else
+            (rsp[off] as Int) | ((rsp[off + 1] as Int) << 8)
+
+// Returns the 16-bit service UUID iff the triplet's value field
+// is 2 bytes wide.  -1 for 128-bit UUIDs (caller can pull the
+// raw 16 bytes via offset arithmetic).
+@satisfies("REQ-BLE-GATT-CL-001")
+@tier(embedded)
+fn primary_services_rsp_uuid16_at(rsp: [u8], idx: Int) -> Int
+    let tlen = primary_services_rsp_triplet_len(rsp)
+    if tlen != 6   // 4 + 2-byte UUID
+        -1
+    else
+        let off = 2 + idx * tlen + 4
+        if off + 1 >= list.len(rsp)
+            -1
+        else
+            (rsp[off] as Int) | ((rsp[off + 1] as Int) << 8)
+
+// `discover_characteristics` returns pairs (handle, value)
+// where value = 5 bytes (props + value_handle + uuid16) for
+// 16-bit characteristic UUIDs.
+@satisfies("REQ-BLE-GATT-CL-002")
+@tier(embedded)
+fn characteristics_rsp_pair_len(rsp: [u8]) -> Int
+    if list.len(rsp) < 2
+        -1
+    else if rsp[0] as Int != att.ATT_OP_READ_BY_TYPE_RSP
+        -1
+    else
+        rsp[1] as Int
+
+@satisfies("REQ-BLE-GATT-CL-002")
+@tier(embedded)
+fn characteristics_rsp_count(rsp: [u8]) -> Int
+    let plen = characteristics_rsp_pair_len(rsp)
+    if plen <= 0
+        -1
+    else
+        let body = list.len(rsp) - 2
+        body / plen
+
+// Per-characteristic accessors (16-bit UUID variant, pair_len = 7).
+//   pair: handle:u16 | props:u8 | value_handle:u16 | uuid16:u16
+@satisfies("REQ-BLE-GATT-CL-002")
+@tier(embedded)
+fn characteristics_rsp_decl_handle_at(rsp: [u8], idx: Int) -> Int
+    let plen = characteristics_rsp_pair_len(rsp)
+    if plen < 0
+        -1
+    else
+        let off = 2 + idx * plen
+        if off + 1 >= list.len(rsp)
+            -1
+        else
+            (rsp[off] as Int) | ((rsp[off + 1] as Int) << 8)
+
+@satisfies("REQ-BLE-GATT-CL-002")
+@tier(embedded)
+fn characteristics_rsp_value_handle_at(rsp: [u8], idx: Int) -> Int
+    let plen = characteristics_rsp_pair_len(rsp)
+    if plen != 7
+        -1
+    else
+        let off = 2 + idx * plen + 3
+        if off + 1 >= list.len(rsp)
+            -1
+        else
+            (rsp[off] as Int) | ((rsp[off + 1] as Int) << 8)
+
+@satisfies("REQ-BLE-GATT-CL-002")
+@tier(embedded)
+fn characteristics_rsp_uuid16_at(rsp: [u8], idx: Int) -> Int
+    let plen = characteristics_rsp_pair_len(rsp)
+    if plen != 7
+        -1
+    else
+        let off = 2 + idx * plen + 5
+        if off + 1 >= list.len(rsp)
+            -1
+        else
+            (rsp[off] as Int) | ((rsp[off + 1] as Int) << 8)
+
+// ── Server-side: notify / indicate / CCCD ──────────────────────────
+//
+// The server emits HANDLE_VALUE_NTF / HANDLE_VALUE_IND on its own
+// initiative when a notifiable / indicatable characteristic's
+// value changes AND the peer has subscribed via a write to the
+// CCCD descriptor (0x2902).  This module is the helper layer
+// between the att/att_server byte builders and the application
+// task that decides "publish a heart-rate measurement now".
+
+@satisfies("REQ-BLE-GATT-CL-001")
+@tier(embedded)
+fn is_cccd_uuid(uuid16: Int) -> Bool
+    uuid16 == GATT_CCCD_UUID
+
+// Decode the CCCD value (a 2-byte LE u16) from raw bytes.
+@tier(embedded)
+fn cccd_decode(value: [u8]) -> Int
+    if list.len(value) < 2
+        0
+    else
+        (value[0] as Int) | ((value[1] as Int) << 8)
+
+@tier(embedded)
+fn cccd_notify_enabled(cccd_value: Int) -> Bool
+    (cccd_value & CCCD_NOTIFY) != 0
+
+@tier(embedded)
+fn cccd_indicate_enabled(cccd_value: Int) -> Bool
+    (cccd_value & CCCD_INDICATE) != 0
+
+// Server-side notify / indicate PDU builders.  Thin wrappers over
+// the att.build_handle_value_* primitives so application code
+// only needs to import `gatt`.
+@satisfies("REQ-BLE-GATT-CL-001")
+@tier(embedded)
+fn build_notify_pdu(value_handle: Int, value: [u8]) -> [u8]
+    att.build_handle_value_ntf(value_handle, value)
+
+@satisfies("REQ-BLE-GATT-CL-001")
+@tier(embedded)
+fn build_indicate_pdu(value_handle: Int, value: [u8]) -> [u8]
+    att.build_handle_value_ind(value_handle, value)
+
+// ── Subscription registry (single connection only) ─────────────────
+//
+// Maps (value_handle → cccd_value) for the currently-connected
+// peer.  A flat-byte table mirroring the gatt_db format keeps
+// allocator behaviour predictable on the hot path:
+//
+//   handle_lo handle_hi cccd_lo cccd_hi
+//
+// 4 bytes per entry; we cap at 16 chars × 4 = 64 bytes.  A linear
+// scan is fast enough for typical service shapes.
+const SUB_ENTRY_LEN = 4
+const SUB_TABLE_CAP_BYTES = 64
+
+@tier(embedded)
+fn subs_lookup(table: [u8], value_handle: Int) -> Int
+    let n = list.len(table)
+    var idx = 0
+    var found = -1
+    loop
+        if idx + SUB_ENTRY_LEN > n
+            break
+        let h = (table[idx] as Int) | ((table[idx + 1] as Int) << 8)
+        if h == value_handle
+            found = (table[idx + 2] as Int) | ((table[idx + 3] as Int) << 8)
+            break
+        idx = idx + SUB_ENTRY_LEN
+    found
+
+// Insert or update the cccd value for `value_handle`.  Returns the
+// new table.  No-op (returns table) if cap would be exceeded on
+// insert.
+@tier(embedded)
+fn subs_set(var table: [u8], value_handle: Int, cccd_value: Int) -> [u8]
+    let n = list.len(table)
+    var idx = 0
+    var found = -1
+    loop
+        if idx + SUB_ENTRY_LEN > n
+            break
+        let h = (table[idx] as Int) | ((table[idx + 1] as Int) << 8)
+        if h == value_handle
+            found = idx
+            break
+        idx = idx + SUB_ENTRY_LEN
+    if found >= 0
+        // Replace existing entry's cccd bytes in place.
+        var out: [u8] = []
+        var i = 0
+        loop
+            if i >= n
+                break
+            if i == found + 2
+                out = list.append(out, [(cccd_value & 0xFF) as u8])
+            else if i == found + 3
+                out = list.append(out, [((cccd_value >>> 8) & 0xFF) as u8])
+            else
+                out = list.append(out, [table[i]])
+            i = i + 1
+        out
+    else if n + SUB_ENTRY_LEN > SUB_TABLE_CAP_BYTES
+        table
+    else
+        let entry: [u8] = [
+            (value_handle & 0xFF) as u8,
+            ((value_handle >>> 8) & 0xFF) as u8,
+            (cccd_value & 0xFF) as u8,
+            ((cccd_value >>> 8) & 0xFF) as u8]
+        list.append(table, entry)
+        table
+
+// Remove subscriptions for `value_handle`.  Used when a CCCD is
+// cleared by the peer (cccd_value = 0x0000).
+@tier(embedded)
+fn subs_remove(var table: [u8], value_handle: Int) -> [u8]
+    subs_set(var table, value_handle, CCCD_OFF)
+
+// Clear the entire subscription table — call on Disconnected.
+@tier(embedded)
+fn subs_clear() -> [u8]
+    []
+
+// Decide whether to emit a notification for `value_handle` given
+// the current subs table; if yes, build the PDU.  Returns empty
+// bytes if no subscription is active.
+@tier(embedded)
+fn try_build_notify_for(table: [u8], value_handle: Int, value: [u8]) -> [u8]
+    let cccd = subs_lookup(table, value_handle)
+    if cccd < 0
+        []
+    else if cccd_notify_enabled(cccd)
+        build_notify_pdu(value_handle, value)
+    else
+        []
+
+@tier(embedded)
+fn try_build_indicate_for(table: [u8], value_handle: Int, value: [u8]) -> [u8]
+    let cccd = subs_lookup(table, value_handle)
+    if cccd < 0
+        []
+    else if cccd_indicate_enabled(cccd)
+        build_indicate_pdu(value_handle, value)
+    else
+        []
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+@test
+@satisfies("REQ-BLE-GATT-CL-001")
+fn test_discover_primary_services_req_shape()
+    let req = build_discover_primary_services_req(0x0001, 0xFFFF)
+    test.assert_eq(list.len(req), 7)
+    test.assert_eq(req[0] as Int, att.ATT_OP_READ_BY_GROUP_TYPE_REQ)
+    test.assert_eq(req[1] as Int, 0x01)
+    test.assert_eq(req[3] as Int, 0xFF)
+    test.assert_eq(req[5] as Int, 0x00)   // group type lo
+    test.assert_eq(req[6] as Int, 0x28)   // group type hi (0x2800)
+
+@test
+@satisfies("REQ-BLE-GATT-CL-002")
+fn test_discover_characteristics_req_shape()
+    let req = build_discover_characteristics_req(0x0001, 0x0005)
+    test.assert_eq(list.len(req), 7)
+    test.assert_eq(req[0] as Int, att.ATT_OP_READ_BY_TYPE_REQ)
+    test.assert_eq(req[5] as Int, 0x03)   // type lo (0x2803)
+    test.assert_eq(req[6] as Int, 0x28)
+
+@test
+@satisfies("REQ-BLE-GATT-CL-003")
+fn test_read_characteristic_value_req_shape()
+    let req = build_read_characteristic_value_req(0x0003)
+    test.assert_eq(list.len(req), 3)
+    test.assert_eq(req[0] as Int, att.ATT_OP_READ_REQ)
+    test.assert_eq(req[1] as Int, 0x03)
+    test.assert_eq(req[2] as Int, 0x00)
+
+@test
+@satisfies("REQ-BLE-GATT-CL-001")
+fn test_primary_services_rsp_decode()
+    // RSP: opcode | triplet_len=6 | (handle=0x0001, end=0x0005, uuid=0x180A)
+    let rsp: [u8] = [
+        att.ATT_OP_READ_BY_GROUP_TYPE_RSP,
+        0x06,
+        0x01, 0x00,
+        0x05, 0x00,
+        0x0A, 0x18]
+    test.assert_eq(primary_services_rsp_triplet_len(rsp), 6)
+    test.assert_eq(primary_services_rsp_count(rsp), 1)
+    test.assert_eq(primary_services_rsp_handle_at(rsp, 0), 0x0001)
+    test.assert_eq(primary_services_rsp_end_group_at(rsp, 0), 0x0005)
+    test.assert_eq(primary_services_rsp_uuid16_at(rsp, 0), 0x180A)
+
+@test
+@satisfies("REQ-BLE-GATT-CL-002")
+fn test_characteristics_rsp_decode()
+    // Two characteristics: Manufacturer Name + Model Number.
+    let rsp: [u8] = [
+        att.ATT_OP_READ_BY_TYPE_RSP,
+        0x07,
+        // pair 1
+        0x02, 0x00,   // decl handle 0x0002
+        0x02,   // props
+        0x03, 0x00,   // value handle 0x0003
+        0x29, 0x2A,   // uuid 0x2A29
+        // pair 2
+        0x04, 0x00,
+        0x02,
+        0x05, 0x00,
+        0x24, 0x2A]
+    test.assert_eq(characteristics_rsp_pair_len(rsp), 7)
+    test.assert_eq(characteristics_rsp_count(rsp), 2)
+    test.assert_eq(characteristics_rsp_decl_handle_at(rsp, 0), 0x0002)
+    test.assert_eq(characteristics_rsp_value_handle_at(rsp, 0), 0x0003)
+    test.assert_eq(characteristics_rsp_uuid16_at(rsp, 0), 0x2A29)
+    test.assert_eq(characteristics_rsp_decl_handle_at(rsp, 1), 0x0004)
+    test.assert_eq(characteristics_rsp_uuid16_at(rsp, 1), 0x2A24)
+
+@test
+fn test_rsp_decoders_reject_wrong_opcode()
+    let err: [u8] = [att.ATT_OP_ERROR_RSP, 0x08, 0x00, 0x00, 0x0A]
+    test.assert_eq(primary_services_rsp_triplet_len(err), -1)
+    test.assert_eq(characteristics_rsp_pair_len(err), -1)
+
+// ── Tests: CCCD + notify/indicate + subscription registry ──────────
+
+@test
+fn test_cccd_uuid_and_decode()
+    test.assert_eq(is_cccd_uuid(0x2902), true)
+    test.assert_eq(is_cccd_uuid(0x2A37), false)
+
+    let off: [u8] = [0x00, 0x00]
+    let ntf: [u8] = [0x01, 0x00]
+    let ind: [u8] = [0x02, 0x00]
+    let both: [u8] = [0x03, 0x00]
+    test.assert_eq(cccd_decode(off), CCCD_OFF)
+    test.assert_eq(cccd_decode(ntf), CCCD_NOTIFY)
+    test.assert_eq(cccd_decode(ind), CCCD_INDICATE)
+    test.assert_eq(cccd_decode(both), 0x0003)
+
+    test.assert_eq(cccd_notify_enabled(CCCD_NOTIFY), true)
+    test.assert_eq(cccd_notify_enabled(CCCD_INDICATE), false)
+    test.assert_eq(cccd_indicate_enabled(CCCD_INDICATE), true)
+    test.assert_eq(cccd_notify_enabled(0x0003), true)
+    test.assert_eq(cccd_indicate_enabled(0x0003), true)
+
+@test
+@satisfies("REQ-BLE-GATT-CL-001")
+fn test_build_notify_indicate_pdus()
+    let v: [u8] = [0x55, 0xAA]
+    let n = build_notify_pdu(0x0011, v)
+    test.assert_eq(n[0] as Int, att.ATT_OP_HANDLE_VALUE_NTF)
+    test.assert_eq(n[1] as Int, 0x11)
+    test.assert_eq(n[3] as Int, 0x55)
+
+    let i = build_indicate_pdu(0x0011, v)
+    test.assert_eq(i[0] as Int, att.ATT_OP_HANDLE_VALUE_IND)
+
+@test
+fn test_subs_set_lookup_remove()
+    var t: [u8] = []
+    test.assert_eq(subs_lookup(t, 0x0011), -1)   // empty
+
+    t = subs_set(var t, 0x0011, CCCD_NOTIFY)
+    t = subs_set(var t, 0x0022, CCCD_INDICATE)
+    test.assert_eq(subs_lookup(t, 0x0011), CCCD_NOTIFY)
+    test.assert_eq(subs_lookup(t, 0x0022), CCCD_INDICATE)
+    test.assert_eq(subs_lookup(t, 0x0033), -1)   // not present
+
+    // Update existing entry — shouldn't grow the table.
+    t = subs_set(var t, 0x0011, 0x0003)
+    test.assert_eq(subs_lookup(t, 0x0011), 0x0003)
+    test.assert_eq(list.len(t), SUB_ENTRY_LEN * 2)
+
+    // Remove (= set to OFF).
+    t = subs_remove(var t, 0x0011)
+    test.assert_eq(subs_lookup(t, 0x0011), CCCD_OFF)
+
+    // subs_clear drops everything.
+    let empty = subs_clear()
+    test.assert_eq(list.len(empty), 0)
+
+@test
+fn test_try_build_notify_respects_subscription_state()
+    let value: [u8] = [0x01, 0x42]
+    var t: [u8] = []
+    // No subscription — empty bytes.
+    test.assert_eq(list.len(try_build_notify_for(t, 0x0011, value)), 0)
+
+    // Enable notifications.
+    t = subs_set(var t, 0x0011, CCCD_NOTIFY)
+    let pdu = try_build_notify_for(t, 0x0011, value)
+    test.assert_eq(pdu[0] as Int, att.ATT_OP_HANDLE_VALUE_NTF)
+
+    // Indication-only — notify path should remain silent.
+    t = subs_set(var t, 0x0011, CCCD_INDICATE)
+    test.assert_eq(list.len(try_build_notify_for(t, 0x0011, value)), 0)
+    let ind_pdu = try_build_indicate_for(t, 0x0011, value)
+    test.assert_eq(ind_pdu[0] as Int, att.ATT_OP_HANDLE_VALUE_IND)

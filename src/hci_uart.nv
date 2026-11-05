@@ -1,0 +1,243 @@
+// hci_uart.nv — `HciUart` transport struct + helpers +
+// impl HciTransport for HciUart.
+//
+// Trait conformance sits on top of the data-shape helpers.
+// Send-side is fully wired (encode typed frame → prepend H4 type
+// byte → blast bytes via `hal.uart.write_byte`).  **Receive-side
+// always returns None**: byte-stream deframing needs caller-held
+// buffer state, and `self` is a value here with nowhere to keep
+// it.  A caller that wants inbound frames has to drive
+// `hci_deframer.nv` itself — see the impl block below.
+//
+// Satisfies:
+//   - REQ-BLE-ARCH-002 — HCI host-controller boundary as a
+//     first-class type (HciUart) with trait conformance.
+//   - REQ-BLE-H4-001 — H4 type-byte framing on send.
+//   - REQ-BLE-H4-007 — framing-error recovery on receive
+//     (handled outside the trait surface today via the
+//     controller's `controller_uart_loop`).
+
+use std.test
+use hci_frame
+use hci_transport
+use hci_deframer
+
+// ── HciUart struct ──────────────────────────────────────────────────
+//
+// Marker struct holding configuration metadata only.  No
+// per-instance buffers — the deframer state for receive lives in
+// the caller's `var buf : [u8]`, and send is fire-and-forget into
+// the UART hardware FIFO.
+
+struct HciUart
+    baud: Int
+
+@satisfies("REQ-BLE-ARCH-002")
+@satisfies("REQ-BLE-H4-005")
+@tier(embedded)
+fn new_hci_uart(baud: Int) -> HciUart
+    HciUart { baud: baud }
+
+// ── Free helpers (data shape; no I/O) ───────────────────────────────
+
+// Strip the H4 type prefix from a deframed packet, returning
+// just the HCI body (header + params).
+@tier(embedded)
+fn strip_h4_prefix(pkt: [u8]) -> [u8]
+    var out: [u8] = []
+    for i in 1..list.len(pkt)
+        out = list.append(out, [pkt[i]])
+    out
+
+// Verify the first byte of a deframed packet matches the
+// expected H4 type.  Returns true when the packet is non-
+// empty and types match.  Caller drops mismatched packets.
+@tier(embedded)
+@no_alloc
+fn packet_type_matches(pkt: [u8], expected: Int) -> Bool
+    if list.len(pkt) == 0
+        false
+    else
+        pkt[0] as Int == expected
+
+// H4 packet types per Core Vol 4 Part A §2.  Re-exported here
+// for callers building send paths against this transport so
+// they don't have to reach into hci_h4 for them.
+const H4_PKT_COMMAND = 0x01
+
+const H4_PKT_ACL = 0x02
+
+const H4_PKT_EVENT = 0x04
+
+// ── Encode helpers (H4-prefixed) ────────────────────────────────────
+//
+// Wire-shape for a UART HCI packet: [H4_type_byte] ++ [HCI_body].
+// The HCI body is the same as the in-RAM transport's payload; the
+// only difference is the leading type byte.  Helpers prepend the
+// type byte to the typed-frame encoding so the impl methods stay
+// one-liners.
+
+@tier(embedded)
+fn encode_hci_cmd_h4(cmd: HciCmdMsg) -> [u8]
+    let body = hci_frame.encode_hci_cmd_msg(cmd)
+    list.append([H4_PKT_COMMAND], body)
+
+@tier(embedded)
+fn encode_hci_evt_h4(evt: HciEvtMsg) -> [u8]
+    let body = hci_frame.encode_hci_evt_msg(evt)
+    list.append([H4_PKT_EVENT], body)
+
+// ── Send helper (loops over UART byte API) ──────────────────────────
+
+@tier(embedded)
+fn uart_send_bytes(out: [u8]) [hw]
+    for i in 0..list.len(out)
+        hal.uart.write_byte(out[i] as Int)
+
+// ── impl HciTransport for HciUart ───────────────────────────────────
+//
+// Send-side is fully wired: encode the typed frame, prepend the H4
+// type byte, blast the bytes out the UART.  Receive-side is stubbed
+// (`None` / placeholder) because non-blocking byte-stream
+// deframing needs caller-held buffer state — the existing
+// `hci_deframer.nv` is a stateless byte-by-byte feeder that
+// expects the caller to thread a `var buf : [u8]` across calls.
+// Wiring receive into the trait surface needs HciUart to grow an
+// internal buffer field (or for the trait to take a `&mut` buffer),
+// which is a separate refactor.  For the typed-shape demo, the
+// host-driving-controller direction is the more useful path; the
+// controller-driving-host direction (event delivery) lives outside
+// this trait surface and is handled by the controller's existing
+// `controller_uart_loop` directly today.
+
+impl HciTransport for HciUart
+    type CmdFrame = HciCmdMsg
+    type EvtFrame = HciEvtMsg
+    fn send_command(self, cmd: HciCmdMsg) -> Bool [hw]
+        let frame = encode_hci_cmd_h4(cmd)
+        uart_send_bytes(frame)
+        // UART send is fire-and-forget — there's no per-call back-
+        // pressure surface today.  Always returns true once we've
+        // pushed all bytes out the FIFO.  When the FIFO fills (high
+        // command rate to a slow controller) this will need a
+        // hardware-flow-control surface; deferred.
+        true
+
+    fn recv_event(self) -> ?HciEvtMsg
+        // Stateful byte-stream deframing requires a caller-held
+        // buffer that this method's value-typed `self` doesn't
+        // expose.  Returns None until HciUart grows an internal
+        // buffer field.  See the impl-block comment above and the
+        // sibling `controller_uart_loop` for the assemble-bytes-
+        // into-packet pattern.
+        None
+
+    fn send_acl(self, acl: [u8]) -> Bool [hw]
+        let prefixed = list.append([H4_PKT_ACL], acl)
+        uart_send_bytes(prefixed)
+        true
+
+    fn recv_acl(self) -> ?[u8]
+        // Same stateful-deframe gap as recv_event.
+        None
+
+    fn is_open(self) -> Bool
+        // Treat baud > 0 as "configured" — closed transport sets
+        // baud to 0 explicitly via close().  Stateless proxy for
+        // "the underlying UART is initialised".
+        self.baud > 0
+
+    fn close(self)
+        // No-op today — UART deinit isn't abstracted into a
+        // single hal.uart call.  Leaving as `pass` lets the
+        // trait method exist without making false claims.
+        pass
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+@test
+fn test_strip_h4_prefix_removes_type_byte()
+    let pkt: [u8] = [0x04, 0x0E, 0x04, 0x01, 0x03, 0x0C, 0x00]
+    let body = strip_h4_prefix(pkt)
+    test.assert_eq(list.len(body), 6)
+    test.assert_eq(body[0] as Int, 0x0E)
+    test.assert_eq(body[5] as Int, 0x00)
+
+@test
+fn test_strip_h4_prefix_on_short_buffer()
+    let pkt: [u8] = [0x04]
+    let body = strip_h4_prefix(pkt)
+    test.assert_eq(list.len(body), 0)
+
+@test
+fn test_packet_type_matches_event()
+    let pkt: [u8] = [0x04, 0x0E, 0x04]
+    test.assert_eq(packet_type_matches(pkt, 0x04), true)
+    test.assert_eq(packet_type_matches(pkt, 0x01), false)
+
+@test
+fn test_packet_type_matches_empty_buffer_is_false()
+    let empty: [u8] = []
+    test.assert_eq(packet_type_matches(empty, 0x04), false)
+
+@test
+fn test_new_hci_uart_records_baud()
+    let t = new_hci_uart(1000000)
+    test.assert_eq(t.baud, 1000000)
+
+@test
+fn test_h4_packet_type_constants()
+    test.assert_eq(H4_PKT_COMMAND, 0x01)
+    test.assert_eq(H4_PKT_ACL, 0x02)
+    test.assert_eq(H4_PKT_EVENT, 0x04)
+
+// ── trait HciTransport surface tests ────────────────────────────────
+//
+// Tests cover the encode helpers + the trait's pure methods
+// (is_open / close).  send_command via the trait writes bytes
+// to stdout under the OCaml host (Hal_uart.write_byte stub) —
+// not exercised in @test to keep test output clean.
+
+@test
+fn test_encode_hci_cmd_h4_prepends_type_byte()
+    let cmd = HciCmdMsg { opcode: 0x0C03, params: [] }   // HCI_Reset
+    let frame = encode_hci_cmd_h4(cmd)
+    test.assert_eq(list.len(frame), 4)
+    test.assert_eq(frame[0] as Int, H4_PKT_COMMAND)   // 0x01
+    test.assert_eq(frame[1] as Int, 0x03)   // opcode_lo
+    test.assert_eq(frame[2] as Int, 0x0C)   // opcode_hi
+    test.assert_eq(frame[3] as Int, 0x00)   // param_len
+
+@test
+fn test_encode_hci_evt_h4_prepends_type_byte()
+    let evt = HciEvtMsg {
+        event_code: 0x0E,   // Command_Complete
+        params: [0x01, 0x03, 0x0C, 0x00] }
+    let frame = encode_hci_evt_h4(evt)
+    test.assert_eq(list.len(frame), 7)
+    test.assert_eq(frame[0] as Int, H4_PKT_EVENT)   // 0x04
+    test.assert_eq(frame[1] as Int, 0x0E)   // event_code
+    test.assert_eq(frame[2] as Int, 0x04)   // param_len
+    test.assert_eq(frame[6] as Int, 0x00)
+
+@test
+fn test_trait_is_open_after_construction()
+    let xport = new_hci_uart(115200)
+    test.assert(HciUart.is_open(xport))
+
+@test
+fn test_trait_close_is_noop_today()
+    let xport = new_hci_uart(115200)
+    HciUart.close(xport)
+    // close() is a no-op; the value's baud field is unchanged.
+    test.assert(HciUart.is_open(xport))
+
+@test
+fn test_trait_recv_returns_none_until_stateful_buffer_lands()
+    let xport = new_hci_uart(115200)
+    match HciUart.recv_event(xport)
+        Some(_) => test.fail("recv_event stubbed; should be None")
+        None    => test.assert(true)
+    match HciUart.recv_acl(xport)
+        Some(_) => test.fail("recv_acl stubbed; should be None")
+        None    => test.assert(true)

@@ -1,0 +1,40 @@
+// limits.nv -- the values the build limits of the Host derive.
+//
+// The limits themselves are the package configuration (docs/config.md): the schema in
+// novo.toml declares each key, a file of configs/ chooses the values, and the
+// build writes them as the constants of the module `noble_config`, which a source reads as
+// `noble_config.MAX_CONNECTIONS`.  Nothing is generated into the tree and no file is
+// rewritten when a profile is chosen: `novo build --config configs/pc.toml` selects the
+// values, a `[[bin]]` entry of novo.toml names its file, and a build with neither takes the
+// defaults of the schema, which are the `device` profile.
+//
+// This module holds what the keys do not say by themselves: the slots the link registry is
+// declared for, the frame buffer, and `max1`.  What the Controller derives (the switches of its
+// features, the slots of its tables, the octets of the LE feature set) is in
+// orbit/noble-controller/src/ctl_limits.nv: the Host and the Controller import no module of each other
+// (tests/seam_imports.sh), and each reads the keys of its own package (`noble_config`, `noble_controller_config`).
+//
+// A `const` item cannot read a constant of the configuration module, and a capacity cannot
+// call a `const fn` of another module, so a type that sizes a `Vec` from a key writes the
+// expression in its own module with that module's `max1` (`Vec[Cis; max1(noble_controller_config.CTL_CIS)]`)
+// and a test beside it compares the capacity with the function here.  `budget_bytes` of
+// `noble_config` is the storage the schema adds up to; budget.nv recomputes the Host core's
+// part from the keys and asserts that it agrees with it, ctl_budget.nv of the package
+// noble-controller does the same for the Controller's part, and host/ext_budget.nv of orbit/ble
+// does the same for the keys of its own schema.
+
+use noble_config
+
+// Connection slots the registry and the ACL credit pool of links.nv are declared for;
+// `max_connections` may not exceed it (budget.nv asserts so).
+pub const LINK_SLOTS = 4
+
+// The larger of `n` and 1: a table of an absent feature keeps one record.
+@tier(embedded)
+const fn max1(n: Int) -> Int
+    if n > 1 then n else 1
+
+// One L2CAP B-frame buffer: the largest ATT PDU and the L2CAP header.
+@tier(embedded)
+const fn frame_octets() -> Int
+    noble_config.MAX_ATT_MTU + 4

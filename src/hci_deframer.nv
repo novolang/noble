@@ -1,0 +1,295 @@
+// hci_deframer.nv — stateful H4 byte-stream deframer.
+//
+// A UART driver delivers bytes one (or a handful) at a time;
+// the HCI layer wants complete packets.  This module bridges
+// the two.  Callers maintain a `var buf: [u8]` themselves and
+// invoke the functions here to push bytes + take complete
+// packets when ready.
+//
+// The original design used a `struct H4Deframer { mut buf }`
+// with methods, but cross-module struct-type references hit
+// pilot finding #8 (OCaml codegen emits bare type names) and
+// method dispatch on function-returned receivers hits #13.
+// The stateless-API approach sidesteps both: the buffer lives
+// in the caller's scope as a plain `[u8]` and every function
+// takes + returns it.
+//
+// Typical use from a consumer module:
+//
+//     var buf : [u8] = []
+//     let result = hci_deframer.push_bytes(buf, incoming)
+//     buf = result.0
+//     match result.1
+//       Some(pkt) => // complete packet
+//       None      => // not yet
+//
+// On a `reject` status (unknown type byte — see
+// `h4_bytes_reject` in hci_h4), the deframer drops the
+// offending byte and tries again.
+//
+// Avoids finding #14 (list.take/drop args swapped) by never
+// calling those stdlib helpers — uses index-based while-loops.
+//
+// Satisfies: REQ-BLE-H4-007 (framing-error recovery — drain
+// on reject), REQ-BLE-H4-009 (no H4 fragmentation — every
+// complete packet pulled from the stream is a single HCI
+// packet).
+
+use std.test
+use std.bits
+use hci_h4
+
+// ── Byte-range helpers (avoid stdlib list.take / list.drop) ──────────
+
+@tier(embedded)
+fn take_first(buf: [u8], n: Int) -> [u8]
+    var out: [u8] = []
+    for i in 0..n
+        if i >= list.len(buf)
+            break
+        out = list.append(out, [buf[i]])
+    out
+
+@tier(embedded)
+fn drop_first_n(buf: [u8], n: Int) -> [u8]
+    var out: [u8] = []
+    for i in n..list.len(buf)
+        out = list.append(out, [buf[i]])
+    out
+
+@tier(embedded)
+fn drop_first(buf: [u8]) -> [u8]
+    drop_first_n(buf, 1)
+
+// ── Result struct ────────────────────────────────────────────────────
+//
+// Named-fields return type.  Tuples via `(x, y)` parse but
+// neither `.0` field access nor `let (a, b) = ...` destructure
+// work (finding #18) — only `match` extracts components, which
+// is awkward for a pure-data return.  Struct-with-fields is
+// clean cross-module: construction stays inside this module
+// (finding #8 stays clear), `.field` access works at the call
+// site.
+
+struct DeframerResult
+    new_buf: [u8]
+    packet: ?[u8]
+
+// ── Core operations ──────────────────────────────────────────────────
+//
+// Each returns a `DeframerResult`.  Consumers reassign
+// `buf = result.new_buf` to advance state and dispatch on
+// `result.packet` for any complete packet that came out.
+
+@satisfies("REQ-BLE-H4-009")
+@tier(embedded)
+fn push_byte(var buf: [u8], b: Int) -> DeframerResult
+    try_take(list.append(buf, [b as u8]))
+
+@satisfies("REQ-BLE-H4-009")
+@tier(embedded)
+fn push_bytes(var buf: [u8], bytes: [u8]) -> DeframerResult
+    try_take(list.append(buf, bytes))
+
+@satisfies("REQ-BLE-H4-007")
+@satisfies("REQ-BLE-H4-008")
+@satisfies("REQ-BLE-H4-009")
+@tier(embedded)
+fn try_take(buf: [u8]) -> DeframerResult
+    let plen = hci_h4.h4_packet_length(buf)
+    match plen
+        n if n == hci_h4.H4_BYTES_NEED_MORE =>
+            DeframerResult { new_buf: buf, packet: None }
+        n if n == hci_h4.H4_BYTES_REJECT    =>
+            // Drop the offending byte.  Real framing sync drains
+            // until the next plausible type byte; single-byte
+            // drop is equivalent in a driven loop.
+            DeframerResult { new_buf: drop_first(buf), packet: None }
+        n                                   =>
+            let have = list.len(buf)
+            if have < n
+                DeframerResult { new_buf: buf, packet: None }
+            else
+                let pkt = take_first(buf, n)
+                DeframerResult { new_buf: drop_first_n(buf, n), packet: Some(pkt) }
+
+// Take the next complete HCI packet, HCI packet indicator first, off
+// the front of `buf`.  Unlike `try_take`, which stops after dropping
+// one byte that is not an HCI packet indicator ([Vol 4] Part A,
+// Section 2), this goes on until a packet completes or none can, so
+// `packet` is `None` only when `buf` holds no complete packet.
+// `new_buf` is what remains either way.
+pub @satisfies("REQ-BLE-H4-007")
+@satisfies("REQ-BLE-H4-009")
+@tier(embedded)
+fn next_packet(buf: [u8]) -> DeframerResult
+    var r = try_take(buf)
+    var had = list.len(buf)
+    // A pass that yields no packet drops one byte or stops, so the
+    // buffer's length bounds the passes.
+    for _ in 0..list.len(buf)
+        if has_packet(r) or list.len(r.new_buf) == had
+            break
+        had = list.len(r.new_buf)
+        r = try_take(r.new_buf)
+    r
+
+@tier(embedded)
+@no_alloc
+fn has_packet(r: DeframerResult) -> Bool
+    match r.packet
+        Some(_) => true
+        None    => false
+
+// ── Tests ────────────────────────────────────────────────────────────
+//
+// Single-module tests only (no cross-module use beyond hci_h4,
+// which is a same-folder module — OK under the current
+// novo-test-single-file behaviour).
+
+@test
+fn test_take_first_helper()
+    let b: [u8] = [0x11, 0x22, 0x33, 0x44, 0x55]
+    let first3 = take_first(b, 3)
+    test.assert_eq(list.len(first3), 3)
+    test.assert_eq(first3[0] as Int, 0x11)
+    test.assert_eq(first3[2] as Int, 0x33)
+
+@test
+fn test_take_first_n_greater_than_len()
+    let b: [u8] = [0x11, 0x22]
+    let all = take_first(b, 5)
+    test.assert_eq(list.len(all), 2)
+
+@test
+fn test_drop_first_n_helper()
+    let b: [u8] = [0x11, 0x22, 0x33, 0x44, 0x55]
+    let rest = drop_first_n(b, 2)
+    test.assert_eq(list.len(rest), 3)
+    test.assert_eq(rest[0] as Int, 0x33)
+    test.assert_eq(rest[2] as Int, 0x55)
+
+@test
+fn test_drop_first_helper()
+    let b: [u8] = [0xFF, 0x01, 0x02]
+    let rest = drop_first(b)
+    test.assert_eq(list.len(rest), 2)
+    test.assert_eq(rest[0] as Int, 0x01)
+
+@test
+fn test_drop_first_n_zero_returns_original()
+    let b: [u8] = [0x11, 0x22]
+    let same = drop_first_n(b, 0)
+    test.assert_eq(list.len(same), 2)
+    test.assert_eq(same[0] as Int, 0x11)
+
+// Feed `stream` to `next_packet` in pieces of `step` bytes and
+// collect every packet that comes out.
+@tier(app)
+fn reassemble_in_steps(stream: [u8], step: Int) -> [[u8]]
+    var rx: [u8] = []
+    var out: [[u8]] = []
+    var pos = 0
+    while pos < list.len(stream)
+        var end = pos + step
+        if end > list.len(stream)
+            end = list.len(stream)
+        list.append(rx, stream[pos:end])
+        pos = end
+        var more = true
+        while more
+            let r = next_packet(rx)
+            rx = r.new_buf[:]
+            match r.packet
+                Some(pkt) => list.push(out, pkt[:])
+                None      => more = false
+    out
+
+// Command Complete for HCI_Reset, then Command Complete for Read
+// Local Version Information: two events, 7 and 15 bytes.
+@tier(app)
+fn two_event_stream() -> [u8]
+    [0x04, 0x0E, 0x04, 0x01, 0x03, 0x0C, 0x00,
+     0x04, 0x0E, 0x0C, 0x01, 0x01, 0x10, 0x00, 0x0D, 0x00, 0x00, 0x0D, 0xF1, 0x05, 0xFF, 0xFF]
+
+@test
+@satisfies("REQ-BLE-H4-009")
+fn test_next_packet_whole_stream_at_once()
+    let pkts = reassemble_in_steps(two_event_stream(), 64)
+    test.assert_eq(list.len(pkts), 2)
+    test.assert_eq(list.len(pkts[0]), 7)
+    test.assert_eq(list.len(pkts[1]), 15)
+    test.assert_eq(pkts[1][4] as Int, 0x01)
+
+@test
+@satisfies("REQ-BLE-H4-009")
+fn test_next_packet_every_split_size()
+    // Every piece size from one byte to the whole stream gives the
+    // same two packets with the same bytes.
+    let stream = two_event_stream()
+    for step in 1..list.len(stream) + 1
+        let pkts = reassemble_in_steps(stream, step)
+        test.assert_eq(list.len(pkts), 2)
+        test.assert_eq(list.len(pkts[0]), 7)
+        test.assert_eq(list.len(pkts[1]), 15)
+        test.assert_eq(pkts[0][6] as Int, 0x00)
+        test.assert_eq(pkts[1][14] as Int, 0xFF)
+
+@test
+@satisfies("REQ-BLE-H4-007")
+fn test_next_packet_drops_bytes_that_start_no_packet()
+    var stream: [u8] = [0xFF, 0x00, 0x07]
+    list.append(stream, two_event_stream())
+    for step in 1..5
+        let pkts = reassemble_in_steps(stream, step)
+        test.assert_eq(list.len(pkts), 2)
+        test.assert_eq(pkts[0][0] as Int, 0x04)
+        test.assert_eq(pkts[0][1] as Int, 0x0E)
+
+@test
+fn test_next_packet_keeps_partial_packet()
+    let partial: [u8] = [0x04, 0x0E, 0x04, 0x01]
+    let r = next_packet(partial)
+    match r.packet
+        Some(_) => test.fail("a partial packet must stay in the buffer")
+        None    => test.assert_eq(list.len(r.new_buf), 4)
+
+// An ISO Data packet with a 4-octet header and `n` octets of data, type
+// byte first.
+@tier(app)
+fn iso_packet(handle: Int, n: Int) -> [u8]
+    var p: [u8] = [0x05, (handle & 0xFF) as u8, (0x20 | ((handle >>> 8) & 0x0F)) as u8, (n & 0xFF) as u8, ((n >>> 8) & 0x3F) as u8]
+    for i in 0..n
+        list.push(p, (i & 0xFF) as u8)
+    p
+
+@test
+@satisfies("REQ-BLE-H4-009")
+fn test_next_packet_cuts_iso_packets_at_every_split_size()
+    // An event, an ISO packet that is longer than 255 octets (so that its
+    // length uses the second octet of the field), and an ISO packet with no
+    // data, back to back.
+    var stream = two_event_stream()
+    list.append(stream, iso_packet(0x0040, 300))
+    list.append(stream, iso_packet(0x0041, 0))
+    for step in [1, 2, 5, 7, 64, 400]
+        let pkts = reassemble_in_steps(stream, step)
+        test.assert_eq(list.len(pkts), 4)
+        test.assert_eq(list.len(pkts[2]), 305)
+        test.assert_eq(pkts[2][0] as Int, 0x05)
+        test.assert_eq(pkts[2][304] as Int, (299 & 0xFF))
+        test.assert_eq(list.len(pkts[3]), 5)
+        test.assert_eq(pkts[3][1] as Int, 0x41)
+
+@test
+@satisfies("REQ-BLE-H4-007")
+fn test_next_packet_keeps_partial_iso_packet()
+    let whole = iso_packet(0x0040, 10)
+    let r = next_packet(whole[0:9])
+    match r.packet
+        Some(_) => test.fail("a partial ISO packet must stay in the buffer")
+        None    => test.assert_eq(list.len(r.new_buf), 9)
+    let done = next_packet(whole)
+    match done.packet
+        None      => test.fail("a whole ISO packet comes out")
+        Some(pkt) => test.assert_eq(list.len(pkt), 15)

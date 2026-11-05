@@ -1,0 +1,502 @@
+// smp_keys.nv — the Security Manager's keys and
+// values in the byte order of the wire.
+//
+// The cryptographic toolbox of [Vol 3] Part H, Section 2.2 lives in
+// crypto-ble-ecc (smp_toolbox.nv, prims/p256.nv, privacy_rpa.nv) and
+// takes every value most significant octet first, as the
+// specification writes it.  SMP commands, HCI parameters and the
+// device addresses a Controller reports carry the same values least
+// significant octet first (Section 1.2.1).  This module is the
+// boundary: each function takes and answers wire-order values and
+// reverses them around the toolbox call, so the pairing procedure in
+// smp_responder.nv never handles the other order.
+//
+// It also holds the parts of the key handling that are not toolbox
+// functions: the Temporary Key of Passkey Entry (Section 2.3.5.3), the
+// masking of a key to the negotiated encryption key size (Section
+// 2.3.4), the P-256 public key check (Section 2.3.5.6.1), the debug
+// key pair, the 7-octet addresses f5 and f6 take, Resolvable Private
+// Addresses with an IRK, a constant-time comparison, and the random
+// number generator the procedure draws its nonces and keys from.
+
+use std.test
+use std.bits
+use prims.aes128
+use prims.p256
+use smp_toolbox
+use privacy_rpa
+
+// ── Byte order ──────────────────────────────────────────────────────
+
+// The octets of `b` in the reverse order, as a new list.
+pub @tier(embedded)
+fn reversed(b: [u8]) -> [u8]
+    let n = list.len(b)
+    var out: [u8] = []
+    for i in 0..n
+        list.push(out, b[n - 1 - i])
+    out
+
+// `n` zero octets.
+pub @tier(embedded)
+fn zeros(n: Int) -> [u8]
+    var out: [u8] = []
+    for i in 0..n
+        list.push(out, 0)
+    out
+
+// True when the two lists hold the same octets.  Every octet is read
+// whatever the earlier ones held, so the time taken does not tell how
+// many leading octets agree.  Confirm values and DHKey check values are
+// compared with this.
+pub @tier(embedded)
+@no_alloc
+fn equal_ct(a: [u8], b: [u8]) -> Bool
+    if list.len(a) != list.len(b)
+        return false
+    var diff = 0
+    for i in 0..list.len(a)
+        diff = diff | ((a[i] as Int) ^ (b[i] as Int))
+    diff == 0
+
+@tier(embedded)
+@no_alloc
+fn is_all_zero(b: [u8]) -> Bool
+    var acc = 0
+    for i in 0..list.len(b)
+        acc = acc | (b[i] as Int)
+    acc == 0
+
+// ── LE legacy pairing ([Vol 3] Part H, Sections 2.2.3, 2.2.4, 2.3.5) ─
+
+// The Temporary Key of Passkey Entry: the passkey as a 128-bit value,
+// least significant octet first ("019655" gives
+// 0x00000000000000000000000000004CC7, Section 2.3.5.3).
+@tier(embedded)
+fn passkey_tk(passkey: Int) -> [u8]
+    var tk = zeros(16)
+    tk[0] = (passkey & 0xFF) as u8
+    tk[1] = ((passkey >> 8) & 0xFF) as u8
+    tk[2] = ((passkey >> 16) & 0xFF) as u8
+    tk
+
+// LP_CONFIRM = c1(TK, rand, Pairing Request, Pairing Response, iat,
+// ia, rat, ra) (Section 2.3.5.5).  `tk` and `rand` are as a Pairing
+// Random carries them, the two commands as exchanged, the addresses
+// least significant octet first.  The answer is as a Pairing Confirm
+// carries it.
+@tier(embedded)
+fn legacy_confirm(tk: [u8], rand: [u8], preq: [u8], pres: [u8], iat: Int, ia: [u8], rat: Int, ra: [u8]) -> [u8]
+    let p1 = smp_toolbox.build_c1_p1(pres, preq, rat, iat)
+    let p2 = smp_toolbox.build_c1_p2(ia, ra)
+    reversed(smp_toolbox.c1(reversed(tk), reversed(rand), p1, p2))
+
+// STK = s1(TK, LP_RAND_R, LP_RAND_I) (Section 2.3.5.5), wire order in
+// and out.
+@tier(embedded)
+@satisfies("REQ-BLE-SMP-029")
+fn legacy_stk(tk: [u8], rand_r: [u8], rand_i: [u8]) -> [u8]
+    reversed(smp_toolbox.s1(reversed(tk), reversed(rand_r), reversed(rand_i)))
+
+// A key shortened to `key_size` octets by masking its most significant
+// octets (Section 2.3.4).  `key` is least significant octet first, so
+// the octets from `key_size` on become zero.
+@tier(embedded)
+@satisfies("REQ-BLE-SMP-030")
+fn mask_key(key: [u8], key_size: Int) -> [u8]
+    var out: [u8] = []
+    for i in 0..16
+        if i < key_size
+            list.push(out, key[i])
+        else
+            list.push(out, 0)
+    out
+
+// ── LE Secure Connections ([Vol 3] Part H, Sections 2.2.6 to 2.2.9) ──
+
+// A1 and A2 of f5 and f6: the address type in the least significant
+// bit of the most significant octet, then the 48-bit address, as the
+// toolbox takes them (Section 2.2.7).  `address` is least significant
+// octet first.
+pub @tier(embedded)
+fn address_56(address_type: Int, address: [u8]) -> [u8]
+    [(address_type & 0x01) as u8, address[5], address[4], address[3], address[2], address[1], address[0]]
+
+// f4(U, V, X, Z), wire order in and out.
+pub @tier(embedded)
+@satisfies("REQ-BLE-SMP-025")
+fn sc_confirm(u: [u8], v: [u8], x: [u8], z: Int) -> [u8]
+    reversed(smp_toolbox.f4(reversed(u), reversed(v), reversed(x), z))
+
+// MacKey and LTK of f5(DHKey, Nc, Np, BD_ADDR_C, BD_ADDR_P) (Section
+// 2.2.7).  `dhkey` is the DHKey least significant octet first, as the
+// LE Generate DHKey Complete event reports it; the nonces as a Pairing
+// Random carries them.  MacKey is answered most significant octet
+// first, the order f6 takes it in, and is never sent; the LTK least
+// significant octet first, the order of the LE Long Term Key Request
+// Reply command.
+struct ScKeys
+    mac_key: [u8]
+    ltk: [u8]
+
+// The MacKey and the long term key of an LE Secure Connections pairing, from the Diffie-Hellman key, the two nonces
+// and the two device addresses (function f5, [Vol 3] Part H, Section 2.2.8).
+pub @tier(embedded)
+@satisfies("REQ-BLE-SMP-026")
+fn sc_keys(dhkey: [u8], nc: [u8], np: [u8], a_central: [u8], a_peripheral: [u8]) -> ScKeys
+    let w = reversed(dhkey)
+    let t = smp_toolbox.f5_t(w)
+    let n1 = reversed(nc)
+    let n2 = reversed(np)
+    ScKeys {
+        mac_key: smp_toolbox.f5_block(t, 0, n1, n2, a_central, a_peripheral),
+        ltk: reversed(smp_toolbox.f5_block(t, 1, n1, n2, a_central, a_peripheral)) }
+
+// f6(MacKey, N1, N2, R, IOcap, A1, A2) (Section 2.2.8).  IOcap is
+// AuthReq, OOB data flag and IO capability, most significant first.
+// The answer is as a Pairing DHKey Check carries it.
+pub @tier(embedded)
+@satisfies("REQ-BLE-SMP-027")
+fn sc_check(mac_key: [u8], n1: [u8], n2: [u8], r: [u8], auth_req: Int, oob: Int, io_cap: Int, a1: [u8], a2: [u8]) -> [u8]
+    let iocap: [u8] = [auth_req as u8, oob as u8, io_cap as u8]
+    reversed(smp_toolbox.f6(mac_key, reversed(n1), reversed(n2), reversed(r), iocap, a1, a2))
+
+// The six-digit value of Numeric Comparison, g2(PKax, PKbx, Na, Nb)
+// mod 10^6 (Section 2.2.9).
+@tier(embedded)
+@satisfies("REQ-BLE-SMP-028")
+fn numeric_value(pkax: [u8], pkbx: [u8], na: [u8], nb: [u8]) -> Int
+    smp_toolbox.g2(reversed(pkax), reversed(pkbx), reversed(na), reversed(nb))
+
+// The passkey as R of f6 in Passkey Entry: a 128-bit integer
+// (Section 2.2.8), least significant octet first.
+@tier(embedded)
+fn passkey_r(passkey: Int) -> [u8]
+    passkey_tk(passkey)
+
+// Z of f4 for passkey bit `i`: 0x80 or 0x81 (Section 2.2.6).
+@tier(embedded)
+@no_alloc
+fn passkey_z(passkey: Int, i: Int) -> Int
+    0x80 | ((passkey >> i) & 1)
+
+// ── P-256 ([Vol 3] Part H, Section 2.3.5.6.1) ───────────────────────
+//
+// A coordinate travels as 32 octets least significant first; the field
+// arithmetic of prims/p256.nv takes eight 32-bit limbs, least
+// significant limb first.
+
+@tier(embedded)
+fn limbs_of(b: [u8]) -> [Int]
+    var out: [Int] = []
+    for i in 0..8
+        let v = (b[4 * i] as Int) | ((b[4 * i + 1] as Int) << 8) | ((b[4 * i + 2] as Int) << 16) | ((b[4 * i + 3] as Int) << 24)
+        list.push(out, v)
+    out
+
+@tier(embedded)
+fn bytes_of(limbs: [Int]) -> [u8]
+    var out: [u8] = []
+    for i in 0..8
+        let v = limbs[i]
+        list.push(out, (v & 0xFF) as u8)
+        list.push(out, ((v >> 8) & 0xFF) as u8)
+        list.push(out, ((v >> 16) & 0xFF) as u8)
+        list.push(out, ((v >> 24) & 0xFF) as u8)
+    out
+
+// A P-256 public key, each coordinate 32 octets least significant
+// first, as the Pairing Public Key command carries it.
+pub struct PublicKey
+    x: [u8]
+    y: [u8]
+
+// The local key pair.  `private_key` is empty when the Controller holds
+// the private key (LE Read Local P-256 Public Key, [Vol 4] Part E,
+// Section 7.8.36) and computes the DHKey itself.
+pub struct KeyPair
+    private_key: [u8]
+    public_key: PublicKey
+
+// The public key of `private_key` (32 octets, least significant first).
+// The scalar multiplication of prims/p256.nv is not constant time.
+pub @tier(embedded)
+fn key_pair_from_private(private_key: [u8]) -> KeyPair
+    let pk = p256.p256_scalar_mul_base(limbs_of(private_key))
+    KeyPair {
+        private_key: private_key,
+        public_key: PublicKey { x: bytes_of(p256.aff_x(pk)), y: bytes_of(p256.aff_y(pk)) } }
+
+// True when (x, y) is on the curve with both coordinates below p
+// (Section 2.3.5.6.1).
+@tier(embedded)
+fn is_valid_public_key(key: PublicKey) -> Bool
+    if list.len(key.x) != 32 or list.len(key.y) != 32
+        return false
+    p256.p256_is_valid_public_key(limbs_of(key.x), limbs_of(key.y))
+
+// The DHKey of the local private key and the peer's public key: the x
+// coordinate of the product, 32 octets least significant first.
+pub @tier(embedded)
+fn dhkey(private_key: [u8], peer: PublicKey) -> [u8]
+    bytes_of(p256.p256_ecdh(limbs_of(private_key), limbs_of(peer.x), limbs_of(peer.y)))
+
+// The debug key pair a Security Manager in Debug mode uses (Section
+// 2.3.5.6.1), least significant octet first.
+pub @tier(embedded)
+fn debug_private_key() -> [u8]
+    reversed([
+        0x3f, 0x49, 0xf6, 0xd4, 0xa3, 0xc5, 0x5f, 0x38,
+        0x74, 0xc9, 0xb3, 0xe3, 0xd2, 0x10, 0x3f, 0x50,
+        0x4a, 0xff, 0x60, 0x7b, 0xeb, 0x40, 0xb7, 0x99,
+        0x58, 0x99, 0xb8, 0xa6, 0xcd, 0x3c, 0x1a, 0xbd])
+
+@tier(embedded)
+fn debug_public_key() -> PublicKey
+    PublicKey {
+        x: reversed([
+            0x20, 0xb0, 0x03, 0xd2, 0xf2, 0x97, 0xbe, 0x2c,
+            0x5e, 0x2c, 0x83, 0xa7, 0xe9, 0xf9, 0xa5, 0xb9,
+            0xef, 0xf4, 0x91, 0x11, 0xac, 0xf4, 0xfd, 0xdb,
+            0xcc, 0x03, 0x01, 0x48, 0x0e, 0x35, 0x9d, 0xe6]),
+        y: reversed([
+            0xdc, 0x80, 0x9c, 0x49, 0x65, 0x2a, 0xeb, 0x6d,
+            0x63, 0x32, 0x9a, 0xbf, 0x5a, 0x52, 0x15, 0x5c,
+            0x76, 0x63, 0x45, 0xc2, 0x8f, 0xed, 0x30, 0x24,
+            0x74, 0x1c, 0x8e, 0xd0, 0x15, 0x89, 0xd2, 0x8b]) }
+
+// True when `key` is the debug public key of the Core Specification.
+pub @tier(embedded)
+fn is_debug_public_key(key: PublicKey) -> Bool
+    let d = debug_public_key()
+    equal_ct(key.x, d.x) and equal_ct(key.y, d.y)
+
+// ── Resolvable Private Addresses ([Vol 3] Part H, Section 2.2.2) ────
+
+// A Resolvable Private Address made with `irk` from three octets of
+// randomness, least significant octet first.  `irk` is least
+// significant octet first, as Identity Information carries it.
+pub @tier(embedded)
+@satisfies("REQ-BLE-PRIV-001")
+fn resolvable_private_address(irk: [u8], random3: [u8]) -> [u8]
+    privacy_rpa.rpa_generate(reversed(irk), random3)
+
+// True when `address` (least significant octet first) is a Resolvable
+// Private Address made with `irk`.
+pub @tier(embedded)
+fn resolves(irk: [u8], address: [u8]) -> Bool
+    privacy_rpa.rpa_resolve(reversed(irk), address)
+
+// ── Random numbers ([Vol 3] Part H, Section 1.2.2) ──────────────────
+//
+// An AES-128 counter-mode generator: each draw answers e(key, counter)
+// and replaces the key with e(key, counter + 2^127), so a key read out
+// later does not give the earlier draws.  The program seeds it from the
+// Controller's random numbers (LE Rand, [Vol 4] Part E, Section 7.8.23)
+// or the operating system's, and may mix in more seed at any time.
+// A fixed seed makes every value of a pairing reproducible, which the
+// tests use.
+
+// The generator of the random numbers of a pairing: an AES-128 key and a counter.
+pub struct SmpRandom
+    key: [u8]
+    counter: Int
+
+struct RandomDraw
+    random: SmpRandom
+    value: [u8]
+
+// A generator seeded with the first 16 octets of `seed`.
+pub @tier(embedded)
+fn random_from_seed(seed: [u8]) -> SmpRandom
+    SmpRandom { key: seed[:16], counter: 0 }
+
+// Mix 16 more octets of seed into the generator.
+@tier(embedded)
+fn random_reseed(r: SmpRandom, seed: [u8]) -> SmpRandom
+    SmpRandom { key: aes128.aes128_encrypt(r.key, seed[:16]), counter: r.counter }
+
+@tier(embedded)
+fn counter_block(counter: Int, top: Int) -> [u8]
+    var b = zeros(16)
+    b[0] = top as u8
+    for i in 0..8
+        b[15 - i] = ((counter >> (8 * i)) & 0xFF) as u8
+    b
+
+// 16 random octets.
+pub @tier(embedded)
+fn random_draw(r: SmpRandom) -> RandomDraw
+    let value = aes128.aes128_encrypt(counter_block(r.counter, 0x00), r.key)
+    let next_key = aes128.aes128_encrypt(counter_block(r.counter, 0x80), r.key)
+    RandomDraw { random: SmpRandom { key: next_key, counter: r.counter + 1 }, value: value }
+
+struct KeyPairDraw
+    key_pair: KeyPair
+    random: SmpRandom
+
+// A new P-256 key pair from the generator: 32 random octets with the most
+// significant bit cleared, which keeps the private key below the order of
+// the curve's base point.
+@tier(embedded)
+fn random_key_pair(r: SmpRandom) -> KeyPairDraw
+    let first = random_draw(r)
+    let second = random_draw(first.random)
+    var private_key = first.value[:]
+    list.append(private_key, second.value)
+    private_key[31] = ((private_key[31] as Int) & 0x7F) as u8
+    KeyPairDraw { key_pair: key_pair_from_private(private_key), random: second.random }
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+fn hex(text: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_hex(text)!)
+
+// A value the specification prints most significant octet first, in
+// wire order.
+fn wire(text: Str) -> [u8]
+    reversed(hex(text))
+
+fn assert_bytes(got: [u8], want: [u8])
+    test.assert_eq(list.len(got), list.len(want))
+    for i in 0..list.len(want)
+        test.assert_eq(got[i] as Int, want[i] as Int)
+
+@test
+fn test_passkey_tk_matches_the_section_2_3_5_3_example()
+    assert_bytes(passkey_tk(19655), wire("00000000000000000000000000004CC7"))
+
+@test
+fn test_legacy_confirm_in_wire_order_matches_the_section_2_2_3_example()
+    let preq: [u8] = [0x01, 0x01, 0x00, 0x00, 0x10, 0x07, 0x07]
+    let pres: [u8] = [0x02, 0x03, 0x00, 0x00, 0x08, 0x00, 0x05]
+    let got = legacy_confirm(zeros(16), wire("5783D52156AD6F0E6388274EC6702EE0"), preq, pres,
+                             1, wire("A1A2A3A4A5A6"), 0, wire("B1B2B3B4B5B6"))
+    assert_bytes(got, wire("1E1E3FEF878988EAD2A74DC5BEF13B86"))
+
+@test
+fn test_legacy_stk_in_wire_order_matches_the_section_2_2_4_example()
+    let got = legacy_stk(zeros(16), wire("000F0E0D0C0B0A091122334455667788"), wire("010203040506070899AABBCCDDEEFF00"))
+    assert_bytes(got, wire("9A1FE1F0E8B0F49B5B4216AE796DA062"))
+
+@test
+fn test_mask_key_matches_the_section_2_3_4_example()
+    let got = mask_key(wire("123456789ABCDEF0123456789ABCDEF0"), 7)
+    assert_bytes(got, wire("0000000000000000003456789ABCDEF0"))
+    assert_bytes(mask_key(wire("123456789ABCDEF0123456789ABCDEF0"), 16), wire("123456789ABCDEF0123456789ABCDEF0"))
+
+@test
+fn test_sc_confirm_in_wire_order_matches_appendix_d2()
+    let got = sc_confirm(wire("20b003d2f297be2c5e2c83a7e9f9a5b9eff49111acf4fddbcc0301480e359de6"),
+                         wire("55188b3d32f6bb9a900afcfbeed4e72a59cb9ac2f19d7cfb6b4fdd49f47fc5fd"),
+                         wire("d5cb8454d177733effffb2ec712baeab"), 0)
+    assert_bytes(got, wire("f2c916f107a9bd1cf1eda1bea974872d"))
+
+@test
+fn test_sc_keys_in_wire_order_match_appendix_d3()
+    // A1 00561237 37bfce and A2 00a71370 2dcfc1: public addresses.
+    let a1 = address_56(0, wire("56123737bfce"))
+    let a2 = address_56(0, wire("a713702dcfc1"))
+    assert_bytes(a1, hex("0056123737bfce"))
+    let keys = sc_keys(wire("ec0234a357c8ad05341010a60a397d9b99796b13b4f866f1868d34f373bfa698"),
+                       wire("d5cb8454d177733effffb2ec712baeab"), wire("a6e8e7cc25a75f6e216583f7ff3dc4cf"), a1, a2)
+    assert_bytes(keys.mac_key, hex("2965f176a1084a02fd3f6a20ce636e20"))
+    assert_bytes(keys.ltk, wire("6986791169d7cd23980522b594750a38"))
+
+@test
+fn test_sc_check_in_wire_order_matches_appendix_d4()
+    let got = sc_check(hex("2965f176a1084a02fd3f6a20ce636e20"),
+                       wire("d5cb8454d177733effffb2ec712baeab"), wire("a6e8e7cc25a75f6e216583f7ff3dc4cf"),
+                       wire("12a3343bb453bb5408da42d20c2d0fc8"), 0x01, 0x01, 0x02,
+                       hex("0056123737bfce"), hex("00a713702dcfc1"))
+    assert_bytes(got, wire("e3c473989cd0e8c5d26c0b09da958f61"))
+
+// Appendix D.2: the debug private key (private key A of the sample) with the public key of
+// the sample's private key B gives the sample's DHKey, from either side.
+@test
+fn test_debug_private_key_gives_the_appendix_d2_dhkey()
+    let a = key_pair_from_private(debug_private_key())
+    let b = key_pair_from_private(wire("55188b3d32f6bb9a900afcfbeed4e72a59cb9ac2f19d7cfb6b4fdd49f47fc5fd"))
+    let want = wire("ec0234a357c8ad05341010a60a397d9b99796b13b4f866f1868d34f373bfa698")
+    assert_bytes(dhkey(a.private_key, b.public_key), want)
+    assert_bytes(dhkey(b.private_key, a.public_key), want)
+
+@test
+fn test_numeric_value_matches_appendix_d5()
+    let v = numeric_value(wire("20b003d2f297be2c5e2c83a7e9f9a5b9eff49111acf4fddbcc0301480e359de6"),
+                          wire("55188b3d32f6bb9a900afcfbeed4e72a59cb9ac2f19d7cfb6b4fdd49f47fc5fd"),
+                          wire("d5cb8454d177733effffb2ec712baeab"), wire("a6e8e7cc25a75f6e216583f7ff3dc4cf"))
+    test.assert_eq(v, 0x2f9ed5ba % 1000000)
+
+@test
+fn test_passkey_r_matches_the_section_2_2_8_example()
+    assert_bytes(passkey_r(131313), wire("000000000000000000000000000200f1"))
+    test.assert_eq(passkey_z(131313, 0), 0x81)
+    test.assert_eq(passkey_z(131313, 1), 0x80)
+
+@test
+fn test_debug_key_pair_is_consistent_and_valid()
+    let kp = key_pair_from_private(debug_private_key())
+    let d = debug_public_key()
+    assert_bytes(kp.public_key.x, d.x)
+    assert_bytes(kp.public_key.y, d.y)
+    test.assert(is_valid_public_key(d))
+    test.assert(is_debug_public_key(kp.public_key))
+
+@test
+fn test_invalid_public_keys_are_refused()
+    let d = debug_public_key()
+    test.assert(not is_valid_public_key(PublicKey { x: d.x, y: zeros(32) }))
+    var flipped = d.y[:]
+    flipped[0] = ((flipped[0] as Int) ^ 1) as u8
+    test.assert(not is_valid_public_key(PublicKey { x: d.x, y: flipped }))
+    test.assert(not is_valid_public_key(PublicKey { x: zeros(32), y: zeros(32) }))
+    test.assert(not is_valid_public_key(PublicKey { x: zeros(31), y: zeros(32) }))
+
+@test
+fn test_dhkey_agrees_between_two_key_pairs()
+    var b_priv = zeros(32)
+    b_priv[0] = 7
+    b_priv[20] = 0x55
+    let a = key_pair_from_private(debug_private_key())
+    let b = key_pair_from_private(b_priv)
+    assert_bytes(dhkey(a.private_key, b.public_key), dhkey(b.private_key, a.public_key))
+
+@test
+fn test_resolvable_private_address_matches_appendix_d7()
+    // IRK ec0234a357c8ad05341010a60a397d9b, prand 708194, ah 0dfbaa.
+    let irk = wire("ec0234a357c8ad05341010a60a397d9b")
+    let rpa = resolvable_private_address(irk, hex("708194"))
+    assert_bytes(rpa, wire("7081940dfbaa"))
+    test.assert(resolves(irk, rpa))
+    test.assert(not resolves(wire("00000000000000000000000000000001"), rpa))
+
+@test
+fn test_equal_ct()
+    test.assert(equal_ct(hex("0102"), hex("0102")))
+    test.assert(not equal_ct(hex("0102"), hex("0103")))
+    test.assert(not equal_ct(hex("0102"), hex("01")))
+    test.assert(is_all_zero(zeros(4)))
+    test.assert(not is_all_zero(hex("0001")))
+
+@test
+fn test_random_draws_differ_and_repeat_from_the_same_seed()
+    let r0 = random_from_seed(hex("000102030405060708090a0b0c0d0e0f"))
+    let d1 = random_draw(r0)
+    let d2 = random_draw(d1.random)
+    test.assert(not equal_ct(d1.value, d2.value))
+    // The first draw is e(seed, 0).
+    assert_bytes(d1.value, aes128.aes128_encrypt(zeros(16), hex("000102030405060708090a0b0c0d0e0f")))
+    let again = random_draw(random_from_seed(hex("000102030405060708090a0b0c0d0e0f")))
+    assert_bytes(again.value, d1.value)
+    let mixed = random_draw(random_reseed(r0, hex("ffffffffffffffffffffffffffffffff")))
+    test.assert(not equal_ct(mixed.value, d1.value))
+
+@test
+fn test_a_random_key_pair_has_a_private_key_below_the_curve_order()
+    let draw = random_key_pair(random_from_seed(zeros(16)))
+    test.assert_eq(list.len(draw.key_pair.private_key), 32)
+    test.assert_eq((draw.key_pair.private_key[31] as Int) & 0x80, 0)
+    test.assert(is_valid_public_key(draw.key_pair.public_key))
+    let next = random_key_pair(draw.random)
+    test.assert(not equal_ct(next.key_pair.private_key, draw.key_pair.private_key))

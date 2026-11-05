@@ -1,0 +1,242 @@
+// tests/integration_gatt_tests.nv — host-stack integration.
+//
+// Walks the GATT client procedures through the ATT server +
+// Device Information GATT db end-to-end:
+//
+//   1. Discover all primary services (READ_BY_GROUP_TYPE 0x2800),
+//      repeating the request until Attribute Not Found
+//      → expect five services: GAP, GATT, Device Information,
+//        Heart Rate and Battery, in handle order.
+//   2. Discover characteristics in [0x0001, 0x0005] (READ_BY_TYPE 0x2803)
+//      → expect two pairs: (decl 0x0002, value 0x0003, uuid 0x2A29)
+//                          (decl 0x0004, value 0x0005, uuid 0x2A24).
+//   3. Read characteristic value at handle 0x0003 (READ_REQ)
+//      → expect "Novo".
+//   4. Read characteristic value at handle 0x0005 (READ_REQ)
+//      → expect "M5-1.0".
+//
+// Bypasses the HciRam transport plumbing — the host stack sits
+// above HCI and the GATT/ATT/L2CAP layers don't change shape based
+// on whether ACL data rides UART, USB CDC, or the in-RAM ring.
+// The L2CAP TX-payload integration with the connection event is
+// radio-side and is only exercised during hardware bring-up.
+//
+// Satisfies: REQ-BLE-GATT-INTEG-001 (discover-then-read end-to-end
+// against real Device Information db).
+
+use std.test
+use att
+use att_server
+use gatt_db
+use gatt
+use l2cap
+
+// ── Fixture: build the GATT db once; reuse across tests ────────────
+@tier(embedded)
+fn fixture_db() -> [u8]
+    gatt_db.build()
+
+// The Discover All Primary Services procedure (Core v6.2, Vol 3,
+// Part G, § 4.4.1): send READ_BY_GROUP_TYPE_REQ from `start` to
+// 0xFFFF, and again from one past the last End Group Handle of each
+// response, until the server answers ATT_ERROR_RSP with Attribute Not
+// Found or the last End Group Handle is 0xFFFF.  Answers the
+// (handle, uuid16) pairs of every service found, flattened, in handle
+// order, and the number of requests it took as the last element.
+fn discover_all_primary_services(db: [u8], mtu: Int) -> [Int]
+    var found : [Int] = []
+    var requests = 0
+    var start = 0x0001
+    loop
+        if start > 0xFFFF
+            break
+        let req = gatt.build_discover_primary_services_req(start, 0xFFFF)
+        let rsp = att_server.handle_request(db, mtu, req)
+        requests = requests + 1
+        let n = gatt.primary_services_rsp_count(rsp)
+        if n <= 0
+            break
+        var k = 0
+        loop
+            if k >= n
+                break
+            list.push(found, gatt.primary_services_rsp_handle_at(rsp, k))
+            list.push(found, gatt.primary_services_rsp_uuid16_at(rsp, k))
+            k = k + 1
+        start = gatt.primary_services_rsp_end_group_at(rsp, n - 1) + 1
+    list.push(found, requests)
+    found
+
+@test
+@satisfies("REQ-BLE-GATT-INTEG-001")
+fn test_discover_all_primary_services_finds_five()
+    // The db exposes five primary services in handle order:
+    // GAP / GATT / Device Info / Heart Rate / Battery.  At the
+    // default ATT_MTU of 23 one READ_BY_GROUP_TYPE_RSP carries at
+    // most (23 - 2) / 6 = 3 triplets of a 16-bit UUID (Vol 3,
+    // Part F, § 3.4.4.10), so the client walks the procedure and
+    // needs a second request for the last two services, and a third
+    // that the server answers with Attribute Not Found.
+    let db = fixture_db()
+    let first = att_server.handle_request(db, att_server.ATT_DEFAULT_MTU,
+        gatt.build_discover_primary_services_req(0x0001, 0xFFFF))
+    test.assert_eq(gatt.primary_services_rsp_count(first), 3)
+
+    let found = discover_all_primary_services(db, att_server.ATT_DEFAULT_MTU)
+    test.assert_eq((list.len(found) - 1) / 2, 5)
+    test.assert_eq(found[list.len(found) - 1], 3)
+    test.assert_eq(found[0], gatt_db.HANDLE_GAP_SVC)
+    test.assert_eq(found[1], gatt_db.UUID_GAP_SVC)
+    test.assert_eq(found[2], gatt_db.HANDLE_GATT_SVC)
+    test.assert_eq(found[3], gatt_db.UUID_GATT_SVC)
+    test.assert_eq(found[4], gatt_db.HANDLE_DEVICE_INFO_SVC)
+    test.assert_eq(found[5], gatt_db.UUID_DEVICE_INFO_SVC)
+    test.assert_eq(found[6], gatt_db.HANDLE_HRS_SVC)
+    test.assert_eq(found[7], gatt_db.UUID_HRS_SVC)
+    test.assert_eq(found[8], gatt_db.HANDLE_BATTERY_SVC)
+    test.assert_eq(found[9], gatt_db.UUID_BATTERY_SVC)
+
+@test
+@satisfies("REQ-BLE-GATT-INTEG-001")
+fn test_discover_characteristics_finds_mfr_and_model()
+    let db = fixture_db()
+    let req = gatt.build_discover_characteristics_req(
+        gatt_db.HANDLE_DEVICE_INFO_SVC,
+        gatt_db.HANDLE_DEVICE_INFO_END_GROUP)
+    let rsp = att_server.handle_request(db, att_server.ATT_DEFAULT_MTU, req)
+    test.assert_eq(gatt.characteristics_rsp_count(rsp), 2)
+
+    // Char 1 — Manufacturer Name (0x2A29) at decl 0x0002, value 0x0003.
+    test.assert_eq(gatt.characteristics_rsp_decl_handle_at(rsp, 0), gatt_db.HANDLE_MFR_NAME_DECL)
+    test.assert_eq(gatt.characteristics_rsp_value_handle_at(rsp, 0), gatt_db.HANDLE_MFR_NAME_VALUE)
+    test.assert_eq(gatt.characteristics_rsp_uuid16_at(rsp, 0), gatt_db.UUID_MANUFACTURER_NAME)
+
+    // Char 2 — Model Number (0x2A24) at decl 0x0004, value 0x0005.
+    test.assert_eq(gatt.characteristics_rsp_decl_handle_at(rsp, 1), gatt_db.HANDLE_MODEL_NUMBER_DECL)
+    test.assert_eq(gatt.characteristics_rsp_value_handle_at(rsp, 1), gatt_db.HANDLE_MODEL_NUMBER_VALUE)
+    test.assert_eq(gatt.characteristics_rsp_uuid16_at(rsp, 1), gatt_db.UUID_MODEL_NUMBER)
+
+@test
+@satisfies("REQ-BLE-GATT-INTEG-001")
+fn test_read_manufacturer_name_returns_novo()
+    let db = fixture_db()
+    let req = gatt.build_read_characteristic_value_req(gatt_db.HANDLE_MFR_NAME_VALUE)
+    let rsp = att_server.handle_request(db, att_server.ATT_DEFAULT_MTU, req)
+    test.assert_eq(rsp[0] as Int, 0x0B)   // ATT_OP_READ_RSP
+    test.assert_eq(list.len(rsp), 1 + 4)
+    test.assert_eq(rsp[1] as Int, 0x4E)   // 'N'
+    test.assert_eq(rsp[2] as Int, 0x6F)   // 'o'
+    test.assert_eq(rsp[3] as Int, 0x76)   // 'v'
+    test.assert_eq(rsp[4] as Int, 0x6F)   // 'o'
+
+@test
+@satisfies("REQ-BLE-GATT-INTEG-001")
+fn test_read_model_number_returns_m5_1_0()
+    let db = fixture_db()
+    let req = gatt.build_read_characteristic_value_req(gatt_db.HANDLE_MODEL_NUMBER_VALUE)
+    let rsp = att_server.handle_request(db, att_server.ATT_DEFAULT_MTU, req)
+    test.assert_eq(rsp[0] as Int, 0x0B)
+    test.assert_eq(list.len(rsp), 1 + 6)
+    test.assert_eq(rsp[1] as Int, 0x4D)   // 'M'
+    test.assert_eq(rsp[6] as Int, 0x30)   // '0'
+
+@test
+fn test_read_unknown_handle_returns_invalid_handle_error()
+    let db = fixture_db()
+    let req = gatt.build_read_characteristic_value_req(0x00FF)
+    let rsp = att_server.handle_request(db, att_server.ATT_DEFAULT_MTU, req)
+    test.assert_eq(rsp[0] as Int, 0x01)   // ATT_OP_ERROR_RSP
+    test.assert_eq(rsp[4] as Int, 0x01)   // ATT_ERR_INVALID_HANDLE
+
+@test
+fn test_l2cap_b_frame_wraps_att_response()
+    // The connection-event runner wraps every ATT response in an
+    // L2CAP B-frame on CID 0x0004.  Verify the wrap shape so the
+    // wire-side bytes line up before they go on-air.
+    let db = fixture_db()
+    let req = gatt.build_read_characteristic_value_req(gatt_db.HANDLE_MFR_NAME_VALUE)
+    let att_rsp = att_server.handle_request(db, att_server.ATT_DEFAULT_MTU, req)
+    let pkt = l2cap.build_b_frame(l2cap.CID_ATT, att_rsp)
+    test.assert_eq(l2cap.b_frame_cid(pkt), l2cap.CID_ATT)
+    test.assert_eq(l2cap.b_frame_length(pkt), list.len(att_rsp))
+    test.assert_eq(l2cap.b_frame_complete(pkt), true)
+    let recovered = l2cap.b_frame_payload(pkt)
+    test.assert_eq(list.len(recovered), list.len(att_rsp))
+    test.assert_eq(recovered[1] as Int, 0x4E)   // 'N' from "Novo"
+
+// ── Integration: CCCD subscribe + notify dispatch ─────────────────
+
+@test
+@satisfies("REQ-BLE-GATT-INTEG-001")
+fn test_cccd_subscribe_then_notify_dispatch()
+    // Walk an end-to-end CCCD flow:
+    //   1. Read the HRM CCCD — should be 0x0000 (off at boot).
+    //   2. WRITE_REQ to the CCCD with 0x0001 (NOTIFY).
+    //   3. Confirm via gatt.subs_set + try_build_notify_for that the
+    //      stack would emit a HANDLE_VALUE_NTF for the HRM value
+    //      handle if the application published a measurement.
+    var db = fixture_db()
+
+    // Step 1: read CCCD value pre-subscribe.
+    let read_cccd_req: [u8] = [
+        att.ATT_OP_READ_REQ,
+        (gatt_db.HANDLE_HRM_CCCD - gatt_db.HANDLE_HRM_CCCD / 256 * 256) as u8,
+        (gatt_db.HANDLE_HRM_CCCD / 256) as u8]
+    let pre = att_server.handle_request(db, att_server.ATT_DEFAULT_MTU, read_cccd_req)
+    test.assert_eq(pre[0] as Int, att.ATT_OP_READ_RSP)
+    test.assert_eq(pre[1] as Int, 0x00)
+    test.assert_eq(pre[2] as Int, 0x00)
+
+    // Step 2: peer subscribes by writing 0x0001 to the CCCD.
+    let write_cccd: [u8] = [
+        att.ATT_OP_WRITE_REQ,
+        (gatt_db.HANDLE_HRM_CCCD - gatt_db.HANDLE_HRM_CCCD / 256 * 256) as u8,
+        (gatt_db.HANDLE_HRM_CCCD / 256) as u8,
+        0x01, 0x00]   // CCCD = NOTIFY
+    let queue: [u8] = []
+    let r = att_server.handle_write_req(var db, queue, write_cccd)
+    test.assert_eq(r.rsp[0] as Int, att.ATT_OP_WRITE_RSP)
+    test.assert_eq(r.applied, true)
+    db = r.new_blob[:]
+
+    // Read CCCD post-subscribe — should now be 0x0001.
+    let post = att_server.handle_request(db, att_server.ATT_DEFAULT_MTU, read_cccd_req)
+    test.assert_eq(post[1] as Int, 0x01)
+
+    // Step 3: the stack-side subscription registry mirrors the
+    // on-wire CCCD write — on the firmware side a WRITE event is
+    // fanned into `gatt.subs_set`.  Verify try_build_notify_for
+    // honours it.
+    var subs: [u8] = []
+    subs = gatt.subs_set(var subs, gatt_db.HANDLE_HRM_VALUE, gatt.CCCD_NOTIFY)
+    let measurement: [u8] = [0x00, 75]   // flags=0, bpm=75
+    let pdu = gatt.try_build_notify_for(subs, gatt_db.HANDLE_HRM_VALUE, measurement)
+    test.assert_eq(list.len(pdu), 1 + 2 + 2)
+    test.assert_eq(pdu[0] as Int, att.ATT_OP_HANDLE_VALUE_NTF)
+    // Handle in PDU = HRM_VALUE = 0x0010.
+    test.assert_eq(pdu[1] as Int, 0x10)
+    test.assert_eq(pdu[2] as Int, 0x00)
+    test.assert_eq(pdu[3] as Int, 0x00)   // flags
+    test.assert_eq(pdu[4] as Int, 75)   // bpm
+
+@test
+@satisfies("REQ-BLE-GATT-INTEG-001")
+fn test_battery_level_write_through_gatt_path()
+    // Simulate an application "publish a new battery level": route
+    // a WRITE_REQ on the value handle (BAS spec marks Battery
+    // Level read-only so this test uses the extended db where
+    // CHAR_PROP_NOTIFY+CHAR_PROP_READ are advertised — write
+    // permission is absent, so the WRITE_REQ should bounce with
+    // WRITE_NOT_PERMITTED).  What this exercises is the
+    // permission check, not the write path.
+    var db = fixture_db()
+    let queue: [u8] = []
+    let req: [u8] = [
+        att.ATT_OP_WRITE_REQ,
+        (gatt_db.HANDLE_BATTERY_LEVEL_VALUE - gatt_db.HANDLE_BATTERY_LEVEL_VALUE / 256 * 256) as u8,
+        (gatt_db.HANDLE_BATTERY_LEVEL_VALUE / 256) as u8,
+        50]   // 50%
+    let r = att_server.handle_write_req(var db, queue, req)
+    test.assert_eq(r.rsp[0] as Int, att.ATT_OP_ERROR_RSP)
+    test.assert_eq(r.rsp[4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    test.assert_eq(r.applied, false)

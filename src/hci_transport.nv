@@ -1,0 +1,117 @@
+// hci_transport.nv — HciTransport trait declaration.
+//
+// The architectural surface that lets host-side code issue HCI
+// commands and receive events without caring whether the wire
+// is a UART, USB CDC-ACM, or in-process SPSC ring.  Core Vol 4
+// splits exactly this way: one HCI packet layer (Part E) over a
+// per-wire transport part — Part A UART, Part B USB, Part C
+// RS232, Part D three-wire.  This trait is that split in Novo.
+//
+// This module declares the trait and the transport-level error
+// codes; the impls live beside each transport
+// (`coresident/hci_ram.nv`, `hci_uart.nv`, `hci_usb_cdc.nv`).
+//
+// Satisfies: REQ-BLE-ARCH-002 (HCI is the host-controller
+// boundary; one trait, interchangeable transports).
+
+use std.test
+
+// ── Transport error codes ───────────────────────────────────────────
+//
+// Plain integer codes rather than an enum: these cross the
+// package boundary into caller code that may not import this
+// module, and an Int needs no constructor in scope to compare
+// against.
+
+const HCI_TRANSPORT_OK = 0
+
+const HCI_TRANSPORT_ERR_FULL = 1
+
+const HCI_TRANSPORT_ERR_DISCONNECTED = 2
+
+const HCI_TRANSPORT_ERR_MALFORMED = 3
+
+fn hci_transport_empty_payload() -> [u8]
+    []
+
+// ── trait HciTransport ──────────────────────────────────────────────
+//
+// Satisfies REQ-BLE-ARCH-002 — HCI is the host-controller boundary;
+// one trait, interchangeable transports.
+//
+// **Typed shape.**  Each transport binds its own concrete frame
+// types via the associated types `CmdFrame` and `EvtFrame`
+// (SPEC.md §3.7.1).  In-RAM transports (`HciRam`)
+// carry typed structs (`HciCmdMsg` / `HciEvtMsg`); byte-stream
+// transports (`HciUart`, `HciUsbCdc` when they land) bind the same
+// typed structs and encode/decode at the trait boundary so callers
+// always speak in HCI semantics, never in raw bytes.
+//
+// `send_command` / `recv_event` return Bool / ?T instead of the
+// previous Int error codes — false on a full outbound queue, None
+// on an empty inbound queue.  The HCI_TRANSPORT_ERR_* codes still
+// live above for richer error reporting in transports that need it
+// (UART framing errors, USB stalls); the typed trait surface is
+// intentionally minimal so the common path stays simple.
+//
+// ACL frames remain bytes-shaped — nothing carries ACL traffic yet,
+// and the wire layer for ACL is naturally byte-oriented
+// (variable-length frames keyed by the connection handle).  Mixing
+// typed Cmd/Evt with byte-shaped ACL is fine; it matches the H4 wire
+// where ACL packets get their own packet-type byte.
+
+trait HciTransport
+    type CmdFrame
+    type EvtFrame
+
+    fn send_command(self, cmd: Self.CmdFrame) -> Bool
+    fn recv_event(self) -> ?Self.EvtFrame
+
+    fn send_acl(self, acl: [u8]) -> Bool
+    fn recv_acl(self) -> ?[u8]
+
+    fn is_open(self) -> Bool
+    fn close(self)
+
+// ── trait HciLink ───────────────────────────────────────────────────
+//
+// Whole HCI packets over a byte-stream transport such as the HCI UART
+// Transport Layer ([Vol 4] Part A, Section 2), with a deadline on the
+// receive.  `pkt` is one HCI packet with its HCI packet indicator
+// first.
+//
+// `HciTransport.recv_event` is a poll: it answers at once, takes no
+// timeout, and its plain `self` gives a byte-stream transport nowhere
+// to keep a packet that has only partly arrived.  A Host that waits
+// for the Command Complete event or Command Status event answering
+// each command ([Vol 4] Part E, Section 4.4) needs both, so this
+// trait carries them: `recv_packet` waits up to `timeout_ms` for a
+// complete packet and takes `var self` to keep the bytes of the next
+// one.
+//
+// The effect parameter `e` is what the wire costs each impl: `[net]`
+// for a socket, `[hw]` for a UART.  A byte-stream transport implements
+// both traits, the `HciTransport` methods on top of these two.
+
+trait HciLink[e]
+    fn send_packet(self, pkt: [u8]) -> Bool [e]
+    fn recv_packet(var self, timeout_ms: Int) -> ?[u8] [e]
+
+// ── Tests ────────────────────────────────────────────────────────────
+//
+// Only the error-code surface is testable here — a trait
+// declaration has no behaviour of its own.  Behavioural tests
+// live beside each impl (`coresident/hci_ram.nv`, `hci_uart.nv`,
+// `hci_usb_cdc.nv`).
+
+@test
+fn test_transport_error_code_constants()
+    test.assert_eq(HCI_TRANSPORT_OK, 0)
+    test.assert_eq(HCI_TRANSPORT_ERR_FULL, 1)
+    test.assert_eq(HCI_TRANSPORT_ERR_DISCONNECTED, 2)
+    test.assert_eq(HCI_TRANSPORT_ERR_MALFORMED, 3)
+
+@test
+fn test_empty_payload_has_length_zero()
+    let p = hci_transport_empty_payload()
+    test.assert_eq(list.len(p), 0)

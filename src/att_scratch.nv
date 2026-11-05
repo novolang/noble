@@ -1,0 +1,283 @@
+// att_scratch.nv — fixed-RAM ATT response scratch.
+//
+// Replaces the list.append-based response builders with a
+// cursor-based fixed-RAM buffer.  Each ATT response handler writes
+// directly into this scratch via the helpers below; caller wraps
+// in L2CAP by writing the 4-byte header at offsets 0-3 after the
+// ATT bytes are committed and the final length is known.
+//
+// Eliminates two costs that drove the 300 ms post-discovery stall
+// the 23-attribute, 5-primary-service db hit on
+// hardware:
+//
+//   1. list.append was O(N²) — each iteration copied the full
+//      accumulator.  For READ_BY_GROUP_TYPE walking 5 services
+//      with 6-byte triplets that's ~150 bytes copied + N
+//      heap allocations.
+//   2. Heap traffic per response (5 services × 4 list.append per
+//      triplet = ~20 allocs/response) drove perceus dup/drop
+//      churn that pushed the build past the 30 ms post-TX gap
+//      and missed connection events.
+//
+// Cursor-based fixed-RAM writing is allocation-free.  Build cost
+// is dominated by the byte loop, not allocator overhead.
+//
+// 256 bytes covers the largest response (READ_BY_GROUP_TYPE with
+// 23 attributes, about 140 bytes) with headroom for future services.
+
+use std.bits
+
+// ATT_SCRATCH[0..1]   = 2-byte LE u16, the current cursor
+// ATT_SCRATCH[2..257] = 256 bytes of scratch buffer
+//
+// Until 2026-09-30 the cursor sat at a hand-picked address that was
+// also the last two bytes of the BTP RX accumulator; a full BTP frame
+// overwrote the cursor.  As a static it overlaps nothing.
+static ATT_SCRATCH : [u8; 258]
+
+const SCRATCH_BUF_CAPACITY = 256
+
+// The address of the two-octet cursor that opens the ATT scratch buffer.
+pub @tier(embedded)
+@no_alloc
+fn scratch_cursor_addr() -> Int
+    addr_of(ATT_SCRATCH)
+
+// The address of the first octet of the ATT scratch buffer, which follows its cursor.
+pub @tier(embedded)
+@no_alloc
+fn scratch_buf_addr() -> Int
+    addr_of(ATT_SCRATCH) + 2
+
+// ── Fixed-RAM GATT db storage ─────────────────────────────────────
+//
+// The GATT db blob lives in a static so writes (CCCD enable,
+// prepared writes, runtime SET_VALUE) can mutate it in-place via
+// hw.mem_write8 — the writes persist across the hw.heap_save_ptr /
+// heap_restore_ptr wrap that bounds list.append pressure on the
+// request-decode side.
+//
+// GATT_DB_RAM[0..1]   = 2-byte LE u16, the blob's length
+// GATT_DB_RAM[2..769] = 768 bytes of blob
+//
+// 768 bytes covers the 23-attribute db (~280 bytes used) plus
+// headroom for service-changed indications, future characteristics,
+// and the 4-byte CCCD descriptor expansions when writes start
+// landing.
+static GATT_DB_RAM : [u8; 770]
+
+const GATT_DB_BLOB_CAPACITY = 768
+
+// The address of the two-octet little-endian length that opens the fixed-RAM GATT database blob.
+pub @tier(embedded)
+@no_alloc
+fn gatt_db_len_addr() -> Int
+    addr_of(GATT_DB_RAM)
+
+// The address of the first octet of the fixed-RAM GATT database blob, which follows its length.
+pub @tier(embedded)
+@no_alloc
+fn gatt_db_blob_addr() -> Int
+    addr_of(GATT_DB_RAM) + 2
+
+@tier(embedded)
+fn gatt_db_ram_len() -> Int [hw]
+    let lo = hw.mem_read8(gatt_db_len_addr())
+    let hi = hw.mem_read8(gatt_db_len_addr() + 1)
+    lo | (hi << 8)
+
+@tier(embedded)
+fn gatt_db_ram_set_len(n: Int) [hw]
+    hw.mem_write8(gatt_db_len_addr(), n & 0xFF)
+    hw.mem_write8(gatt_db_len_addr() + 1, (n >>> 8) & 0xFF)
+
+@tier(embedded)
+fn gatt_db_ram_byte_at(off: Int) -> Int [hw]
+    if off < 0 or off >= GATT_DB_BLOB_CAPACITY
+        0
+    else
+        hw.mem_read8(gatt_db_blob_addr() + off)
+
+@tier(embedded)
+fn gatt_db_ram_set_byte_at(off: Int, b: Int) [hw]
+    if off >= 0 and off < GATT_DB_BLOB_CAPACITY
+        hw.mem_write8(gatt_db_blob_addr() + off, b & 0xFF)
+
+// ── Boot-time copy: heap blob → fixed RAM ─────────────────────────
+//
+// gatt_db.build() still constructs the db on the heap via
+// list.append (one-shot at boot, not per-request — the boot-time
+// allocation is dwarfed by per-connection traffic).  This helper
+// copies the result into the fixed-RAM region so subsequent
+// reads/writes go through hw.mem_*.
+//
+// After init, the heap-side `gatt_db_blob` can be dropped; all
+// runtime access uses gatt_db_ram_byte_at / _set_byte_at.
+pub fn gatt_db_ram_init_from_blob(blob: [u8]) [hw]
+    let n = list.len(blob)
+    let copy_n = if n > GATT_DB_BLOB_CAPACITY
+        GATT_DB_BLOB_CAPACITY
+    else
+        n
+    var i = 0
+    loop
+        if i >= copy_n
+            break
+        hw.mem_write8(gatt_db_blob_addr() + i, blob[i] as Int)
+        i = i + 1
+    gatt_db_ram_set_len(copy_n)
+
+// ── Last-dispatch write_handle slot ───────────────────────────────
+//
+// LLVM struct-return codegen tripped on a struct carrying both
+// rsp_len and write_handle through the read-fallback path
+// (`store i64 ptr, ...` type mismatch in main_nrf52.ll).  Punt:
+// the dispatcher writes the handle here and main.nv reads it via
+// `last_write_handle()`.  -1 = no write applied this request.
+static LAST_WRITE_HANDLE : [u8; 2]
+
+// The address of the two octets that hold the handle the last write request changed.
+pub @tier(embedded)
+@no_alloc
+fn last_write_handle_addr() -> Int
+    addr_of(LAST_WRITE_HANDLE)
+
+@tier(embedded)
+fn last_write_handle_clear() [hw]
+    hw.mem_write8(last_write_handle_addr(), 0xFF)
+    hw.mem_write8(last_write_handle_addr() + 1, 0xFF)
+
+@tier(embedded)
+fn last_write_handle_set(h: Int) [hw]
+    hw.mem_write8(last_write_handle_addr(), h & 0xFF)
+    hw.mem_write8(last_write_handle_addr() + 1, (h >>> 8) & 0xFF)
+
+// The handle the last write request of this request changed, or -1 when none was applied.
+pub @tier(embedded)
+fn last_write_handle() -> Int [hw]
+    let lo = hw.mem_read8(last_write_handle_addr())
+    let hi = hw.mem_read8(last_write_handle_addr() + 1)
+    let v = lo | (hi << 8)
+    if v == 0xFFFF
+        -1
+    else
+        v
+
+// ── Snapshot ram → heap [u8] (per-request, transient) ─────────────
+//
+// The existing scratch read handlers (handle_*_to_scratch) take a
+// heap [u8] blob.  Per-request we materialise a fresh copy from
+// the ram-resident truth via list.append.  Bracketed by
+// hw.heap_save_ptr / heap_restore_ptr in the dispatcher so the
+// transient [u8] gets reclaimed each request.
+//
+// Cost: one list.append per byte (~280 bytes for the current db).
+// At ~50 ns per byte on the embedded allocator that is ~14 µs per
+// request — well under the conn-interval budget post-TX, and much
+// cheaper than rewriting every read handler to take an
+// addressable byte source.
+fn gatt_db_ram_to_blob() -> [u8] [hw]
+    let n = gatt_db_ram_len()
+    var out: [u8] = []
+    var i = 0
+    loop
+        if i >= n
+            break
+        out = list.append(out, [hw.mem_read8(gatt_db_blob_addr() + i) as u8])
+        i = i + 1
+    out
+
+// ── Cursor accessors (LE u16 in RAM) ───────────────────────────────
+//
+// Same shape as btp_rtt_poll's RX-len addressing: two bytes of the
+// static, read and written with byte ops.  The cursor is 0 at boot
+// (`.bss`); `scratch_reset()` starts each response at 0.
+pub @tier(embedded)
+fn scratch_reset() [hw]
+    hw.mem_write8(scratch_cursor_addr(), 0)
+    hw.mem_write8(scratch_cursor_addr() + 1, 0)
+
+// The number of octets written to the ATT scratch buffer.
+pub @tier(embedded)
+fn scratch_len() -> Int [hw]
+    let lo = hw.mem_read8(scratch_cursor_addr())
+    let hi = hw.mem_read8(scratch_cursor_addr() + 1)
+    lo | (hi << 8)
+
+@tier(embedded)
+fn scratch_set_len(n: Int) [hw]
+    hw.mem_write8(scratch_cursor_addr(), n & 0xFF)
+    hw.mem_write8(scratch_cursor_addr() + 1, (n >>> 8) & 0xFF)
+
+// ── Append primitives ──────────────────────────────────────────────
+//
+// All return false on overflow (caller should treat as ATT
+// PREPARE_QUEUE_FULL / drop response and emit ERROR_RSP).  Cursor
+// stays at last-good byte so a partial write doesn't poison the
+// buffer for a subsequent reset+retry.
+
+@tier(embedded)
+fn scratch_write_u8(b: Int) -> Bool [hw]
+    let n = scratch_len()
+    if n >= SCRATCH_BUF_CAPACITY
+        false
+    else
+        hw.mem_write8(scratch_buf_addr() + n, b & 0xFF)
+        scratch_set_len(n + 1)
+        true
+
+// Append `v` to the ATT scratch buffer as two little-endian octets.  False when the buffer has no room.
+pub @tier(embedded)
+fn scratch_write_u16_le(v: Int) -> Bool [hw]
+    if scratch_write_u8(v & 0xFF)
+        scratch_write_u8((v >>> 8) & 0xFF)
+    else
+        false
+
+// Copy `n` bytes starting at `off` from the heap-resident `[u8]`
+// into the scratch.  Used by ATT response builders that pull
+// attribute values out of the GATT db (which still lives on the
+// heap as a [u8], not in the fixed-RAM window).
+@tier(embedded)
+fn scratch_write_bytes(src: [u8], off: Int, n: Int) -> Bool [hw]
+    var i = 0
+    var ok = true
+    loop
+        if i >= n or not ok
+            break
+        ok = scratch_write_u8(src[off + i] as Int)
+        i = i + 1
+    ok
+
+// ── Patch helpers — write a u8 / u16 at a known offset ───────────
+//
+// Used to back-fill length fields after the value bytes are
+// known.  L2CAP B-frame length is u16 (uses scratch_patch_u16_le);
+// ATT response length-of-each-pair / length-of-each-triplet
+// fields (READ_BY_TYPE_RSP, READ_BY_GROUP_TYPE_RSP) are u8 — must
+// use scratch_patch_u8 there or the high byte will overwrite the
+// first byte of the response data.
+@tier(embedded)
+fn scratch_patch_u8(off: Int, v: Int) [hw]
+    if off < SCRATCH_BUF_CAPACITY
+        hw.mem_write8(scratch_buf_addr() + off, v & 0xFF)
+
+// Overwrite the two octets at offset `off` of the ATT scratch buffer with `v`, little-endian.  An offset past the
+// buffer leaves it unchanged.
+pub @tier(embedded)
+fn scratch_patch_u16_le(off: Int, v: Int) [hw]
+    if off + 1 < SCRATCH_BUF_CAPACITY
+        hw.mem_write8(scratch_buf_addr() + off, v & 0xFF)
+        hw.mem_write8(scratch_buf_addr() + off + 1, (v >>> 8) & 0xFF)
+
+// ── Read-back accessor — for staging into att_deferred ────────────
+//
+// Returns the byte at `off` in the scratch.  Used by the staging
+// path to copy scratch → att_deferred in the existing fixed-RAM
+// flow.
+@tier(embedded)
+fn scratch_byte_at(off: Int) -> Int [hw]
+    if off < 0 or off >= SCRATCH_BUF_CAPACITY
+        0
+    else
+        hw.mem_read8(scratch_buf_addr() + off)

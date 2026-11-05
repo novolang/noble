@@ -1,0 +1,306 @@
+// smp_ctx.nv — SMP pairing-procedure context
+// in fixed RAM.
+//
+// Holds the per-procedure state Just Works needs to compute
+// Sconfirm, verify Mconfirm, and derive STK:
+//
+//   pres / preq    — full 7-byte Pairing_Response / _Request PDUs
+//   rat / iat      — responder / initiator address types
+//   ra  / ia       — 6-byte BD_ADDRs (LSB-first per BLE convention)
+//   TK             — 16-byte Temporary Key (= 0x00..00 for Just Works)
+//   Srand / Mrand  — 16-byte random nonces
+//   Sconfirm / Mconfirm — 16-byte c1(TK, r, p1, p2) values
+//
+// All slots in one 128-byte `static`.  Same hw.mem_* pattern as
+// enc_ctx.nv / att_scratch.nv: byte-level @tests can't run on
+// the OCaml backend (hw.mem_write8 panics), so unit testing
+// here is limited to the offset-sanity table.  Behavioural
+// verification needs a sniffer rig; nothing here does that.
+//
+// Single-connection only.  More than one would replace these flat
+// slots with per-conn fields owned by host_conn_task[i]; the
+// byte-offset table here is the migration
+// target.
+//
+// Satisfies REQ-BLE-SMP-031 (per-conn SMP state).
+
+use std.test
+use std.bits
+
+// ── Base + offsets ──────────────────────────────────────────────────
+
+static SMP_CTX_RAM : [u8; 128]
+
+// The address of the 128 octets of fixed RAM that hold the context of the pairing in progress.
+pub @tier(embedded)
+@no_alloc
+fn smp_ctx_base() -> Int
+    addr_of(SMP_CTX_RAM)
+
+const SMP_CTX_PRES_OFFSET = 0x00  // 7 bytes
+const SMP_CTX_PREQ_OFFSET = 0x07  // 7 bytes
+const SMP_CTX_RAT_OFFSET = 0x0E  // 1 byte
+const SMP_CTX_IAT_OFFSET = 0x0F  // 1 byte
+const SMP_CTX_RA_OFFSET = 0x10  // 6 bytes
+const SMP_CTX_IA_OFFSET = 0x16  // 6 bytes
+// 4-byte gap for 16-byte alignment of the next field
+const SMP_CTX_TK_OFFSET = 0x20  // 16 bytes
+const SMP_CTX_SRAND_OFFSET = 0x30  // 16 bytes
+const SMP_CTX_MRAND_OFFSET = 0x40  // 16 bytes
+const SMP_CTX_SCONFIRM_OFFSET = 0x50  // 16 bytes
+const SMP_CTX_MCONFIRM_OFFSET = 0x60  // 16 bytes
+
+// Total reachable region (clear_all sweep): 128 bytes.
+const SMP_CTX_TOTAL_BYTES = 128
+
+// ── pres / preq accessors (7 bytes each) ───────────────────────────
+
+@tier(embedded)
+fn set_pres_byte(i: Int, value: Int) [hw]
+    hw.mem_write8(smp_ctx_base() + SMP_CTX_PRES_OFFSET + i, value & 0xFF)
+
+// The octet `i` of the stored Pairing Response, 0 to 6.
+pub @tier(embedded)
+fn get_pres_byte(i: Int) -> Int [hw]
+    hw.mem_read8(smp_ctx_base() + SMP_CTX_PRES_OFFSET + i)
+
+// Store the octet `i` of the Pairing Request, 0 to 6.
+pub @tier(embedded)
+fn set_preq_byte(i: Int, value: Int) [hw]
+    hw.mem_write8(smp_ctx_base() + SMP_CTX_PREQ_OFFSET + i, value & 0xFF)
+
+// The octet `i` of the stored Pairing Request, 0 to 6.
+pub @tier(embedded)
+fn get_preq_byte(i: Int) -> Int [hw]
+    hw.mem_read8(smp_ctx_base() + SMP_CTX_PREQ_OFFSET + i)
+
+// Bulk-write the 7-byte PDU.  Caller passes the full Pairing_Response
+// (or Pairing_Request) bytes — opcode at [0], 6 fields at [1..6].
+pub @tier(embedded)
+fn stash_pres(pdu: [u8]) [hw]
+    for i in 0..7
+        hw.mem_write8(smp_ctx_base() + SMP_CTX_PRES_OFFSET + i, pdu[i] as Int)
+
+@tier(embedded)
+fn stash_preq(pdu: [u8]) [hw]
+    for i in 0..7
+        hw.mem_write8(smp_ctx_base() + SMP_CTX_PREQ_OFFSET + i, pdu[i] as Int)
+
+// ── Address-type accessors ─────────────────────────────────────────
+
+// Store the address type of the responder.
+pub @tier(embedded)
+fn set_rat(value: Int) [hw]
+    hw.mem_write8(smp_ctx_base() + SMP_CTX_RAT_OFFSET, value & 0xFF)
+
+// The stored address type of the responder.
+pub @tier(embedded)
+fn get_rat() -> Int [hw]
+    hw.mem_read8(smp_ctx_base() + SMP_CTX_RAT_OFFSET)
+
+// Store the address type of the initiator.
+pub @tier(embedded)
+fn set_iat(value: Int) [hw]
+    hw.mem_write8(smp_ctx_base() + SMP_CTX_IAT_OFFSET, value & 0xFF)
+
+// The stored address type of the initiator.
+pub @tier(embedded)
+fn get_iat() -> Int [hw]
+    hw.mem_read8(smp_ctx_base() + SMP_CTX_IAT_OFFSET)
+
+// ── BD_ADDR accessors (6 bytes each, LSB-first) ────────────────────
+
+// Store the octet `i` of the responder's address, least significant first.
+pub @tier(embedded)
+fn set_ra_byte(i: Int, value: Int) [hw]
+    hw.mem_write8(smp_ctx_base() + SMP_CTX_RA_OFFSET + i, value & 0xFF)
+
+// The octet `i` of the stored responder's address, least significant first.
+pub @tier(embedded)
+fn get_ra_byte(i: Int) -> Int [hw]
+    hw.mem_read8(smp_ctx_base() + SMP_CTX_RA_OFFSET + i)
+
+// Store the octet `i` of the initiator's address, least significant first.
+pub @tier(embedded)
+fn set_ia_byte(i: Int, value: Int) [hw]
+    hw.mem_write8(smp_ctx_base() + SMP_CTX_IA_OFFSET + i, value & 0xFF)
+
+// The octet `i` of the stored initiator's address, least significant first.
+pub @tier(embedded)
+fn get_ia_byte(i: Int) -> Int [hw]
+    hw.mem_read8(smp_ctx_base() + SMP_CTX_IA_OFFSET + i)
+
+@tier(embedded)
+fn stash_ra(addr: [u8]) [hw]
+    for i in 0..6
+        hw.mem_write8(smp_ctx_base() + SMP_CTX_RA_OFFSET + i, addr[i] as Int)
+
+@tier(embedded)
+fn stash_ia(addr: [u8]) [hw]
+    for i in 0..6
+        hw.mem_write8(smp_ctx_base() + SMP_CTX_IA_OFFSET + i, addr[i] as Int)
+
+// ── 16-byte slot accessors (TK / Srand / Mrand / Sconfirm / Mconfirm) ──
+
+@tier(embedded)
+fn set_tk_byte(i: Int, value: Int) [hw]
+    hw.mem_write8(smp_ctx_base() + SMP_CTX_TK_OFFSET + i, value & 0xFF)
+
+// The octet `i` of the Temporary Key, 0 to 15.
+pub @tier(embedded)
+fn get_tk_byte(i: Int) -> Int [hw]
+    hw.mem_read8(smp_ctx_base() + SMP_CTX_TK_OFFSET + i)
+
+@tier(embedded)
+fn set_srand_byte(i: Int, value: Int) [hw]
+    hw.mem_write8(smp_ctx_base() + SMP_CTX_SRAND_OFFSET + i, value & 0xFF)
+
+@tier(embedded)
+fn get_srand_byte(i: Int) -> Int [hw]
+    hw.mem_read8(smp_ctx_base() + SMP_CTX_SRAND_OFFSET + i)
+
+// Store the octet `i` of the initiator's random value, 0 to 15.
+pub @tier(embedded)
+fn set_mrand_byte(i: Int, value: Int) [hw]
+    hw.mem_write8(smp_ctx_base() + SMP_CTX_MRAND_OFFSET + i, value & 0xFF)
+
+// The octet `i` of the stored initiator's random value, 0 to 15.
+pub @tier(embedded)
+fn get_mrand_byte(i: Int) -> Int [hw]
+    hw.mem_read8(smp_ctx_base() + SMP_CTX_MRAND_OFFSET + i)
+
+@tier(embedded)
+fn set_sconfirm_byte(i: Int, value: Int) [hw]
+    hw.mem_write8(smp_ctx_base() + SMP_CTX_SCONFIRM_OFFSET + i, value & 0xFF)
+
+@tier(embedded)
+fn get_sconfirm_byte(i: Int) -> Int [hw]
+    hw.mem_read8(smp_ctx_base() + SMP_CTX_SCONFIRM_OFFSET + i)
+
+// Store the octet `i` of the initiator's confirm value, 0 to 15.
+pub @tier(embedded)
+fn set_mconfirm_byte(i: Int, value: Int) [hw]
+    hw.mem_write8(smp_ctx_base() + SMP_CTX_MCONFIRM_OFFSET + i, value & 0xFF)
+
+// The octet `i` of the stored initiator's confirm value, 0 to 15.
+pub @tier(embedded)
+fn get_mconfirm_byte(i: Int) -> Int [hw]
+    hw.mem_read8(smp_ctx_base() + SMP_CTX_MCONFIRM_OFFSET + i)
+
+// ── Slot reader / writer for 16-byte values via [u8] ────────────────
+//
+// Useful when interfacing with caller code that already holds a
+// 16-byte [u8] (e.g., the bytes from a received Pairing_Confirm
+// PDU).  Avoids the byte-by-byte loop at the call site.
+
+@tier(embedded)
+fn stash_mconfirm(bytes: [u8]) [hw]
+    for i in 0..16
+        hw.mem_write8(smp_ctx_base() + SMP_CTX_MCONFIRM_OFFSET + i, bytes[i] as Int)
+
+@tier(embedded)
+fn stash_mrand(bytes: [u8]) [hw]
+    for i in 0..16
+        hw.mem_write8(smp_ctx_base() + SMP_CTX_MRAND_OFFSET + i, bytes[i] as Int)
+
+// Store the responder's random value, 16 octets.
+pub @tier(embedded)
+fn stash_srand(bytes: [u8]) [hw]
+    for i in 0..16
+        hw.mem_write8(smp_ctx_base() + SMP_CTX_SRAND_OFFSET + i, bytes[i] as Int)
+
+// Store the responder's confirm value, 16 octets.
+pub @tier(embedded)
+fn stash_sconfirm(bytes: [u8]) [hw]
+    for i in 0..16
+        hw.mem_write8(smp_ctx_base() + SMP_CTX_SCONFIRM_OFFSET + i, bytes[i] as Int)
+
+// ── Materialise a 16-byte slot as [u8] ──────────────────────────────
+//
+// Mirror of the stash_* helpers — copies a 16-byte slot into a
+// fresh [u8] for callers that need it as a value (e.g., to pass
+// to smp_crypto.c1_via_ecb).
+
+// The stored responder's random value as a list of 16 octets.
+pub @tier(embedded)
+fn read_srand() -> [u8] [hw]
+    [
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SRAND_OFFSET + 0) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SRAND_OFFSET + 1) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SRAND_OFFSET + 2) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SRAND_OFFSET + 3) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SRAND_OFFSET + 4) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SRAND_OFFSET + 5) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SRAND_OFFSET + 6) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SRAND_OFFSET + 7) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SRAND_OFFSET + 8) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SRAND_OFFSET + 9) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SRAND_OFFSET + 10) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SRAND_OFFSET + 11) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SRAND_OFFSET + 12) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SRAND_OFFSET + 13) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SRAND_OFFSET + 14) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SRAND_OFFSET + 15) as u8]
+
+// The stored responder's confirm value as a list of 16 octets.
+pub @tier(embedded)
+fn read_sconfirm() -> [u8] [hw]
+    [
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SCONFIRM_OFFSET + 0) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SCONFIRM_OFFSET + 1) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SCONFIRM_OFFSET + 2) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SCONFIRM_OFFSET + 3) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SCONFIRM_OFFSET + 4) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SCONFIRM_OFFSET + 5) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SCONFIRM_OFFSET + 6) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SCONFIRM_OFFSET + 7) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SCONFIRM_OFFSET + 8) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SCONFIRM_OFFSET + 9) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SCONFIRM_OFFSET + 10) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SCONFIRM_OFFSET + 11) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SCONFIRM_OFFSET + 12) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SCONFIRM_OFFSET + 13) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SCONFIRM_OFFSET + 14) as u8,
+        hw.mem_read8(smp_ctx_base() + SMP_CTX_SCONFIRM_OFFSET + 15) as u8]
+
+// ── One-shot: clear the whole context. ─────────────────────────────
+//
+// Wipes 128 bytes starting at SMP_CTX_BASE, covering every
+// named slot.  Caller invokes on Disconnected to keep PII (TK,
+// LTK material if we ever cache it here) out of fixed RAM
+// across reconnections.
+pub @tier(embedded)
+fn clear_all() [hw]
+    for i in 0..128
+        hw.mem_write8(smp_ctx_base() + i, 0)
+
+// ── Tests ────────────────────────────────────────────────────────────
+//
+// hw.mem_* panics on the OCaml backend so we can't @test the
+// byte accessors directly.  What we CAN test is the offset
+// table — a transcription error in any constant silently
+// corrupts every pairing exchange and is impossible to debug
+// without a sniffer.
+
+@test
+fn test_offset_table_matches_documented_layout()
+    test.assert_eq(SMP_CTX_PRES_OFFSET, 0x00)
+    test.assert_eq(SMP_CTX_PREQ_OFFSET, 0x07)
+    test.assert_eq(SMP_CTX_RAT_OFFSET, 0x0E)
+    test.assert_eq(SMP_CTX_IAT_OFFSET, 0x0F)
+    test.assert_eq(SMP_CTX_RA_OFFSET, 0x10)
+    test.assert_eq(SMP_CTX_IA_OFFSET, 0x16)
+    test.assert_eq(SMP_CTX_TK_OFFSET, 0x20)
+    test.assert_eq(SMP_CTX_SRAND_OFFSET, 0x30)
+    test.assert_eq(SMP_CTX_MRAND_OFFSET, 0x40)
+    test.assert_eq(SMP_CTX_SCONFIRM_OFFSET, 0x50)
+    test.assert_eq(SMP_CTX_MCONFIRM_OFFSET, 0x60)
+    test.assert_eq(SMP_CTX_TOTAL_BYTES, 128)
+    // Total used: pres(7) + preq(7) + rat(1) + iat(1) + ra(6) +
+    // ia(6) + 4-byte gap + 5×16(TK+Srand+Mrand+Sconfirm+Mconfirm)
+    //   = 28 + 80 = 108 bytes named, < 128 sweep.
+    test.assert(SMP_CTX_MCONFIRM_OFFSET + 16 <= SMP_CTX_TOTAL_BYTES)
+
+// Disjointness from the other fixed buffers is the linker's: every
+// buffer is its own `static`.  tests/integration_ram_window.nv checks
+// the placement across modules.

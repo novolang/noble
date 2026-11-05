@@ -1,0 +1,166 @@
+// hci_init.nv — named-constant HCI init payload builders.
+//
+// Hosts the LE_Set_Advertising_Parameters payload builder so the
+// magic-byte assembly (interval, type, addr-type, channel-map,
+// filter) lives in one place rather than scattered as opaque hex
+// literals across every call site.  Callers in main.nv,
+// in_ram_dual_demo.nv, etc. call this builder + the existing
+// `hci_commands.opcode_*` helpers to construct typed HciCmdMsg
+// values, then encode + push via the chosen transport.
+//
+// The transport-agnostic generic drivers (`drive_to_advertising
+// (xport: HciTransport)` etc.) that this file ALSO wanted to
+// host live in `tests/build/test_hci_init_polymorphism.sh`'s
+// inline source instead — placing them here breaks `novo test`
+// on every sibling BLE file because the OCaml backend doesn't
+// monomorphize trait-typed parameters yet (per the "Backend
+// caveat" note in docs/language/guide.md).  When that lands,
+// the polymorphic helpers come back to this file and main.nv
+// can drop down to a single `drive_to_advertising(xport)` call
+// regardless of the transport.
+
+use std.test
+use hci_frame
+use hci_transport
+use hci_commands
+
+// ── Drive any HciTransport to the Advertising state ────────────────
+//
+// Sends the two HCI commands required to walk the controller FSM
+// from Idle → Configured → Advertising:
+//
+//   1. LE_Set_Advertising_Parameters  (opcode 0x2006)
+//   2. LE_Set_Advertising_Enable(1)   (opcode 0x200A)
+//
+// Returns true if both pushes succeeded, false on the first push
+// failure (e.g. ring full).  Caller decides whether to retry / log
+// / give up — keeping the trait surface narrow.
+
+// LE_Set_Advertising_Parameters payload layout (Vol 4 Part E §7.8.5):
+//
+//   bytes 0-1    Advertising_Interval_Min  (u16, LE, 0.625-ms units)
+//   bytes 2-3    Advertising_Interval_Max  (u16, LE, 0.625-ms units)
+//   byte  4      Advertising_Type          (ADV_TYPE_*)
+//   byte  5      Own_Address_Type          (OWN_ADDR_TYPE_*)
+//   byte  6      Peer_Address_Type         (0 = public, 1 = random)
+//   bytes 7-12   Peer_Address              (6 bytes, all-zero when ignored)
+//   byte 13      Advertising_Channel_Map   (ADV_CHANNEL_MAP_ALL etc.)
+//   byte 14      Advertising_Filter_Policy (ADV_FILTER_*)
+
+const ADV_PEER_ADDRESS_TYPE_PUBLIC = 0x00
+
+// The parameters of LE Set Advertising Parameters for connectable undirected advertising (ADV_IND) from the random
+// address, on all three channels, with no filter and the default interval range.
+pub @tier(embedded)
+fn build_le_set_adv_params_default() -> [u8]
+    build_le_set_advertising_parameters(hci_commands.adv_interval_min_default(),
+        hci_commands.ADV_INTERVAL_MAX_DEFAULT)
+
+// Connectable undirected advertising (ADV_IND) from the random
+// address, on all three channels, with no filter, between
+// `interval_min` and `interval_max` in 0.625 ms units.
+@tier(embedded)
+fn build_le_set_advertising_parameters(interval_min: Int, interval_max: Int) -> [u8]
+    build_le_set_advertising_parameters_for(interval_min, interval_max,
+        hci_commands.ADV_TYPE_ADV_IND, hci_commands.OWN_ADDR_TYPE_RANDOM)
+
+// Undirected advertising of `advertising_type` (ADV_IND, ADV_SCAN_IND
+// or ADV_NONCONN_IND) from `own_address_type`, on all three channels,
+// with no filter.  The peer address fields are zero: the Controller
+// ignores them unless the advertising is directed ([Vol 4] Part E,
+// Section 7.8.5).
+pub @tier(embedded)
+fn build_le_set_advertising_parameters_for(interval_min: Int, interval_max: Int, advertising_type: Int, own_address_type: Int) -> [u8]
+    build_le_set_advertising_parameters_to(interval_min, interval_max, advertising_type, own_address_type,
+        ADV_PEER_ADDRESS_TYPE_PUBLIC, [0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+
+// Advertising of `advertising_type` from `own_address_type` towards the
+// peer device `peer_address_type` and `peer_address` (6 octets, least
+// significant first), on all three channels, with no filter.  For
+// directed advertising, ADV_DIRECT_IND high or low duty cycle, the peer
+// fields shall be valid, and for the high duty cycle the Controller
+// ignores the two intervals ([Vol 4] Part E, Section 7.8.5).
+pub @tier(embedded)
+fn build_le_set_advertising_parameters_to(interval_min: Int, interval_max: Int, advertising_type: Int, own_address_type: Int, peer_address_type: Int, peer_address: [u8]) -> [u8]
+    [
+        // Advertising_Interval_Min  (LE)
+        (interval_min & 0xFF) as u8,
+        ((interval_min >>> 8) & 0xFF) as u8,
+        // Advertising_Interval_Max  (LE)
+        (interval_max & 0xFF) as u8,
+        ((interval_max >>> 8) & 0xFF) as u8,
+        // Advertising_Type
+        advertising_type as u8,
+        // Own_Address_Type
+        own_address_type as u8,
+        // Peer_Address_Type
+        peer_address_type as u8,
+        // Peer_Address
+        peer_address[0], peer_address[1], peer_address[2],
+        peer_address[3], peer_address[4], peer_address[5],
+        // Advertising_Channel_Map (37+38+39)
+        hci_commands.ADV_CHANNEL_MAP_ALL,
+        // Advertising_Filter_Policy
+        hci_commands.ADV_FILTER_NONE]
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+@test
+fn test_build_le_set_adv_params_default_layout()
+    let p = build_le_set_adv_params_default()
+    test.assert_eq(list.len(p), 15)
+    // Interval_Min LE = 0x00A0 → bytes [0xA0, 0x00].
+    test.assert_eq(p[0] as Int, 0xA0)
+    test.assert_eq(p[1] as Int, 0x00)
+    // Interval_Max LE = 0x00A0 → bytes [0xA0, 0x00].
+    test.assert_eq(p[2] as Int, 0xA0)
+    test.assert_eq(p[3] as Int, 0x00)
+    // Adv_Type = ADV_IND = 0x00.
+    test.assert_eq(p[4] as Int, 0x00)
+    // Own_Addr_Type = RANDOM = 0x01.
+    test.assert_eq(p[5] as Int, 0x01)
+    // Peer_Addr_Type = PUBLIC = 0x00.
+    test.assert_eq(p[6] as Int, 0x00)
+    // Channel map at byte 13 (after 6 zero peer-address bytes).
+    test.assert_eq(p[13] as Int, 0x07)
+    // Filter policy at byte 14 — NONE = 0x00.
+    test.assert_eq(p[14] as Int, 0x00)
+
+@test
+fn test_build_le_set_adv_params_interval()
+    // 1 s is 1600 units, 0x0640.
+    let p = build_le_set_advertising_parameters(0x0640, 0x0640)
+    test.assert_eq(list.len(p), 15)
+    test.assert_eq(p[0] as Int, 0x40)
+    test.assert_eq(p[1] as Int, 0x06)
+    test.assert_eq(p[2] as Int, 0x40)
+    test.assert_eq(p[3] as Int, 0x06)
+    test.assert_eq(p[4] as Int, 0x00)
+    test.assert_eq(p[5] as Int, 0x01)
+    test.assert_eq(p[13] as Int, 0x07)
+
+@test
+fn test_build_le_set_adv_params_for_type_and_address()
+    // ADV_NONCONN_IND from the public address, 100 ms.
+    let p = build_le_set_advertising_parameters_for(0xA0, 0xA0, hci_commands.ADV_TYPE_ADV_NONCONN_IND, hci_commands.OWN_ADDR_TYPE_PUBLIC)
+    test.assert_eq(list.len(p), 15)
+    test.assert_eq(p[0] as Int, 0xA0)
+    test.assert_eq(p[4] as Int, 0x03)
+    test.assert_eq(p[5] as Int, 0x00)
+    test.assert_eq(p[13] as Int, 0x07)
+    test.assert_eq(p[14] as Int, 0x00)
+
+@test
+fn test_build_le_set_adv_params_to_a_peer()
+    // Low duty cycle directed advertising from the random address to
+    // the public address 66:55:44:33:22:11.
+    let peer: [u8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66]
+    let p = build_le_set_advertising_parameters_to(0xA0, 0xA0, hci_commands.ADV_TYPE_ADV_DIRECT_IND_LDC, hci_commands.OWN_ADDR_TYPE_RANDOM, 0x00, peer)
+    test.assert_eq(list.len(p), 15)
+    test.assert_eq(p[4] as Int, 0x04)
+    test.assert_eq(p[5] as Int, 0x01)
+    test.assert_eq(p[6] as Int, 0x00)
+    test.assert_eq(p[7] as Int, 0x11)
+    test.assert_eq(p[12] as Int, 0x66)
+    test.assert_eq(p[13] as Int, 0x07)
+    test.assert_eq(p[14] as Int, 0x00)

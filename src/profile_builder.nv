@@ -1,0 +1,89 @@
+// profile_builder.nv — the steps the profile modules
+// share when they add a service to a `GattServer`.
+//
+// A service is added with `gatt_server.add_service`, each characteristic
+// with `add_characteristic`, and each descriptor with `add_descriptor`;
+// every one of them answers -1 when the attribute table is full or the
+// UUID is malformed.  The functions here turn that answer into a
+// `ProfileError` and set the value of what they add, so a profile's
+// builder reads as the list of its characteristics.
+//
+// A characteristic value takes the handle after its declaration, so the
+// value handle of a characteristic is the declaration's handle plus one
+// ([Vol 3] Part G, Section 3.3).
+
+use std.test
+use gatt_server
+
+// Why a profile could not be added to the server.  NoRoom: the attribute
+// table has no handle left.  InvalidValue: a value longer than the
+// longest attribute value.  NotPermitted: an access the profile does not
+// allow for a characteristic, such as a control point any link may write.
+pub enum ProfileError
+    NoRoom
+    InvalidValue
+    NotPermitted
+
+impl Error for ProfileError
+    fn message(self) -> Str
+        match self
+            NoRoom => "the attribute table has no handle left"
+            InvalidValue => "the value is longer than an attribute value may be"
+            NotPermitted => "the profile does not allow the access of a characteristic"
+
+// The Report Reference descriptor type, which the HID service gives each
+// Report characteristic.
+pub const UUID_REPORT_REFERENCE = 0x2908
+
+// Start a primary service for the 16-bit or 128-bit `uuid` (least
+// significant octet first); the declaration's handle.
+pub fn start_service(var db: GattDb, uuid: [u8]) -> Result<Int, ProfileError>
+    let handle = gatt_server.add_service(var db, false, uuid)
+    if handle < 0
+        return Err(ProfileError.NoRoom)
+    Ok(handle)
+
+// Permissions of a value a client can only read at `access`.
+pub fn read_only(access: gatt_server.Access) -> gatt_server.Permissions
+    gatt_server.Permissions { read: access, write: gatt_server.Access.Denied }
+
+// Permissions of a value a client can only write at `access`.
+pub fn write_only(access: gatt_server.Access) -> gatt_server.Permissions
+    gatt_server.Permissions { read: gatt_server.Access.Denied, write: access }
+
+// Permissions of a value that is only notified or indicated: the client
+// neither reads nor writes it, and the access its subscription needs is
+// the one of its Client Characteristic Configuration descriptor.
+pub fn notify_only() -> gatt_server.Permissions
+    gatt_server.Permissions { read: gatt_server.Access.Denied, write: gatt_server.Access.Denied }
+
+// Add a characteristic with `properties` and `permissions` whose value
+// starts as `value`; the value handle.  An empty `value` leaves the
+// value empty, and a client that may write it may write up to the longest
+// attribute value.
+pub fn add_value(var db: GattDb, properties: Int, permissions: gatt_server.Permissions, uuid: [u8], value: [u8]) -> Result<Int, ProfileError>
+    let declaration = gatt_server.add_characteristic(var db, properties, gatt_server.permission_bits(permissions), uuid)
+    if declaration < 0
+        return Err(ProfileError.NoRoom)
+    if list.len(value) > 0 and not gatt_server.set_value(var db, 0, value)
+        return Err(ProfileError.InvalidValue)
+    Ok(declaration + 1)
+
+// Add a descriptor of type `uuid16` to the last characteristic with
+// `permissions` and `value`; its handle.
+pub fn add_descriptor(var db: GattDb, permissions: gatt_server.Permissions, uuid16: Int, value: [u8]) -> Result<Int, ProfileError>
+    let handle = gatt_server.add_descriptor(var db, gatt_server.permission_bits(permissions), gatt_server.le16(uuid16))
+    if handle < 0
+        return Err(ProfileError.NoRoom)
+    if list.len(value) > 0 and not gatt_server.set_value(var db, handle, value)
+        return Err(ProfileError.InvalidValue)
+    Ok(handle)
+
+// Add the Client Characteristic Configuration descriptor to the last
+// characteristic with the access `permissions` give a client to read and
+// to write it; its handle.
+pub fn add_cccd(var db: GattDb, permissions: gatt_server.Permissions) -> Result<Int, ProfileError>
+    let handle = gatt_server.add_configuration(var db, permissions)
+    if handle < 0
+        return Err(ProfileError.NoRoom)
+    Ok(handle)

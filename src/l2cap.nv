@@ -1,0 +1,449 @@
+// l2cap.nv — L2CAP PDUs on an LE-U logical link.
+//
+// Every L2CAP PDU in Basic L2CAP mode, the B-frame, is the Basic L2CAP
+// header and the information payload ([Vol 3] Part A, Section 3.1):
+//
+//   PDU Length (2)   octets of payload, the 4-octet header excluded
+//   Channel ID (2)   the destination channel endpoint
+//   payload
+//
+// all little-endian.  An LE-U logical link carries three fixed channels
+// that every implementation supports ([Vol 3] Part A, Section 2.1):
+//
+//   0x0004  Attribute Protocol
+//   0x0005  LE signaling channel
+//   0x0006  Security Manager Protocol
+//
+// A PDU received on a CID that is not assigned on the logical link is
+// ignored ([Vol 3] Part A, Section 3).  Channels with dynamically
+// allocated CIDs (0x0040 and up) are out of scope.
+//
+// This module builds and reads B-frames and the signaling packets of
+// the LE signaling channel.  Fragmentation into HCI ACL Data packets
+// and recombination of the fragments the Controller delivers
+// ([Vol 3] Part A, Section 7.2) are done per logical link in
+// `le_link.nv`.  On a device whose Controller is in the same image,
+// the Link Layer carries the fragments itself
+// (`coresident/conn_event_dispatch.nv`).
+//
+// Satisfies: REQ-BLE-L2CAP-001 (B-frame layout), -002 (CID demux
+// for LE fixed channels), -003 (length-field validation).
+
+use std.test
+use std.bits
+
+// ── L2CAP fixed CIDs (LE) ───────────────────────────────────────────
+pub const CID_ATT = 0x0004
+// The fixed channel of the LE signaling channel ([Vol 3] Part A, Section 2.1).
+pub const CID_LE_SIGNALING = 0x0005
+// The fixed channel of the Security Manager Protocol ([Vol 3] Part A, Section 2.1).
+pub const CID_SMP = 0x0006
+
+// ── L2CAP B-frame header size (length:u16 + cid:u16) ────────────────
+const L2CAP_HEADER_LEN = 4
+
+// ── Build an L2CAP B-frame for the given CID and payload ────────────
+//
+// The on-air bytes are:
+//
+//   [length_lo, length_hi, cid_lo, cid_hi, payload..]
+//
+// `length` here is the payload byte count, NOT including the
+// 4-byte L2CAP header.  Caller-side fragmentation across LL
+// PDUs is the connection-event runner's responsibility; this
+// function returns the complete B-frame.
+pub @satisfies("REQ-BLE-L2CAP-001")
+@tier(embedded)
+fn build_b_frame(cid: Int, payload: [u8]) -> [u8]
+    let plen = list.len(payload)
+    var header: [u8] = list.with_capacity(4 + list.len(payload))
+    list.append(header, [(plen & 0xFF) as u8, ((plen >>> 8) & 0xFF) as u8, (cid & 0xFF) as u8, ((cid >>> 8) & 0xFF) as u8])
+    list.append(header, payload)
+    header
+
+// ── Parse the L2CAP header off a buffer ─────────────────────────────
+//
+// `b` is the LL data-PDU payload (everything after the 2-byte LL
+// header).  Returns the encoded length field; the caller then
+// reads `cid` and slices `payload`.  Returns -1 if the buffer
+// is too short to contain even the L2CAP header.
+@satisfies("REQ-BLE-L2CAP-003")
+@tier(embedded)
+@no_alloc
+fn b_frame_length(b: [u8]) -> Int
+    if list.len(b) < L2CAP_HEADER_LEN
+        -1
+    else
+        (b[0] as Int) | ((b[1] as Int) << 8)
+
+@satisfies("REQ-BLE-L2CAP-002")
+@tier(embedded)
+@no_alloc
+fn b_frame_cid(b: [u8]) -> Int
+    if list.len(b) < L2CAP_HEADER_LEN
+        -1
+    else
+        (b[2] as Int) | ((b[3] as Int) << 8)
+
+// ── True if the framing is internally consistent ────────────────────
+//
+// length field equals (buffer_len - header).  An LL PDU that
+// only carries the start of a fragmented L2CAP frame would
+// fail this check; the connection runner uses that as the
+// signal to start reassembly (here: drop).
+@satisfies("REQ-BLE-L2CAP-003")
+@tier(embedded)
+@no_alloc
+fn b_frame_complete(b: [u8]) -> Bool
+    let plen = b_frame_length(b)
+    if plen < 0
+        false
+    else
+        list.len(b) == L2CAP_HEADER_LEN + plen
+
+// ── Slice the payload out of a complete L2CAP B-frame ───────────────
+//
+// Drops the first 4 header bytes and returns the rest.  Caller
+// is responsible for verifying `b_frame_complete(b)` first if
+// they want to be sure they're not handing garbage to the
+// upper layer.
+@tier(embedded)
+fn b_frame_payload(b: [u8]) -> [u8]
+    let n = list.len(b)
+    if n <= L2CAP_HEADER_LEN
+        []
+    else
+        var out: [u8] = []
+        var i = L2CAP_HEADER_LEN
+        loop
+            if i >= n
+                break
+            out = list.append(out, [b[i]])
+            i = i + 1
+        out
+
+// ── CID classification — what to dispatch to ────────────────────────
+//
+// Returns one of:
+//   1  → ATT          (CID 0x0004)
+//   2  → LE Signaling (CID 0x0005)
+//   3  → SMP          (CID 0x0006)
+//   0  → unknown / dynamic-allocated CID we don't handle yet
+@satisfies("REQ-BLE-L2CAP-002")
+@tier(embedded)
+@no_alloc
+fn classify_cid(cid: Int) -> Int
+    if cid == CID_ATT
+        1
+    else if cid == CID_LE_SIGNALING
+        2
+    else if cid == CID_SMP
+        3
+    else
+        0
+
+// ── LE signaling channel, [Vol 3] Part A, Section 4 ─────────────────
+//
+// A C-frame on the LE signaling channel holds one signaling packet:
+//
+//   Code (1)          the command, Table 4.2
+//   Identifier (1)    matches a response with its request; 0x00 is
+//                     invalid
+//   Data Length (2)   octets of Data
+//   Data
+//
+// A packet shorter than 4 octets or whose Data Length disagrees with
+// the octets that follow is not correctly formed.  The signaling MTU of
+// an LE-U logical link, MTUsig, is 23 octets (Table 4.1); a receiver
+// sends L2CAP_COMMAND_REJECT_RSP with reason Signaling MTU exceeded for
+// a longer C-frame.
+
+const MTU_SIG_LE = 23
+
+const SIGNALING_HEADER_LEN = 4
+
+// Codes allowed on the LE signaling channel (Table 4.2).
+const CODE_COMMAND_REJECT_RSP = 0x01
+// The signaling code of L2CAP_DISCONNECTION_REQ.
+pub const CODE_DISCONNECTION_REQ = 0x06
+const CODE_DISCONNECTION_RSP = 0x07
+const CODE_CONNECTION_PARAMETER_UPDATE_REQ = 0x12
+const CODE_CONNECTION_PARAMETER_UPDATE_RSP = 0x13
+// The signaling code of L2CAP_LE_CREDIT_BASED_CONNECTION_REQ.
+pub const CODE_LE_CREDIT_BASED_CONNECTION_REQ = 0x14
+const CODE_LE_CREDIT_BASED_CONNECTION_RSP = 0x15
+// The signaling code of L2CAP_FLOW_CONTROL_CREDIT_IND.
+pub const CODE_FLOW_CONTROL_CREDIT_IND = 0x16
+const CODE_CREDIT_BASED_CONNECTION_REQ = 0x17
+const CODE_CREDIT_BASED_CONNECTION_RSP = 0x18
+const CODE_CREDIT_BASED_RECONFIGURE_REQ = 0x19
+const CODE_CREDIT_BASED_RECONFIGURE_RSP = 0x1A
+
+// L2CAP_COMMAND_REJECT_RSP Reason (Table 4.3).
+const REJECT_COMMAND_NOT_UNDERSTOOD = 0x0000
+const REJECT_SIGNALING_MTU_EXCEEDED = 0x0001
+const REJECT_INVALID_CID = 0x0002
+
+// L2CAP_CONNECTION_PARAMETER_UPDATE_RSP Result (Section 4.21).
+const CONNECTION_PARAMETERS_ACCEPTED = 0x0000
+const CONNECTION_PARAMETERS_REJECTED = 0x0001
+
+// One signaling packet.
+struct SignalingPacket
+    code: Int
+    identifier: Int
+    data: [u8]
+
+@tier(embedded)
+fn le16(v: Int) -> [u8]
+    [(v & 0xFF) as u8, ((v >>> 8) & 0xFF) as u8]
+
+@tier(embedded)
+@no_alloc
+fn read_le16(b: [u8], at: Int) -> Int
+    (b[at] as Int) | ((b[at + 1] as Int) << 8)
+
+// The payload of a C-frame holding one signaling packet.
+@tier(embedded)
+fn build_signaling_packet(code: Int, identifier: Int, data: [u8]) -> [u8]
+    var out: [u8] = [code as u8, identifier as u8]
+    list.append(out, le16(list.len(data)))
+    list.append(out, data)
+    out
+
+// The signaling packet a C-frame payload holds, or None when it is not
+// correctly formed: shorter than its header, or with a Data Length other
+// than the octets that follow.
+@tier(embedded)
+fn parse_signaling_packet(payload: [u8]) -> ?SignalingPacket
+    let n = list.len(payload)
+    if n < SIGNALING_HEADER_LEN
+        None
+    else if read_le16(payload, 2) != n - SIGNALING_HEADER_LEN
+        None
+    else
+        Some(SignalingPacket { code: payload[0] as Int, identifier: payload[1] as Int, data: payload[SIGNALING_HEADER_LEN:n] })
+
+// Whether a signaling code is a response.  A response nobody asked for
+// is silently discarded ([Vol 3] Part A, Section 4); an indication or a
+// request that is not understood is answered with
+// L2CAP_COMMAND_REJECT_RSP (Section 4.1).
+@tier(embedded)
+@no_alloc
+fn is_response_code(code: Int) -> Bool
+    match code
+        0x01 | 0x07 | 0x13 | 0x15 | 0x18 | 0x1A => true
+        _ => false
+
+// L2CAP_COMMAND_REJECT_RSP ([Vol 3] Part A, Section 4.1): Reason, then
+// the Reason Data the reason carries: none for Command not understood,
+// the receiver's MTUsig for Signaling MTU exceeded.
+@tier(embedded)
+fn build_command_reject(identifier: Int, reason: Int) -> [u8]
+    var data = le16(reason)
+    if reason == REJECT_SIGNALING_MTU_EXCEEDED
+        list.append(data, le16(MTU_SIG_LE))
+    build_signaling_packet(CODE_COMMAND_REJECT_RSP, identifier, data)
+
+// L2CAP_COMMAND_REJECT_RSP with reason Invalid CID in request: the
+// Reason Data is the local and the remote endpoint of the disputed
+// channel, as seen by the sender of the reject (Section 4.1, Table 4.4).
+@tier(embedded)
+fn build_command_reject_invalid_cid(identifier: Int, local_cid: Int, remote_cid: Int) -> [u8]
+    var data = le16(REJECT_INVALID_CID)
+    list.append(data, le16(local_cid))
+    list.append(data, le16(remote_cid))
+    build_signaling_packet(CODE_COMMAND_REJECT_RSP, identifier, data)
+
+// L2CAP_CONNECTION_PARAMETER_UPDATE_REQ ([Vol 3] Part A, Section 4.20):
+// Interval Min, Interval Max, Latency and Timeout, 2 octets each, with
+// the meanings of the LL_CONNECTION_PARAM_REQ fields of the same names:
+// the intervals in 1.25 ms units, the Peripheral latency in connection
+// events, the supervision timeout in 10 ms units.
+@tier(embedded)
+fn build_connection_parameter_update_req(identifier: Int, interval_min: Int, interval_max: Int, latency: Int, timeout: Int) -> [u8]
+    var data = le16(interval_min)
+    list.append(data, le16(interval_max))
+    list.append(data, le16(latency))
+    list.append(data, le16(timeout))
+    build_signaling_packet(CODE_CONNECTION_PARAMETER_UPDATE_REQ, identifier, data)
+
+// The Result of an L2CAP_CONNECTION_PARAMETER_UPDATE_RSP
+// ([Vol 3] Part A, Section 4.21), or -1 when its Data is not 2 octets.
+@tier(embedded)
+@no_alloc
+fn connection_parameter_update_result(p: SignalingPacket) -> Int
+    if p.code != CODE_CONNECTION_PARAMETER_UPDATE_RSP or list.len(p.data) != 2
+        -1
+    else
+        read_le16(p.data, 0)
+
+// L2CAP_CONNECTION_PARAMETER_UPDATE_RSP (Section 4.21): the Result,
+// 0x0000 accepted or 0x0001 rejected - unacceptable parameters, with the
+// Identifier of the request it answers.
+@tier(embedded)
+fn build_connection_parameter_update_rsp(identifier: Int, result: Int) -> [u8]
+    build_signaling_packet(CODE_CONNECTION_PARAMETER_UPDATE_RSP, identifier, le16(result))
+
+// The four parameters of an L2CAP_CONNECTION_PARAMETER_UPDATE_REQ as its
+// Data carries them, or None when the Data is not 8 octets.
+@tier(embedded)
+fn parse_connection_parameter_update_req(p: SignalingPacket) -> ?[Int]
+    if p.code != CODE_CONNECTION_PARAMETER_UPDATE_REQ or list.len(p.data) != 8
+        None
+    else
+        Some([read_le16(p.data, 0), read_le16(p.data, 2), read_le16(p.data, 4), read_le16(p.data, 6)])
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+@test
+fn test_signaling_packet_round_trip()
+    let pkt = build_connection_parameter_update_req(0x01, 0x0032, 0x0046, 0x0001, 0x01F4)
+    let want: [u8] = [0x12, 0x01, 0x08, 0x00, 0x32, 0x00, 0x46, 0x00, 0x01, 0x00, 0xF4, 0x01]
+    test.assert_eq(list.len(pkt), list.len(want))
+    for i in 0..list.len(want)
+        test.assert_eq(pkt[i] as Int, want[i] as Int)
+    match parse_signaling_packet(pkt)
+        None    => test.fail("the packet parses")
+        Some(p) =>
+            test.assert_eq(p.code, CODE_CONNECTION_PARAMETER_UPDATE_REQ)
+            test.assert_eq(p.identifier, 1)
+            test.assert_eq(list.len(p.data), 8)
+
+@test
+fn test_signaling_packet_not_correctly_formed()
+    test.assert(parse_signaling_packet([0x13, 0x01, 0x02]) == None)
+    // Data Length 2, one octet of data.
+    test.assert(parse_signaling_packet([0x13, 0x01, 0x02, 0x00, 0x00]) == None)
+
+@test
+fn test_connection_parameter_update_rsp_result()
+    let rsp: [u8] = [0x13, 0x07, 0x02, 0x00, 0x01, 0x00]
+    match parse_signaling_packet(rsp)
+        None    => test.fail("the response parses")
+        Some(p) => test.assert_eq(connection_parameter_update_result(p), CONNECTION_PARAMETERS_REJECTED)
+    let short: [u8] = [0x13, 0x07, 0x01, 0x00, 0x01]
+    match parse_signaling_packet(short)
+        None    => test.fail("the packet parses")
+        Some(p) => test.assert_eq(connection_parameter_update_result(p), -1)
+
+@test
+fn test_connection_parameter_update_request_round_trip()
+    let req = build_connection_parameter_update_req(0x03, 0x0032, 0x0046, 0x0200, 0x01F4)
+    match parse_signaling_packet(req)
+        None    => test.fail("the request parses")
+        Some(p) =>
+            match parse_connection_parameter_update_req(p)
+                None      => test.fail("the parameters parse")
+                Some(f)   =>
+                    test.assert_eq(f[0], 0x0032)
+                    test.assert_eq(f[1], 0x0046)
+                    test.assert_eq(f[2], 0x0200)
+                    test.assert_eq(f[3], 0x01F4)
+    // A response is not a request, and a request with 6 octets of Data
+    // has no parameters.
+    let rsp = build_connection_parameter_update_rsp(0x03, CONNECTION_PARAMETERS_ACCEPTED)
+    match parse_signaling_packet(rsp)
+        None    => test.fail("the response parses")
+        Some(p) =>
+            test.assert_eq(connection_parameter_update_result(p), CONNECTION_PARAMETERS_ACCEPTED)
+            test.assert(parse_connection_parameter_update_req(p) == None)
+
+@test
+fn test_command_reject_layouts()
+    let not_understood = build_command_reject(0x05, REJECT_COMMAND_NOT_UNDERSTOOD)
+    let want: [u8] = [0x01, 0x05, 0x02, 0x00, 0x00, 0x00]
+    test.assert_eq(list.len(not_understood), list.len(want))
+    for i in 0..list.len(want)
+        test.assert_eq(not_understood[i] as Int, want[i] as Int)
+    let mtu = build_command_reject(0x06, REJECT_SIGNALING_MTU_EXCEEDED)
+    test.assert_eq(list.len(mtu), 8)
+    test.assert_eq(mtu[4] as Int, 0x01)
+    test.assert_eq(mtu[6] as Int, MTU_SIG_LE)
+
+@test
+fn test_response_codes()
+    test.assert(is_response_code(CODE_CONNECTION_PARAMETER_UPDATE_RSP))
+    test.assert(is_response_code(CODE_COMMAND_REJECT_RSP))
+    test.assert(not is_response_code(CODE_CONNECTION_PARAMETER_UPDATE_REQ))
+    test.assert(not is_response_code(CODE_FLOW_CONTROL_CREDIT_IND))
+
+@test
+@satisfies("REQ-BLE-L2CAP-001")
+fn test_build_b_frame_att_round_trip()
+    // Mock ATT_READ_REQ: opcode 0x0A, handle 0x0001 → 3 bytes.
+    let payload: [u8] = [0x0A, 0x01, 0x00]
+    let pkt = build_b_frame(CID_ATT, payload)
+    test.assert_eq(list.len(pkt), L2CAP_HEADER_LEN + 3)
+    test.assert_eq(pkt[0] as Int, 0x03)   // length lo
+    test.assert_eq(pkt[1] as Int, 0x00)   // length hi
+    test.assert_eq(pkt[2] as Int, 0x04)   // cid lo (ATT)
+    test.assert_eq(pkt[3] as Int, 0x00)   // cid hi
+    test.assert_eq(pkt[4] as Int, 0x0A)   // first payload byte
+
+@test
+@satisfies("REQ-BLE-L2CAP-002")
+fn test_b_frame_cid_extraction()
+    let payload: [u8] = [0x00]
+    let f1 = build_b_frame(CID_ATT, payload)
+    let f2 = build_b_frame(CID_LE_SIGNALING, payload)
+    let f3 = build_b_frame(CID_SMP, payload)
+    test.assert_eq(b_frame_cid(f1), CID_ATT)
+    test.assert_eq(b_frame_cid(f2), CID_LE_SIGNALING)
+    test.assert_eq(b_frame_cid(f3), CID_SMP)
+
+@test
+@satisfies("REQ-BLE-L2CAP-003")
+fn test_b_frame_length_extraction()
+    let payload: [u8] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE]
+    let pkt = build_b_frame(CID_ATT, payload)
+    test.assert_eq(b_frame_length(pkt), 5)
+    test.assert_eq(b_frame_complete(pkt), true)
+
+@test
+@satisfies("REQ-BLE-L2CAP-003")
+fn test_b_frame_too_short_returns_minus_one()
+    let runt: [u8] = [0x01, 0x00, 0x04]   // only 3 bytes
+    test.assert_eq(b_frame_length(runt), -1)
+    test.assert_eq(b_frame_cid(runt), -1)
+    test.assert_eq(b_frame_complete(runt), false)
+
+@test
+@satisfies("REQ-BLE-L2CAP-003")
+fn test_b_frame_incomplete_when_length_field_lies()
+    // Header claims 5-byte payload, only 2 actually present.
+    let bad: [u8] = [
+        0x05, 0x00,   // length = 5
+        0x04, 0x00,   // cid    = ATT
+        0xAA, 0xBB]   // payload = 2 bytes (short!)
+    test.assert_eq(b_frame_length(bad), 5)
+    test.assert_eq(b_frame_complete(bad), false)
+
+@test
+fn test_b_frame_payload_strips_header()
+    let payload: [u8] = [0x10, 0x20, 0x30]
+    let pkt = build_b_frame(CID_ATT, payload)
+    let recovered = b_frame_payload(pkt)
+    test.assert_eq(list.len(recovered), 3)
+    test.assert_eq(recovered[0] as Int, 0x10)
+    test.assert_eq(recovered[1] as Int, 0x20)
+    test.assert_eq(recovered[2] as Int, 0x30)
+
+@test
+fn test_b_frame_payload_empty_for_header_only()
+    let pkt: [u8] = [0x00, 0x00, 0x04, 0x00]
+    let recovered = b_frame_payload(pkt)
+    test.assert_eq(list.len(recovered), 0)
+
+@test
+@satisfies("REQ-BLE-L2CAP-002")
+fn test_classify_cid_known_channels()
+    test.assert_eq(classify_cid(CID_ATT), 1)
+    test.assert_eq(classify_cid(CID_LE_SIGNALING), 2)
+    test.assert_eq(classify_cid(CID_SMP), 3)
+
+@test
+fn test_classify_cid_unknown_returns_zero()
+    test.assert_eq(classify_cid(0x0040), 0)   // dynamic-CFC range
+    test.assert_eq(classify_cid(0x0001), 0)   // BR/EDR signalling
+    test.assert_eq(classify_cid(0x0000), 0)   // null

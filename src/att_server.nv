@@ -1,0 +1,1388 @@
+// att_server.nv — ATT server FSM + handle-value table.
+//
+// The ATT server consumes incoming ATT PDUs and produces
+// responses against a flat attribute database.  Surface:
+//
+//   EXCHANGE_MTU_REQ          → EXCHANGE_MTU_RSP (server's MTU)
+//   FIND_INFORMATION_REQ      → FIND_INFORMATION_RSP (handle+UUID list)
+//   FIND_BY_TYPE_VALUE_REQ    → FIND_BY_TYPE_VALUE_RSP (handles for matching attrs)
+//   READ_BY_TYPE_REQ          → READ_BY_TYPE_RSP      (handle+value pairs)
+//   READ_REQ                  → READ_RSP              (one attribute value)
+//   READ_BLOB_REQ             → READ_BLOB_RSP         (offset slice)
+//   READ_BY_GROUP_TYPE_REQ    → READ_BY_GROUP_TYPE_RSP (handle+end+value triplets)
+//
+// Anything else → ERROR_RSP / Request_Not_Supported.
+//
+// ── Database wire format ────────────────────────────────────────────
+//
+// The attribute table is a single flat [u8] buffer of records
+// rather than a list of structs: reading an Int out of a struct
+// field and using it as a pointer HardFaults on this target (see
+// the note in `controller/ll_scanning.nv`).
+// Each record is variable-length:
+//
+//   handle_lo handle_hi type16_lo type16_hi end_group_lo end_group_hi value_len value...
+//
+// Total record size = 7 + value_len bytes.  For records that
+// aren't a service declaration, end_group is the same as
+// handle (so the field always has well-defined semantics).
+//
+// `gatt_db.nv` provides the constructor that lays out the Device
+// Information service in this format; this module's API is the
+// consumer side — pure byte walking.
+//
+// Walks are O(n) per record because records are variable-sized;
+// for a database of a handful of attributes that is effectively
+// constant, but it scales linearly with attribute count.
+//
+// Satisfies: REQ-BLE-ATT-SRV-001 (request dispatch), -002
+// (handle-value lookup), -003 (READ / READ_BY_TYPE / READ_BY_GROUP_TYPE
+// + ERROR_RSP fallback), -004 (Find_Information / Find_By_Type_Value).
+
+use std.test
+use std.bits
+use att
+
+
+// ── Default ATT MTU per Vol 3 Part F §3.2.8 — 23 bytes for LE ──────
+pub const ATT_DEFAULT_MTU = 23
+
+// Standard 16-bit GATT type UUIDs we recognise:
+const GATT_UUID_PRIMARY_SERVICE   = 0x2800
+const GATT_UUID_SECONDARY_SERVICE = 0x2801
+const GATT_UUID_INCLUDE           = 0x2802
+const GATT_UUID_CHARACTERISTIC    = 0x2803
+
+
+// ── Write result struct — write/prep/execute return these ──────────
+//
+// Returns the response PDU bytes, the (possibly updated) database
+// blob, and the (possibly updated) prepare-write queue.  The
+// handlers own no storage, so callers thread all three back in:
+//
+//   var blob  = ...
+//   var queue : [u8] = []
+//   let r = handle_request_m6(blob, queue, my_mtu, req)
+//   blob  = r.new_blob
+//   queue = r.new_queue
+//   send_to_peer(r.rsp)
+//
+// `applied` flags whether the write/execute actually mutated the
+// blob.  That is the signal a notify dispatcher needs: emit
+// HANDLE_VALUE_NTF to subscribers iff `applied`.
+struct WriteResult
+    rsp        : [u8]
+    new_blob   : [u8]
+    new_queue  : [u8]
+    applied    : Bool
+
+
+// ── Database record helpers — operate on the flat-blob format ──────
+
+const DB_REC_HEADER_LEN = 7
+
+// Returns the total number of attribute records in the blob.
+@tier(embedded)
+@no_alloc
+fn db_count(blob: [u8]) -> Int
+    let n = list.len(blob)
+    var idx = 0
+    var count = 0
+    loop
+        if idx >= n
+            break
+        if idx + DB_REC_HEADER_LEN > n
+            // Truncated header — stop counting; treat blob as
+            // ill-formed but don't crash.
+            break
+        let value_len = blob[idx + 6] as Int
+        idx = idx + DB_REC_HEADER_LEN + value_len
+        count = count + 1
+    count
+
+// Returns the byte offset of record `idx` (0-based), or -1 if out of range.
+@tier(embedded)
+@no_alloc
+fn db_record_offset(blob: [u8], idx: Int) -> Int
+    let n = list.len(blob)
+    var off = 0
+    var i = 0
+    var found = -1
+    loop
+        if i > idx
+            break
+        if off >= n
+            break
+        if off + DB_REC_HEADER_LEN > n
+            break
+        if i == idx
+            found = off
+            break
+        let value_len = blob[off + 6] as Int
+        off = off + DB_REC_HEADER_LEN + value_len
+        i = i + 1
+    found
+
+@tier(embedded)
+@no_alloc
+fn db_handle_at(blob: [u8], idx: Int) -> Int
+    let off = db_record_offset(blob, idx)
+    if off < 0
+        -1
+    else
+        (blob[off] as Int) | ((blob[off + 1] as Int) << 8)
+
+@tier(embedded)
+@no_alloc
+fn db_type16_at(blob: [u8], idx: Int) -> Int
+    let off = db_record_offset(blob, idx)
+    if off < 0
+        -1
+    else
+        (blob[off + 2] as Int) | ((blob[off + 3] as Int) << 8)
+
+@tier(embedded)
+@no_alloc
+fn db_end_group_at(blob: [u8], idx: Int) -> Int
+    let off = db_record_offset(blob, idx)
+    if off < 0
+        -1
+    else
+        (blob[off + 4] as Int) | ((blob[off + 5] as Int) << 8)
+
+@tier(embedded)
+@no_alloc
+fn db_value_len_at(blob: [u8], idx: Int) -> Int
+    let off = db_record_offset(blob, idx)
+    if off < 0
+        -1
+    else
+        blob[off + 6] as Int
+
+// Copy out the value bytes for record `idx`.  Returns an empty
+// list if the record doesn't exist or has zero-length value.
+@tier(embedded)
+fn db_value_at(blob: [u8], idx: Int) -> [u8]
+    let off = db_record_offset(blob, idx)
+    if off < 0
+        []
+    else
+        let value_len = blob[off + 6] as Int
+        var out : [u8] = list.with_capacity(value_len)
+        for i in 0..value_len
+            let _ = list.try_push(out, blob[off + DB_REC_HEADER_LEN + i])
+        out
+
+// Find the record index whose handle == `handle`, or -1.
+@tier(embedded)
+@no_alloc
+fn db_index_for_handle(blob: [u8], handle: Int) -> Int
+    let count = db_count(blob)
+    var i = 0
+    var found = -1
+    loop
+        if i >= count
+            break
+        if db_handle_at(blob, i) == handle
+            found = i
+            break
+        i = i + 1
+    found
+
+
+// ── Permission lookup ───────────────────────────────────────────────
+//
+// In a GATT db, writability of a value attribute is encoded by the
+// *preceding* characteristic declaration record (type=0x2803).  Its
+// value layout is:
+//
+//   properties:u8 | value_handle:u16 LE | uuid:u16/u128
+//
+// Properties bit map (Vol 3 Part G §3.3.1.1):
+//
+//   0x01  Broadcast
+//   0x02  Read
+//   0x04  Write Without Response
+//   0x08  Write
+//   0x10  Notify
+//   0x20  Indicate
+//   0x40  Authenticated Signed Writes
+//   0x80  Extended Properties
+//
+// Returns the properties byte for the characteristic that owns
+// `value_handle`, or -1 if no declaration is found.
+@tier(embedded)
+fn db_properties_for_value_handle(blob: [u8], value_handle: Int) -> Int
+    let count = db_count(blob)
+    var i = 0
+    var found = -1
+    loop
+        if i >= count
+            break
+        if db_type16_at(blob, i) == GATT_UUID_CHARACTERISTIC
+            let v = db_value_at(blob, i)
+            if list.len(v) >= 3
+                let vh = (v[1] as Int) | ((v[2] as Int) << 8)
+                if vh == value_handle
+                    found = v[0] as Int
+                    break
+        i = i + 1
+    found
+
+// CCCDs (Client Characteristic Configuration Descriptors,
+// UUID 0x2902) are *always* writable by spec — the peer must be
+// able to enable / disable notifications and indications.  The read
+// hadn't introduced descriptors so the perm check only had to
+// path never looked at characteristic declarations; the write path
+// has to.
+const CCCD_UUID16 = 0x2902
+
+// True if the attribute at `value_handle` permits Write Request /
+// Write Command.  Authentication is not enforced: a writable
+// attribute is writable by any connected peer.
+@tier(embedded)
+fn db_writable_at(blob: [u8], value_handle: Int) -> Bool
+    // CCCDs are unconditionally writable.
+    let idx = db_index_for_handle(blob, value_handle)
+    if idx < 0
+        false
+    else if db_type16_at(blob, idx) == CCCD_UUID16
+        true
+    else
+        let p = db_properties_for_value_handle(blob, value_handle)
+        if p < 0
+            false
+        else
+            // 0x08 = Write, 0x04 = Write Without Response.
+            (p & 0x0C) != 0
+
+
+// Whether the attribute at `handle` can be read.  A characteristic
+// value whose characteristic declaration lacks the Read property is not
+// ([Vol 3] Part G, Section 3.3.1.1); the declarations themselves,
+// service declarations and descriptors are.
+@tier(embedded)
+fn db_readable_at(blob: [u8], handle: Int) -> Bool
+    let p = db_properties_for_value_handle(blob, handle)
+    p < 0 or (p & 0x02) != 0
+
+// ── Db mutation: in-place value update ─────────────────────────────
+//
+// Applies `value` at `offset` to the attribute identified by
+// `handle`.  Returns a new blob with the bytes substituted (Novo
+// doesn't have in-place mutation of [u8] payloads visible across
+// returns, so we copy + splice).
+//
+// Offset semantics:
+//   - WRITE_REQ:  offset = 0, value fully replaces the attribute.
+//                 Spec rejects len > current_value_len with
+//                 INVALID_ATTRIBUTE_VALUE_LEN.
+//   - PREPARE_WRITE: offset can be > 0; len can extend past current
+//                 length up to the database record's allocated value_len.
+//                 (Records are sized at boot; runtime-grow isn't supported.)
+//
+// Returns the original blob on out-of-range offset / length —
+// caller is expected to have already validated via the perm check
+// and length sanity in the request handler.
+@tier(embedded)
+fn db_apply_write(var blob: [u8], handle: Int, offset: Int, value: [u8]) -> [u8]
+    let idx = db_index_for_handle(blob, handle)
+    if idx < 0
+        blob
+    else
+        let off = db_record_offset(blob, idx)
+        let value_len = blob[off + 6] as Int
+        let write_len = list.len(value)
+        if offset < 0 or offset + write_len > value_len
+            blob
+        else
+            // Copy the blob byte-by-byte, substituting the value bytes.
+            let n = list.len(blob)
+            var out : [u8] = []
+            var i = 0
+            let value_start = off + DB_REC_HEADER_LEN + offset
+            let value_end = value_start + write_len
+            loop
+                if i >= n
+                    break
+                if i >= value_start and i < value_end
+                    out = list.append(out, [value[i - value_start]])
+                else
+                    out = list.append(out, [blob[i]])
+                i = i + 1
+            out
+
+
+// ── Prepare-write queue ────────────────────────────────────────────
+//
+// Wire format for queued entries (chosen to mirror the db blob's
+// flat layout):
+//
+//   handle_lo handle_hi offset_lo offset_hi value_len value...
+//
+// Total entry size = 5 + value_len bytes.  The queue is a [u8]
+// owned by the caller — one queue per connection, and this stack
+// only ever has one.
+const PREP_QUEUE_ENTRY_HEADER_LEN = 5
+
+// Cap on total queued bytes — the spec says the server MAY reject
+// with PREPARE_QUEUE_FULL, so any limit is correct as long as it's
+// applied consistently.  256 bytes accommodates ~5 typical
+// prepared writes.
+const PREP_QUEUE_CAP_BYTES = 256
+
+@tier(embedded)
+fn prep_queue_push(var queue: [u8], handle: Int, offset: Int, value: [u8]) -> [u8]
+    let header : [u8] = [
+        (handle & 0xFF) as u8,
+        ((handle >>> 8) & 0xFF) as u8,
+        (offset & 0xFF) as u8,
+        ((offset >>> 8) & 0xFF) as u8,
+        (list.len(value)) as u8
+    ]
+    list.append(queue, header)
+    list.append(queue, value)
+    queue
+
+// Walk every queued entry and apply it in FIFO order to `blob`.
+// Returns the resulting blob.  If any entry fails its bounds
+// check, that one is skipped (the prepared-write feature is
+// best-effort apply per spec — INVALID_OFFSET / INVALID_VALUE_LEN
+// only apply to the *prep* response, not execute).
+@tier(embedded)
+fn prep_queue_apply(queue: [u8], var blob: [u8]) -> [u8]
+    let n = list.len(queue)
+    var out = blob
+    var idx = 0
+    loop
+        if idx >= n
+            break
+        if idx + PREP_QUEUE_ENTRY_HEADER_LEN > n
+            break
+        let h = (queue[idx] as Int) | ((queue[idx + 1] as Int) << 8)
+        let o = (queue[idx + 2] as Int) | ((queue[idx + 3] as Int) << 8)
+        let vlen = queue[idx + 4] as Int
+        if idx + PREP_QUEUE_ENTRY_HEADER_LEN + vlen > n
+            break
+        var v : [u8] = []
+        var k = 0
+        loop
+            if k >= vlen
+                break
+            v = list.append(v, [queue[idx + PREP_QUEUE_ENTRY_HEADER_LEN + k]])
+            k = k + 1
+        out = db_apply_write(var out, h, o, v)
+        idx = idx + PREP_QUEUE_ENTRY_HEADER_LEN + vlen
+    out
+
+
+// ── Write-side request handlers ────────────────────────────────────
+
+// WRITE_REQ — overwrite the attribute's value (offset always 0).
+@satisfies("REQ-BLE-ATT-SRV-001")
+@tier(embedded)
+fn handle_write_req(var blob: [u8], queue: [u8], req: [u8]) -> WriteResult
+    let handle = att.read_write_req_handle(req)
+    if handle < 0
+        WriteResult {
+            rsp: att.build_error_rsp(att.ATT_OP_WRITE_REQ, 0, att.ATT_ERR_INVALID_PDU),
+            new_blob: blob, new_queue: queue, applied: false
+        }
+    else
+        let idx = db_index_for_handle(blob, handle)
+        if idx < 0
+            WriteResult {
+                rsp: att.build_error_rsp(att.ATT_OP_WRITE_REQ, handle, att.ATT_ERR_INVALID_HANDLE),
+                new_blob: blob, new_queue: queue, applied: false
+            }
+        else if not db_writable_at(blob, handle)
+            WriteResult {
+                rsp: att.build_error_rsp(att.ATT_OP_WRITE_REQ, handle, att.ATT_ERR_WRITE_NOT_PERMITTED),
+                new_blob: blob, new_queue: queue, applied: false
+            }
+        else
+            let value = att.read_write_req_value(req)
+            let value_len = db_value_len_at(blob, idx)
+            if list.len(value) > value_len
+                WriteResult {
+                    rsp: att.build_error_rsp(att.ATT_OP_WRITE_REQ, handle, att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN),
+                    new_blob: blob, new_queue: queue, applied: false
+                }
+            else
+                WriteResult {
+                    rsp: att.build_write_rsp(),
+                    new_blob: db_apply_write(var blob, handle, 0, value),
+                    new_queue: queue, applied: true
+                }
+
+// WRITE_CMD — silent overwrite (no response).  Errors are dropped:
+// command-flag opcodes don't elicit any reply per spec.  Returns
+// `applied=true` iff the write actually went through — the flag a
+// notify dispatcher keys off.
+@satisfies("REQ-BLE-ATT-SRV-001")
+@tier(embedded)
+fn handle_write_cmd(var blob: [u8], queue: [u8], req: [u8]) -> WriteResult
+    let empty_rsp : [u8] = []
+    let handle = att.read_write_req_handle(req)
+    if handle < 0
+        WriteResult { rsp: empty_rsp, new_blob: blob, new_queue: queue, applied: false }
+    else
+        let idx = db_index_for_handle(blob, handle)
+        if idx < 0 or not db_writable_at(blob, handle)
+            WriteResult { rsp: empty_rsp, new_blob: blob, new_queue: queue, applied: false }
+        else
+            let value = att.read_write_req_value(req)
+            let value_len = db_value_len_at(blob, idx)
+            if list.len(value) > value_len
+                WriteResult { rsp: empty_rsp, new_blob: blob, new_queue: queue, applied: false }
+            else
+                WriteResult {
+                    rsp: empty_rsp,
+                    new_blob: db_apply_write(var blob, handle, 0, value),
+                    new_queue: queue, applied: true
+                }
+
+// PREPARE_WRITE_REQ — queue a partial value for atomic apply later.
+// Echoes handle/offset/value in the RSP per spec §3.4.6.1.  Doesn't
+// apply to the blob yet (that's EXECUTE_WRITE_REQ flag=0x01).
+@satisfies("REQ-BLE-ATT-SRV-001")
+@tier(embedded)
+fn handle_prepare_write_req(blob: [u8], var queue: [u8], req: [u8]) -> WriteResult
+    let handle = att.read_prepare_write_req_handle(req)
+    let offset = att.read_prepare_write_req_offset(req)
+    if handle < 0 or offset < 0
+        WriteResult {
+            rsp: att.build_error_rsp(att.ATT_OP_PREPARE_WRITE_REQ, 0, att.ATT_ERR_INVALID_PDU),
+            new_blob: blob, new_queue: queue, applied: false
+        }
+    else
+        let idx = db_index_for_handle(blob, handle)
+        if idx < 0
+            WriteResult {
+                rsp: att.build_error_rsp(att.ATT_OP_PREPARE_WRITE_REQ, handle, att.ATT_ERR_INVALID_HANDLE),
+                new_blob: blob, new_queue: queue, applied: false
+            }
+        else if not db_writable_at(blob, handle)
+            WriteResult {
+                rsp: att.build_error_rsp(att.ATT_OP_PREPARE_WRITE_REQ, handle, att.ATT_ERR_WRITE_NOT_PERMITTED),
+                new_blob: blob, new_queue: queue, applied: false
+            }
+        else
+            let value = att.read_prepare_write_req_value(req)
+            let value_len = db_value_len_at(blob, idx)
+            if offset + list.len(value) > value_len
+                WriteResult {
+                    rsp: att.build_error_rsp(att.ATT_OP_PREPARE_WRITE_REQ, handle, att.ATT_ERR_INVALID_OFFSET),
+                    new_blob: blob, new_queue: queue, applied: false
+                }
+            else if list.len(queue) + PREP_QUEUE_ENTRY_HEADER_LEN + list.len(value) > PREP_QUEUE_CAP_BYTES
+                WriteResult {
+                    rsp: att.build_error_rsp(att.ATT_OP_PREPARE_WRITE_REQ, handle, att.ATT_ERR_PREPARE_QUEUE_FULL),
+                    new_blob: blob, new_queue: queue, applied: false
+                }
+            else
+                WriteResult {
+                    rsp: att.build_prepare_write_rsp(handle, offset, value),
+                    new_blob: blob,
+                    new_queue: prep_queue_push(var queue, handle, offset, value),
+                    applied: false
+                }
+
+// EXECUTE_WRITE_REQ — flag=0x01 commits the queue, flag=0x00 cancels.
+@satisfies("REQ-BLE-ATT-SRV-001")
+@tier(embedded)
+fn handle_execute_write_req(var blob: [u8], queue: [u8], req: [u8]) -> WriteResult
+    let flag = att.read_execute_write_req_flags(req)
+    if flag < 0
+        WriteResult {
+            rsp: att.build_error_rsp(att.ATT_OP_EXECUTE_WRITE_REQ, 0, att.ATT_ERR_INVALID_PDU),
+            new_blob: blob, new_queue: queue, applied: false
+        }
+    else if flag == att.ATT_EXECUTE_WRITE_FLAG_CANCEL
+        let empty_queue : [u8] = []
+        WriteResult {
+            rsp: att.build_execute_write_rsp(),
+            new_blob: blob, new_queue: empty_queue, applied: false
+        }
+    else if flag == att.ATT_EXECUTE_WRITE_FLAG_WRITE
+        let new_blob = prep_queue_apply(queue, var blob)
+        let empty_queue : [u8] = []
+        WriteResult {
+            rsp: att.build_execute_write_rsp(),
+            new_blob: new_blob, new_queue: empty_queue,
+            applied: list.len(queue) > 0
+        }
+    else
+        WriteResult {
+            rsp: att.build_error_rsp(att.ATT_OP_EXECUTE_WRITE_REQ, 0, att.ATT_ERR_INVALID_PDU),
+            new_blob: blob, new_queue: queue, applied: false
+        }
+
+
+// Top-level write-aware dispatcher — the replacement for
+// handle_request.  Threads the queue + blob through write paths,
+// falls back to handle_request for read-only opcodes (which never
+// mutate state, so we lift their response into a WriteResult with
+// no side effects).
+pub @satisfies("REQ-BLE-ATT-SRV-001")
+@tier(embedded)
+fn handle_request_m6(var blob: [u8], var queue: [u8], my_mtu: Int, req: [u8]) -> WriteResult
+    let n = list.len(req)
+    if n < 1
+        WriteResult {
+            rsp: att.build_error_rsp(0, 0, att.ATT_ERR_INVALID_PDU),
+            new_blob: blob, new_queue: queue, applied: false
+        }
+    else
+        let op = req[0] as Int
+        // WRITE_REQ (0x12) and WRITE_CMD (0x52) share the same
+        // method nibble — match on raw op for those two so the
+        // command-flag distinction routes correctly.  PREPARE_WRITE
+        // and EXECUTE_WRITE match on opcode_method since either
+        // form (with or without the command flag) means the same
+        // request family.
+        match op
+            0x12 => handle_write_req(var blob, queue, req)              // WRITE_REQ
+            0x52 => handle_write_cmd(var blob, queue, req)              // WRITE_CMD
+            _    =>
+                match att.opcode_method(op)
+                    0x16 => handle_prepare_write_req(blob, var queue, req)   // PREPARE_WRITE_REQ
+                    0x18 => handle_execute_write_req(var blob, queue, req)   // EXECUTE_WRITE_REQ
+                    _    =>
+                        // Read paths — handle_request is read-only;
+                        // wrap into a WriteResult with no mutation.
+                        WriteResult {
+                            rsp: handle_request(blob, my_mtu, req),
+                            new_blob: blob, new_queue: queue, applied: false
+                        }
+
+
+// ── Builder helper for `gatt_db.nv` and tests ───────────────────────
+//
+// Build one DB record.  Pass end_group = handle for non-service
+// attributes.
+@tier(embedded)
+fn build_db_record(handle: Int, type_uuid16: Int, end_group: Int, value: [u8]) -> [u8]
+    var out: [u8] = list.with_capacity(DB_REC_HEADER_LEN + list.len(value))
+    put_db_record(var out, handle, type_uuid16, end_group, value)
+    out
+
+// The record written onto the end of `out`, which the caller sized: the
+// seven octets of the header (handle, type, end group, value length, all
+// least significant first) and then the value, each pushed in place.
+@tier(embedded)
+fn put_db_record(var out: [u8], handle: Int, type_uuid16: Int, end_group: Int, value: [u8])
+    let plen = list.len(value)
+    let _ = list.try_push(out, (handle & 0xFF) as u8)
+    let _ = list.try_push(out, ((handle >>> 8) & 0xFF) as u8)
+    let _ = list.try_push(out, (type_uuid16 & 0xFF) as u8)
+    let _ = list.try_push(out, ((type_uuid16 >>> 8) & 0xFF) as u8)
+    let _ = list.try_push(out, (end_group & 0xFF) as u8)
+    let _ = list.try_push(out, ((end_group >>> 8) & 0xFF) as u8)
+    let _ = list.try_push(out, plen as u8)
+    for i in 0..plen
+        let _ = list.try_push(out, value[i])
+
+
+// ── Per-opcode handlers ─────────────────────────────────────────────
+
+// EXCHANGE_MTU — server returns its preferred RX MTU.
+@satisfies("REQ-BLE-ATT-SRV-001")
+@tier(embedded)
+fn handle_exchange_mtu(_blob: [u8], my_mtu: Int, _req: [u8]) -> [u8]
+    att.build_exchange_mtu_rsp(my_mtu)
+
+// READ — the attribute's value, its first (ATT_MTU - 1) octets when it
+// is longer ([Vol 3] Part F, Section 3.4.4.4); Invalid Handle for no
+// such attribute and Read Not Permitted for one that cannot be read
+// (Section 3.4.4.3).
+@satisfies("REQ-BLE-ATT-SRV-002")
+@satisfies("REQ-BLE-ATT-SRV-003")
+@tier(embedded)
+fn handle_read(blob: [u8], my_mtu: Int, req: [u8]) -> [u8]
+    let handle = att.read_read_req_handle(req)
+    if handle < 0
+        att.build_error_rsp(att.ATT_OP_READ_REQ, 0, att.ATT_ERR_INVALID_PDU)
+    else
+        let idx = db_index_for_handle(blob, handle)
+        if idx < 0
+            att.build_error_rsp(att.ATT_OP_READ_REQ, handle, att.ATT_ERR_INVALID_HANDLE)
+        else if not db_readable_at(blob, handle)
+            att.build_error_rsp(att.ATT_OP_READ_REQ, handle, att.ATT_ERR_READ_NOT_PERMITTED)
+        else
+            let value = db_value_at(blob, idx)
+            if list.len(value) > my_mtu - 1
+                att.build_read_rsp(value[0:my_mtu - 1])
+            else
+                att.build_read_rsp(value)
+
+// READ_BLOB — return value[offset..min(offset+22, value_len)].
+@satisfies("REQ-BLE-ATT-SRV-003")
+@tier(embedded)
+fn handle_read_blob(blob: [u8], my_mtu: Int, req: [u8]) -> [u8]
+    let handle = att.read_read_blob_req_handle(req)
+    let offset = att.read_read_blob_req_offset(req)
+    if handle < 0 or offset < 0
+        att.build_error_rsp(att.ATT_OP_READ_BLOB_REQ, 0, att.ATT_ERR_INVALID_PDU)
+    else
+        let idx = db_index_for_handle(blob, handle)
+        if idx < 0
+            att.build_error_rsp(att.ATT_OP_READ_BLOB_REQ, handle, att.ATT_ERR_INVALID_HANDLE)
+        else if not db_readable_at(blob, handle)
+            att.build_error_rsp(att.ATT_OP_READ_BLOB_REQ, handle, att.ATT_ERR_READ_NOT_PERMITTED)
+        else
+            let value = db_value_at(blob, idx)
+            let value_len = list.len(value)
+            if offset > value_len
+                att.build_error_rsp(att.ATT_OP_READ_BLOB_REQ, handle, att.ATT_ERR_INVALID_OFFSET)
+            else if offset == value_len
+                // Spec: a READ_BLOB at exactly value_len returns
+                // empty value (signals end of blob).
+                att.build_read_blob_rsp([])
+            else
+                let max = my_mtu - 1
+                var out : [u8] = []
+                var i = offset
+                var end = offset + max
+                if value_len < end
+                    end = value_len
+                loop
+                    if i >= end
+                        break
+                    out = list.append(out, [value[i]])
+                    i = i + 1
+                att.build_read_blob_rsp(out)
+
+// READ_BY_TYPE — for each attribute in [start, end] whose type
+// matches `type16`, emit (handle, value) pairs.  Per spec, all
+// pairs in one RSP must have the same value length; if values
+// differ in length, only the first run with a common length is
+// returned (caller can re-issue with start=last_handle+1).  A value
+// longer than (ATT_MTU - 4) or 253 octets, whichever is smaller, is
+// cut to that length, and only attributes that can be read are
+// returned: one that cannot ends the list, and as the first it is
+// answered with Read Not Permitted ([Vol 3] Part F, Sections 3.4.4.1
+// and 3.4.4.2).
+@satisfies("REQ-BLE-ATT-SRV-003")
+@tier(embedded)
+fn handle_read_by_type(blob: [u8], my_mtu: Int, req: [u8]) -> [u8]
+    let start = att.read_read_by_type_req_start(req)
+    let end = att.read_read_by_type_req_end(req)
+    let tlen = att.read_read_by_type_req_type_len(req)
+    if start < 0 or end < 0 or tlen < 0
+        att.build_error_rsp(att.ATT_OP_READ_BY_TYPE_REQ, 0, att.ATT_ERR_INVALID_PDU)
+    else if tlen != 2
+        // Only 16-bit types are supported in READ_BY_TYPE.
+        att.build_error_rsp(att.ATT_OP_READ_BY_TYPE_REQ, start, att.ATT_ERR_REQUEST_NOT_SUPPORTED)
+    else if start == 0 or start > end
+        att.build_error_rsp(att.ATT_OP_READ_BY_TYPE_REQ, start, att.ATT_ERR_INVALID_HANDLE)
+    else
+        let type16 = att.read_read_by_type_req_type16(req)
+        let count = db_count(blob)
+        var data : [u8] = []
+        var pair_value_len = -1
+        var pair_byte_len = 0
+        var i = 0
+        var first_handle = -1
+        var refused = -1
+        let max_payload = my_mtu - 2
+        let max_value = if my_mtu - 4 < 253 then my_mtu - 4 else 253
+        loop
+            if i >= count
+                break
+            let h = db_handle_at(blob, i)
+            let t = db_type16_at(blob, i)
+            if h >= start and h <= end and t == type16 and not db_readable_at(blob, h)
+                if pair_value_len < 0
+                    refused = h
+                i = count
+            else if h >= start and h <= end and t == type16
+                let full = db_value_at(blob, i)
+                let v = if list.len(full) > max_value then full[0:max_value] else full
+                let vlen = list.len(v)
+                if pair_value_len < 0
+                    // First match — set the pair length.
+                    pair_value_len = vlen
+                    pair_byte_len = 2 + vlen
+                    first_handle = h
+                if vlen == pair_value_len
+                    if list.len(data) + pair_byte_len <= max_payload
+                        let entry : [u8] = [
+                            (h & 0xFF) as u8,
+                            ((h >>> 8) & 0xFF) as u8
+                        ]
+                        data = list.append(list.append(data, entry), v)
+                    else
+                        // RSP is full.
+                        i = count
+            i = i + 1
+        if refused >= 0
+            att.build_error_rsp(att.ATT_OP_READ_BY_TYPE_REQ, refused, att.ATT_ERR_READ_NOT_PERMITTED)
+        else if list.len(data) == 0
+            att.build_error_rsp(att.ATT_OP_READ_BY_TYPE_REQ, start, att.ATT_ERR_ATTRIBUTE_NOT_FOUND)
+        else
+            att.build_read_by_type_rsp(pair_byte_len, data)
+
+// READ_BY_GROUP_TYPE — return (handle, end_group, value) triplets
+// for each attribute matching the group type (typically 0x2800
+// Primary Service).
+@satisfies("REQ-BLE-ATT-SRV-003")
+@tier(embedded)
+fn handle_read_by_group_type(blob: [u8], my_mtu: Int, req: [u8]) -> [u8]
+    let start = att.read_read_by_group_type_req_start(req)
+    let end = att.read_read_by_group_type_req_end(req)
+    let tlen = att.read_read_by_group_type_req_type_len(req)
+    if start < 0 or end < 0 or tlen < 0
+        att.build_error_rsp(att.ATT_OP_READ_BY_GROUP_TYPE_REQ, 0, att.ATT_ERR_INVALID_PDU)
+    else if tlen != 2
+        att.build_error_rsp(att.ATT_OP_READ_BY_GROUP_TYPE_REQ, start, att.ATT_ERR_REQUEST_NOT_SUPPORTED)
+    else if start == 0 or start > end
+        att.build_error_rsp(att.ATT_OP_READ_BY_GROUP_TYPE_REQ, start, att.ATT_ERR_INVALID_HANDLE)
+    else
+        let type16 = att.read_read_by_group_type_req_type16(req)
+        // Only the Primary Service group type is supported.
+        if type16 != GATT_UUID_PRIMARY_SERVICE
+            att.build_error_rsp(att.ATT_OP_READ_BY_GROUP_TYPE_REQ, start, att.ATT_ERR_UNSUPPORTED_GROUP_TYPE)
+        else
+            let count = db_count(blob)
+            var data : [u8] = []
+            var triplet_value_len = -1
+            var triplet_byte_len = 0
+            var i = 0
+            let max_payload = my_mtu - 2
+            loop
+                if i >= count
+                    break
+                let h = db_handle_at(blob, i)
+                let t = db_type16_at(blob, i)
+                if h >= start and h <= end and t == type16
+                    let v = db_value_at(blob, i)
+                    let eg = db_end_group_at(blob, i)
+                    let vlen = list.len(v)
+                    if triplet_value_len < 0
+                        triplet_value_len = vlen
+                        triplet_byte_len = 4 + vlen
+                    if vlen == triplet_value_len
+                        if list.len(data) + triplet_byte_len <= max_payload
+                            let entry : [u8] = [
+                                (h & 0xFF) as u8,
+                                ((h >>> 8) & 0xFF) as u8,
+                                (eg & 0xFF) as u8,
+                                ((eg >>> 8) & 0xFF) as u8
+                            ]
+                            data = list.append(list.append(data, entry), v)
+                        else
+                            i = count
+                i = i + 1
+            if list.len(data) == 0
+                att.build_error_rsp(att.ATT_OP_READ_BY_GROUP_TYPE_REQ, start, att.ATT_ERR_ATTRIBUTE_NOT_FOUND)
+            else
+                att.build_read_by_group_type_rsp(triplet_byte_len, data)
+
+// FIND_INFORMATION — handle + UUID pairs.  The server emits
+// the 16-bit format (0x01).  128-bit attributes are not yet
+// in the db.
+@satisfies("REQ-BLE-ATT-SRV-004")
+@tier(embedded)
+fn handle_find_information(blob: [u8], my_mtu: Int, req: [u8]) -> [u8]
+    let start = att.read_find_info_req_start(req)
+    let end = att.read_find_info_req_end(req)
+    if start < 0 or end < 0
+        att.build_error_rsp(att.ATT_OP_FIND_INFORMATION_REQ, 0, att.ATT_ERR_INVALID_PDU)
+    else if start == 0 or start > end
+        att.build_error_rsp(att.ATT_OP_FIND_INFORMATION_REQ, start, att.ATT_ERR_INVALID_HANDLE)
+    else
+        let count = db_count(blob)
+        var data : [u8] = []
+        var i = 0
+        let max_payload = my_mtu - 2
+        loop
+            if i >= count
+                break
+            let h = db_handle_at(blob, i)
+            let t = db_type16_at(blob, i)
+            if h >= start and h <= end
+                if list.len(data) + 4 <= max_payload
+                    let entry : [u8] = [
+                        (h & 0xFF) as u8,
+                        ((h >>> 8) & 0xFF) as u8,
+                        (t & 0xFF) as u8,
+                        ((t >>> 8) & 0xFF) as u8
+                    ]
+                    data = list.append(data, entry)
+                else
+                    i = count
+            i = i + 1
+        if list.len(data) == 0
+            att.build_error_rsp(att.ATT_OP_FIND_INFORMATION_REQ, start, att.ATT_ERR_ATTRIBUTE_NOT_FOUND)
+        else
+            att.build_find_info_rsp(att.ATT_FIND_INFO_FORMAT_UUID16, data)
+
+// FIND_BY_TYPE_VALUE — handle group ids for attributes with
+// (type == uuid16) and (value == compare_value).  Used by GATT
+// "discover service by UUID" — the ATT layer doesn't peek at
+// what 0x2800 means, it just compares bytes.
+@satisfies("REQ-BLE-ATT-SRV-004")
+@tier(embedded)
+fn handle_find_by_type_value(blob: [u8], my_mtu: Int, req: [u8]) -> [u8]
+    let start = att.read_find_by_type_value_req_start(req)
+    let end = att.read_find_by_type_value_req_end(req)
+    let type16 = att.read_find_by_type_value_req_type16(req)
+    let req_len = list.len(req)
+    if start < 0 or end < 0 or type16 < 0 or req_len < 7
+        att.build_error_rsp(att.ATT_OP_FIND_BY_TYPE_VALUE_REQ, 0, att.ATT_ERR_INVALID_PDU)
+    else if start == 0 or start > end
+        att.build_error_rsp(att.ATT_OP_FIND_BY_TYPE_VALUE_REQ, start, att.ATT_ERR_INVALID_HANDLE)
+    else
+        // Compare-value bytes start at req[7].
+        let compare_len = req_len - 7
+        let count = db_count(blob)
+        var data : [u8] = []
+        var i = 0
+        let max_payload = my_mtu - 1
+        loop
+            if i >= count
+                break
+            let h = db_handle_at(blob, i)
+            let t = db_type16_at(blob, i)
+            if h >= start and h <= end and t == type16
+                let v = db_value_at(blob, i)
+                if list.len(v) == compare_len
+                    var matches = true
+                    var j = 0
+                    loop
+                        if j >= compare_len
+                            break
+                        if (v[j] as Int) != (req[7 + j] as Int)
+                            matches = false
+                            break
+                        j = j + 1
+                    if matches
+                        let eg = db_end_group_at(blob, i)
+                        if list.len(data) + 4 <= max_payload
+                            let entry : [u8] = [
+                                (h & 0xFF) as u8,
+                                ((h >>> 8) & 0xFF) as u8,
+                                (eg & 0xFF) as u8,
+                                ((eg >>> 8) & 0xFF) as u8
+                            ]
+                            data = list.append(data, entry)
+                        else
+                            i = count
+            i = i + 1
+        if list.len(data) == 0
+            att.build_error_rsp(att.ATT_OP_FIND_BY_TYPE_VALUE_REQ, start, att.ATT_ERR_ATTRIBUTE_NOT_FOUND)
+        else
+            att.build_find_by_type_value_rsp(data)
+
+
+// ── Top-level dispatcher ────────────────────────────────────────────
+//
+// Single entry-point.  Returns the response PDU bytes.  Always
+// returns *something* — even malformed input gets an ERROR_RSP.
+pub @satisfies("REQ-BLE-ATT-SRV-001")
+@tier(embedded)
+fn handle_request(blob: [u8], my_mtu: Int, req: [u8]) -> [u8]
+    let n = list.len(req)
+    if n < 1
+        att.build_error_rsp(0, 0, att.ATT_ERR_INVALID_PDU)
+    else
+        let op = req[0] as Int
+        // Match against opcode_method so a request with the
+        // command flag set (rare for read-side) still classifies.
+        match att.opcode_method(op)
+            0x02 => handle_exchange_mtu(blob, my_mtu, req)         // EXCHANGE_MTU_REQ
+            0x0A => handle_read(blob, my_mtu, req)                  // READ_REQ
+            0x0C => handle_read_blob(blob, my_mtu, req)             // READ_BLOB_REQ
+            0x08 => handle_read_by_type(blob, my_mtu, req)          // READ_BY_TYPE_REQ
+            0x10 => handle_read_by_group_type(blob, my_mtu, req)    // READ_BY_GROUP_TYPE_REQ
+            0x04 => handle_find_information(blob, my_mtu, req)      // FIND_INFORMATION_REQ
+            0x06 => handle_find_by_type_value(blob, my_mtu, req)    // FIND_BY_TYPE_VALUE_REQ
+            _    => att.build_error_rsp(op, 0, att.ATT_ERR_REQUEST_NOT_SUPPORTED)
+
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+// Small fixture DB used by the tests below.  Mirrors the minimal
+// Device Information service that `gatt_db.nv` builds for real:
+//
+//   0x0001  PrimaryService    end=0x0005   value=0x180A
+//   0x0002  Characteristic    end=0x0002   value=[02,03,00,29,2A]
+//   0x0003  Manufacturer Name end=0x0003   value="Novo"
+//   0x0004  Characteristic    end=0x0004   value=[02,05,00,24,2A]
+//   0x0005  Model Number      end=0x0005   value="M5-1.0"
+@tier(embedded)
+fn fixture_db() -> [u8]
+    var r1 = build_db_record(0x0001, GATT_UUID_PRIMARY_SERVICE, 0x0005,
+        [0x0A, 0x18])
+    let r2 = build_db_record(0x0002, GATT_UUID_CHARACTERISTIC, 0x0002,
+        [0x02, 0x03, 0x00, 0x29, 0x2A])
+    let r3 = build_db_record(0x0003, 0x2A29, 0x0003,
+        [0x4E, 0x6F, 0x76, 0x6F])
+    let r4 = build_db_record(0x0004, GATT_UUID_CHARACTERISTIC, 0x0004,
+        [0x02, 0x05, 0x00, 0x24, 0x2A])
+    let r5 = build_db_record(0x0005, 0x2A24, 0x0005,
+        [0x4D, 0x35, 0x2D, 0x31, 0x2E, 0x30])
+    list.append(r1, r2)
+    list.append(r1, r3)
+    list.append(r1, r4)
+    list.append(r1, r5)
+    r1
+
+
+@test
+fn test_db_count_walks_records()
+    let db = fixture_db()
+    test.assert_eq(db_count(db), 5)
+
+@test
+fn test_db_handle_lookup()
+    let db = fixture_db()
+    test.assert_eq(db_handle_at(db, 0), 0x0001)
+    test.assert_eq(db_handle_at(db, 4), 0x0005)
+    test.assert_eq(db_index_for_handle(db, 0x0003), 2)
+    test.assert_eq(db_index_for_handle(db, 0x9999), -1)
+
+@test
+fn test_db_value_lookup()
+    let db = fixture_db()
+    let v = db_value_at(db, 2)
+    test.assert_eq(list.len(v), 4)
+    test.assert_eq(v[0] as Int, 0x4E)        // 'N'
+    test.assert_eq(v[3] as Int, 0x6F)        // 'o'
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-001")
+fn test_dispatch_exchange_mtu()
+    let db = fixture_db()
+    let req : [u8] = [att.ATT_OP_EXCHANGE_MTU_REQ, 0x17, 0x00]
+    let rsp = handle_request(db, ATT_DEFAULT_MTU, req)
+    test.assert_eq(rsp[0] as Int, att.ATT_OP_EXCHANGE_MTU_RSP)
+    test.assert_eq(rsp[1] as Int, ATT_DEFAULT_MTU)
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-002")
+fn test_dispatch_read_existing_handle()
+    let db = fixture_db()
+    let req : [u8] = [att.ATT_OP_READ_REQ, 0x03, 0x00]
+    let rsp = handle_request(db, ATT_DEFAULT_MTU, req)
+    test.assert_eq(rsp[0] as Int, att.ATT_OP_READ_RSP)
+    test.assert_eq(list.len(rsp), 1 + 4)
+    test.assert_eq(rsp[1] as Int, 0x4E)      // "Novo"
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-003")
+fn test_dispatch_read_invalid_handle()
+    let db = fixture_db()
+    let req : [u8] = [att.ATT_OP_READ_REQ, 0xFF, 0x00]
+    let rsp = handle_request(db, ATT_DEFAULT_MTU, req)
+    test.assert_eq(rsp[0] as Int, att.ATT_OP_ERROR_RSP)
+    test.assert_eq(rsp[1] as Int, att.ATT_OP_READ_REQ)
+    test.assert_eq(rsp[4] as Int, att.ATT_ERR_INVALID_HANDLE)
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-003")
+fn test_dispatch_read_by_group_type_primary_service()
+    // RBGT start=1 end=0xFFFF type=0x2800.
+    let db = fixture_db()
+    let req : [u8] = [
+        att.ATT_OP_READ_BY_GROUP_TYPE_REQ,
+        0x01, 0x00,
+        0xFF, 0xFF,
+        0x00, 0x28
+    ]
+    let rsp = handle_request(db, ATT_DEFAULT_MTU, req)
+    test.assert_eq(rsp[0] as Int, att.ATT_OP_READ_BY_GROUP_TYPE_RSP)
+    test.assert_eq(rsp[1] as Int, 6)         // triplet_len = 4 + value(2)
+    test.assert_eq(rsp[2] as Int, 0x01)      // handle lo
+    test.assert_eq(rsp[3] as Int, 0x00)
+    test.assert_eq(rsp[4] as Int, 0x05)      // end_group lo
+    test.assert_eq(rsp[5] as Int, 0x00)
+    test.assert_eq(rsp[6] as Int, 0x0A)      // value lo (Device Info)
+    test.assert_eq(rsp[7] as Int, 0x18)
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-003")
+fn test_dispatch_read_by_group_type_unsupported_group_type()
+    // Group type 0x2802 (Include) is not a primary-service alias —
+    // The server rejects.
+    let db = fixture_db()
+    let req : [u8] = [
+        att.ATT_OP_READ_BY_GROUP_TYPE_REQ,
+        0x01, 0x00,
+        0xFF, 0xFF,
+        0x02, 0x28
+    ]
+    let rsp = handle_request(db, ATT_DEFAULT_MTU, req)
+    test.assert_eq(rsp[0] as Int, att.ATT_OP_ERROR_RSP)
+    test.assert_eq(rsp[4] as Int, att.ATT_ERR_UNSUPPORTED_GROUP_TYPE)
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-003")
+fn test_dispatch_read_by_type_characteristics()
+    // RBT start=1 end=0xFFFF type=0x2803 → both characteristic decls.
+    let db = fixture_db()
+    let req : [u8] = [
+        att.ATT_OP_READ_BY_TYPE_REQ,
+        0x01, 0x00,
+        0xFF, 0xFF,
+        0x03, 0x28
+    ]
+    let rsp = handle_request(db, ATT_DEFAULT_MTU, req)
+    test.assert_eq(rsp[0] as Int, att.ATT_OP_READ_BY_TYPE_RSP)
+    test.assert_eq(rsp[1] as Int, 7)         // pair_len = 2 + value(5)
+    test.assert_eq(rsp[2] as Int, 0x02)      // first handle = 0x0002
+    test.assert_eq(rsp[9] as Int, 0x04)      // second handle = 0x0004
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-004")
+fn test_dispatch_find_information()
+    // FII start=1 end=2 — should return 2 handle/UUID pairs.
+    let db = fixture_db()
+    let req : [u8] = [
+        att.ATT_OP_FIND_INFORMATION_REQ,
+        0x01, 0x00,
+        0x02, 0x00
+    ]
+    let rsp = handle_request(db, ATT_DEFAULT_MTU, req)
+    test.assert_eq(rsp[0] as Int, att.ATT_OP_FIND_INFORMATION_RSP)
+    test.assert_eq(rsp[1] as Int, att.ATT_FIND_INFO_FORMAT_UUID16)
+    test.assert_eq(list.len(rsp), 2 + 4 + 4)
+    test.assert_eq(rsp[2] as Int, 0x01)      // handle 0x0001
+    test.assert_eq(rsp[4] as Int, 0x00)      // type 0x2800 lo
+    test.assert_eq(rsp[5] as Int, 0x28)      // type 0x2800 hi
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-004")
+fn test_dispatch_find_by_type_value_primary_service_dev_info()
+    // FBTV looking for service with UUID 0x180A.  Should return
+    // (handle=0x0001, end_group=0x0005).
+    let db = fixture_db()
+    let req : [u8] = [
+        att.ATT_OP_FIND_BY_TYPE_VALUE_REQ,
+        0x01, 0x00,
+        0xFF, 0xFF,
+        0x00, 0x28,
+        0x0A, 0x18
+    ]
+    let rsp = handle_request(db, ATT_DEFAULT_MTU, req)
+    test.assert_eq(rsp[0] as Int, att.ATT_OP_FIND_BY_TYPE_VALUE_RSP)
+    test.assert_eq(list.len(rsp), 1 + 4)
+    test.assert_eq(rsp[1] as Int, 0x01)      // handle lo
+    test.assert_eq(rsp[3] as Int, 0x05)      // end_group lo
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-001")
+fn test_dispatch_unknown_opcode_returns_error()
+    let db = fixture_db()
+    // 0xFF is reserved.
+    let req : [u8] = [0xFF]
+    let rsp = handle_request(db, ATT_DEFAULT_MTU, req)
+    test.assert_eq(rsp[0] as Int, att.ATT_OP_ERROR_RSP)
+    test.assert_eq(rsp[1] as Int, 0xFF)
+    test.assert_eq(rsp[4] as Int, att.ATT_ERR_REQUEST_NOT_SUPPORTED)
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-003")
+fn test_dispatch_read_blob_offset_within_value()
+    // READ_BLOB on handle 0x0005 ("M5-1.0") with offset 3.
+    let db = fixture_db()
+    let req : [u8] = [
+        att.ATT_OP_READ_BLOB_REQ,
+        0x05, 0x00,
+        0x03, 0x00
+    ]
+    let rsp = handle_request(db, ATT_DEFAULT_MTU, req)
+    test.assert_eq(rsp[0] as Int, att.ATT_OP_READ_BLOB_RSP)
+    test.assert_eq(list.len(rsp), 1 + 3)     // "1.0"
+    test.assert_eq(rsp[1] as Int, 0x31)
+    test.assert_eq(rsp[2] as Int, 0x2E)
+    test.assert_eq(rsp[3] as Int, 0x30)
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-003")
+fn test_dispatch_read_blob_offset_past_end()
+    let db = fixture_db()
+    let req : [u8] = [
+        att.ATT_OP_READ_BLOB_REQ,
+        0x05, 0x00,
+        0xFF, 0x00        // offset 255 — way past 6-byte value
+    ]
+    let rsp = handle_request(db, ATT_DEFAULT_MTU, req)
+    test.assert_eq(rsp[0] as Int, att.ATT_OP_ERROR_RSP)
+    test.assert_eq(rsp[4] as Int, att.ATT_ERR_INVALID_OFFSET)
+
+
+// ── Fixture: writable Heart-Rate-style db ───────────────────────────
+//
+// Mirrors a single-characteristic writable service for tests:
+//
+//   0x0001  PrimaryService (0x180D Heart Rate)   value=[0x0D 0x18]
+//   0x0002  Characteristic decl  props=0x0A (R+W) value_handle=0x0003 uuid=0x2A37
+//                                value=[0x0A, 0x03 0x00, 0x37 0x2A]
+//   0x0003  Heart Rate Measurement (writable)    value=[0x00 0x00 0x00 0x00]   (4-byte slot)
+@tier(embedded)
+fn fixture_writable_db() -> [u8]
+    var r1 = build_db_record(0x0001, GATT_UUID_PRIMARY_SERVICE, 0x0003,
+        [0x0D, 0x18])
+    let r2 = build_db_record(0x0002, GATT_UUID_CHARACTERISTIC, 0x0002,
+        [0x0A, 0x03, 0x00, 0x37, 0x2A])
+    // 4-byte writable slot — initialised to zeros.
+    let r3 = build_db_record(0x0003, 0x2A37, 0x0003,
+        [0x00, 0x00, 0x00, 0x00])
+    list.append(r1, r2)
+    list.append(r1, r3)
+    r1
+
+
+@test
+fn test_db_properties_for_value_handle()
+    let db = fixture_writable_db()
+    test.assert_eq(db_properties_for_value_handle(db, 0x0003), 0x0A)  // R+W
+    test.assert_eq(db_properties_for_value_handle(db, 0x9999), -1)
+    // Read-only DB lookup — fixture_db's char at 0x0003 has props 0x02 (R only).
+    test.assert_eq(db_writable_at(fixture_db(), 0x0003), false)
+    test.assert_eq(db_writable_at(db, 0x0003), true)
+
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-001")
+fn test_handle_write_req_success_round_trip()
+    var db = fixture_writable_db()
+    let queue : [u8] = []
+    // WRITE_REQ handle=0x0003 value=[0xAA 0xBB 0xCC 0xDD]
+    let req : [u8] = [
+        att.ATT_OP_WRITE_REQ,
+        0x03, 0x00,
+        0xAA, 0xBB, 0xCC, 0xDD
+    ]
+    let r = handle_write_req(var db, queue, req)
+    test.assert_eq(r.rsp[0] as Int, att.ATT_OP_WRITE_RSP)
+    test.assert_eq(r.applied, true)
+    // Read back through the new blob.
+    let read_req : [u8] = [att.ATT_OP_READ_REQ, 0x03, 0x00]
+    let read_rsp = handle_request(r.new_blob, ATT_DEFAULT_MTU, read_req)
+    test.assert_eq(read_rsp[0] as Int, att.ATT_OP_READ_RSP)
+    test.assert_eq(read_rsp[1] as Int, 0xAA)
+    test.assert_eq(read_rsp[4] as Int, 0xDD)
+
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-001")
+fn test_handle_write_req_invalid_handle_returns_error()
+    var db = fixture_writable_db()
+    let queue : [u8] = []
+    let req : [u8] = [
+        att.ATT_OP_WRITE_REQ,
+        0xFF, 0x00,
+        0x42
+    ]
+    let r = handle_write_req(var db, queue, req)
+    test.assert_eq(r.rsp[0] as Int, att.ATT_OP_ERROR_RSP)
+    test.assert_eq(r.rsp[1] as Int, att.ATT_OP_WRITE_REQ)
+    test.assert_eq(r.rsp[4] as Int, att.ATT_ERR_INVALID_HANDLE)
+    test.assert_eq(r.applied, false)
+
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-001")
+fn test_handle_write_req_read_only_returns_write_not_permitted()
+    // Manufacturer Name in fixture_db is read-only (props 0x02).
+    var db = fixture_db()
+    let queue : [u8] = []
+    let req : [u8] = [
+        att.ATT_OP_WRITE_REQ,
+        0x03, 0x00,
+        0x42
+    ]
+    let r = handle_write_req(var db, queue, req)
+    test.assert_eq(r.rsp[0] as Int, att.ATT_OP_ERROR_RSP)
+    test.assert_eq(r.rsp[4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    test.assert_eq(r.applied, false)
+
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-001")
+fn test_handle_write_req_value_too_long_returns_invalid_value_len()
+    var db = fixture_writable_db()
+    let queue : [u8] = []
+    // 4-byte slot, 5-byte payload.
+    let req : [u8] = [
+        att.ATT_OP_WRITE_REQ,
+        0x03, 0x00,
+        0x01, 0x02, 0x03, 0x04, 0x05
+    ]
+    let r = handle_write_req(var db, queue, req)
+    test.assert_eq(r.rsp[0] as Int, att.ATT_OP_ERROR_RSP)
+    test.assert_eq(r.rsp[4] as Int, att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    test.assert_eq(r.applied, false)
+
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-001")
+fn test_handle_write_cmd_silent_and_applies()
+    var db = fixture_writable_db()
+    let queue : [u8] = []
+    // WRITE_CMD opcode=0x52, handle=0x0003, value=[0x11 0x22]
+    let req : [u8] = [
+        att.ATT_OP_WRITE_CMD,
+        0x03, 0x00,
+        0x11, 0x22
+    ]
+    let r = handle_write_cmd(var db, queue, req)
+    // No response per spec — empty rsp bytes.
+    test.assert_eq(list.len(r.rsp), 0)
+    test.assert_eq(r.applied, true)
+    // Verify partial-overwrite behaviour: bytes 0-1 changed, 2-3 still zero.
+    let read_req : [u8] = [att.ATT_OP_READ_REQ, 0x03, 0x00]
+    let read_rsp = handle_request(r.new_blob, ATT_DEFAULT_MTU, read_req)
+    test.assert_eq(read_rsp[1] as Int, 0x11)
+    test.assert_eq(read_rsp[2] as Int, 0x22)
+    test.assert_eq(read_rsp[3] as Int, 0x00)
+    test.assert_eq(read_rsp[4] as Int, 0x00)
+
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-001")
+fn test_handle_write_cmd_silent_on_unwritable()
+    var db = fixture_db()                  // read-only fixture
+    let queue : [u8] = []
+    let req : [u8] = [
+        att.ATT_OP_WRITE_CMD,
+        0x03, 0x00,
+        0x42
+    ]
+    let r = handle_write_cmd(var db, queue, req)
+    test.assert_eq(list.len(r.rsp), 0)     // still silent
+    test.assert_eq(r.applied, false)
+
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-001")
+fn test_prepare_then_execute_commits_atomically()
+    let db = fixture_writable_db()
+    var queue : [u8] = []
+    // Prepare two slices: offset 0 = [0xAA 0xBB], offset 2 = [0xCC 0xDD].
+    let prep1 : [u8] = [
+        att.ATT_OP_PREPARE_WRITE_REQ,
+        0x03, 0x00,
+        0x00, 0x00,
+        0xAA, 0xBB
+    ]
+    let r1 = handle_prepare_write_req(db, var queue, prep1)
+    test.assert_eq(r1.rsp[0] as Int, att.ATT_OP_PREPARE_WRITE_RSP)
+    test.assert_eq(r1.applied, false)        // not yet committed
+    let prep2 : [u8] = [
+        att.ATT_OP_PREPARE_WRITE_REQ,
+        0x03, 0x00,
+        0x02, 0x00,
+        0xCC, 0xDD
+    ]
+    let r2 = handle_prepare_write_req(r1.new_blob, r1.new_queue[:], prep2)
+    test.assert_eq(r2.rsp[0] as Int, att.ATT_OP_PREPARE_WRITE_RSP)
+    test.assert_eq(r2.applied, false)
+    // Pre-execute the value should still be all zeros.
+    let read_pre : [u8] = [att.ATT_OP_READ_REQ, 0x03, 0x00]
+    let pre_rsp = handle_request(r2.new_blob, ATT_DEFAULT_MTU, read_pre)
+    test.assert_eq(pre_rsp[1] as Int, 0x00)
+
+    // EXECUTE_WRITE flag=0x01 → commit.
+    let exec : [u8] = [att.ATT_OP_EXECUTE_WRITE_REQ, 0x01]
+    let r3 = handle_execute_write_req(r2.new_blob[:], r2.new_queue, exec)
+    test.assert_eq(r3.rsp[0] as Int, att.ATT_OP_EXECUTE_WRITE_RSP)
+    test.assert_eq(r3.applied, true)
+    test.assert_eq(list.len(r3.new_queue), 0)            // queue drained
+    // Both slices applied.
+    let post_rsp = handle_request(r3.new_blob, ATT_DEFAULT_MTU, read_pre)
+    test.assert_eq(post_rsp[1] as Int, 0xAA)
+    test.assert_eq(post_rsp[2] as Int, 0xBB)
+    test.assert_eq(post_rsp[3] as Int, 0xCC)
+    test.assert_eq(post_rsp[4] as Int, 0xDD)
+
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-001")
+fn test_execute_write_cancel_drops_queue_without_committing()
+    let db = fixture_writable_db()
+    var queue : [u8] = []
+    let prep : [u8] = [
+        att.ATT_OP_PREPARE_WRITE_REQ,
+        0x03, 0x00,
+        0x00, 0x00,
+        0xAA, 0xBB
+    ]
+    let r1 = handle_prepare_write_req(db, var queue, prep)
+    let exec : [u8] = [att.ATT_OP_EXECUTE_WRITE_REQ, 0x00]
+    let r2 = handle_execute_write_req(r1.new_blob[:], r1.new_queue, exec)
+    test.assert_eq(r2.rsp[0] as Int, att.ATT_OP_EXECUTE_WRITE_RSP)
+    test.assert_eq(r2.applied, false)
+    test.assert_eq(list.len(r2.new_queue), 0)
+    // Value still all zeros.
+    let read : [u8] = [att.ATT_OP_READ_REQ, 0x03, 0x00]
+    let post = handle_request(r2.new_blob, ATT_DEFAULT_MTU, read)
+    test.assert_eq(post[1] as Int, 0x00)
+
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-001")
+fn test_handle_request_m6_routes_writes_through_to_blob()
+    // Top-level dispatcher — confirm it routes write opcodes
+    // into the write path while passing reads through unchanged.
+    var db = fixture_writable_db()
+    var queue : [u8] = []
+    let req : [u8] = [
+        att.ATT_OP_WRITE_REQ,
+        0x03, 0x00,
+        0x42
+    ]
+    let r = handle_request_m6(var db, var queue, ATT_DEFAULT_MTU, req)
+    test.assert_eq(r.rsp[0] as Int, att.ATT_OP_WRITE_RSP)
+    test.assert_eq(r.applied, true)
+    // Now route a read through the same dispatcher — applied=false
+    // because reads don't mutate.
+    let read : [u8] = [att.ATT_OP_READ_REQ, 0x03, 0x00]
+    let r2 = handle_request_m6(r.new_blob[:], r.new_queue[:], ATT_DEFAULT_MTU, read)
+    test.assert_eq(r2.rsp[0] as Int, att.ATT_OP_READ_RSP)
+    test.assert_eq(r2.rsp[1] as Int, 0x42)
+    test.assert_eq(r2.applied, false)
+
+// A characteristic with Indicate only, its value at 0x0003, then a
+// readable 30-octet value at 0x0005.
+@tier(app)
+fn fixture_permissions_db() -> [u8]
+    var long_value: [u8] = []
+    for i in 0..30
+        list.push(long_value, (0x41 + i) as u8)
+    var db = build_db_record(0x0001, GATT_UUID_PRIMARY_SERVICE, 0x0005, [0x01, 0x18])
+    list.append(db, build_db_record(0x0002, GATT_UUID_CHARACTERISTIC, 0x0002, [0x20, 0x03, 0x00, 0x05, 0x2A]))
+    list.append(db, build_db_record(0x0003, 0x2A05, 0x0003, [0x01, 0x00, 0xFF, 0xFF]))
+    list.append(db, build_db_record(0x0004, GATT_UUID_CHARACTERISTIC, 0x0004, [0x02, 0x05, 0x00, 0x00, 0x2A]))
+    list.append(db, build_db_record(0x0005, 0x2A00, 0x0005, long_value))
+    db
+
+@test
+fn test_read_not_permitted_without_the_read_property()
+    let db = fixture_permissions_db()
+    let rsp = handle_request(db, ATT_DEFAULT_MTU, [0x0A, 0x03, 0x00])
+    test.assert_eq(rsp[0] as Int, att.ATT_OP_ERROR_RSP)
+    test.assert_eq(rsp[4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+    let blob_rsp = handle_request(db, ATT_DEFAULT_MTU, [0x0C, 0x03, 0x00, 0x00, 0x00])
+    test.assert_eq(blob_rsp[4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+    // Read By Type of the value's type: the first match cannot be read.
+    let by_type = handle_request(db, ATT_DEFAULT_MTU, [0x08, 0x01, 0x00, 0xFF, 0xFF, 0x05, 0x2A])
+    test.assert_eq(by_type[0] as Int, att.ATT_OP_ERROR_RSP)
+    test.assert_eq(by_type[2] as Int, 0x03)
+    test.assert_eq(by_type[4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+
+@test
+fn test_long_values_are_cut_to_the_mtu()
+    let db = fixture_permissions_db()
+    // ATT_READ_RSP: opcode and ATT_MTU - 1 = 22 octets.
+    let rsp = handle_request(db, ATT_DEFAULT_MTU, [0x0A, 0x05, 0x00])
+    test.assert_eq(list.len(rsp), ATT_DEFAULT_MTU)
+    test.assert_eq(rsp[1] as Int, 0x41)
+    // ATT_READ_BY_TYPE_RSP: one pair of handle and ATT_MTU - 4 = 19 octets.
+    let by_type = handle_request(db, ATT_DEFAULT_MTU, [0x08, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x2A])
+    test.assert_eq(by_type[0] as Int, att.ATT_OP_READ_BY_TYPE_RSP)
+    test.assert_eq(by_type[1] as Int, 21)
+    test.assert_eq(list.len(by_type), 2 + 21)

@@ -1,0 +1,412 @@
+// src/budget.nv — the RAM the Host core's storage adds up to, from the limits.
+//
+// The keys of the package configuration (`noble_config`, schema in novo.toml) name every
+// capacity of the Host core's storage, and this module adds the storage up with the size
+// rule measured on the toolchain: a `Vec[T; N]` takes round8(8 + N * sizeof(T)) bytes, the 8
+// being its length.  The tests assert that the sum equals `noble_config.budget_bytes()`, the
+// total that the `bytes_expr` fields of the schema give (`novo config explain` prints it), so
+// the schema and this module agree on the size rule.  The storage of the extension modules
+// whose keys stay in the schema of orbit/ble (the BTP faces, the Unicast Client, the
+// Broadcast Assistant and the others) is added up the same way in orbit/ble
+// (src/host/ext_budget.nv), which also holds the sum to the RAM the board leaves the Host
+// (`host_budget_bytes`).  The Controller's storage is added up in the package
+// noble-controller (`ctl_budget`).  The figure is the size of the declared storage; the
+// memory report of the device build (tests/memory.sh of orbit/ble) is what the image
+// reserves.
+//
+// The keys of the audio roles and the services whose storage is a product of a key of the
+// core (the ASE rows of every link, the control services, the Broadcast Source and Sink
+// rows over the BIS count, the Unicast streams over the SDU octets, the control clients, the
+// Battery levels of every link) are keys of this schema: a cost formula reads only the keys
+// of its own schema (docs/config.md, Cost formulas).  They move to the packages of the
+// roles with the roles.
+//
+// The record sizes below are those of the schema's `bytes_expr` fields.
+
+use std.test
+use limits
+use noble_config
+use links
+
+// The in-RAM transport rings of coresident/hci_ram.nv.
+const TRANSPORT_RINGS = 1456
+// One SMP pairing state.
+const PAIRING_CONTEXT = 700
+// One bond (peer, keys, counters, flags) and the header of the store.
+const BOND_RECORD = 128
+const BOND_HEADER = 8
+// The scalars and security of one connection's ATT state, and one bearer.
+const ATT_LINK_FIXED = 52
+const BEARER_RECORD = 24
+// One L2CAP channel's record, one CIS record, one broadcast group's, one
+// broadcast stream's, and one ASE row.
+const COC_CHANNEL_RECORD = 64
+const CIS_RECORD = 48
+const BIG_RECORD = 24
+const BIS_RECORD = 8
+const ASE_ROW = 116
+// The control services: the handles and standing state of the four services
+// that exist once, one AICS or VOCS instance, one preset, and one client's
+// rows of the Coordinated Set and Hearing Access services.
+const CONTROL_SERVICES = 256
+const CONTROL_INSTANCE = 96
+const PRESET_ROW = 56
+const CSIS_CLIENT_ROW = 24
+const HAS_CLIENT_ROW = 24
+// The scalars of the database and the header of the sequenced pool.
+const DB_SCALARS = 16
+const SEQUENCED_HEADER = 8
+// The registers of one client bearer, the fields of one queued client
+// request and the octets of the Database Hash a client link keeps, and the
+// scalars of the BTP client bridge of one connection (btp/btp_gatt_client.nv).
+const CLIENT_REGS = 41
+const CLIENT_QUEUE_FIELDS = 10
+const CLIENT_HASH_OCTETS = 16
+const BRIDGE_ROW = 96
+
+// One broadcast Audio Stream of the Broadcast Source without its BIS handles:
+// the scalars, and the lists (address, code, name, Metadata, advertising data
+// and the BASE) at their largest; and the running procedure's buffers.
+const BCAST_ROW_FIXED = 272
+const BCAST_ROW_LISTS = 1472
+const BCAST_PROC = 1536
+
+// The longest codec configuration or Metadata a BTP BAP or CAP command carries
+// (a length octet), and the scalars of the BTP face of the Source
+// (btp/btp_bap.nv): the command that waits and the draft's header.
+const BAP_LTV_OCTETS = 255
+const BAP_SCALARS = 64
+
+// One stream of the Unicast Server (gaf/unicast_iso.nv) without the buffer an
+// SDU is put together in, and the queue of steps with the registers of the BTP
+// face.
+const UNI_STREAM_FIXED = 128
+const UNI_PROC = 512
+
+// The Scan Delegator and the Broadcast Sink (gaf/bcast_sink.nv): the scalars of
+// a receive state and its synchronization, its lists at their largest (address,
+// codes, subgroups with their Metadata, requests, the periodic data and the
+// BASE), and the table's command, queues, script and handles.
+const SINK_ROW_FIXED = 448
+const SINK_ROW_LISTS = 1088
+const SINK_TABLE = 768
+// The control clients (gaf/control_client.nv, csip_coordinator.nv, cap_commander.nv):
+// the registers of a link's row and of a service instance, the steps of a job, the
+// octets it stages and the SIRK a link read; the Set Coordinator's scalars and one
+// member of its set, the Commander's scalars, and the BTP face (btp/btp_gaf_client.nv).
+const CTL_LINK_REGS = 16
+const CTL_INSTANCE_REGS = 17
+const CTL_JOB_INTS = 120
+const CTL_STAGE = 64
+const CTL_SIRK = 16
+const CTL_COORD_FIXED = 256
+const CTL_COORD_MEMBER = 40
+const CTL_CMD_FIXED = 128
+const CTL_BTP_STATE = 512
+// The Hearing Access Profile clients (gaf/has_client.nv, ias_client.nv): the service instances of a
+// link's row, the registers of the Remote Controller's row, the fields of a cached preset record and
+// the longest name, and the BTP face (btp/btp_hap.nv).
+const HAP_INSTANCES = 3
+const HAP_LINK_REGS = 18
+const HAP_RECORD_FIELDS = 3
+const HAP_NAME_OCTETS = 40
+const HAP_BTP_STATE = 640
+
+// The larger of `n` and 1: a table of an absent feature keeps one record.
+@tier(embedded)
+const fn max1(n: Int) -> Int
+    if n > 1 then n else 1
+
+// One L2CAP B-frame buffer: the largest ATT PDU and the L2CAP header.
+@tier(embedded)
+const fn frame_octets() -> Int
+    noble_config.MAX_ATT_MTU + 4
+
+// `n` rounded up to a multiple of 8.
+@tier(embedded)
+const fn round8(n: Int) -> Int
+    (n + 7) / 8 * 8
+
+// The bytes of a `Vec[T; n]` whose element is `size` octets.
+@tier(embedded)
+const fn vec_bytes(n: Int, size: Int) -> Int
+    round8(8 + n * size)
+
+// The bytes of a `Vec[u8; octets]`, the unit of every buffer pool.
+@tier(embedded)
+const fn slot(octets: Int) -> Int
+    vec_bytes(octets, 1)
+
+// The GATT database: one column per attribute field, the value store, the
+// 128-bit UUID table and the scalars.
+@tier(embedded)
+const fn database_bytes() -> Int
+    let a = noble_config.MAX_ATTRIBUTES
+    vec_bytes(a, 2) * 6 + vec_bytes(a, 1) * 4 + slot(noble_config.MAX_VALUE_BYTES)
+        + vec_bytes(noble_config.MAX_UUID128, slot(16)) + DB_SCALARS
+
+@tier(embedded)
+const fn registry_bytes() -> Int
+    let n = limits.LINK_SLOTS
+    8 + vec_bytes(n, 1) + vec_bytes(n, 4) + vec_bytes(n, 2) + vec_bytes(n, 1) + vec_bytes(n, 1)
+        + vec_bytes(n * 6, 1) + 8 + vec_bytes(n, 1)
+        + 2 * vec_bytes(links.ACL_OWED_HANDLES, 2)
+
+@tier(embedded)
+const fn receive_frame_bytes() -> Int
+    8 + noble_config.MAX_CONNECTIONS * slot(frame_octets())
+
+@tier(embedded)
+const fn att_state_bytes() -> Int
+    let prepared = if noble_config.MAX_PREPARED_BYTES > 0 then slot(noble_config.MAX_PREPARED_BYTES) else 0
+    noble_config.MAX_CONNECTIONS * (ATT_LINK_FIXED + noble_config.MAX_BEARERS * BEARER_RECORD
+        + vec_bytes(noble_config.MAX_CCCD, 2) + prepared)
+
+@tier(embedded)
+const fn transmit_pool_bytes() -> Int
+    let slots = noble_config.ACL_BUFFERS + noble_config.MAX_CONNECTIONS
+    slots * slot(noble_config.ACL_OCTETS) + 8 + 8 * slots
+
+@tier(embedded)
+const fn sequenced_bytes() -> Int
+    if noble_config.SEQUENCED_SLOTS > 0 then noble_config.SEQUENCED_SLOTS * slot(frame_octets()) + SEQUENCED_HEADER else 0
+
+@tier(embedded)
+const fn pending_bit_bytes() -> Int
+    noble_config.MAX_CONNECTIONS * round8((noble_config.MAX_ATTRIBUTES + 7) / 8)
+
+@tier(embedded)
+const fn bond_bytes() -> Int
+    BOND_HEADER + noble_config.MAX_BONDS * (BOND_RECORD + vec_bytes(noble_config.MAX_CCCD, 2))
+
+@tier(embedded)
+const fn channel_bytes() -> Int
+    noble_config.MAX_COC_CHANNELS * (slot(frame_octets()) + COC_CHANNEL_RECORD)
+
+@tier(embedded)
+const fn iso_bytes() -> Int
+    let streams = noble_config.MAX_CIS + noble_config.MAX_BIS
+    if streams > 0
+        streams * 3 * slot(noble_config.ISO_SDU_OCTETS) + noble_config.MAX_CIS * CIS_RECORD
+            + noble_config.MAX_BIG * BIG_RECORD + noble_config.MAX_BIS * BIS_RECORD
+    else
+        0
+
+@tier(embedded)
+const fn ase_bytes() -> Int
+    noble_config.MAX_CONNECTIONS * noble_config.MAX_ASES * ASE_ROW
+
+@tier(embedded)
+const fn control_bytes() -> Int
+    let configured = noble_config.MAX_AICS + noble_config.MAX_VOCS + noble_config.MAX_PRESETS + noble_config.MAX_SET_SIZE
+    if configured > 0
+        CONTROL_SERVICES + (noble_config.MAX_AICS + noble_config.MAX_VOCS) * CONTROL_INSTANCE + noble_config.MAX_PRESETS * PRESET_ROW
+            + noble_config.MAX_CONNECTIONS * (CSIS_CLIENT_ROW + HAS_CLIENT_ROW + slot(noble_config.MAX_PRESETS))
+    else
+        0
+
+// The GATT client engine (gatt_client.nv): five scalar columns and the
+// Database Hash per link, the discovery cache, and per bearer the registers,
+// the request queue, the value and payload buffers and the PDU buffer.
+@tier(embedded)
+const fn client_bytes() -> Int
+    let links = noble_config.MAX_CLIENT_LINKS
+    let rows = links * noble_config.CLIENT_BEARERS
+    let cache = links * noble_config.CLIENT_CACHE_RECORDS
+    if links == 0
+        0
+    else
+        5 * vec_bytes(links, 8) + slot(links * CLIENT_HASH_OCTETS) + 2 * slot(cache) + 3 * vec_bytes(cache, 2)
+            + 2 * vec_bytes(cache, 8) + vec_bytes(rows * CLIENT_REGS, 8)
+            + vec_bytes(rows * noble_config.CLIENT_QUEUE * CLIENT_QUEUE_FIELDS, 8)
+            + 2 * slot(rows * noble_config.CLIENT_VALUE_BYTES) + slot(rows * noble_config.MAX_ATT_MTU)
+
+// The BTP client bridge: the scalars one session keeps for each client link it
+// serves, which are the connections of the session up to the links of the
+// engine.
+@tier(embedded)
+const fn bridge_bytes() -> Int
+    if noble_config.MAX_CLIENT_LINKS == 0
+        0
+    else if noble_config.MAX_CONNECTIONS < noble_config.MAX_CLIENT_LINKS
+        noble_config.MAX_CONNECTIONS * BRIDGE_ROW
+    else
+        noble_config.MAX_CLIENT_LINKS * BRIDGE_ROW
+
+// The Broadcast Source (host/gaf/bcast_source.nv): a row for each stream, the
+// candidate row that a reconfigure or a Metadata update builds, and the
+// procedure.
+@tier(embedded)
+const fn broadcast_bytes() -> Int
+    let sources = noble_config.MAX_BCAST_SOURCES
+    let row = BCAST_ROW_FIXED + BCAST_ROW_LISTS + vec_bytes(noble_config.MAX_BIS, 8)
+    if sources == 0
+        0
+    else
+        sources * row + row + BCAST_PROC
+
+// The BTP face of the Broadcast Source (btp/btp_bap.nv): the CAP draft, which
+// holds a codec configuration for each stream and each subgroup and the
+// Codec_ID and Metadata of a subgroup, the row of each source_id, and the
+// Metadata of the Public Broadcast Announcement and the Broadcast Name that PBP
+// sets.
+@tier(embedded)
+const fn bap_bytes() -> Int
+    let sources = noble_config.MAX_BCAST_SOURCES
+    let ltv = slot(BAP_LTV_OCTETS)
+    let draft = noble_config.MAX_BIS * ((8 + ltv) + (8 + slot(5) + 2 * ltv))
+    if sources == 0
+        0
+    else
+        draft + vec_bytes(sources, 8) + slot(250) + ltv + BAP_SCALARS
+
+// The isochronous side of the Unicast Server (host/gaf/unicast_iso.nv): for
+// each stream its scalars and the buffer an SDU is put together in, and the
+// queue of steps.
+@tier(embedded)
+const fn unicast_bytes() -> Int
+    let streams = noble_config.MAX_UNICAST_STREAMS
+    if streams == 0
+        0
+    else
+        streams * (UNI_STREAM_FIXED + slot(noble_config.ISO_SDU_OCTETS)) + UNI_PROC
+
+// The Scan Delegator and the Broadcast Sink (host/gaf/bcast_sink.nv): a row for
+// each receive state, with the lists of BIS numbers and handles that follow
+// MAX_BIS, and the table.
+@tier(embedded)
+const fn sink_bytes() -> Int
+    let sinks = noble_config.MAX_BCAST_SINKS
+    if sinks == 0
+        0
+    else
+        sinks * (SINK_ROW_FIXED + SINK_ROW_LISTS + 3 * vec_bytes(noble_config.MAX_BIS, 8)) + SINK_TABLE
+// The control clients of a Volume Controller, a Microphone Controller, a Set Coordinator
+// and a CAP Commander, for the links `noble_config.MAX_GAF_CLIENTS` names.
+@tier(embedded)
+const fn control_client_bytes() -> Int
+    if noble_config.MAX_GAF_CLIENTS == 0
+        0
+    else
+        noble_config.MAX_GAF_CLIENTS * (vec_bytes(CTL_LINK_REGS, 8) + vec_bytes(noble_config.MAX_CTL_INSTANCES * CTL_INSTANCE_REGS, 8)
+            + vec_bytes(CTL_JOB_INTS, 8) + slot(CTL_STAGE) + slot(CTL_SIRK))
+            + CTL_COORD_FIXED + noble_config.MAX_SET_SIZE * CTL_COORD_MEMBER + CTL_CMD_FIXED + noble_config.MAX_SET_SIZE * 8 + CTL_BTP_STATE
+
+// The per-link state of the Battery and HID Services (profiles/bas_policy.nv,
+// profiles/hogp.nv): the level last sent for each instance on each link, and
+// the Protocol Mode and the suspend state of each link.
+@tier(embedded)
+const fn profile_link_bytes() -> Int
+    vec_bytes(noble_config.MAX_CONNECTIONS * noble_config.MAX_BAS, 8) + 2 * vec_bytes(noble_config.MAX_CONNECTIONS, 8)
+
+// The Hearing Access Profile clients, for the links `noble_config.MAX_GAF_CLIENTS` names and
+// the preset records `noble_config.MAX_HAS_CACHE` names: a job runner and a cache for each link,
+// and the BTP face once.  None without both.
+@tier(embedded)
+const fn hap_bytes() -> Int
+    if noble_config.MAX_GAF_CLIENTS == 0 or noble_config.MAX_HAS_CACHE == 0
+        0
+    else
+        noble_config.MAX_GAF_CLIENTS * (vec_bytes(CTL_LINK_REGS, 8) + vec_bytes(HAP_INSTANCES * CTL_INSTANCE_REGS, 8)
+            + vec_bytes(CTL_JOB_INTS, 8) + slot(CTL_STAGE) + slot(CTL_SIRK)
+            + vec_bytes(HAP_LINK_REGS, 8) + vec_bytes(noble_config.MAX_HAS_CACHE * HAP_RECORD_FIELDS, 8)
+            + vec_bytes(noble_config.MAX_HAS_CACHE * HAP_NAME_OCTETS, 1) + slot(HAP_NAME_OCTETS)) + HAP_BTP_STATE
+
+// The Host core's storage, in bytes.
+@tier(embedded)
+const fn total_bytes() -> Int
+    database_bytes() + registry_bytes() + receive_frame_bytes() + att_state_bytes()
+        + transmit_pool_bytes() + sequenced_bytes() + pending_bit_bytes()
+        + noble_config.MAX_PAIRING * PAIRING_CONTEXT + bond_bytes() + channel_bytes() + iso_bytes()
+        + ase_bytes() + control_bytes() + 2 * slot(noble_config.HCI_BUFFER_OCTETS) + TRANSPORT_RINGS + client_bytes() + bridge_bytes()
+        + broadcast_bytes() + bap_bytes() + unicast_bytes() + sink_bytes() + control_client_bytes()
+        + profile_link_bytes() + hap_bytes()
+
+// The checks of the limits, made when the build is compiled: a profile that
+// breaks one stops `novo build` and `novo test` with the message, before the
+// linker or a test run.  They are the compile-time form of what used to be
+// tests, and the messages name the key to change.
+
+// The storage is the total the schema's `bytes_expr` fields give, so the schema and this module agree on the size rule.
+assert_const(total_bytes() == noble_config.budget_bytes(), "noble: budget.nv and the bytes_expr fields of novo.toml disagree on the storage total: correct the size rule in one of them (`novo config explain` prints the schema's rows)")
+// Every pool holds a slot for every connection, and the registry is declared for them.
+assert_const(noble_config.MAX_CONNECTIONS >= 1, "noble: MAX_CONNECTIONS must be at least 1")
+assert_const(noble_config.MAX_CONNECTIONS <= limits.LINK_SLOTS, "noble: max_connections exceeds LINK_SLOTS (limits.nv), the connection slots the registry and the ACL credit pool are declared for: lower MAX_CONNECTIONS or declare more slots")
+assert_const(noble_config.ACL_BUFFERS >= 1, "noble: ACL_BUFFERS must be at least 1")
+assert_const(noble_config.MAX_BEARERS >= 1, "noble: MAX_BEARERS must be at least 1")
+assert_const(noble_config.MAX_PAIRING >= 1, "noble: MAX_PAIRING must be at least 1")
+assert_const(noble_config.MAX_ATT_MTU >= 23, "noble: MAX_ATT_MTU must be at least 23, the ATT default MTU")
+// The profiles keep their minimum.
+assert_const(noble_config.MAX_BAS >= 1, "noble: MAX_BAS must be at least 1")
+assert_const(noble_config.MAX_GAF_CLIENTS == 0 or noble_config.MAX_CTL_INSTANCES >= 3, "noble: MAX_CTL_INSTANCES must be at least 3 where MAX_GAF_CLIENTS asks for the control clients")
+
+// The sizes the toolchain reports for these types.
+@test
+fn test_a_vec_takes_its_elements_and_an_eight_octet_length()
+    test.assert_eq(slot(27), 40)
+    test.assert_eq(slot(16), 24)
+    test.assert_eq(vec_bytes(3, 2), 16)
+    test.assert_eq(vec_bytes(3, slot(16)), 80)
+    test.assert_eq(slot(512), 520)
+    test.assert_eq(slot(792), 800)
+
+@test
+fn test_the_btp_face_of_the_source_holds_a_draft_a_row_for_each_source_and_the_announcement()
+    if noble_config.MAX_BCAST_SOURCES == 0
+        test.assert_eq(bap_bytes(), 0)
+    else
+        let ltv = slot(255)
+        test.assert_eq(bap_bytes(), noble_config.MAX_BIS * ((8 + ltv) + (8 + slot(5) + 2 * ltv)) + vec_bytes(noble_config.MAX_BCAST_SOURCES, 8) + slot(250) + ltv + BAP_SCALARS)
+
+@test
+fn test_the_broadcast_source_holds_a_row_for_each_stream_a_candidate_and_a_procedure()
+    let row = BCAST_ROW_FIXED + BCAST_ROW_LISTS + vec_bytes(noble_config.MAX_BIS, 8)
+    if noble_config.MAX_BCAST_SOURCES == 0
+        test.assert_eq(broadcast_bytes(), 0)
+    else
+        test.assert_eq(broadcast_bytes(), noble_config.MAX_BCAST_SOURCES * row + row + BCAST_PROC)
+    // The lists at their largest: the address, the Broadcast_Code, a name of 32
+    // octets, Metadata of 250, advertising data of 310 and 256, and the BASE
+    // twice (the layout and its encoding) at 252.
+    test.assert(BCAST_ROW_LISTS >= slot(6) + slot(16) + slot(32) + slot(250) + slot(310) + slot(256) + 2 * slot(252))
+
+@test
+fn test_the_unicast_server_holds_a_row_and_an_sdu_buffer_for_each_stream_and_a_queue()
+    if noble_config.MAX_UNICAST_STREAMS == 0
+        test.assert_eq(unicast_bytes(), 0)
+    else
+        test.assert_eq(unicast_bytes(), noble_config.MAX_UNICAST_STREAMS * (UNI_STREAM_FIXED + slot(noble_config.ISO_SDU_OCTETS)) + UNI_PROC)
+
+@test
+fn test_the_sink_holds_a_row_for_each_receive_state_and_a_table()
+    if noble_config.MAX_BCAST_SINKS == 0
+        test.assert_eq(sink_bytes(), 0)
+    else
+        test.assert_eq(sink_bytes(), noble_config.MAX_BCAST_SINKS * (SINK_ROW_FIXED + SINK_ROW_LISTS + 3 * vec_bytes(noble_config.MAX_BIS, 8)) + SINK_TABLE)
+    // The lists at their largest: the address, the Bad_Code and the Broadcast_Code, four
+    // subgroups with 255 octets of Metadata between them, the requests, 256 octets of
+    // periodic data and the BASE of 252.
+    test.assert(SINK_ROW_LISTS >= slot(6) + slot(16) + slot(16) + 4 * 16 + slot(255) + vec_bytes(4, 8) + slot(256) + slot(252))
+
+@test
+fn test_the_control_clients_are_there_where_the_profile_asks_for_them()
+    if noble_config.MAX_GAF_CLIENTS == 0
+        test.assert_eq(control_client_bytes(), 0)
+    else
+        // A row for each link, and the set, the Commander and the BTP face once.
+        test.assert(control_client_bytes() > noble_config.MAX_GAF_CLIENTS * vec_bytes(CTL_JOB_INTS, 8))
+
+
+@test
+@satisfies("REQ-BLE-PRF-005")
+fn test_the_battery_and_hid_link_state_is_a_level_for_each_instance_and_two_registers_for_each_link()
+    test.assert_eq(profile_link_bytes(), vec_bytes(noble_config.MAX_CONNECTIONS * noble_config.MAX_BAS, 8) + 2 * vec_bytes(noble_config.MAX_CONNECTIONS, 8))
+
+@test
+fn test_the_hap_controllers_are_there_where_the_profile_asks_for_them()
+    if noble_config.MAX_GAF_CLIENTS == 0 or noble_config.MAX_HAS_CACHE == 0
+        test.assert_eq(hap_bytes(), 0)
+    else
+        // A row for each link, and the BTP face once.
+        test.assert(hap_bytes() > noble_config.MAX_GAF_CLIENTS * vec_bytes(noble_config.MAX_HAS_CACHE * HAP_NAME_OCTETS, 1))
+        test.assert(hap_bytes() > HAP_BTP_STATE)

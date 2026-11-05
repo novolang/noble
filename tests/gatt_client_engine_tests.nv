@@ -1,0 +1,1670 @@
+// tests/gatt_client_engine_tests.nv -- the GATT client engine against the
+// GATT server, in one process.
+//
+// `gatt_client` is the client half and `gatt_server` the server half of the
+// Attribute Protocol.  Each test builds a server (the database of
+// `gatt_server.host_server` and the services it adds), opens a client link on
+// a `ClientTable`, and moves the PDUs between them as a transport would:
+// whatever `take_tx` hands out goes to `gatt_server.receive_on`, and what the
+// server answers goes to `on_pdu`.  A second server and a second client link
+// make the two links of a Central that talks to two peripherals at once.
+//
+//   * every procedure of the engine runs against the server that answers it:
+//     MTU exchange, the discoveries, the reads, the writes, the subscriptions;
+//   * the error paths: an Error Response, a response that cannot be read, a
+//     transaction that times out, a queue that is full;
+//   * the peer's database changes: Database Out Of Sync, the Database Hash and
+//     a Service Changed indication;
+//   * two links, and two bearers of one link, run side by side and keep their
+//     own state.
+
+use std.test
+use att
+use gatt_client
+use gatt_db
+use gatt_server
+use links
+
+// ── Fixtures ────────────────────────────────────────────────────────
+
+// What a run of the PDU pump saw: the events `on_pdu` answered, and for each
+// `EV_DONE` the ticket, the status and the value buffer at that moment.
+struct Log
+    var events: [Int]
+    var tickets: [Int]
+    var statuses: [Int]
+    var values: [[Int]]
+    var sent: [[Int]]
+    var notified: [Int]
+    var pushed: [[Int]]
+    var kinds: [Int]
+
+fn new_log() -> Log
+    Log { events: [], tickets: [], statuses: [], values: [], sent: [], notified: [], pushed: [], kinds: [] }
+
+fn to_pdu(b: [u8]) -> Vec[u8; 247]
+    var v: Vec[u8; 247] = Vec.new()
+    for x in b
+        let _ = v.push(x)
+    v
+
+fn from_pdu(v: Vec[u8; 247], n: Int) -> [u8]
+    var out: [u8] = []
+    for i in 0..n
+        list.push(out, v[i])
+    out
+
+fn payload(b: [Int]) -> Vec[u8; 256]
+    var v: Vec[u8; 256] = Vec.new()
+    for x in b
+        let _ = v.push(x as u8)
+    v
+
+fn ints(b: [u8]) -> [Int]
+    var out: [Int] = []
+    for x in b
+        list.push(out, x as Int)
+    out
+
+fn value_of(var t: gatt_client.ClientTable, link: links.LinkId, bearer: Int) -> [Int]
+    var out: [Int] = []
+    for i in 0..gatt_client.value_len(var t, link, bearer)
+        list.push(out, gatt_client.value_at(var t, link, bearer, i))
+    out
+
+fn fill(n: Int, v: Int) -> [Int]
+    var out: [Int] = []
+    for _ in 0..n
+        list.push(out, v)
+    out
+
+fn ramp(n: Int) -> [Int]
+    var out: [Int] = []
+    for i in 0..n
+        list.push(out, (i + 1) & 0xFF)
+    out
+
+fn link_a() -> links.LinkId
+    links.link_id(0, 1)
+
+fn link_b() -> links.LinkId
+    links.link_id(1, 1)
+
+// A table with link A open.
+fn table() -> gatt_client.ClientTable
+    var t = gatt_client.new_table()
+    test.assert(gatt_client.open(var t, link_a()))
+    t
+
+// Hand the client bearer's PDUs to `s` and the answers back, until the client
+// has nothing more to send.  `now` is the clock the client's timers read.
+fn pump_at(var t: gatt_client.ClientTable, link: links.LinkId, bearer: Int, var s: gatt_server.GattServer, now: Int, var log: Log)
+    for _ in 0..200
+        var out: Vec[u8; 247] = Vec.new()
+        let kind = gatt_client.take_tx(var t, link, bearer, now, var out)
+        if kind == gatt_client.TX_NONE
+            return
+        list.push(log.kinds, kind)
+        let sent = from_pdu(out, out.len())
+        list.push(log.sent, ints(sent))
+        for r in gatt_server.receive_on(var s.db, var s.link, bearer, sent, now)
+            deliver(t, link, bearer, r, log)
+    test.fail("the pump did not settle")
+
+// Feed one PDU to the client and note what came of it.
+fn deliver(var t: gatt_client.ClientTable, link: links.LinkId, bearer: Int, pdu: [u8], var log: Log)
+    var p = to_pdu(pdu)
+    let ev = gatt_client.on_pdu(var t, link, bearer, var p, list.len(pdu))
+    if ev != gatt_client.EV_NONE
+        list.push(log.events, ev)
+    if ev == gatt_client.EV_DONE
+        list.push(log.tickets, gatt_client.result_ticket(var t, link, bearer))
+        list.push(log.statuses, gatt_client.result_status(var t, link, bearer))
+        list.push(log.values, value_of(t, link, bearer))
+    if ev == gatt_client.EV_NOTIFICATION or ev == gatt_client.EV_INDICATION or ev == gatt_client.EV_SERVICE_CHANGED
+        list.push(log.notified, gatt_client.event_handle(var t, link, bearer))
+        list.push(log.pushed, ints(pdu[3:]))
+
+fn pump(var t: gatt_client.ClientTable, link: links.LinkId, var s: gatt_server.GattServer, var log: Log)
+    pump_at(var t, link, 0, var s, 0, var log)
+
+// Take one PDU from the client bearer, hand it to the server and answer what
+// the server answered without delivering it, so a test can change it first.
+// `kind` is what `take_tx` said; the answers are empty when there was nothing
+// to send.
+fn exchange(var t: gatt_client.ClientTable, link: links.LinkId, bearer: Int, var s: gatt_server.GattServer, now: Int, var log: Log) -> [[u8]]
+    var out: Vec[u8; 247] = Vec.new()
+    let kind = gatt_client.take_tx(var t, link, bearer, now, var out)
+    if kind == gatt_client.TX_NONE
+        return []
+    list.push(log.kinds, kind)
+    let sent = from_pdu(out, out.len())
+    list.push(log.sent, ints(sent))
+    gatt_server.receive_on(var s.db, var s.link, bearer, sent, now)
+
+// The value the server holds at `handle`.
+fn served(var s: gatt_server.GattServer, handle: Int) -> [Int]
+    ints(s.db.attributes[gatt_server.index_of(s.db, handle)].value)
+
+// Run one request to its end and answer its status.
+fn run(var t: gatt_client.ClientTable, link: links.LinkId, var s: gatt_server.GattServer, ticket: Int) -> Int
+    test.assert(ticket > 0)
+    var trace = new_log()
+    pump(t, link, s, trace)
+    test.assert_eq(list.len(trace.tickets), 1)
+    test.assert_eq(trace.tickets[0], ticket)
+    trace.statuses[0]
+
+// A server with the services below on top of the GAP and GATT services of
+// `host_server` (handles 0x0001 to 0x0017):
+//
+//   0x0018 service 0xAA00, to 0x0021
+//     0x0019 characteristic 0xAA01 (read, write), value 0x001A = 01 02 03 04
+//     0x001B characteristic 0xAA02 (read, write, notify, indicate), value 0x001C,
+//            with the configuration descriptor 0x001D and a user description 0x001E
+//     0x001F characteristic 0xAA03 (read), value 0x0020 = the ramp of 100 octets
+//     0x0021 characteristic 0xAA04 (write without response), value 0x0022
+//   0x0023 service 0xBB00, to 0x0026, which includes the first service
+//     0x0024 include of 0x0018
+//     0x0025 characteristic 0xBB01 (read), value 0x0026
+fn server() -> gatt_server.GattServer
+    var s = gatt_server.host_server()
+    test.assert_eq(gatt_server.add_service(var s.db, false, gatt_server.le16(0xAA00)), 0x0018)
+    test.assert_eq(gatt_server.add_characteristic(var s.db, 0x0A, gatt_server.PERM_READ | gatt_server.PERM_WRITE, gatt_server.le16(0xAA01)), 0x0019)
+    test.assert(gatt_server.set_value(var s.db, 0, [0x01, 0x02, 0x03, 0x04]))
+    test.assert_eq(gatt_server.add_characteristic(var s.db, 0x3A, gatt_server.PERM_READ | gatt_server.PERM_WRITE, gatt_server.le16(0xAA02)), 0x001B)
+    test.assert(gatt_server.set_value(var s.db, 0, [0x09]))
+    test.assert_eq(gatt_server.add_descriptor(var s.db, gatt_server.PERM_READ | gatt_server.PERM_WRITE, gatt_server.le16(gatt_server.UUID_CLIENT_CHARACTERISTIC_CONFIGURATION)), 0x001D)
+    test.assert_eq(gatt_server.add_descriptor(var s.db, gatt_server.PERM_READ, gatt_server.le16(gatt_server.UUID_CHARACTERISTIC_USER_DESCRIPTION)), 0x001E)
+    test.assert_eq(gatt_server.add_characteristic(var s.db, 0x02, gatt_server.PERM_READ, gatt_server.le16(0xAA03)), 0x001F)
+    test.assert(gatt_server.set_value(var s.db, 0, gatt_server.octets(ramp(100))))
+    test.assert_eq(gatt_server.add_characteristic(var s.db, 0x04, gatt_server.PERM_WRITE, gatt_server.le16(0xAA04)), 0x0021)
+    test.assert(gatt_server.set_value(var s.db, 0, [0x00]))
+    test.assert_eq(gatt_server.add_service(var s.db, false, gatt_server.le16(0xBB00)), 0x0023)
+    test.assert_eq(gatt_server.add_included(var s.db, 0x0018), 0x0024)
+    test.assert_eq(gatt_server.add_characteristic(var s.db, 0x02, gatt_server.PERM_READ, gatt_server.le16(0xBB01)), 0x0025)
+    test.assert(gatt_server.set_value(var s.db, 0, [0x77]))
+    s
+
+// ── Link and bearer ─────────────────────────────────────────────────
+
+@test
+fn test_the_mtu_is_exchanged_once_and_is_the_smaller_of_the_two()
+    var t = table()
+    var s = server()
+    test.assert_eq(gatt_client.mtu(var t, link_a(), 0), 23)
+    let ticket = gatt_client.begin_exchange_mtu(var t, link_a(), 0)
+    test.assert_eq(run(t, link_a(), s, ticket), 0)
+    // The server's Rx MTU is 65 and the client offers its own 247.
+    test.assert_eq(gatt_client.mtu(var t, link_a(), 0), 65)
+    test.assert_eq(gatt_server.mtu_of(s.link, 0), 65)
+    test.assert_eq(gatt_client.begin_exchange_mtu(var t, link_a(), 0), gatt_client.ERR_REPEAT)
+
+@test
+fn test_the_mtu_request_carries_the_clients_rx_mtu()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let _ = gatt_client.begin_exchange_mtu(var t, link_a(), 0)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.sent[0], [0x02, 247, 0])
+
+// ── Discovery ───────────────────────────────────────────────────────
+
+// Record `i` of the cache as kind, handle, a, b and the UUID's low word.
+fn rec(var t: gatt_client.ClientTable, link: links.LinkId, i: Int) -> [Int]
+    [gatt_client.cache_kind_at(var t, link, i), gatt_client.cache_handle_at(var t, link, i), gatt_client.cache_a_at(var t, link, i),
+        gatt_client.cache_b_at(var t, link, i), gatt_client.cache_uuid_at(var t, link, i).lo]
+
+// The UUID of the 16 octets `b` as they are on the air.
+fn uuid_of(b: [u8]) -> gatt_client.Uuid
+    var lo = 0
+    var hi = 0
+    for k in 0..8
+        lo = lo | ((b[k] as Int) << (8 * k))
+        hi = hi | ((b[8 + k] as Int) << (8 * k))
+    gatt_client.uuid128(lo, hi)
+
+fn discover_everything(var t: gatt_client.ClientTable, link: links.LinkId, var s: gatt_server.GattServer)
+    test.assert_eq(run(t, link, s, gatt_client.begin_exchange_mtu(var t, link, 0)), 0)
+    test.assert_eq(run(t, link, s, gatt_client.begin_discover_services(var t, link, 0, 1, 0xFFFF, false)), 0)
+
+@test
+fn test_primary_services_are_discovered_and_cached()
+    var t = table()
+    var s = server()
+    discover_everything(var t, link_a(), var s)
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 4)
+    test.assert_eq(rec(var t, link_a(), 0), [1, 0x0001, 0x000D, 0, 0x1800])
+    test.assert_eq(rec(var t, link_a(), 1), [1, 0x000E, 0x0017, 0, 0x1801])
+    test.assert_eq(rec(var t, link_a(), 2), [1, 0x0018, 0x0022, 0, 0xAA00])
+    test.assert_eq(rec(var t, link_a(), 3), [1, 0x0023, 0x0026, 0, 0xBB00])
+    test.assert(not gatt_client.cache_secondary_at(var t, link_a(), 0))
+
+@test
+fn test_discovery_pages_until_the_range_ends()
+    var t = table()
+    var s = server()
+    // At ATT_MTU 23 a response holds three services of six octets.
+    var trace = new_log()
+    let _ = gatt_client.begin_discover_services(var t, link_a(), 0, 1, 0xFFFF, false)
+    pump(t, link_a(), s, trace)
+    // The third request, past the last service, is answered Attribute Not Found.
+    test.assert_eq(list.len(trace.sent), 3)
+    test.assert_eq(trace.sent[0], [0x10, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28])
+    test.assert_eq(trace.sent[1], [0x10, 0x23, 0x00, 0xFF, 0xFF, 0x00, 0x28])
+    test.assert_eq(trace.sent[2], [0x10, 0x27, 0x00, 0xFF, 0xFF, 0x00, 0x28])
+    test.assert_eq(trace.statuses, [0])
+    test.assert_eq(gatt_client.result_found(var t, link_a(), 0), 4)
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 4)
+
+@test
+fn test_discovery_of_a_narrow_range_stops_at_its_end()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let _ = gatt_client.begin_discover_services(var t, link_a(), 0, 0x0018, 0x0018, false)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(list.len(trace.sent), 1)
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 1)
+    test.assert_eq(rec(var t, link_a(), 0), [1, 0x0018, 0x0022, 0, 0xAA00])
+
+@test
+fn test_a_range_with_no_service_ends_well_with_nothing_found()
+    var t = table()
+    var s = server()
+    test.assert_eq(run(t, link_a(), s, gatt_client.begin_discover_services(var t, link_a(), 0, 0x0030, 0xFFFF, false)), 0)
+    test.assert_eq(gatt_client.result_found(var t, link_a(), 0), 0)
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 0)
+
+@test
+fn test_services_of_both_uuid_widths_are_discovered()
+    var t = table()
+    var s = server()
+    let wide = gatt_server.add_service(var s.db, false, gatt_server.uuid128(0x05))
+    test.assert_eq(wide, 0x0027)
+    discover_everything(var t, link_a(), var s)
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 5)
+    let u = gatt_client.cache_uuid_at(var t, link_a(), 4)
+    test.assert(u.wide)
+    test.assert(gatt_client.uuid_same(u, uuid_of(gatt_server.uuid128(0x05))))
+    test.assert_eq(gatt_client.cache_handle_at(var t, link_a(), 4), 0x0027)
+
+@test
+fn test_secondary_services_are_discovered_apart_from_primary_ones()
+    var t = table()
+    var s = server()
+    let secondary = gatt_server.add_service(var s.db, true, gatt_server.le16(0xCC00))
+    test.assert_eq(run(t, link_a(), s, gatt_client.begin_discover_services(var t, link_a(), 0, 1, 0xFFFF, true)), 0)
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 1)
+    test.assert_eq(gatt_client.cache_handle_at(var t, link_a(), 0), secondary)
+    test.assert(gatt_client.cache_secondary_at(var t, link_a(), 0))
+
+@test
+fn test_a_service_is_found_by_uuid()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let _ = gatt_client.begin_discover_services_by_uuid(var t, link_a(), 0, 1, 0xFFFF, gatt_client.uuid16(0xBB00))
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.sent[0], [0x06, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28, 0x00, 0xBB])
+    test.assert_eq(trace.statuses, [0])
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 1)
+    test.assert_eq(rec(var t, link_a(), 0), [1, 0x0023, 0x0026, 0, 0xBB00])
+
+@test
+fn test_a_128_bit_service_is_found_by_uuid()
+    var t = table()
+    var s = server()
+    let _ = gatt_server.add_service(var s.db, false, gatt_server.uuid128(0x05))
+    let want = uuid_of(gatt_server.uuid128(0x05))
+    var trace = new_log()
+    let _ = gatt_client.begin_discover_services_by_uuid(var t, link_a(), 0, 1, 0xFFFF, want)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(list.len(trace.sent[0]), 7 + 16)
+    test.assert_eq(trace.statuses, [0])
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 1)
+    test.assert(gatt_client.uuid_same(gatt_client.cache_uuid_at(var t, link_a(), 0), want))
+
+@test
+fn test_a_service_that_is_not_there_is_not_found_and_not_an_error()
+    var t = table()
+    var s = server()
+    test.assert_eq(run(t, link_a(), s, gatt_client.begin_discover_services_by_uuid(var t, link_a(), 0, 1, 0xFFFF, gatt_client.uuid16(0x1234))), 0)
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 0)
+
+@test
+fn test_characteristics_of_a_service_are_discovered()
+    var t = table()
+    var s = server()
+    test.assert_eq(run(t, link_a(), s, gatt_client.begin_discover_characteristics(var t, link_a(), 0, 0x0018, 0x0022)), 0)
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 4)
+    test.assert_eq(rec(var t, link_a(), 0), [3, 0x0019, 0x001A, 0x0A, 0xAA01])
+    test.assert_eq(rec(var t, link_a(), 1), [3, 0x001B, 0x001C, 0x3A, 0xAA02])
+    test.assert_eq(rec(var t, link_a(), 2), [3, 0x001F, 0x0020, 0x02, 0xAA03])
+    test.assert_eq(rec(var t, link_a(), 3), [3, 0x0021, 0x0022, 0x04, 0xAA04])
+
+@test
+fn test_characteristics_are_found_by_uuid_and_only_those_are_cached()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let _ = gatt_client.begin_discover_characteristics_by_uuid(var t, link_a(), 0, 0x0018, 0x0022, gatt_client.uuid16(0xAA03))
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.statuses, [0])
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 1)
+    test.assert_eq(rec(var t, link_a(), 0), [3, 0x001F, 0x0020, 0x02, 0xAA03])
+    test.assert_eq(gatt_client.result_found(var t, link_a(), 0), 1)
+
+@test
+fn test_a_128_bit_characteristic_is_discovered()
+    var t = table()
+    var s = server()
+    let decl = gatt_server.add_characteristic(var s.db, 0x02, gatt_server.PERM_READ, gatt_server.uuid128(0x06))
+    test.assert(gatt_server.set_value(var s.db, 0, [0x01]))
+    test.assert_eq(run(t, link_a(), s, gatt_client.begin_discover_characteristics(var t, link_a(), 0, decl, decl + 1)), 0)
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 1)
+    test.assert(gatt_client.uuid_same(gatt_client.cache_uuid_at(var t, link_a(), 0), uuid_of(gatt_server.uuid128(0x06))))
+    test.assert_eq(gatt_client.cache_a_at(var t, link_a(), 0), decl + 1)
+
+@test
+fn test_descriptors_are_discovered_and_the_cccd_is_found()
+    var t = table()
+    var s = server()
+    test.assert_eq(run(t, link_a(), s, gatt_client.begin_discover_characteristics(var t, link_a(), 0, 0x0018, 0x0022)), 0)
+    test.assert_eq(run(t, link_a(), s, gatt_client.begin_discover_descriptors(var t, link_a(), 0, 0x001D, 0x001E)), 0)
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 6)
+    test.assert_eq(rec(var t, link_a(), 4), [4, 0x001D, 0, 0, 0x2902])
+    test.assert_eq(rec(var t, link_a(), 5), [4, 0x001E, 0, 0, 0x2901])
+    // The second characteristic owns the descriptors; no other does.
+    test.assert_eq(gatt_client.cccd_of(var t, link_a(), 1), 0x001D)
+    test.assert_eq(gatt_client.cccd_of(var t, link_a(), 0), 0)
+    test.assert_eq(gatt_client.cccd_of(var t, link_a(), 2), 0)
+    test.assert_eq(gatt_client.descriptor_of(var t, link_a(), 1, 0x2901), 0x001E)
+
+@test
+fn test_a_descriptor_range_with_nothing_in_it_ends_well()
+    var t = table()
+    var s = server()
+    test.assert_eq(run(t, link_a(), s, gatt_client.begin_discover_descriptors(var t, link_a(), 0, 0x0030, 0x0040)), 0)
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 0)
+
+@test
+fn test_included_services_are_found_with_their_range_and_uuid()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let _ = gatt_client.begin_find_included(var t, link_a(), 0, 0x0023, 0x0026)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.statuses, [0])
+    test.assert_eq(trace.sent[0], [0x08, 0x23, 0x00, 0x26, 0x00, 0x02, 0x28])
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 1)
+    test.assert_eq(rec(var t, link_a(), 0), [2, 0x0024, 0x0018, 0x0022, 0xAA00])
+
+@test
+fn test_an_included_service_with_a_128_bit_uuid_costs_a_read_for_its_uuid()
+    var t = table()
+    var s = server()
+    let target = gatt_server.add_service(var s.db, false, gatt_server.uuid128(0x07))
+    let _ = gatt_server.add_characteristic(var s.db, 0x02, gatt_server.PERM_READ, gatt_server.le16(0xDD01))
+    test.assert(gatt_server.set_value(var s.db, 0, [0x01]))
+    let outer = gatt_server.add_service(var s.db, false, gatt_server.le16(0xDD00))
+    let include = gatt_server.add_included(var s.db, target)
+    var trace = new_log()
+    let _ = gatt_client.begin_find_included(var t, link_a(), 0, outer, include)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.statuses, [0])
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 1)
+    test.assert_eq(gatt_client.cache_handle_at(var t, link_a(), 0), include)
+    test.assert_eq(gatt_client.cache_a_at(var t, link_a(), 0), target)
+    test.assert(gatt_client.uuid_same(gatt_client.cache_uuid_at(var t, link_a(), 0), uuid_of(gatt_server.uuid128(0x07))))
+    // Read By Type found it, and a Read Request fetched the UUID.
+    test.assert_eq(list.len(trace.sent), 2)
+    test.assert_eq(trace.sent[1], [0x0A, target & 0xFF, target >>> 8])
+
+// ── Reads ───────────────────────────────────────────────────────────
+
+// A characteristic that anyone reads and writes, with no value set: it takes
+// a value of any length up to the Attribute Protocol's 512 octets.  Answers
+// the value handle.
+fn open_value(var s: gatt_server.GattServer, uuid16: Int) -> Int
+    let decl = gatt_server.add_characteristic(var s.db, 0x0A, gatt_server.PERM_READ | gatt_server.PERM_WRITE, gatt_server.le16(uuid16))
+    decl + 1
+
+@test
+fn test_a_value_is_read_with_one_request()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let _ = gatt_client.begin_read(var t, link_a(), 0, 0x001A)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.sent[0], [0x0A, 0x1A, 0x00])
+    test.assert_eq(trace.statuses, [0])
+    test.assert_eq(trace.values[0], [1, 2, 3, 4])
+    test.assert_eq(gatt_client.value_len(var t, link_a(), 0), 4)
+
+@test
+fn test_a_read_of_a_value_longer_than_the_mtu_is_cut_by_the_peer()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let _ = gatt_client.begin_read(var t, link_a(), 0, 0x0020)
+    pump(t, link_a(), s, trace)
+    // ATT_MTU 23 leaves 22 octets of a 100 octet value.
+    test.assert_eq(trace.values[0], ramp(22))
+
+@test
+fn test_read_by_type_answers_the_handle_value_pairs()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let _ = gatt_client.begin_read_by_type(var t, link_a(), 0, 0x0018, 0x0022, gatt_client.uuid16(0xAA01))
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.sent[0], [0x08, 0x18, 0x00, 0x22, 0x00, 0x01, 0xAA])
+    test.assert_eq(trace.statuses, [0])
+    test.assert_eq(trace.values[0], [0x1A, 0x00, 1, 2, 3, 4])
+    test.assert_eq(gatt_client.result_item_len(var t, link_a(), 0), 6)
+
+@test
+fn test_a_long_value_is_read_with_blobs_until_a_short_part()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let _ = gatt_client.begin_read_long(var t, link_a(), 0, 0x0020)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.statuses, [0])
+    test.assert_eq(trace.values[0], ramp(100))
+    // One Read Request of 22 octets, then four Read Blob Requests (22, 22,
+    // 22 and the last 12).
+    test.assert_eq(list.len(trace.sent), 5)
+    test.assert_eq(trace.sent[0], [0x0A, 0x20, 0x00])
+    test.assert_eq(trace.sent[1], [0x0C, 0x20, 0x00, 22, 0x00])
+    test.assert_eq(trace.sent[4], [0x0C, 0x20, 0x00, 88, 0x00])
+
+@test
+fn test_a_long_read_takes_the_larger_mtu_once_it_is_exchanged()
+    var t = table()
+    var s = server()
+    test.assert_eq(run(t, link_a(), s, gatt_client.begin_exchange_mtu(var t, link_a(), 0)), 0)
+    var trace = new_log()
+    let _ = gatt_client.begin_read_long(var t, link_a(), 0, 0x0020)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.values[0], ramp(100))
+    test.assert_eq(list.len(trace.sent), 2)
+    test.assert_eq(trace.sent[1], [0x0C, 0x20, 0x00, 64, 0x00])
+
+@test
+fn test_a_value_that_fills_the_last_part_ends_on_an_empty_blob()
+    var t = table()
+    var s = server()
+    let handle = open_value(var s, 0xAA10)
+    test.assert(gatt_server.set_value(var s.db, 0, gatt_server.octets(ramp(44))))
+    var trace = new_log()
+    let _ = gatt_client.begin_read_long(var t, link_a(), 0, handle)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.statuses, [0])
+    test.assert_eq(trace.values[0], ramp(44))
+    test.assert_eq(list.len(trace.sent), 3)
+
+@test
+fn test_a_value_longer_than_the_buffer_is_cut_and_says_so()
+    var t = table()
+    var s = server()
+    test.assert_eq(run(t, link_a(), s, gatt_client.begin_exchange_mtu(var t, link_a(), 0)), 0)
+    let handle = open_value(var s, 0xAA10)
+    test.assert(gatt_server.set_value(var s.db, 0, gatt_server.octets(ramp(300))))
+    var trace = new_log()
+    let _ = gatt_client.begin_read_long(var t, link_a(), 0, handle)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.statuses, [gatt_client.STATUS_TRUNCATED])
+    test.assert_eq(list.len(trace.values[0]), gatt_client.value_octets())
+    test.assert_eq(trace.values[0], ramp(gatt_client.value_octets()))
+    test.assert(gatt_client.is_local(gatt_client.STATUS_TRUNCATED))
+
+@test
+fn test_a_read_blob_the_peer_refuses_at_the_end_ends_the_value()
+    var t = table()
+    var trace = new_log()
+    let _ = gatt_client.begin_read_long(var t, link_a(), 0, 0x0020)
+    var out: Vec[u8; 247] = Vec.new()
+    test.assert_eq(gatt_client.take_tx(var t, link_a(), 0, 0, var out), gatt_client.TX_REQUEST)
+    var full: [u8] = [0x0B]
+    for x in ramp(22)
+        list.push(full, x as u8)
+    deliver(t, link_a(), 0, full, trace)
+    test.assert_eq(gatt_client.take_tx(var t, link_a(), 0, 0, var out), gatt_client.TX_REQUEST)
+    test.assert_eq(out[0] as Int, 0x0C)
+    deliver(t, link_a(), 0, [0x01, 0x0C, 0x20, 0x00, 0x07], trace)
+    test.assert_eq(trace.statuses, [0])
+    test.assert_eq(trace.values[0], ramp(22))
+
+@test
+fn test_a_read_the_peer_refuses_ends_with_its_error_code_and_handle()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let _ = gatt_client.begin_read(var t, link_a(), 0, 0x0300)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.statuses, [att.ATT_ERR_INVALID_HANDLE])
+    test.assert_eq(gatt_client.result_handle(var t, link_a(), 0), 0x0300)
+    test.assert(gatt_client.is_peer_error(trace.statuses[0]))
+    test.assert_eq(trace.values[0], [])
+
+@test
+fn test_a_refusal_for_security_ends_the_procedure_and_sends_nothing_more()
+    var t = table()
+    var s = server()
+    let decl = gatt_server.add_characteristic(var s.db, 0x02, gatt_server.PERM_READ_ENCRYPT, gatt_server.le16(0xAA20))
+    test.assert(gatt_server.set_value(var s.db, 0, [0x01]))
+    var trace = new_log()
+    let _ = gatt_client.begin_read_long(var t, link_a(), 0, decl + 1)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(list.len(trace.sent), 1)
+    test.assert_eq(list.len(trace.statuses), 1)
+    test.assert(gatt_client.needs_security(trace.statuses[0]))
+    test.assert_eq(gatt_client.result_handle(var t, link_a(), 0), decl + 1)
+    test.assert(not gatt_client.is_busy(var t, link_a(), 0))
+
+// ── Writes ──────────────────────────────────────────────────────────
+
+@test
+fn test_a_value_is_written_with_a_request()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let _ = gatt_client.begin_write(var t, link_a(), 0, 0x001A, payload([9, 8]), 2)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.sent[0], [0x12, 0x1A, 0x00, 9, 8])
+    test.assert_eq(trace.statuses, [0])
+    test.assert_eq(served(var s, 0x001A), [9, 8])
+
+@test
+fn test_a_write_the_peer_refuses_ends_with_its_code()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let _ = gatt_client.begin_write(var t, link_a(), 0, 0x0020, payload([1]), 1)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.statuses, [att.ATT_ERR_WRITE_NOT_PERMITTED])
+    test.assert_eq(gatt_client.result_handle(var t, link_a(), 0), 0x0020)
+    test.assert_eq(served(var s, 0x0020), ramp(100))
+
+@test
+fn test_a_write_longer_than_the_mtu_allows_is_not_queued()
+    var t = table()
+    test.assert_eq(gatt_client.begin_write(var t, link_a(), 0, 0x001A, payload(fill(21, 1)), 21), gatt_client.ERR_ARGUMENT)
+    test.assert_eq(gatt_client.begin_write_command(var t, link_a(), 0, 0x001A, payload(fill(21, 1)), 21), gatt_client.ERR_ARGUMENT)
+    test.assert(gatt_client.begin_write(var t, link_a(), 0, 0x001A, payload(fill(20, 1)), 20) > 0)
+    test.assert_eq(gatt_client.begin_write(var t, link_a(), 0, 0x001A, payload([]), -1), gatt_client.ERR_ARGUMENT)
+    test.assert_eq(gatt_client.begin_write(var t, link_a(), 0, 0, payload([1]), 1), gatt_client.ERR_ARGUMENT)
+
+@test
+fn test_a_write_command_has_no_response_and_ends_when_it_is_sent()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let _ = gatt_client.begin_write_command(var t, link_a(), 0, 0x0022, payload([5]), 1)
+    test.assert_eq(gatt_client.is_busy(var t, link_a(), 0), true)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.kinds, [gatt_client.TX_COMMAND])
+    test.assert_eq(trace.sent[0], [0x52, 0x22, 0x00, 5])
+    test.assert_eq(list.len(trace.events), 0)
+    test.assert_eq(gatt_client.is_busy(var t, link_a(), 0), false)
+    test.assert_eq(served(var s, 0x0022), [5])
+
+@test
+fn test_a_request_queued_behind_a_command_runs_after_it()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let _ = gatt_client.begin_write_command(var t, link_a(), 0, 0x0022, payload([5]), 1)
+    let read = gatt_client.begin_read(var t, link_a(), 0, 0x0022)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.kinds, [gatt_client.TX_COMMAND, gatt_client.TX_REQUEST])
+    test.assert_eq(trace.tickets, [read])
+    test.assert_eq(trace.statuses, [att.ATT_ERR_READ_NOT_PERMITTED])
+
+@test
+fn test_a_long_value_is_written_in_parts_and_executed()
+    var t = table()
+    var s = server()
+    let handle = open_value(var s, 0xAA10)
+    var trace = new_log()
+    let _ = gatt_client.begin_write_long(var t, link_a(), 0, handle, payload(ramp(100)), 100)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.statuses, [0])
+    // Parts of ATT_MTU - 5 = 18 octets: five of 18 and one of 10, then Execute.
+    test.assert_eq(list.len(trace.sent), 7)
+    test.assert_eq(trace.sent[0][0:5], [0x16, handle & 0xFF, handle >>> 8, 0, 0])
+    test.assert_eq(list.len(trace.sent[0]), 23)
+    test.assert_eq(trace.sent[5][3:5], [90, 0])
+    test.assert_eq(list.len(trace.sent[5]), 15)
+    test.assert_eq(trace.sent[6], [0x18, 0x01])
+    test.assert_eq(served(var s, handle), ramp(100))
+
+@test
+fn test_a_value_that_fits_one_part_is_still_prepared_and_executed()
+    var t = table()
+    var s = server()
+    let handle = open_value(var s, 0xAA10)
+    var trace = new_log()
+    let _ = gatt_client.begin_write_long(var t, link_a(), 0, handle, payload([1, 2, 3]), 3)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(list.len(trace.sent), 2)
+    test.assert_eq(served(var s, handle), [1, 2, 3])
+
+@test
+fn test_an_execute_the_peer_refuses_ends_with_the_handle_it_names()
+    var t = table()
+    var s = server()
+    let decl = gatt_server.add_characteristic(var s.db, 0x0A, gatt_server.PERM_READ | gatt_server.PERM_WRITE, gatt_server.le16(0xAA11))
+    test.assert(gatt_server.set_value(var s.db, 0, gatt_server.octets(ramp(30))))
+    var trace = new_log()
+    let _ = gatt_client.begin_write_long(var t, link_a(), 0, decl + 1, payload(ramp(60)), 60)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.statuses, [att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN])
+    test.assert_eq(gatt_client.result_handle(var t, link_a(), 0), decl + 1)
+    test.assert_eq(served(var s, decl + 1), ramp(30))
+
+@test
+fn test_a_part_the_peer_refuses_after_one_was_accepted_is_cancelled()
+    var t = table()
+    var s = server()
+    let handle = open_value(var s, 0xAA10)
+    var trace = new_log()
+    let _ = gatt_client.begin_write_long(var t, link_a(), 0, handle, payload(ramp(60)), 60)
+    // The first part goes through; the second is refused.
+    var first = exchange(t, link_a(), 0, s, 0, trace)
+    deliver(t, link_a(), 0, first[0], trace)
+    let second = exchange(t, link_a(), 0, s, 0, trace)
+    test.assert_eq(list.len(second), 1)
+    deliver(t, link_a(), 0, [0x01, 0x16, (handle & 0xFF) as u8, (handle >>> 8) as u8, att.ATT_ERR_PREPARE_QUEUE_FULL], trace)
+    // The queue the peer holds is cancelled, and the request ends with the
+    // refusal once the cancel is answered.
+    test.assert_eq(list.len(trace.statuses), 0)
+    let cancel = exchange(t, link_a(), 0, s, 0, trace)
+    test.assert_eq(trace.sent[2], [0x18, 0x00])
+    deliver(t, link_a(), 0, cancel[0], trace)
+    test.assert_eq(trace.statuses, [att.ATT_ERR_PREPARE_QUEUE_FULL])
+    test.assert_eq(list.len(s.link.prepare_queue), 0)
+    test.assert_eq(served(var s, handle), [])
+
+@test
+fn test_a_first_part_the_peer_refuses_needs_no_cancel()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let _ = gatt_client.begin_write_long(var t, link_a(), 0, 0x0020, payload(ramp(30)), 30)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(list.len(trace.sent), 1)
+    test.assert_eq(trace.statuses, [att.ATT_ERR_WRITE_NOT_PERMITTED])
+
+@test
+fn test_a_reliable_write_checks_what_the_peer_echoes()
+    var t = table()
+    var s = server()
+    let handle = open_value(var s, 0xAA10)
+    var trace = new_log()
+    let _ = gatt_client.begin_reliable_write(var t, link_a(), 0, handle, payload(ramp(40)), 40)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.statuses, [0])
+    test.assert_eq(served(var s, handle), ramp(40))
+
+@test
+fn test_a_reliable_write_the_peer_echoes_wrongly_is_cancelled()
+    var t = table()
+    var s = server()
+    let handle = open_value(var s, 0xAA10)
+    var trace = new_log()
+    let _ = gatt_client.begin_reliable_write(var t, link_a(), 0, handle, payload(ramp(40)), 40)
+    var echo = exchange(t, link_a(), 0, s, 0, trace)
+    var wrong = echo[0][:]
+    wrong[7] = 0xEE
+    deliver(t, link_a(), 0, wrong, trace)
+    let cancel = exchange(t, link_a(), 0, s, 0, trace)
+    test.assert_eq(trace.sent[1], [0x18, 0x00])
+    deliver(t, link_a(), 0, cancel[0], trace)
+    test.assert_eq(trace.statuses, [gatt_client.STATUS_MISMATCH])
+    test.assert_eq(served(var s, handle), [])
+
+@test
+fn test_a_long_write_does_not_compare_the_echo()
+    var t = table()
+    var s = server()
+    let handle = open_value(var s, 0xAA10)
+    var trace = new_log()
+    let _ = gatt_client.begin_write_long(var t, link_a(), 0, handle, payload(ramp(20)), 20)
+    var echo = exchange(t, link_a(), 0, s, 0, trace)
+    var wrong = echo[0][:]
+    wrong[6] = 0xEE
+    deliver(t, link_a(), 0, wrong, trace)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.statuses, [0])
+
+@test
+fn test_a_prepare_response_for_another_handle_is_cancelled()
+    var t = table()
+    var s = server()
+    let handle = open_value(var s, 0xAA10)
+    var trace = new_log()
+    let _ = gatt_client.begin_write_long(var t, link_a(), 0, handle, payload(ramp(20)), 20)
+    var echo = exchange(t, link_a(), 0, s, 0, trace)
+    var wrong = echo[0][:]
+    wrong[1] = 0x70
+    deliver(t, link_a(), 0, wrong, trace)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.statuses, [gatt_client.STATUS_PROTOCOL])
+
+// ── Subscriptions, notifications and indications ────────────────────
+
+// Subscribe to the characteristic at 0x001C (CCCD 0x001D) with `mode` and
+// run the write.
+fn subscribe(var t: gatt_client.ClientTable, link: links.LinkId, var s: gatt_server.GattServer, mode: Int)
+    test.assert_eq(run(t, link, s, gatt_client.begin_subscribe(var t, link, 0, 0x001D, mode)), 0)
+
+@test
+fn test_a_subscription_is_a_write_of_the_configuration_descriptor()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let _ = gatt_client.begin_subscribe(var t, link_a(), 0, 0x001D, gatt_client.CCCD_NOTIFY)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.sent[0], [0x12, 0x1D, 0x00, 0x01, 0x00])
+    test.assert_eq(trace.statuses, [0])
+    test.assert_eq(gatt_server.configuration(s.link, 0x001D), 1)
+
+@test
+fn test_a_notification_is_reported_with_its_handle_and_value()
+    var t = table()
+    var s = server()
+    subscribe(t, link_a(), s, gatt_client.CCCD_NOTIFY)
+    test.assert(gatt_server.set_value(var s.db, 0x001C, [0x42, 0x43]))
+    var trace = new_log()
+    for pdu in gatt_server.send_value(var s.db, var s.link, 0x001C, 0)
+        deliver(t, link_a(), 0, pdu, trace)
+    test.assert_eq(trace.events, [gatt_client.EV_NOTIFICATION])
+    test.assert_eq(trace.notified, [0x001C])
+    test.assert_eq(trace.pushed, [[0x42, 0x43]])
+    // A notification is not confirmed.
+    var out: Vec[u8; 247] = Vec.new()
+    test.assert_eq(gatt_client.take_tx(var t, link_a(), 0, 0, var out), gatt_client.TX_NONE)
+
+@test
+fn test_an_indication_is_reported_and_confirmed()
+    var t = table()
+    var s = server()
+    subscribe(t, link_a(), s, gatt_client.CCCD_INDICATE)
+    test.assert(gatt_server.set_value(var s.db, 0x001C, [0x11]))
+    var trace = new_log()
+    for pdu in gatt_server.send_value(var s.db, var s.link, 0x001C, 0)
+        deliver(t, link_a(), 0, pdu, trace)
+    test.assert_eq(trace.events, [gatt_client.EV_INDICATION])
+    test.assert_eq(trace.pushed, [[0x11]])
+    test.assert_eq(s.link.bearers[0].indicating, 0x001C)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.kinds, [gatt_client.TX_CONFIRM])
+    test.assert_eq(trace.sent[0], [0x1E])
+    test.assert_eq(s.link.bearers[0].indicating, 0)
+
+@test
+fn test_the_next_indication_follows_the_confirmation_of_the_one_before()
+    var t = table()
+    var s = server()
+    subscribe(t, link_a(), s, gatt_client.CCCD_INDICATE)
+    var trace = new_log()
+    test.assert(gatt_server.set_value(var s.db, 0x001C, [0x01]))
+    for pdu in gatt_server.send_value(var s.db, var s.link, 0x001C, 0)
+        deliver(t, link_a(), 0, pdu, trace)
+    test.assert(gatt_server.set_value(var s.db, 0x001C, [0x02]))
+    test.assert_eq(list.len(gatt_server.send_value(var s.db, var s.link, 0x001C, 0)), 0)
+    var next: [[u8]] = []
+    var out: Vec[u8; 247] = Vec.new()
+    test.assert_eq(gatt_client.take_tx(var t, link_a(), 0, 0, var out), gatt_client.TX_CONFIRM)
+    next = gatt_server.receive_on(var s.db, var s.link, 0, from_pdu(out, out.len()), 0)
+    test.assert_eq(list.len(next), 1)
+    deliver(t, link_a(), 0, next[0], trace)
+    test.assert_eq(trace.pushed, [[0x01], [0x02]])
+    test.assert_eq(trace.events, [gatt_client.EV_INDICATION, gatt_client.EV_INDICATION])
+
+@test
+fn test_a_subscription_ends_with_a_write_of_zero()
+    var t = table()
+    var s = server()
+    subscribe(t, link_a(), s, gatt_client.CCCD_NOTIFY)
+    subscribe(t, link_a(), s, 0)
+    test.assert_eq(list.len(gatt_server.send_value(var s.db, var s.link, 0x001C, 0)), 0)
+
+@test
+fn test_a_notification_arrives_while_a_request_is_outstanding()
+    var t = table()
+    var s = server()
+    subscribe(t, link_a(), s, gatt_client.CCCD_NOTIFY)
+    var trace = new_log()
+    let read = gatt_client.begin_read(var t, link_a(), 0, 0x001A)
+    let answers = exchange(t, link_a(), 0, s, 0, trace)
+    for pdu in gatt_server.send_value(var s.db, var s.link, 0x001C, 0)
+        deliver(t, link_a(), 0, pdu, trace)
+    deliver(t, link_a(), 0, answers[0], trace)
+    test.assert_eq(trace.events, [gatt_client.EV_NOTIFICATION, gatt_client.EV_DONE])
+    test.assert_eq(trace.tickets, [read])
+
+@test
+fn test_a_pdu_for_the_server_role_is_not_the_clients()
+    var t = table()
+    var trace = new_log()
+    deliver(t, link_a(), 0, [0x0A, 0x03, 0x00], trace)
+    deliver(t, link_a(), 0, [0x52, 0x03, 0x00, 0x01], trace)
+    test.assert_eq(trace.events, [gatt_client.EV_FOREIGN, gatt_client.EV_FOREIGN])
+
+@test
+fn test_a_response_with_no_request_waiting_is_dropped()
+    var t = table()
+    var trace = new_log()
+    deliver(t, link_a(), 0, [0x0B, 0x01], trace)
+    deliver(t, link_a(), 0, [0x01, 0x0A, 0x03, 0x00, 0x0A], trace)
+    test.assert_eq(trace.events, [])
+    // So is a request the client has queued but not sent.
+    let _ = gatt_client.begin_read(var t, link_a(), 0, 0x0003)
+    deliver(t, link_a(), 0, [0x0B, 0x01], trace)
+    test.assert_eq(trace.events, [])
+
+@test
+fn test_a_notification_too_short_to_read_is_dropped()
+    var t = table()
+    var trace = new_log()
+    deliver(t, link_a(), 0, [0x1B, 0x03], trace)
+    deliver(t, link_a(), 0, [0x1D], trace)
+    deliver(t, link_a(), 0, [], trace)
+    test.assert_eq(trace.events, [])
+
+// ── Errors in what the peer sends ───────────────────────────────────
+
+// Take the request out and answer it with the PDU `answer`; answers the
+// status the request ended with.
+fn broken(var t: gatt_client.ClientTable, answer: [Int]) -> Int
+    var out: Vec[u8; 247] = Vec.new()
+    test.assert_eq(gatt_client.take_tx(var t, link_a(), 0, 0, var out), gatt_client.TX_REQUEST)
+    var trace = new_log()
+    deliver(t, link_a(), 0, gatt_server.octets(answer), trace)
+    test.assert_eq(trace.events, [gatt_client.EV_DONE])
+    trace.statuses[0]
+
+@test
+fn test_a_response_the_client_cannot_read_ends_the_request_with_protocol_or_order_error()
+    var t = table()
+    let protocol = gatt_client.STATUS_PROTOCOL
+    // A response whose handles go back is a status of its own, `STATUS_ORDER`.
+    let order = gatt_client.STATUS_ORDER
+    // Services: an item length that is neither 6 nor 20, a ragged list, a
+    // range that runs backwards, a handle before the start.
+    let _ = gatt_client.begin_discover_services(var t, link_a(), 0, 1, 0xFFFF, false)
+    test.assert_eq(broken(var t, [0x11, 5, 1, 0, 2, 0, 0x0A]), protocol)
+    let _ = gatt_client.begin_discover_services(var t, link_a(), 0, 1, 0xFFFF, false)
+    test.assert_eq(broken(var t, [0x11, 6, 1, 0, 2, 0, 0x0A, 0x18, 9]), protocol)
+    let _ = gatt_client.begin_discover_services(var t, link_a(), 0, 5, 0xFFFF, false)
+    test.assert_eq(broken(var t, [0x11, 6, 1, 0, 2, 0, 0x0A, 0x18]), order)
+    let _ = gatt_client.begin_discover_services(var t, link_a(), 0, 1, 0xFFFF, false)
+    test.assert_eq(broken(var t, [0x11, 6, 4, 0, 2, 0, 0x0A, 0x18]), order)
+    // Services by UUID: not a multiple of four.
+    let _ = gatt_client.begin_discover_services_by_uuid(var t, link_a(), 0, 1, 0xFFFF, gatt_client.uuid16(0x180A))
+    test.assert_eq(broken(var t, [0x07, 1, 0, 2]), protocol)
+    // Included: an item length that is neither 6 nor 8; a handle before the start.
+    let _ = gatt_client.begin_find_included(var t, link_a(), 0, 4, 0xFFFF)
+    test.assert_eq(broken(var t, [0x09, 7, 1, 0, 2, 0, 3, 0, 0x0A]), protocol)
+    let _ = gatt_client.begin_find_included(var t, link_a(), 0, 4, 0xFFFF)
+    test.assert_eq(broken(var t, [0x09, 8, 1, 0, 2, 0, 3, 0, 0x0A, 0x18]), order)
+    // Characteristics: item length; value handle not after the declaration.
+    let _ = gatt_client.begin_discover_characteristics(var t, link_a(), 0, 1, 0xFFFF)
+    test.assert_eq(broken(var t, [0x09, 6, 1, 0, 2, 3, 0, 0x0A]), protocol)
+    let _ = gatt_client.begin_discover_characteristics(var t, link_a(), 0, 1, 0xFFFF)
+    test.assert_eq(broken(var t, [0x09, 7, 2, 0, 2, 2, 0, 0x0A, 0x2A]), order)
+    // Descriptors: a format that is neither 1 nor 2; a ragged list; a handle before the start.
+    let _ = gatt_client.begin_discover_descriptors(var t, link_a(), 0, 3, 0xFFFF)
+    test.assert_eq(broken(var t, [0x05, 3, 3, 0, 0x02, 0x29]), protocol)
+    let _ = gatt_client.begin_discover_descriptors(var t, link_a(), 0, 3, 0xFFFF)
+    test.assert_eq(broken(var t, [0x05, 1, 3, 0, 0x02, 0x29, 9]), protocol)
+    let _ = gatt_client.begin_discover_descriptors(var t, link_a(), 0, 3, 0xFFFF)
+    test.assert_eq(broken(var t, [0x05, 1, 2, 0, 0x02, 0x29]), order)
+    // MTU, read by type and the hash.
+    let _ = gatt_client.begin_exchange_mtu(var t, link_a(), 0)
+    test.assert_eq(broken(var t, [0x03, 0x40]), protocol)
+    let _ = gatt_client.begin_read_by_type(var t, link_a(), 0, 1, 0xFFFF, gatt_client.uuid16(0x2A00))
+    test.assert_eq(broken(var t, [0x09, 4]), protocol)
+    let _ = gatt_client.begin_database_hash(var t, link_a(), 0)
+    test.assert_eq(broken(var t, [0x09, 6, 0x15, 0, 1, 2]), protocol)
+
+@test
+fn test_a_response_that_does_not_answer_the_request_ends_it_with_protocol_error()
+    var t = table()
+    let _ = gatt_client.begin_read(var t, link_a(), 0, 3)
+    test.assert_eq(broken(var t, [0x13]), gatt_client.STATUS_PROTOCOL)
+    let _ = gatt_client.begin_read(var t, link_a(), 0, 3)
+    // An Error Response for another request, and one too short to read.
+    test.assert_eq(broken(var t, [0x01, 0x08, 3, 0, 0x0A]), gatt_client.STATUS_PROTOCOL)
+    let _ = gatt_client.begin_read(var t, link_a(), 0, 3)
+    test.assert_eq(broken(var t, [0x01, 0x0A, 3]), gatt_client.STATUS_PROTOCOL)
+
+@test
+fn test_a_cache_that_is_full_ends_discovery_with_its_own_status()
+    var t = table()
+    var s = server()
+    for i in 0..30
+        let _ = gatt_server.add_service(var s.db, false, gatt_server.le16(0xC000 + i))
+    var trace = new_log()
+    let _ = gatt_client.begin_discover_services(var t, link_a(), 0, 1, 0xFFFF, false)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.statuses, [gatt_client.STATUS_CACHE_FULL])
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), gatt_client.cache())
+    test.assert(gatt_client.is_local(trace.statuses[0]))
+    // A record found again replaces itself and does not need room.
+    gatt_client.cache_clear(var t, link_a())
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 0)
+
+@test
+fn test_rediscovery_replaces_what_was_found_before()
+    var t = table()
+    var s = server()
+    discover_everything(var t, link_a(), var s)
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 4)
+    test.assert_eq(run(t, link_a(), s, gatt_client.begin_discover_services(var t, link_a(), 0, 1, 0xFFFF, false)), 0)
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 4)
+
+@test
+fn test_the_cache_is_searched_by_kind_and_uuid()
+    var t = table()
+    var s = server()
+    discover_everything(var t, link_a(), var s)
+    test.assert_eq(run(t, link_a(), s, gatt_client.begin_discover_characteristics(var t, link_a(), 0, 0x0018, 0x0022)), 0)
+    test.assert_eq(gatt_client.cache_find(var t, link_a(), gatt_client.KIND_SERVICE, gatt_client.uuid16(0xBB00), 0), 3)
+    test.assert_eq(gatt_client.cache_find(var t, link_a(), gatt_client.KIND_CHAR, gatt_client.uuid16(0xAA02), 0), 5)
+    test.assert_eq(gatt_client.cache_find(var t, link_a(), gatt_client.KIND_CHAR, gatt_client.uuid16(0xAA02), 6), -1)
+    test.assert_eq(gatt_client.cache_find(var t, link_a(), gatt_client.KIND_SERVICE, gatt_client.uuid16(0xAA02), 0), -1)
+    test.assert_eq(gatt_client.cache_kind_at(var t, link_a(), 99), 0)
+    test.assert_eq(gatt_client.cache_handle_at(var t, link_a(), -1), 0)
+
+// ── Queue, time and the transaction rule ────────────────────────────
+
+@test
+fn test_one_transaction_is_outstanding_and_the_rest_wait_in_order()
+    var t = table()
+    var s = server()
+    let a = gatt_client.begin_read(var t, link_a(), 0, 0x001A)
+    let b = gatt_client.begin_read(var t, link_a(), 0, 0x0020)
+    let c = gatt_client.begin_read(var t, link_a(), 0, 0x0003)
+    test.assert_eq(list.len([a, b, c]), 3)
+    test.assert(a < b and b < c)
+    var out: Vec[u8; 247] = Vec.new()
+    test.assert_eq(gatt_client.take_tx(var t, link_a(), 0, 0, var out), gatt_client.TX_REQUEST)
+    // The first is out; nothing else goes until it is answered.
+    test.assert_eq(gatt_client.take_tx(var t, link_a(), 0, 0, var out), gatt_client.TX_NONE)
+    var trace = new_log()
+    let first = gatt_server.receive_on(var s.db, var s.link, 0, [0x0A, 0x1A, 0x00], 0)
+    deliver(t, link_a(), 0, first[0], trace)
+    test.assert_eq(trace.tickets, [a])
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.tickets, [a, b, c])
+    test.assert_eq(trace.values[0], [1, 2, 3, 4])
+    test.assert_eq(trace.values[1], ramp(22))
+    test.assert_eq(trace.values[2], [0x54, 0x65, 0x73, 0x74])
+
+@test
+fn test_a_full_queue_refuses_the_next_request_and_takes_it_again_when_room_is_made()
+    var t = table()
+    var s = server()
+    // One request runs and the queue holds four more.
+    for _ in 0..5
+        test.assert(gatt_client.begin_read(var t, link_a(), 0, 0x001A) > 0)
+    test.assert_eq(gatt_client.begin_read(var t, link_a(), 0, 0x001A), gatt_client.ERR_QUEUE_FULL)
+    var trace = new_log()
+    pump(t, link_a(), s, trace)
+    test.assert_eq(list.len(trace.tickets), 5)
+    test.assert(gatt_client.begin_read(var t, link_a(), 0, 0x001A) > 0)
+
+@test
+fn test_tickets_rise_by_one_for_each_request_of_a_bearer()
+    var t = table()
+    let a = gatt_client.begin_read(var t, link_a(), 0, 0x001A)
+    let b = gatt_client.begin_write_command(var t, link_a(), 0, 0x0022, payload([1]), 1)
+    let c = gatt_client.begin_exchange_mtu(var t, link_a(), 0)
+    test.assert_eq(b, a + 1)
+    test.assert_eq(c, a + 2)
+
+@test
+fn test_queued_payloads_share_the_buffer_and_it_is_free_again_when_they_are_sent()
+    var t = table()
+    var s = server()
+    let handle = open_value(var s, 0xAA10)
+    test.assert(gatt_client.begin_write_long(var t, link_a(), 0, handle, payload(ramp(200)), 200) > 0)
+    test.assert_eq(gatt_client.begin_write_long(var t, link_a(), 0, handle, payload(ramp(100)), 100), gatt_client.ERR_NO_ROOM)
+    test.assert(gatt_client.begin_write_long(var t, link_a(), 0, handle, payload(ramp(56)), 56) > 0)
+    var trace = new_log()
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.statuses, [0, 0])
+    test.assert_eq(served(var s, handle), ramp(56))
+    test.assert(gatt_client.begin_write_long(var t, link_a(), 0, handle, payload(ramp(100)), 100) > 0)
+
+@test
+fn test_a_transaction_that_gets_no_response_in_30_s_ends_the_bearer()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let first = gatt_client.begin_read(var t, link_a(), 0, 0x001A)
+    let queued = gatt_client.begin_read(var t, link_a(), 0, 0x0020)
+    var out: Vec[u8; 247] = Vec.new()
+    test.assert_eq(gatt_client.take_tx(var t, link_a(), 0, 1000, var out), gatt_client.TX_REQUEST)
+    test.assert_eq(gatt_client.tick(var t, link_a(), 0, 30999), gatt_client.EV_NONE)
+    test.assert(not gatt_client.is_dead(var t, link_a(), 0))
+    test.assert_eq(gatt_client.tick(var t, link_a(), 0, 31000), gatt_client.EV_DONE)
+    test.assert_eq(gatt_client.result_ticket(var t, link_a(), 0), first)
+    test.assert_eq(gatt_client.result_status(var t, link_a(), 0), gatt_client.STATUS_TIMEOUT)
+    test.assert(gatt_client.is_dead(var t, link_a(), 0))
+    test.assert(queued > first)
+    // The queue is dropped, nothing more is sent, nothing more is accepted,
+    // and a late answer is not heard.
+    test.assert(not gatt_client.is_busy(var t, link_a(), 0))
+    test.assert_eq(gatt_client.take_tx(var t, link_a(), 0, 31000, var out), gatt_client.TX_NONE)
+    test.assert_eq(gatt_client.begin_read(var t, link_a(), 0, 0x001A), gatt_client.ERR_DEAD)
+    deliver(t, link_a(), 0, [0x0B, 0x01], trace)
+    test.assert_eq(trace.events, [])
+    test.assert_eq(gatt_client.tick(var t, link_a(), 0, 99999), gatt_client.EV_NONE)
+
+@test
+fn test_the_timer_runs_from_the_moment_the_request_is_sent()
+    var t = table()
+    let _ = gatt_client.begin_read(var t, link_a(), 0, 0x001A)
+    // Queued and not yet sent: no timer.
+    test.assert_eq(gatt_client.tick(var t, link_a(), 0, 100000), gatt_client.EV_NONE)
+    var out: Vec[u8; 247] = Vec.new()
+    test.assert_eq(gatt_client.take_tx(var t, link_a(), 0, 100000, var out), gatt_client.TX_REQUEST)
+    test.assert_eq(gatt_client.tick(var t, link_a(), 0, 129999), gatt_client.EV_NONE)
+    test.assert_eq(gatt_client.tick(var t, link_a(), 0, 130000), gatt_client.EV_DONE)
+
+@test
+fn test_an_answered_request_does_not_time_out()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let _ = gatt_client.begin_read(var t, link_a(), 0, 0x001A)
+    pump_at(var t, link_a(), 0, var s, 5000, var trace)
+    test.assert_eq(trace.statuses, [0])
+    test.assert_eq(gatt_client.tick(var t, link_a(), 0, 500000), gatt_client.EV_NONE)
+    test.assert(not gatt_client.is_dead(var t, link_a(), 0))
+
+@test
+fn test_a_dead_bearer_is_alive_again_when_the_link_is_opened_again()
+    var t = table()
+    let _ = gatt_client.begin_read(var t, link_a(), 0, 0x001A)
+    var out: Vec[u8; 247] = Vec.new()
+    let _ = gatt_client.take_tx(var t, link_a(), 0, 0, var out)
+    test.assert_eq(gatt_client.tick(var t, link_a(), 0, 30000), gatt_client.EV_DONE)
+    test.assert(gatt_client.open(var t, links.link_id(0, 2)))
+    test.assert(gatt_client.begin_read(var t, links.link_id(0, 2), 0, 0x001A) > 0)
+
+// ── The peer's database changes ─────────────────────────────────────
+
+@test
+fn test_the_database_hash_is_read_and_compared_with_the_last_one()
+    var t = table()
+    var s = server()
+    discover_everything(var t, link_a(), var s)
+    let first = gatt_client.begin_database_hash(var t, link_a(), 0)
+    test.assert_eq(run(t, link_a(), s, first), 0)
+    test.assert(not gatt_client.take_changed(var t, link_a()))
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 4)
+    // The same database: the cache stays.
+    test.assert_eq(run(t, link_a(), s, gatt_client.begin_database_hash(var t, link_a(), 0)), 0)
+    test.assert(not gatt_client.take_changed(var t, link_a()))
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 4)
+    // A new service: the hash differs and the cache goes.
+    let _ = gatt_server.add_service(var s.db, false, gatt_server.le16(0xEE00))
+    test.assert_eq(run(t, link_a(), s, gatt_client.begin_database_hash(var t, link_a(), 0)), 0)
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 0)
+    test.assert(gatt_client.take_changed(var t, link_a()))
+    test.assert(not gatt_client.take_changed(var t, link_a()))
+
+@test
+fn test_the_hash_request_is_read_by_type_over_all_handles()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let _ = gatt_client.begin_database_hash(var t, link_a(), 0)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.sent[0], [0x08, 0x01, 0x00, 0xFF, 0xFF, 0x2A, 0x2B])
+    test.assert_eq(trace.values[0], [])
+
+@test
+fn test_database_out_of_sync_marks_the_link_and_the_hash_read_clears_it()
+    var t = table()
+    var s = server()
+    discover_everything(var t, link_a(), var s)
+    // The client declares Robust Caching, then the database changes.
+    var features = payload([gatt_server.CSF_ROBUST_CACHING])
+    test.assert_eq(run(t, link_a(), s, gatt_client.begin_write(var t, link_a(), 0, gatt_db.GAP_SERVER_CLIENT_SUPPORTED_FEATURES_HANDLE, features, 1)), 0)
+    test.assert_eq(run(t, link_a(), s, gatt_client.begin_database_hash(var t, link_a(), 0)), 0)
+    let _ = gatt_server.add_service(var s.db, false, gatt_server.le16(0xEE00))
+    test.assert(not gatt_client.is_stale(var t, link_a()))
+    let status = run(t, link_a(), s, gatt_client.begin_read(var t, link_a(), 0, 0x001A))
+    test.assert_eq(status, att.ATT_ERR_DATABASE_OUT_OF_SYNC)
+    test.assert(gatt_client.is_out_of_sync(status))
+    test.assert(gatt_client.is_stale(var t, link_a()))
+    // The cache is kept until the hash says it is wrong.
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 4)
+    test.assert_eq(run(t, link_a(), s, gatt_client.begin_database_hash(var t, link_a(), 0)), 0)
+    test.assert(not gatt_client.is_stale(var t, link_a()))
+    test.assert(gatt_client.take_changed(var t, link_a()))
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 0)
+    // Rediscovery finds the new service, and the read is served.
+    test.assert_eq(run(t, link_a(), s, gatt_client.begin_discover_services(var t, link_a(), 0, 1, 0xFFFF, false)), 0)
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 5)
+    test.assert_eq(run(t, link_a(), s, gatt_client.begin_read(var t, link_a(), 0, 0x001A)), 0)
+
+@test
+fn test_a_service_changed_indication_drops_the_records_of_its_range()
+    var t = table()
+    var s = server()
+    discover_everything(var t, link_a(), var s)
+    test.assert_eq(run(t, link_a(), s, gatt_client.begin_discover_characteristics(var t, link_a(), 0, 0x0018, 0x0022)), 0)
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 8)
+    gatt_client.set_service_changed_handle(var t, link_a(), gatt_db.GAP_SERVER_SERVICE_CHANGED_HANDLE)
+    test.assert_eq(run(t, link_a(), s, gatt_client.begin_subscribe(var t, link_a(), 0, gatt_db.GAP_SERVER_SERVICE_CHANGED_CCCD_HANDLE, gatt_client.CCCD_INDICATE)), 0)
+    var trace = new_log()
+    for pdu in gatt_server.service_changed(var s.db, var s.link, 0x0018, 0x0022, 0)
+        deliver(t, link_a(), 0, pdu, trace)
+    test.assert_eq(trace.events, [gatt_client.EV_SERVICE_CHANGED])
+    test.assert_eq(gatt_client.service_changed_first(var t, link_a(), 0), 0x0018)
+    test.assert_eq(gatt_client.service_changed_last(var t, link_a(), 0), 0x0022)
+    // The service and its four characteristics went; the rest stayed.
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 3)
+    test.assert_eq(gatt_client.cache_handle_at(var t, link_a(), 0), 0x0001)
+    test.assert_eq(gatt_client.cache_handle_at(var t, link_a(), 1), 0x000E)
+    test.assert_eq(gatt_client.cache_handle_at(var t, link_a(), 2), 0x0023)
+    test.assert(gatt_client.take_changed(var t, link_a()))
+    // The indication is confirmed.
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.kinds, [gatt_client.TX_CONFIRM])
+
+@test
+fn test_an_indication_of_another_handle_is_not_service_changed()
+    var t = table()
+    var trace = new_log()
+    gatt_client.set_service_changed_handle(var t, link_a(), 0x0010)
+    deliver(t, link_a(), 0, [0x1D, 0x20, 0x00, 0x01, 0x00, 0x05, 0x00], trace)
+    test.assert_eq(trace.events, [gatt_client.EV_INDICATION])
+    // A Service Changed indication too short to carry a range is a plain one.
+    deliver(t, link_a(), 0, [0x1D, 0x10, 0x00, 0x01], trace)
+    test.assert_eq(trace.events, [gatt_client.EV_INDICATION, gatt_client.EV_INDICATION])
+
+// ── Two links, two bearers ──────────────────────────────────────────
+
+// A table with both links open.
+fn table2() -> gatt_client.ClientTable
+    var t = table()
+    test.assert(gatt_client.open(var t, link_b()))
+    t
+
+@test
+fn test_two_links_run_their_procedures_side_by_side()
+    var t = table2()
+    var sa = server()
+    var sb = server()
+    let _ = gatt_server.add_service(var sb.db, false, gatt_server.le16(0xEE00))
+    var la = new_log()
+    var lb = new_log()
+    let ta = gatt_client.begin_discover_services(var t, link_a(), 0, 1, 0xFFFF, false)
+    let tb = gatt_client.begin_discover_services(var t, link_b(), 0, 1, 0xFFFF, false)
+    // One PDU of each at a time, as two controllers would deliver them.
+    for _ in 0..4
+        for r in exchange(t, link_a(), 0, sa, 0, la)
+            deliver(t, link_a(), 0, r, la)
+        for r in exchange(t, link_b(), 0, sb, 0, lb)
+            deliver(t, link_b(), 0, r, lb)
+    test.assert_eq(la.tickets, [ta])
+    test.assert_eq(lb.tickets, [tb])
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 4)
+    test.assert_eq(gatt_client.cache_count(var t, link_b()), 5)
+    test.assert_eq(gatt_client.cache_handle_at(var t, link_b(), 4), 0x0027)
+
+@test
+fn test_each_link_keeps_its_own_mtu_cache_and_hash()
+    var t = table2()
+    var sa = server()
+    var sb = server()
+    test.assert_eq(run(t, link_a(), sa, gatt_client.begin_exchange_mtu(var t, link_a(), 0)), 0)
+    test.assert_eq(gatt_client.mtu(var t, link_a(), 0), 65)
+    test.assert_eq(gatt_client.mtu(var t, link_b(), 0), 23)
+    test.assert_eq(run(t, link_b(), sb, gatt_client.begin_discover_services(var t, link_b(), 0, 1, 0xFFFF, false)), 0)
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 0)
+    test.assert_eq(gatt_client.cache_count(var t, link_b()), 4)
+    // The hash of one is not the hash of the other: A's database changed.
+    test.assert_eq(run(t, link_a(), sa, gatt_client.begin_database_hash(var t, link_a(), 0)), 0)
+    test.assert_eq(run(t, link_b(), sb, gatt_client.begin_database_hash(var t, link_b(), 0)), 0)
+    let _ = gatt_server.add_service(var sa.db, false, gatt_server.le16(0xEE00))
+    test.assert_eq(run(t, link_a(), sa, gatt_client.begin_database_hash(var t, link_a(), 0)), 0)
+    test.assert(gatt_client.take_changed(var t, link_a()))
+    test.assert(not gatt_client.take_changed(var t, link_b()))
+    test.assert_eq(gatt_client.cache_count(var t, link_b()), 4)
+
+@test
+fn test_a_timeout_on_one_link_leaves_the_other_alone()
+    var t = table2()
+    var sb = server()
+    let _ = gatt_client.begin_read(var t, link_a(), 0, 0x001A)
+    var out: Vec[u8; 247] = Vec.new()
+    let _ = gatt_client.take_tx(var t, link_a(), 0, 0, var out)
+    test.assert_eq(gatt_client.tick(var t, link_a(), 0, 40000), gatt_client.EV_DONE)
+    test.assert(gatt_client.is_dead(var t, link_a(), 0))
+    test.assert(not gatt_client.is_dead(var t, link_b(), 0))
+    test.assert_eq(run(t, link_b(), sb, gatt_client.begin_read(var t, link_b(), 0, 0x001A)), 0)
+
+@test
+fn test_a_link_that_ends_does_not_answer_for_the_next_one_in_its_slot()
+    var t = table2()
+    var sa = server()
+    discover_everything(var t, link_a(), var sa)
+    let old = link_a()
+    gatt_client.close(var t, old)
+    test.assert_eq(gatt_client.cache_count(var t, old), 0)
+    test.assert_eq(gatt_client.begin_read(var t, old, 0, 3), gatt_client.ERR_NO_LINK)
+    let next = links.link_id(0, 2)
+    test.assert(gatt_client.open(var t, next))
+    test.assert_eq(gatt_client.cache_count(var t, next), 0)
+    test.assert_eq(gatt_client.mtu(var t, next, 0), 23)
+    test.assert_eq(gatt_client.begin_read(var t, old, 0, 3), gatt_client.ERR_NO_LINK)
+    test.assert(gatt_client.begin_read(var t, next, 0, 3) > 0)
+    // The other link was not touched.
+    test.assert(gatt_client.begin_read(var t, link_b(), 0, 3) > 0)
+
+@test
+fn test_closing_a_link_drops_its_requests_without_a_completion()
+    var t = table2()
+    let _ = gatt_client.begin_read(var t, link_a(), 0, 0x001A)
+    let _ = gatt_client.begin_read(var t, link_a(), 0, 0x001A)
+    gatt_client.close(var t, link_a())
+    var out: Vec[u8; 247] = Vec.new()
+    test.assert_eq(gatt_client.take_tx(var t, link_a(), 0, 0, var out), gatt_client.TX_NONE)
+    test.assert(not gatt_client.is_busy(var t, link_a(), 0))
+
+@test
+fn test_the_bearers_of_a_link_each_keep_a_transaction_outstanding()
+    var t = table()
+    var s = server()
+    // The second bearer is an Enhanced ATT bearer with an ATT_MTU of its own.
+    test.assert(gatt_client.open_bearer(var t, link_a(), 1, 64))
+    test.assert_eq(gatt_server.open_bearer(var s.link, 0x0040, true, 64), 1)
+    let r0 = gatt_client.begin_read(var t, link_a(), 0, 0x0020)
+    let r1 = gatt_client.begin_read(var t, link_a(), 1, 0x0020)
+    var out: Vec[u8; 247] = Vec.new()
+    // Both requests go out before either is answered.
+    test.assert_eq(gatt_client.take_tx(var t, link_a(), 0, 0, var out), gatt_client.TX_REQUEST)
+    test.assert_eq(gatt_client.take_tx(var t, link_a(), 1, 0, var out), gatt_client.TX_REQUEST)
+    test.assert_eq(gatt_client.take_tx(var t, link_a(), 0, 0, var out), gatt_client.TX_NONE)
+    test.assert_eq(gatt_client.take_tx(var t, link_a(), 1, 0, var out), gatt_client.TX_NONE)
+    // Each is answered at its bearer's ATT_MTU.
+    var l0 = new_log()
+    var l1 = new_log()
+    for r in gatt_server.receive_on(var s.db, var s.link, 0, [0x0A, 0x20, 0x00], 0)
+        deliver(t, link_a(), 0, r, l0)
+    for r in gatt_server.receive_on(var s.db, var s.link, 1, [0x0A, 0x20, 0x00], 0)
+        deliver(t, link_a(), 1, r, l1)
+    test.assert_eq(l0.tickets, [r0])
+    test.assert_eq(l1.tickets, [r1])
+    test.assert_eq(l0.values[0], ramp(22))
+    test.assert_eq(l1.values[0], ramp(63))
+
+@test
+fn test_a_timeout_ends_one_bearer_and_not_the_other()
+    var t = table()
+    test.assert(gatt_client.open_bearer(var t, link_a(), 1, 64))
+    let _ = gatt_client.begin_read(var t, link_a(), 0, 0x001A)
+    let _ = gatt_client.begin_read(var t, link_a(), 1, 0x001A)
+    var out: Vec[u8; 247] = Vec.new()
+    let _ = gatt_client.take_tx(var t, link_a(), 0, 0, var out)
+    let _ = gatt_client.take_tx(var t, link_a(), 1, 20000, var out)
+    test.assert_eq(gatt_client.tick(var t, link_a(), 0, 30000), gatt_client.EV_DONE)
+    test.assert_eq(gatt_client.tick(var t, link_a(), 1, 30000), gatt_client.EV_NONE)
+    test.assert(gatt_client.is_dead(var t, link_a(), 0))
+    test.assert(not gatt_client.is_dead(var t, link_a(), 1))
+
+@test
+fn test_the_discovery_cache_is_the_links_and_not_a_bearers()
+    var t = table()
+    var s = server()
+    test.assert(gatt_client.open_bearer(var t, link_a(), 1, 64))
+    test.assert_eq(gatt_server.open_bearer(var s.link, 0x0040, true, 64), 1)
+    var trace = new_log()
+    let _ = gatt_client.begin_discover_services(var t, link_a(), 1, 1, 0xFFFF, false)
+    pump_at(var t, link_a(), 1, var s, 0, var trace)
+    test.assert_eq(trace.statuses, [0])
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 4)
+    // An Enhanced ATT bearer has its MTU from its channel and no exchange.
+    test.assert_eq(gatt_client.mtu(var t, link_a(), 1), 64)
+    // A closed bearer holds nothing.
+    gatt_client.close_bearer(var t, link_a(), 1)
+    test.assert_eq(gatt_client.begin_read(var t, link_a(), 1, 3), gatt_client.ERR_NO_BEARER)
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 4)
+
+// ── A client for the services the host builds ───────────────────────
+
+@test
+fn test_the_gap_service_of_the_host_is_discovered_and_its_name_read()
+    var t = table()
+    var s = server()
+    test.assert_eq(run(t, link_a(), s, gatt_client.begin_discover_characteristics_by_uuid(var t, link_a(), 0, 0x0001, 0x000D, gatt_client.uuid16(0x2A00))), 0)
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 1)
+    let value_handle = gatt_client.cache_a_at(var t, link_a(), 0)
+    test.assert_eq(value_handle, gatt_db.GAP_SERVER_DEVICE_NAME_HANDLE)
+    var trace = new_log()
+    let _ = gatt_client.begin_read(var t, link_a(), 0, value_handle)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.values[0], [0x54, 0x65, 0x73, 0x74])
+
+// ── More edges ──────────────────────────────────────────────────────
+
+@test
+fn test_a_service_that_includes_nothing_ends_well_with_nothing_found()
+    var t = table()
+    var s = server()
+    test.assert_eq(run(t, link_a(), s, gatt_client.begin_find_included(var t, link_a(), 0, 0x0018, 0x0022)), 0)
+    test.assert_eq(gatt_client.result_found(var t, link_a(), 0), 0)
+    test.assert_eq(gatt_client.cache_count(var t, link_a()), 0)
+
+@test
+fn test_read_by_type_of_a_type_the_peer_has_not_is_a_refusal()
+    var t = table()
+    var s = server()
+    let status = run(t, link_a(), s, gatt_client.begin_read_by_type(var t, link_a(), 0, 1, 0xFFFF, gatt_client.uuid16(0x1234)))
+    test.assert_eq(status, att.ATT_ERR_ATTRIBUTE_NOT_FOUND)
+    test.assert(gatt_client.is_peer_error(status))
+
+@test
+fn test_a_request_the_peer_does_not_support_ends_with_its_code()
+    var t = table()
+    var trace = new_log()
+    let _ = gatt_client.begin_read(var t, link_a(), 0, 0x001A)
+    var out: Vec[u8; 247] = Vec.new()
+    test.assert_eq(gatt_client.take_tx(var t, link_a(), 0, 0, var out), gatt_client.TX_REQUEST)
+    deliver(t, link_a(), 0, [0x01, 0x0A, 0x1A, 0x00, att.ATT_ERR_REQUEST_NOT_SUPPORTED], trace)
+    test.assert_eq(trace.statuses, [att.ATT_ERR_REQUEST_NOT_SUPPORTED])
+    test.assert_eq(gatt_client.result_handle(var t, link_a(), 0), 0x001A)
+
+@test
+fn test_the_results_of_a_bearer_are_read_before_the_next_response_replaces_them()
+    var t = table()
+    var s = server()
+    let first = gatt_client.begin_read(var t, link_a(), 0, 0x001A)
+    let second = gatt_client.begin_read(var t, link_a(), 0, 0x0003)
+    var trace = new_log()
+    let answers = exchange(t, link_a(), 0, s, 0, trace)
+    deliver(t, link_a(), 0, answers[0], trace)
+    // The second request has been started; the first one's result is still there.
+    test.assert_eq(gatt_client.result_ticket(var t, link_a(), 0), first)
+    test.assert_eq(value_of(t, link_a(), 0), [1, 2, 3, 4])
+    let more = exchange(t, link_a(), 0, s, 0, trace)
+    deliver(t, link_a(), 0, more[0], trace)
+    test.assert_eq(gatt_client.result_ticket(var t, link_a(), 0), second)
+    test.assert_eq(value_of(t, link_a(), 0), [0x54, 0x65, 0x73, 0x74])
+
+@test
+fn test_a_write_clears_the_value_a_read_left()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let _ = gatt_client.begin_read(var t, link_a(), 0, 0x001A)
+    let _ = gatt_client.begin_write(var t, link_a(), 0, 0x001A, payload([7]), 1)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.values[0], [1, 2, 3, 4])
+    test.assert_eq(trace.values[1], [])
+
+@test
+fn test_a_slot_taken_over_starts_with_no_state()
+    var t = table()
+    var s = server()
+    discover_everything(var t, link_a(), var s)
+    let _ = gatt_client.begin_read(var t, link_a(), 0, 0x001A)
+    test.assert(gatt_client.open(var t, links.link_id(0, 7)))
+    test.assert_eq(gatt_client.cache_count(var t, links.link_id(0, 7)), 0)
+    test.assert(not gatt_client.is_busy(var t, links.link_id(0, 7), 0))
+    test.assert_eq(gatt_client.mtu(var t, links.link_id(0, 7), 0), 23)
+    test.assert_eq(gatt_client.begin_exchange_mtu(var t, links.link_id(0, 7), 0) > 0, true)
+
+@test
+fn test_a_bearer_that_is_not_open_has_no_state_to_read()
+    var t = table()
+    test.assert_eq(gatt_client.mtu(var t, link_a(), 1), 0)
+    test.assert_eq(gatt_client.result_status(var t, link_a(), 1), 0)
+    test.assert_eq(gatt_client.value_len(var t, link_a(), 1), 0)
+    test.assert_eq(gatt_client.value_at(var t, link_a(), 0, 0), 0)
+    test.assert_eq(gatt_client.event_handle(var t, link_b(), 0), 0)
+    test.assert_eq(gatt_client.tick(var t, link_b(), 0, 0), gatt_client.EV_NONE)
+    test.assert(not gatt_client.is_stale(var t, link_b()))
+    test.assert(not gatt_client.take_changed(var t, link_b()))
+    var out: Vec[u8; 247] = Vec.new()
+    test.assert_eq(gatt_client.take_tx(var t, link_b(), 0, 0, var out), gatt_client.TX_NONE)
+    var pdu: Vec[u8; 247] = Vec.new()
+    test.assert_eq(gatt_client.on_pdu(var t, link_b(), 0, var pdu, 0), gatt_client.EV_NONE)
+
+// ── What a bridge to another protocol needs ─────────────────────────
+//
+// The BTP GATT Client service (src/btp/btp_gatt_client.nv) runs on the engine:
+// it names the Rx MTU it offers, sets the MTU of the bearer the next PDU leaves
+// on, reads a long value from an offset, reads several values at once, signs
+// the writes it sends and writes values of no octets.
+
+@test
+fn test_a_caller_can_lift_the_refusal_of_a_second_mtu_exchange()
+    var t = table()
+    var s = server()
+    test.assert_eq(run(t, link_a(), s, gatt_client.begin_exchange_mtu(var t, link_a(), 0)), 0)
+    test.assert_eq(gatt_client.begin_exchange_mtu(var t, link_a(), 0), gatt_client.ERR_REPEAT)
+    test.assert(gatt_client.allow_another_mtu_exchange(var t, link_a(), 0))
+    test.assert(gatt_client.begin_exchange_mtu(var t, link_a(), 0) > 0)
+    test.assert(not gatt_client.allow_another_mtu_exchange(var t, link_a(), 1))
+    test.assert(not gatt_client.allow_another_mtu_exchange(var t, link_b(), 0))
+
+@test
+fn test_the_rx_mtu_offered_is_the_one_the_caller_names()
+    var t = table()
+    var s = server()
+    test.assert(gatt_client.set_rx_mtu(var t, link_a(), 0, 40))
+    var trace = new_log()
+    let _ = gatt_client.begin_exchange_mtu(var t, link_a(), 0)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.sent[0], [0x02, 40, 0])
+    // The server's own Rx MTU is 65, so the smaller of the two is the client's.
+    test.assert_eq(gatt_client.mtu(var t, link_a(), 0), 40)
+
+@test
+fn test_an_rx_mtu_or_an_mtu_out_of_range_or_for_a_bearer_that_is_not_open_is_refused()
+    var t = table()
+    test.assert(not gatt_client.set_rx_mtu(var t, link_a(), 0, 22))
+    test.assert(not gatt_client.set_rx_mtu(var t, link_a(), 0, 248))
+    test.assert(not gatt_client.set_rx_mtu(var t, link_a(), 1, 40))
+    test.assert(not gatt_client.set_rx_mtu(var t, link_b(), 0, 40))
+    test.assert(not gatt_client.set_mtu(var t, link_a(), 0, 22))
+    test.assert(not gatt_client.set_mtu(var t, link_a(), 0, 248))
+    test.assert(not gatt_client.set_mtu(var t, link_a(), 1, 40))
+    test.assert(not gatt_client.set_mtu(var t, link_b(), 0, 40))
+    test.assert(gatt_client.set_mtu(var t, link_a(), 0, 247))
+    test.assert_eq(gatt_client.mtu(var t, link_a(), 0), 247)
+
+@test
+fn test_the_mtu_set_for_a_bearer_shapes_the_requests_built_after_it()
+    var t = table()
+    test.assert(gatt_client.set_mtu(var t, link_a(), 0, 65))
+    let _ = gatt_client.begin_write_long(var t, link_a(), 0, 0x001A, payload(ramp(100)), 100)
+    var out: Vec[u8; 247] = Vec.new()
+    test.assert_eq(gatt_client.take_tx(var t, link_a(), 0, 0, var out), gatt_client.TX_REQUEST)
+    // A Prepare Write Request of ATT_MTU - 5 = 60 octets of value.
+    test.assert_eq(out.len(), 65)
+
+@test
+fn test_a_long_read_from_an_offset_opens_with_a_blob_and_reads_to_the_end()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let _ = gatt_client.begin_read_long_from(var t, link_a(), 0, 0x0020, 22)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.statuses, [0])
+    test.assert_eq(trace.sent[0], [0x0C, 0x20, 0x00, 22, 0x00])
+    test.assert_eq(list.len(trace.sent), 4)
+    test.assert_eq(trace.sent[3], [0x0C, 0x20, 0x00, 88, 0x00])
+    test.assert_eq(trace.values[0], ramp(100)[22:])
+
+@test
+fn test_a_long_read_from_offset_zero_opens_with_a_read_request()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let _ = gatt_client.begin_read_long_from(var t, link_a(), 0, 0x0020, 0)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.sent[0], [0x0A, 0x20, 0x00])
+    test.assert_eq(trace.values[0], ramp(100))
+
+@test
+fn test_a_long_read_from_an_offset_the_peer_refuses_ends_with_its_code()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let _ = gatt_client.begin_read_long_from(var t, link_a(), 0, 0x0020, 150)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.statuses, [att.ATT_ERR_INVALID_OFFSET])
+    test.assert_eq(gatt_client.value_len(var t, link_a(), 0), 0)
+
+@test
+fn test_a_long_read_from_an_offset_out_of_range_is_not_queued()
+    var t = table()
+    test.assert_eq(gatt_client.begin_read_long_from(var t, link_a(), 0, 0x0020, 0x10000), gatt_client.ERR_ARGUMENT)
+    test.assert_eq(gatt_client.begin_read_long_from(var t, link_a(), 0, 0x0020, -1), gatt_client.ERR_ARGUMENT)
+    test.assert_eq(gatt_client.begin_read_long_from(var t, link_a(), 0, 0, 0), gatt_client.ERR_ARGUMENT)
+
+@test
+fn test_several_values_are_read_with_one_request()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let _ = gatt_client.begin_read_multiple(var t, link_a(), 0, payload([0x1A, 0x00, 0x26, 0x00]), 4)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.sent[0], [0x0E, 0x1A, 0x00, 0x26, 0x00])
+    test.assert_eq(trace.statuses, [0])
+    test.assert_eq(trace.values[0], [1, 2, 3, 4, 0x77])
+
+@test
+fn test_a_read_multiple_the_peer_refuses_ends_with_its_code_and_handle()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let _ = gatt_client.begin_read_multiple(var t, link_a(), 0, payload([0x1A, 0x00, 0x22, 0x00]), 4)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.statuses, [att.ATT_ERR_READ_NOT_PERMITTED])
+    test.assert_eq(gatt_client.result_handle(var t, link_a(), 0), 0x0022)
+    test.assert_eq(gatt_client.value_len(var t, link_a(), 0), 0)
+
+@test
+fn test_values_of_any_length_are_read_with_one_variable_request()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let _ = gatt_client.begin_read_multiple_variable(var t, link_a(), 0, payload([0x1A, 0x00, 0x26, 0x00]), 4)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.sent[0], [0x20, 0x1A, 0x00, 0x26, 0x00])
+    test.assert_eq(trace.statuses, [0])
+    test.assert_eq(trace.values[0], [4, 0, 1, 2, 3, 4, 1, 0, 0x77])
+
+@test
+fn test_a_read_multiple_asks_for_the_handles_it_can_carry()
+    var t = table()
+    test.assert_eq(gatt_client.begin_read_multiple(var t, link_a(), 0, payload([]), 0), gatt_client.ERR_ARGUMENT)
+    test.assert_eq(gatt_client.begin_read_multiple(var t, link_a(), 0, payload([0x1A, 0x00, 0x26]), 3), gatt_client.ERR_ARGUMENT)
+    test.assert_eq(gatt_client.begin_read_multiple_variable(var t, link_a(), 0, payload([0x1A, 0x00]), 2), gatt_client.ERR_ARGUMENT)
+    // Eleven handles are 22 octets and the request is 23, the whole ATT_MTU.
+    test.assert(gatt_client.begin_read_multiple(var t, link_a(), 0, payload(fill(22, 1)), 22) > 0)
+    test.assert_eq(gatt_client.begin_read_multiple(var t, link_a(), 0, payload(fill(24, 1)), 24), gatt_client.ERR_ARGUMENT)
+    test.assert_eq(gatt_client.begin_read_multiple(var t, link_b(), 0, payload([0x1A, 0x00]), 2), gatt_client.ERR_NO_LINK)
+
+@test
+fn test_a_signed_write_goes_out_as_a_command_the_server_verifies()
+    var t = table()
+    var s = server()
+    let csrk = gatt_server.example_csrk()
+    gatt_server.set_client_csrk(var s.link, csrk)
+    gatt_server.set_peer_csrk(var s.link, csrk)
+    let handle = open_value(var s, 0xAA10)
+    let signed = gatt_server.build_signed_write(s.link, handle, [0x13, 0x37], 1)
+    test.assert_eq(list.len(signed), 3 + 2 + 12)
+    var data: [Int] = []
+    for x in signed[3:]
+        list.push(data, x as Int)
+    var trace = new_log()
+    let ticket = gatt_client.begin_signed_write(var t, link_a(), 0, handle, payload(data), list.len(data))
+    test.assert(ticket > 0)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.kinds, [gatt_client.TX_COMMAND])
+    test.assert_eq(trace.sent[0], ints(signed))
+    test.assert_eq(served(var s, handle), [0x13, 0x37])
+    test.assert(not gatt_client.is_busy(var t, link_a(), 0))
+
+@test
+fn test_a_signed_write_carries_at_least_a_signature_and_what_the_mtu_allows()
+    var t = table()
+    test.assert_eq(gatt_client.begin_signed_write(var t, link_a(), 0, 0x001A, payload(fill(11, 1)), 11), gatt_client.ERR_ARGUMENT)
+    test.assert(gatt_client.begin_signed_write(var t, link_a(), 0, 0x001A, payload(fill(12, 1)), 12) > 0)
+    test.assert_eq(gatt_client.begin_signed_write(var t, link_b(), 0, 0x001A, payload(fill(12, 1)), 12), gatt_client.ERR_NO_LINK)
+    var u = table()
+    test.assert_eq(gatt_client.begin_signed_write(var u, link_a(), 0, 0x001A, payload(fill(21, 1)), 21), gatt_client.ERR_ARGUMENT)
+
+@test
+fn test_a_value_of_no_octets_is_written()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let handle = open_value(var s, 0xAA10)
+    let _ = gatt_client.begin_write(var t, link_a(), 0, handle, payload([]), 0)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.sent[0], [0x12, handle & 0xFF, handle >>> 8])
+    test.assert_eq(trace.statuses, [0])
+    test.assert_eq(served(var s, handle), [])
+
+@test
+fn test_a_write_command_of_no_octets_is_sent()
+    var t = table()
+    var s = server()
+    var trace = new_log()
+    let _ = gatt_client.begin_write_command(var t, link_a(), 0, 0x0022, payload([]), 0)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.sent[0], [0x52, 0x22, 0x00])
+    test.assert_eq(trace.kinds, [gatt_client.TX_COMMAND])
+
+@test
+fn test_a_long_write_from_an_offset_carries_it_in_every_part()
+    var t = table()
+    var s = server()
+    let handle = open_value(var s, 0xAA10)
+    var trace = new_log()
+    let _ = gatt_client.begin_write_long_at(var t, link_a(), 0, handle, 5, payload(ramp(30)), 30)
+    pump(t, link_a(), s, trace)
+    // Parts of 18 and 12 octets from offset 5, then the Execute Write Request.
+    test.assert_eq(trace.sent[0][0:5], [0x16, handle & 0xFF, handle >>> 8, 5, 0])
+    test.assert_eq(trace.sent[1][0:5], [0x16, handle & 0xFF, handle >>> 8, 23, 0])
+    test.assert_eq(trace.sent[2], [0x18, 0x01])
+    test.assert_eq(list.len(trace.statuses), 1)
+
+@test
+fn test_a_reliable_write_from_an_offset_checks_the_echo_against_it()
+    var t = table()
+    var s = server()
+    let handle = open_value(var s, 0xAA10)
+    var trace = new_log()
+    let _ = gatt_client.begin_reliable_write_at(var t, link_a(), 0, handle, 7, payload(ramp(10)), 10)
+    pump(t, link_a(), s, trace)
+    test.assert_eq(trace.sent[0][0:5], [0x16, handle & 0xFF, handle >>> 8, 7, 0])
+    // The server echoed offset 7, and the part matched, so the Execute Write Request went out.
+    test.assert_eq(trace.sent[1], [0x18, 0x01])
+    test.assert_eq(gatt_client.begin_write_long_at(var t, link_a(), 0, handle, 0x10000, payload(ramp(10)), 10), gatt_client.ERR_ARGUMENT)
+    test.assert_eq(gatt_client.begin_reliable_write_at(var t, link_a(), 0, handle, -1, payload(ramp(10)), 10), gatt_client.ERR_ARGUMENT)
+
+@test
+fn test_a_long_or_reliable_write_of_no_octets_is_not_queued()
+    var t = table()
+    test.assert_eq(gatt_client.begin_write_long(var t, link_a(), 0, 0x001A, payload([]), 0), gatt_client.ERR_ARGUMENT)
+    test.assert_eq(gatt_client.begin_reliable_write(var t, link_a(), 0, 0x001A, payload([]), 0), gatt_client.ERR_ARGUMENT)
+    test.assert(not gatt_client.is_busy(var t, link_a(), 0))

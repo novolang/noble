@@ -1,0 +1,105 @@
+// control_common.nv — the steps the control services share
+// when they add their characteristics to a `GattDb` and when they read their
+// state back.
+//
+// The Volume, Audio Input, Volume Offset, Microphone, Coordinated Set and
+// Hearing Access services keep their state in the values of their
+// characteristics, the same for every client, so a service reads its state
+// from the database and writes the new state back; nothing is held twice.
+
+use std.test
+use gatt_server
+use profile_builder
+use wire
+
+// The value of the attribute `handle`, empty for none.
+pub fn attr(db: GattDb, handle: Int) -> [u8]
+    let i = gatt_server.index_of(db, handle)
+    if i < 0 then [] else db.attributes[i].value[:]
+
+// The Client Characteristic Configuration descriptor takes the access of the
+// service for a write and is readable on any link.
+pub fn cccd_permissions(access: gatt_server.Access) -> gatt_server.Permissions
+    gatt_server.Permissions { read: gatt_server.Access.Open, write: access }
+
+// Add a characteristic a client reads, optionally writes, and optionally is
+// notified of: the declaration, the value and, when `notify`, the Client
+// Characteristic Configuration descriptor.  `writable` lets a client write
+// the value at `access`; `with_response` and `without_response` are the Write
+// and Write Without Response properties the declaration announces.  The value
+// handle and the descriptor's, 0 when there is none.
+pub fn add_state(var db: GattDb, access: gatt_server.Access, uuid16: Int, value: [u8], notify: Bool, writable: Bool, with_response: Bool, without_response: Bool) -> Result<(Int, Int), profile_builder.ProfileError>
+    var properties = gatt_server.PROP_READ
+    if notify
+        properties = properties | gatt_server.PROP_NOTIFY
+    var permissions = profile_builder.read_only(access)
+    if writable
+        permissions = gatt_server.Permissions { read: access, write: access }
+    if with_response
+        properties = properties | gatt_server.PROP_WRITE
+    if without_response
+        properties = properties | gatt_server.PROP_WRITE_WO_RESP
+    let handle = profile_builder.add_value(var db, properties, permissions, gatt_server.le16(uuid16), value)!
+    if not notify
+        return Ok((handle, 0))
+    let cccd = profile_builder.add_cccd(var db, cccd_permissions(access))!
+    Ok((handle, cccd))
+
+// Add a text characteristic (an Audio Input Description or an Audio Output
+// Description): readable and notified, and, when `writable`, written by a
+// client with Write Without Response, the only write the services list
+// ([AICS] Table 3.1).  A client may write up to 512 octets.
+pub fn add_text(var db: GattDb, access: gatt_server.Access, uuid16: Int, text: [u8], writable: Bool) -> Result<(Int, Int), profile_builder.ProfileError>
+    let added = add_state(var db, access, uuid16, text, true, writable, false, writable)!
+    if writable and not gatt_server.set_max_length(var db, added.0, gatt_server.ATT_VALUE_MAX)
+        return Err(profile_builder.ProfileError.InvalidValue)
+    Ok(added)
+
+// The Change_Counter after `counter`: one more, 255 wrapping to 0.
+pub @tier(embedded)
+@no_alloc
+fn next_counter(counter: Int) -> Int
+    (counter + 1) & 0xFF
+
+// Whether `v` fits in an octet.
+pub @tier(embedded)
+@no_alloc
+fn is_octet(v: Int) -> Bool
+    v >= 0 and v <= 255
+
+// Whether `handles` names only service declarations of `db`.
+pub fn all_services(db: GattDb, handles: [Int]) -> Bool
+    for h in handles
+        let i = gatt_server.index_of(db, h)
+        if i < 0 or not gatt_server.is_service(db.attributes[i])
+            return false
+    true
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+@test
+fn test_the_counter_wraps_at_255()
+    test.assert_eq(next_counter(0), 1)
+    test.assert_eq(next_counter(254), 255)
+    test.assert_eq(next_counter(255), 0)
+
+@test
+fn test_a_state_characteristic_has_its_properties_and_descriptor()
+    var s = gatt_server.new_server([], 247)
+    let service = gatt_server.add_service(var s.db, false, gatt_server.le16(0x1234))
+    test.assert_eq(service, 1)
+    match add_state(var s.db, gatt_server.Access.Encrypted, 0x2A00, [1, 2], true, false, false, false)
+        Err(_) => test.fail("added")
+        Ok(h) =>
+            test.assert_eq(h.0, 3)
+            test.assert_eq(h.1, 4)
+            test.assert_eq(s.db.attributes[1].value[0] as Int, 0x12)
+    match add_state(var s.db, gatt_server.Access.Encrypted, 0x2A01, [], false, true, true, false)
+        Err(_) => test.fail("added")
+        Ok(h) =>
+            test.assert_eq(h.1, 0)
+            test.assert_eq(s.db.attributes[gatt_server.index_of(s.db, h.0 - 1)].value[0] as Int, 0x0A)
+    test.assert(all_services(s.db, [1]))
+    test.assert(not all_services(s.db, [1, 3]))
+    test.assert(not all_services(s.db, [99]))
+    test.assert(is_octet(255) and not is_octet(256) and not is_octet(-1))

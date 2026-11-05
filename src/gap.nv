@@ -1,0 +1,408 @@
+// gap.nv — Generic Access Profile.
+//
+// GAP sits above the LL and below the application: it owns the
+// roles a device plays (Peripheral / Central / Broadcaster /
+// Observer), the discoverability + connectability modes that map
+// to AD flags + advertising parameters, and the procedure shells
+// (general / limited discovery, auto / direct connection
+// establishment) that wrap LL primitives into spec-named flows.
+//
+// Surface in this module (Peripheral-focused; the Central-side
+// scanning / initiating helpers are stubs):
+//
+//   Role             marker enum (Peripheral / Central / Broadcaster /
+//                    Observer)
+//   DiscoverableMode Non / Limited / General → AD flag bits
+//   ConnectableMode  Non / Directed / Undirected (advertising side)
+//   ad_flags_for     map (DiscoverableMode, transport_only_le) → AD
+//                    flags byte
+//   build_ad_flags_record  / build_local_name_record
+//                    AD record builders for the advertising payload
+//
+// Satisfies: REQ-BLE-GAP-001 (role marker), REQ-BLE-GAP-002
+// (discoverable-mode flag mapping), REQ-BLE-GAP-003 (connectable-
+// mode classification), REQ-BLE-GAP-004 (AD record builders).
+
+use std.test
+use std.bits
+
+// ── Roles (Vol 3 Part C §2.2) ──────────────────────────────────────
+//
+// The four GAP roles a device may take.  Marker enum used for
+// type-checking which procedures are valid in which mode.
+enum Role
+    Peripheral
+    Central
+    Broadcaster
+    Observer
+
+// ── Discoverable mode (Vol 3 Part C §9.2) ──────────────────────────
+//
+//   Non         not advertising — invisible to scanners
+//   Limited     advertising for ~30 s with LIMITED_DISCOVERABLE_MODE
+//               flag set (used for one-shot pairings)
+//   General     advertising indefinitely with GENERAL_DISCOVERABLE_MODE
+//               flag set (the common case for an always-on device)
+enum DiscoverableMode
+    NonDiscoverable
+    LimitedDiscoverable
+    GeneralDiscoverable
+
+// ── Connectable mode (Vol 3 Part C §9.3) ───────────────────────────
+//
+//   Non                 ADV_NONCONN_IND / ADV_SCAN_IND on the wire —
+//                       receiver can't initiate a connection.
+//   DirectedConnectable ADV_DIRECT_IND, peer_addr in the AdvA field —
+//                       only the named peer can connect (high-duty
+//                       reconnect after bond).
+//   UndirectedConnectable ADV_IND — any scanner may CONNECT_IND.  The
+//                       common case.
+enum ConnectableMode
+    NonConnectable
+    DirectedConnectable
+    UndirectedConnectable
+
+// ── Advertising Data (AD) flag bits, Vol 3 Part C §11.1.3 ──────────
+//
+//   bit 0  LE Limited Discoverable Mode
+//   bit 1  LE General Discoverable Mode
+//   bit 2  BR/EDR Not Supported
+//   bit 3  Simultaneous LE + BR/EDR (Controller)
+//   bit 4  Simultaneous LE + BR/EDR (Host)
+const AD_FLAG_LE_LIMITED_DISC = 0x01
+const AD_FLAG_LE_GENERAL_DISC = 0x02
+const AD_FLAG_BR_EDR_NOT_SUPPORTED = 0x04
+const AD_FLAG_LE_BR_EDR_CONTROLLER = 0x08
+const AD_FLAG_LE_BR_EDR_HOST = 0x10
+
+// AD record types (Core Specification Supplement §1).  The server
+// uses the basic four:
+const AD_TYPE_FLAGS = 0x01
+const AD_TYPE_INCOMPLETE_LIST_16 = 0x02  // incomplete service UUID list (16-bit)
+const AD_TYPE_COMPLETE_LIST_16 = 0x03  // complete service UUID list (16-bit)
+const AD_TYPE_SHORTENED_LOCAL_NAME = 0x08
+const AD_TYPE_COMPLETE_LOCAL_NAME = 0x09
+const AD_TYPE_TX_POWER_LEVEL = 0x0A
+const AD_TYPE_APPEARANCE = 0x19
+const AD_TYPE_SERVICE_DATA_16 = 0x16  // service data (16-bit UUID)
+
+// ── DiscoverableMode → AD flag bits ────────────────────────────────
+//
+// Per Vol 3 Part C §9.2 — the AD payload's Flags byte must have
+// the right LE-discoverable bit set for the chosen mode.
+// `le_only` = true for typical BLE-only devices; sets the
+// BR/EDR Not Supported bit.
+@satisfies("REQ-BLE-GAP-002")
+@tier(embedded)
+@no_alloc
+fn discoverable_mode_flag(mode: DiscoverableMode) -> Int
+    match mode
+        NonDiscoverable     => 0
+        LimitedDiscoverable => AD_FLAG_LE_LIMITED_DISC
+        GeneralDiscoverable => AD_FLAG_LE_GENERAL_DISC
+
+@satisfies("REQ-BLE-GAP-002")
+@tier(embedded)
+@no_alloc
+fn ad_flags_for(mode: DiscoverableMode, le_only: Bool) -> Int
+    let mode_bit = discoverable_mode_flag(mode)
+    if le_only
+        mode_bit | AD_FLAG_BR_EDR_NOT_SUPPORTED
+    else
+        mode_bit
+
+// ── Mode classification helpers for tests / dispatchers ────────────
+@tier(embedded)
+fn discoverable_mode_name(m: DiscoverableMode) -> Str
+    match m
+        NonDiscoverable     => "Non"
+        LimitedDiscoverable => "Limited"
+        GeneralDiscoverable => "General"
+
+@tier(embedded)
+fn connectable_mode_name(m: ConnectableMode) -> Str
+    match m
+        NonConnectable        => "Non"
+        DirectedConnectable   => "Directed"
+        UndirectedConnectable => "Undirected"
+
+@tier(embedded)
+fn role_name(r: Role) -> Str
+    match r
+        Peripheral  => "Peripheral"
+        Central     => "Central"
+        Broadcaster => "Broadcaster"
+        Observer    => "Observer"
+
+// ── AD record builders ─────────────────────────────────────────────
+//
+// Each AD record on-the-wire is:
+//
+//   length:u8 | type:u8 | data:[u8 length-1]
+//
+// where length counts type + data (so length = data_len + 1).
+
+// Flags record — 1 byte of flag bits.  Fixed shape.
+@satisfies("REQ-BLE-GAP-004")
+@tier(embedded)
+fn build_ad_flags_record(flags: Int) -> [u8]
+    [0x02, AD_TYPE_FLAGS, (flags & 0xFF) as u8]
+
+// Complete Local Name record — len = 1 + len(name).
+@satisfies("REQ-BLE-GAP-004")
+@tier(embedded)
+fn build_local_name_record(name: [u8]) -> [u8]
+    var header: [u8] = list.with_capacity(2 + list.len(name))
+    list.append(header, [(list.len(name) + 1) as u8, AD_TYPE_COMPLETE_LOCAL_NAME])
+    list.append(header, name)
+    header
+
+// Complete List of 16-bit Service UUIDs.  Each UUID = 2 bytes LE.
+// Caller passes the flat byte sequence — i.e. for [0x180D, 0x180F]
+// it should pass [0x0D 0x18 0x0F 0x18].
+@satisfies("REQ-BLE-GAP-004")
+@tier(embedded)
+fn build_complete_list_16_record(uuids_le: [u8]) -> [u8]
+    var header: [u8] = list.with_capacity(2 + list.len(uuids_le))
+    list.append(header, [(list.len(uuids_le) + 1) as u8, AD_TYPE_COMPLETE_LIST_16])
+    list.append(header, uuids_le)
+    header
+
+// Appearance record — the 16-bit appearance value, least significant
+// octet first.
+@satisfies("REQ-BLE-GAP-004")
+@tier(embedded)
+fn build_appearance_record(appearance: Int) -> [u8]
+    [0x03, AD_TYPE_APPEARANCE, (appearance & 0xFF) as u8, ((appearance >>> 8) & 0xFF) as u8]
+
+// Service Data record for the 16-bit service `uuid`: the UUID, least
+// significant octet first, then `data`.
+pub @satisfies("REQ-BLE-GAP-004")
+@tier(embedded)
+fn build_service_data_16_record(uuid: Int, data: [u8]) -> [u8]
+    var record: [u8] = list.with_capacity(4 + list.len(data))
+    list.append(record, [(list.len(data) + 3) as u8, AD_TYPE_SERVICE_DATA_16, (uuid & 0xFF) as u8, ((uuid >>> 8) & 0xFF) as u8])
+    list.append(record, data)
+    record
+
+// Advertising data for a device in General Discoverable mode
+// ([Vol 3] Part C, Section 9.2.4): the Flags AD record followed by the
+// Complete Local Name AD record.  The caller checks
+// the result against the 31-byte limit of the advertising field.
+@satisfies("REQ-BLE-GAP-004")
+@tier(embedded)
+fn build_flags_and_name_ad(flags: Int, name: [u8]) -> [u8]
+    var ad = build_ad_flags_record(flags)
+    list.append(ad, build_local_name_record(name))
+    ad
+
+// ── Discovery procedures (Vol 3 Part C §9.2.5 and §9.2.6) ──────────
+
+// The flag octet of the first Flags AD type in advertising data made of
+// AD structures, or None when there is none.  An AD structure whose
+// Length is zero ends the significant part of the data ([Vol 3] Part C,
+// Section 11), and so does one that runs past the end.
+@tier(embedded)
+fn ad_flags_of(ad: [u8]) -> ?Int
+    let n = list.len(ad)
+    // `next` is the offset of the next AD structure's Length octet; each
+    // structure takes at least one octet, so `n` passes reach them all.
+    var next = 0
+    for at in 0..n
+        if at == next
+            let len = ad[at] as Int
+            if len == 0 or at + 1 + len > n
+                return None
+            if ad[at + 1] as Int == AD_TYPE_FLAGS and len >= 2
+                return Some(ad[at + 2] as Int)
+            next = at + 1 + len
+    None
+
+// The data of the first Complete Local Name AD type in data made of AD
+// structures, or None when there is none; the walk is that of
+// `ad_flags_of`.
+pub @tier(embedded)
+fn complete_local_name_of(ad: [u8]) -> ?[u8]
+    let n = list.len(ad)
+    var next = 0
+    for at in 0..n
+        if at == next
+            let len = ad[at] as Int
+            if len == 0 or at + 1 + len > n
+                return None
+            if ad[at + 1] as Int == AD_TYPE_COMPLETE_LOCAL_NAME
+                return Some(ad[at + 2:at + 1 + len])
+            next = at + 1 + len
+    None
+
+// Whether a Host performing the Limited Discovery procedure (`limited`)
+// or the General Discovery procedure considers the device that sent the
+// advertising data `ad` a discovered device.  The limited procedure
+// takes a device whose Flags AD type has the LE Limited Discoverable
+// Mode flag set; the general procedure takes either that flag or the LE
+// General Discoverable Mode flag.  Advertising data with no Flags AD
+// type is ignored, and the Simultaneous LE and BR/EDR to Same Device
+// Capable (Controller) bit plays no part ([Vol 3] Part C, Sections
+// 9.2.5.2 and 9.2.6.2).
+pub @tier(embedded)
+@no_alloc
+fn is_discovered(ad: [u8], limited: Bool) -> Bool
+    match ad_flags_of(ad)
+        None        => false
+        Some(flags) =>
+            let wanted = if limited then AD_FLAG_LE_LIMITED_DISC else AD_FLAG_LE_LIMITED_DISC | AD_FLAG_LE_GENERAL_DISC
+            (flags & wanted) != 0
+
+// ── Tests ──────────────────────────────────────────────────────────
+
+@test
+fn test_ad_flags_of_finds_the_flags_ad_type()
+    test.assert_eq(ad_flags_of([0x02, 0x01, 0x05]) ?? -1, 0x05)
+    // After a Complete Local Name.
+    test.assert_eq(ad_flags_of([0x03, 0x09, 'h', 'i', 0x02, 0x01, 0x06]) ?? -1, 0x06)
+    // None at all, an empty list, a zero Length first, and a truncated
+    // structure.
+    test.assert_eq(ad_flags_of([0x03, 0x09, 'h', 'i']) ?? -1, -1)
+    test.assert_eq(ad_flags_of([]) ?? -1, -1)
+    test.assert_eq(ad_flags_of([0x00, 0x02, 0x01, 0x06]) ?? -1, -1)
+    test.assert_eq(ad_flags_of([0x02, 0x01]) ?? -1, -1)
+
+@test
+fn test_is_discovered_by_procedure()
+    let limited: [u8] = [0x02, 0x01, 0x05]
+    let general: [u8] = [0x02, 0x01, 0x06]
+    let neither: [u8] = [0x02, 0x01, 0x04]
+    // The Simultaneous LE and BR/EDR (Controller) bit alone.
+    let simultaneous: [u8] = [0x02, 0x01, 0x08]
+    let no_flags: [u8] = [0x03, 0x09, 'h', 'i']
+    test.assert_eq(is_discovered(limited, true), true)
+    test.assert_eq(is_discovered(general, true), false)
+    test.assert_eq(is_discovered(neither, true), false)
+    test.assert_eq(is_discovered(limited, false), true)
+    test.assert_eq(is_discovered(general, false), true)
+    test.assert_eq(is_discovered(neither, false), false)
+    test.assert_eq(is_discovered(simultaneous, false), false)
+    test.assert_eq(is_discovered(no_flags, false), false)
+    test.assert_eq(is_discovered([], true), false)
+
+@test
+@satisfies("REQ-BLE-GAP-001")
+fn test_role_names()
+    test.assert_eq(role_name(Peripheral), "Peripheral")
+    test.assert_eq(role_name(Central), "Central")
+    test.assert_eq(role_name(Broadcaster), "Broadcaster")
+    test.assert_eq(role_name(Observer), "Observer")
+
+@test
+@satisfies("REQ-BLE-GAP-002")
+fn test_ad_flags_for_general_discoverable_le_only()
+    // General + LE-only → bit 1 (general) + bit 2 (BR/EDR not supp) = 0x06
+    test.assert_eq(ad_flags_for(GeneralDiscoverable, true), 0x06)
+
+@test
+@satisfies("REQ-BLE-GAP-002")
+fn test_ad_flags_for_limited_discoverable_le_only()
+    // Limited + LE-only → bit 0 + bit 2 = 0x05
+    test.assert_eq(ad_flags_for(LimitedDiscoverable, true), 0x05)
+
+@test
+@satisfies("REQ-BLE-GAP-002")
+fn test_ad_flags_for_non_discoverable_le_only()
+    // Non + LE-only → just bit 2 = 0x04
+    test.assert_eq(ad_flags_for(NonDiscoverable, true), 0x04)
+
+@test
+@satisfies("REQ-BLE-GAP-002")
+fn test_ad_flags_for_general_dual_mode()
+    // General + dual-mode (le_only=false) → just bit 1 = 0x02
+    test.assert_eq(ad_flags_for(GeneralDiscoverable, false), 0x02)
+
+@test
+@satisfies("REQ-BLE-GAP-003")
+fn test_connectable_mode_names()
+    test.assert_eq(connectable_mode_name(NonConnectable), "Non")
+    test.assert_eq(connectable_mode_name(DirectedConnectable), "Directed")
+    test.assert_eq(connectable_mode_name(UndirectedConnectable), "Undirected")
+
+@test
+@satisfies("REQ-BLE-GAP-002")
+fn test_discoverable_mode_names()
+    test.assert_eq(discoverable_mode_name(NonDiscoverable), "Non")
+    test.assert_eq(discoverable_mode_name(LimitedDiscoverable), "Limited")
+    test.assert_eq(discoverable_mode_name(GeneralDiscoverable), "General")
+
+@test
+@satisfies("REQ-BLE-GAP-004")
+fn test_ad_flags_record_shape()
+    let r = build_ad_flags_record(0x06)
+    test.assert_eq(list.len(r), 3)
+    test.assert_eq(r[0] as Int, 2)   // length
+    test.assert_eq(r[1] as Int, AD_TYPE_FLAGS)
+    test.assert_eq(r[2] as Int, 0x06)
+
+@test
+@satisfies("REQ-BLE-GAP-004")
+fn test_local_name_record_shape()
+    let name: [u8] = [0x4E, 0x6F, 0x76, 0x6F]   // "Novo"
+    let r = build_local_name_record(name)
+    test.assert_eq(list.len(r), 6)
+    test.assert_eq(r[0] as Int, 5)   // 1 (type) + 4 (name)
+    test.assert_eq(r[1] as Int, AD_TYPE_COMPLETE_LOCAL_NAME)
+    test.assert_eq(r[2] as Int, 0x4E)
+    test.assert_eq(r[5] as Int, 0x6F)
+
+@test
+@satisfies("REQ-BLE-GAP-004")
+fn test_complete_list_16_record_shape()
+    // Two services: 0x180D + 0x180F (LE).
+    let uuids: [u8] = [0x0D, 0x18, 0x0F, 0x18]
+    let r = build_complete_list_16_record(uuids)
+    test.assert_eq(list.len(r), 6)
+    test.assert_eq(r[0] as Int, 5)   // 1 (type) + 4 (uuids)
+    test.assert_eq(r[1] as Int, AD_TYPE_COMPLETE_LIST_16)
+    test.assert_eq(r[2] as Int, 0x0D)
+    test.assert_eq(r[3] as Int, 0x18)
+
+@test
+@satisfies("REQ-BLE-GAP-004")
+fn test_flags_and_name_ad_layout()
+    let name: [u8] = [0x4E, 0x6F, 0x76, 0x6F]   // "Novo"
+    let ad = build_flags_and_name_ad(ad_flags_for(GeneralDiscoverable, true), name)
+    test.assert_eq(list.len(ad), 9)
+    test.assert_eq(ad[0] as Int, 0x02)
+    test.assert_eq(ad[1] as Int, AD_TYPE_FLAGS)
+    test.assert_eq(ad[2] as Int, 0x06)
+    test.assert_eq(ad[3] as Int, 5)
+    test.assert_eq(ad[4] as Int, AD_TYPE_COMPLETE_LOCAL_NAME)
+    test.assert_eq(ad[5] as Int, 0x4E)
+    test.assert_eq(ad[8] as Int, 0x6F)
+
+@test
+fn test_appearance_and_service_data_records()
+    let a = build_appearance_record(0x0441)
+    test.assert_eq(list.len(a), 4)
+    test.assert_eq(a[0] as Int, 3)
+    test.assert_eq(a[1] as Int, AD_TYPE_APPEARANCE)
+    test.assert_eq(a[2] as Int, 0x41)
+    test.assert_eq(a[3] as Int, 0x04)
+    let sd = build_service_data_16_record(0x1826, [0x01, 0x20, 0x00])
+    test.assert_eq(list.len(sd), 7)
+    test.assert_eq(sd[0] as Int, 6)
+    test.assert_eq(sd[1] as Int, AD_TYPE_SERVICE_DATA_16)
+    test.assert_eq(sd[2] as Int, 0x26)
+    test.assert_eq(sd[3] as Int, 0x18)
+    test.assert_eq(sd[6] as Int, 0x00)
+
+@test
+fn test_complete_local_name_of()
+    let ad: [u8] = [0x02, 0x01, 0x06, 0x03, 0x09, 'h', 'i']
+    match complete_local_name_of(ad)
+        None       => test.fail("the name is found")
+        Some(name) =>
+            test.assert_eq(list.len(name), 2)
+            test.assert_eq(name[1] as Int, 'i' as Int)
+    // An empty name, none, a Shortened Local Name only, a truncated one.
+    test.assert_eq(list.len(complete_local_name_of([0x01, 0x09]) ?? [0xFF]), 0)
+    test.assert(complete_local_name_of([0x02, 0x01, 0x06]) == None)
+    test.assert(complete_local_name_of([0x03, 0x08, 'h', 'i']) == None)
+    test.assert(complete_local_name_of([0x05, 0x09, 'h']) == None)

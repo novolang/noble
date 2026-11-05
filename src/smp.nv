@@ -1,0 +1,798 @@
+// smp.nv — Security Manager Protocol commands.
+//
+// [Vol 3] Part H, Section 3.  Every SMP command travels on the Security
+// Manager Channel, the L2CAP fixed channel 0x0006 (Section 3.2), as a
+// Code octet followed by the command's Data field (Section 3.3).  This
+// module holds the codes and field values of Sections 3.3 to 3.6, a
+// builder for each command, and readers for the fields.  Multi-octet
+// fields are least significant octet first, as they are transmitted
+// (Section 1.2.1).
+//
+// It holds no state: smp_responder.nv runs the pairing procedure.
+
+use std.test
+use std.bits
+
+// ── Command codes ([Vol 3] Part H, Section 3.3, Table 3.3) ──────────
+
+// The code of the SMP Pairing Request command ([Vol 3] Part H, Section 3.3).
+pub const SMP_OP_PAIRING_REQUEST = 0x01
+// The code of the SMP Pairing Response command ([Vol 3] Part H, Section 3.3).
+pub const SMP_OP_PAIRING_RESPONSE = 0x02
+// The code of the SMP Pairing Confirm command ([Vol 3] Part H, Section 3.3).
+pub const SMP_OP_PAIRING_CONFIRM = 0x03
+// The code of the SMP Pairing Random command ([Vol 3] Part H, Section 3.3).
+pub const SMP_OP_PAIRING_RANDOM = 0x04
+const SMP_OP_PAIRING_FAILED = 0x05
+const SMP_OP_ENCRYPTION_INFORMATION = 0x06
+const SMP_OP_CENTRAL_IDENTIFICATION = 0x07
+const SMP_OP_IDENTITY_INFORMATION = 0x08
+const SMP_OP_IDENTITY_ADDRESS_INFORMATION = 0x09
+const SMP_OP_SIGNING_INFORMATION = 0x0A
+// The code of the SMP Security Request command ([Vol 3] Part H, Section 3.3).
+pub const SMP_OP_SECURITY_REQUEST = 0x0B
+// The code of the SMP Pairing Public Key command ([Vol 3] Part H, Section 3.3).
+pub const SMP_OP_PAIRING_PUBLIC_KEY = 0x0C
+// The code of the SMP Pairing DHKey Check command ([Vol 3] Part H, Section 3.3).
+pub const SMP_OP_PAIRING_DHKEY_CHECK = 0x0D
+const SMP_OP_PAIRING_KEYPRESS_NOTIFICATION = 0x0E
+
+// ── IO Capability ([Vol 3] Part H, Section 3.5.1, Table 3.4) ───────
+
+// The IO Capability DisplayOnly ([Vol 3] Part H, Section 3.5.1).
+pub const SMP_IO_CAP_DISPLAY_ONLY = 0x00
+const SMP_IO_CAP_DISPLAY_YES_NO = 0x01
+const SMP_IO_CAP_KEYBOARD_ONLY = 0x02
+// The IO Capability NoInputNoOutput ([Vol 3] Part H, Section 3.5.1).
+pub const SMP_IO_CAP_NO_INPUT_NO_OUTPUT = 0x03
+const SMP_IO_CAP_KEYBOARD_DISPLAY = 0x04
+
+// ── OOB data flag ([Vol 3] Part H, Section 3.5.1, Table 3.5) ───────
+
+const SMP_OOB_NOT_PRESENT = 0x00
+// The OOB Data Flag that says out-of-band authentication data is present ([Vol 3] Part H, Section 3.5.1).
+pub const SMP_OOB_PRESENT = 0x01
+
+// ── AuthReq ([Vol 3] Part H, Section 3.5.1, Figure 3.3) ────────────
+//
+// Bonding_Flags in bits 0 and 1 (Table 3.6: 00 No Bonding, 01 Bonding,
+// 10 and 11 reserved), MITM in bit 2, SC in bit 3, Keypress in bit 4,
+// CT2 in bit 5; bits 6 and 7 are reserved for future use.
+
+const SMP_AUTHREQ_NO_BONDING = 0x00
+// The AuthReq bit for bonding ([Vol 3] Part H, Section 3.5.1).
+pub const SMP_AUTHREQ_BONDING = 0x01
+// The AuthReq bit that asks for man-in-the-middle protection ([Vol 3] Part H, Section 3.5.1).
+pub const SMP_AUTHREQ_MITM = 0x04
+// The AuthReq bit that asks for LE Secure Connections pairing ([Vol 3] Part H, Section 3.5.1).
+pub const SMP_AUTHREQ_SC = 0x08
+const SMP_AUTHREQ_KEYPRESS = 0x10
+// The AuthReq bit that says the device supports the h7 function of cross-transport key derivation ([Vol 3] Part H,
+// Section 3.5.1).
+pub const SMP_AUTHREQ_CT2 = 0x20
+const SMP_AUTHREQ_BONDING_FLAGS_MASK = 0x03
+
+// ── Key Distribution / Generation ([Vol 3] Part H, Section 3.6.1,
+//    Figure 3.11) ───────────────────────────────────────────────────
+//
+// EncKey in bit 0, IdKey in bit 1, SignKey in bit 2, LinkKey in bit 3;
+// bits 4 to 7 are reserved for future use.
+
+const SMP_KEY_DIST_NONE = 0x00
+const SMP_KEY_DIST_ENC = 0x01
+const SMP_KEY_DIST_ID = 0x02
+const SMP_KEY_DIST_SIGN = 0x04
+const SMP_KEY_DIST_LINK = 0x08
+
+// ── Maximum Encryption Key Size ([Vol 3] Part H, Section 3.5.1) ────
+//
+// In the range 7 to 16 octets (Section 2.3.4).
+pub const SMP_MIN_ENC_KEY_SIZE = 7
+// The largest encryption key size in octets ([Vol 3] Part H, Section 3.5.1).
+pub const SMP_MAX_ENC_KEY_SIZE = 16
+
+// ── Pairing Failed Reason ([Vol 3] Part H, Section 3.5.5, Table 3.7) ─
+
+const SMP_FAIL_PASSKEY_ENTRY_FAILED = 0x01
+const SMP_FAIL_OOB_NOT_AVAILABLE = 0x02
+const SMP_FAIL_AUTH_REQUIREMENTS = 0x03
+// The Pairing Failed reason Confirm Value Failed ([Vol 3] Part H, Section 3.5.5).
+pub const SMP_FAIL_CONFIRM_VALUE_FAILED = 0x04
+const SMP_FAIL_PAIRING_NOT_SUPPORTED = 0x05
+const SMP_FAIL_ENC_KEY_SIZE = 0x06
+const SMP_FAIL_COMMAND_NOT_SUPPORTED = 0x07
+const SMP_FAIL_UNSPECIFIED_REASON = 0x08
+const SMP_FAIL_REPEATED_ATTEMPTS = 0x09
+const SMP_FAIL_INVALID_PARAMETERS = 0x0A
+const SMP_FAIL_DHKEY_CHECK_FAILED = 0x0B
+const SMP_FAIL_NUMERIC_COMPARISON_FAILED = 0x0C
+const SMP_FAIL_BREDR_PAIRING_IN_PROGRESS = 0x0D
+const SMP_FAIL_CROSS_TRANSPORT_NOT_ALLOWED = 0x0E
+const SMP_FAIL_KEY_REJECTED = 0x0F
+const SMP_FAIL_BUSY = 0x10
+
+// ── Keypress Notification Type ([Vol 3] Part H, Section 3.5.8,
+//    Table 3.8) ─────────────────────────────────────────────────────
+
+const SMP_KEYPRESS_ENTRY_STARTED = 0
+const SMP_KEYPRESS_DIGIT_ENTERED = 1
+const SMP_KEYPRESS_DIGIT_ERASED = 2
+const SMP_KEYPRESS_CLEARED = 3
+const SMP_KEYPRESS_ENTRY_COMPLETED = 4
+
+// ── Identity Address Information AddrType ([Vol 3] Part H, Section
+//    3.6.5) ──────────────────────────────────────────────────────────
+
+const SMP_ADDR_TYPE_PUBLIC = 0x00
+// The address type of a static random address, as Identity Address Information carries it ([Vol 3] Part H, Section
+// 3.6.5).
+pub const SMP_ADDR_TYPE_STATIC_RANDOM = 0x01
+
+// ── Command lengths, Code octet included ───────────────────────────
+
+const SMP_PAIRING_REQUEST_SIZE = 7
+const SMP_PAIRING_RESPONSE_SIZE = 7
+const SMP_PAIRING_CONFIRM_SIZE = 17
+const SMP_PAIRING_RANDOM_SIZE = 17
+const SMP_PAIRING_FAILED_SIZE = 2
+const SMP_ENCRYPTION_INFORMATION_SIZE = 17
+const SMP_CENTRAL_IDENTIFICATION_SIZE = 11
+const SMP_IDENTITY_INFORMATION_SIZE = 17
+const SMP_IDENTITY_ADDRESS_INFORMATION_SIZE = 8
+const SMP_SIGNING_INFORMATION_SIZE = 17
+const SMP_SECURITY_REQUEST_SIZE = 2
+const SMP_PAIRING_PUBLIC_KEY_SIZE = 65
+const SMP_PAIRING_DHKEY_CHECK_SIZE = 17
+const SMP_PAIRING_KEYPRESS_NOTIFICATION_SIZE = 2
+
+// The MTU of the Security Manager Channel when LE Secure Connections is
+// supported ([Vol 3] Part H, Section 3.2, Table 3.2): the longest
+// command, Pairing Public Key, is 65 octets.
+const SMP_MTU_SC = 65
+
+// The length of the command with code `opcode`, or -1 for a code that
+// is reserved for future use.
+@tier(embedded)
+@no_alloc
+fn command_length(opcode: Int) -> Int
+    if opcode == SMP_OP_PAIRING_REQUEST or opcode == SMP_OP_PAIRING_RESPONSE
+        SMP_PAIRING_REQUEST_SIZE
+    else if opcode == SMP_OP_PAIRING_CONFIRM or opcode == SMP_OP_PAIRING_RANDOM
+        SMP_PAIRING_CONFIRM_SIZE
+    else if opcode == SMP_OP_PAIRING_FAILED or opcode == SMP_OP_SECURITY_REQUEST
+        SMP_PAIRING_FAILED_SIZE
+    else if opcode == SMP_OP_PAIRING_KEYPRESS_NOTIFICATION
+        SMP_PAIRING_KEYPRESS_NOTIFICATION_SIZE
+    else if opcode == SMP_OP_ENCRYPTION_INFORMATION or opcode == SMP_OP_IDENTITY_INFORMATION
+        SMP_ENCRYPTION_INFORMATION_SIZE
+    else if opcode == SMP_OP_SIGNING_INFORMATION or opcode == SMP_OP_PAIRING_DHKEY_CHECK
+        SMP_SIGNING_INFORMATION_SIZE
+    else if opcode == SMP_OP_CENTRAL_IDENTIFICATION
+        SMP_CENTRAL_IDENTIFICATION_SIZE
+    else if opcode == SMP_OP_IDENTITY_ADDRESS_INFORMATION
+        SMP_IDENTITY_ADDRESS_INFORMATION_SIZE
+    else if opcode == SMP_OP_PAIRING_PUBLIC_KEY
+        SMP_PAIRING_PUBLIC_KEY_SIZE
+    else
+        -1
+
+// ── Commands and reasons as variants ────────────────────────────────
+//
+// The pairing procedures name a command or a Pairing Failed reason by
+// these variants.  `command_of` and `command_code`, `reason_of` and
+// `reason_code` are the one place where a variant and its value on the
+// wire meet; the SMP_OP_* and SMP_FAIL_* constants above stay the
+// values a builder or a test compares an octet with.
+
+// A command of Table 3.3.
+@value
+enum Command
+    PairingRequest
+    PairingResponse
+    PairingConfirm
+    PairingRandom
+    PairingFailed
+    EncryptionInformation
+    CentralIdentification
+    IdentityInformation
+    IdentityAddressInformation
+    SigningInformation
+    SecurityRequest
+    PairingPublicKey
+    PairingDhKeyCheck
+    PairingKeypressNotification
+
+// The command with Code `opcode`, or None for a Code that is reserved
+// for future use (Section 3.3).
+@tier(embedded)
+fn command_of(opcode: Int) -> ?Command
+    if opcode == SMP_OP_PAIRING_REQUEST
+        Some(Command.PairingRequest)
+    else if opcode == SMP_OP_PAIRING_RESPONSE
+        Some(Command.PairingResponse)
+    else if opcode == SMP_OP_PAIRING_CONFIRM
+        Some(Command.PairingConfirm)
+    else if opcode == SMP_OP_PAIRING_RANDOM
+        Some(Command.PairingRandom)
+    else if opcode == SMP_OP_PAIRING_FAILED
+        Some(Command.PairingFailed)
+    else if opcode == SMP_OP_ENCRYPTION_INFORMATION
+        Some(Command.EncryptionInformation)
+    else if opcode == SMP_OP_CENTRAL_IDENTIFICATION
+        Some(Command.CentralIdentification)
+    else if opcode == SMP_OP_IDENTITY_INFORMATION
+        Some(Command.IdentityInformation)
+    else if opcode == SMP_OP_IDENTITY_ADDRESS_INFORMATION
+        Some(Command.IdentityAddressInformation)
+    else if opcode == SMP_OP_SIGNING_INFORMATION
+        Some(Command.SigningInformation)
+    else if opcode == SMP_OP_SECURITY_REQUEST
+        Some(Command.SecurityRequest)
+    else if opcode == SMP_OP_PAIRING_PUBLIC_KEY
+        Some(Command.PairingPublicKey)
+    else if opcode == SMP_OP_PAIRING_DHKEY_CHECK
+        Some(Command.PairingDhKeyCheck)
+    else if opcode == SMP_OP_PAIRING_KEYPRESS_NOTIFICATION
+        Some(Command.PairingKeypressNotification)
+    else
+        None
+
+// The Code of `command`.
+@tier(embedded)
+@no_alloc
+fn command_code(command: Command) -> Int
+    match command
+        PairingRequest => SMP_OP_PAIRING_REQUEST
+        PairingResponse => SMP_OP_PAIRING_RESPONSE
+        PairingConfirm => SMP_OP_PAIRING_CONFIRM
+        PairingRandom => SMP_OP_PAIRING_RANDOM
+        PairingFailed => SMP_OP_PAIRING_FAILED
+        EncryptionInformation => SMP_OP_ENCRYPTION_INFORMATION
+        CentralIdentification => SMP_OP_CENTRAL_IDENTIFICATION
+        IdentityInformation => SMP_OP_IDENTITY_INFORMATION
+        IdentityAddressInformation => SMP_OP_IDENTITY_ADDRESS_INFORMATION
+        SigningInformation => SMP_OP_SIGNING_INFORMATION
+        SecurityRequest => SMP_OP_SECURITY_REQUEST
+        PairingPublicKey => SMP_OP_PAIRING_PUBLIC_KEY
+        PairingDhKeyCheck => SMP_OP_PAIRING_DHKEY_CHECK
+        PairingKeypressNotification => SMP_OP_PAIRING_KEYPRESS_NOTIFICATION
+
+// A Pairing Failed reason a device sends (Table 3.7).
+@value
+enum Reason
+    PasskeyEntryFailed
+    OobNotAvailable
+    AuthenticationRequirements
+    ConfirmValueFailed
+    PairingNotSupported
+    EncryptionKeySize
+    CommandNotSupported
+    UnspecifiedReason
+    RepeatedAttempts
+    InvalidParameters
+    DhKeyCheckFailed
+    NumericComparisonFailed
+    BrEdrPairingInProgress
+    CrossTransportKeyGenerationNotAllowed
+    KeyRejected
+    Busy
+
+// The Reason octet of `reason`.
+@tier(embedded)
+@no_alloc
+fn reason_code(reason: Reason) -> Int
+    match reason
+        PasskeyEntryFailed => SMP_FAIL_PASSKEY_ENTRY_FAILED
+        OobNotAvailable => SMP_FAIL_OOB_NOT_AVAILABLE
+        AuthenticationRequirements => SMP_FAIL_AUTH_REQUIREMENTS
+        ConfirmValueFailed => SMP_FAIL_CONFIRM_VALUE_FAILED
+        PairingNotSupported => SMP_FAIL_PAIRING_NOT_SUPPORTED
+        EncryptionKeySize => SMP_FAIL_ENC_KEY_SIZE
+        CommandNotSupported => SMP_FAIL_COMMAND_NOT_SUPPORTED
+        UnspecifiedReason => SMP_FAIL_UNSPECIFIED_REASON
+        RepeatedAttempts => SMP_FAIL_REPEATED_ATTEMPTS
+        InvalidParameters => SMP_FAIL_INVALID_PARAMETERS
+        DhKeyCheckFailed => SMP_FAIL_DHKEY_CHECK_FAILED
+        NumericComparisonFailed => SMP_FAIL_NUMERIC_COMPARISON_FAILED
+        BrEdrPairingInProgress => SMP_FAIL_BREDR_PAIRING_IN_PROGRESS
+        CrossTransportKeyGenerationNotAllowed => SMP_FAIL_CROSS_TRANSPORT_NOT_ALLOWED
+        KeyRejected => SMP_FAIL_KEY_REJECTED
+        Busy => SMP_FAIL_BUSY
+
+// ── Builders ────────────────────────────────────────────────────────
+
+// Pairing Request (Section 3.5.1).  The Peripheral receives it; the
+// tests build it to play the initiator.
+pub @satisfies("REQ-BLE-SMP-002")
+@tier(embedded)
+fn build_pairing_request(io_cap: Int, oob: Int, auth_req: Int, max_key_size: Int,
+                         init_key_dist: Int, resp_key_dist: Int) -> [u8]
+    [
+        SMP_OP_PAIRING_REQUEST,
+        io_cap as u8,
+        oob as u8,
+        auth_req as u8,
+        max_key_size as u8,
+        init_key_dist as u8,
+        resp_key_dist as u8]
+
+// Pairing Response (Section 3.5.2): the fields of the Pairing Request
+// under its own Code.
+@satisfies("REQ-BLE-SMP-002")
+@tier(embedded)
+fn build_pairing_response(io_cap: Int, oob: Int, auth_req: Int, max_key_size: Int,
+                          init_key_dist: Int, resp_key_dist: Int) -> [u8]
+    [
+        SMP_OP_PAIRING_RESPONSE,
+        io_cap as u8,
+        oob as u8,
+        auth_req as u8,
+        max_key_size as u8,
+        init_key_dist as u8,
+        resp_key_dist as u8]
+
+// The Pairing Response of the on-device Just Works path in smp_fsm.nv:
+// NoInputNoOutput, no OOB data, Bonding, a 16-octet key, no keys
+// distributed.
+pub @satisfies("REQ-BLE-SMP-002")
+@tier(embedded)
+fn build_pairing_response_just_works() -> [u8]
+    build_pairing_response(
+        SMP_IO_CAP_NO_INPUT_NO_OUTPUT,
+        SMP_OOB_NOT_PRESENT,
+        SMP_AUTHREQ_BONDING,
+        SMP_MAX_ENC_KEY_SIZE,
+        SMP_KEY_DIST_NONE,
+        SMP_KEY_DIST_NONE)
+
+// Pairing Confirm: the 16-octet confirm value (Section 3.5.3), c1 in
+// LE legacy pairing and f4 in LE Secure Connections.
+pub @satisfies("REQ-BLE-SMP-003")
+@tier(embedded)
+fn build_pairing_confirm(confirm_value: [u8]) -> [u8]
+    [
+        SMP_OP_PAIRING_CONFIRM,
+        confirm_value[0], confirm_value[1], confirm_value[2], confirm_value[3],
+        confirm_value[4], confirm_value[5], confirm_value[6], confirm_value[7],
+        confirm_value[8], confirm_value[9], confirm_value[10], confirm_value[11],
+        confirm_value[12], confirm_value[13], confirm_value[14], confirm_value[15]]
+
+// Pairing Random: the 16-octet random value (Section 3.5.4), LP_RAND_I
+// or LP_RAND_R in LE legacy pairing and Na or Nb in LE Secure
+// Connections.
+pub @satisfies("REQ-BLE-SMP-003")
+@tier(embedded)
+fn build_pairing_random(random_value: [u8]) -> [u8]
+    [
+        SMP_OP_PAIRING_RANDOM,
+        random_value[0], random_value[1], random_value[2], random_value[3],
+        random_value[4], random_value[5], random_value[6], random_value[7],
+        random_value[8], random_value[9], random_value[10], random_value[11],
+        random_value[12], random_value[13], random_value[14], random_value[15]]
+
+// Pairing Failed: the Reason of Table 3.7 (Section 3.5.5).
+pub @satisfies("REQ-BLE-SMP-003")
+@tier(embedded)
+fn build_pairing_failed(reason: Int) -> [u8]
+    [
+        SMP_OP_PAIRING_FAILED,
+        reason as u8]
+
+// A command whose Data field is one 16-octet value: Pairing Confirm,
+// Pairing Random, Encryption Information, Identity Information, Signing
+// Information and Pairing DHKey Check.  `value` is least significant
+// octet first.
+@tier(embedded)
+fn build_value16(opcode: Int, value: [u8]) -> [u8]
+    var out: [u8] = list.with_capacity(17)
+    let _ = list.try_push(out, opcode as u8)
+    for i in 0..16
+        let _ = list.try_push(out, value[i])
+    out
+
+// Encryption Information: the Long Term Key (Section 3.6.2).
+@tier(embedded)
+fn build_encryption_information(ltk: [u8]) -> [u8]
+    build_value16(SMP_OP_ENCRYPTION_INFORMATION, ltk)
+
+// Central Identification: EDIV (2 octets) and Rand (8 octets)
+// (Section 3.6.3).
+@tier(embedded)
+fn build_central_identification(ediv: Int, rand_value: [u8]) -> [u8]
+    var out: [u8] = [SMP_OP_CENTRAL_IDENTIFICATION, (ediv & 0xFF) as u8, ((ediv >> 8) & 0xFF) as u8]
+    for i in 0..8
+        list.push(out, rand_value[i])
+    out
+
+// Identity Information: the Identity Resolving Key (Section 3.6.4).
+@tier(embedded)
+fn build_identity_information(irk: [u8]) -> [u8]
+    build_value16(SMP_OP_IDENTITY_INFORMATION, irk)
+
+// Identity Address Information: AddrType and BD_ADDR (Section 3.6.5).
+@tier(embedded)
+fn build_identity_address_information(addr_type: Int, bd_addr: [u8]) -> [u8]
+    [SMP_OP_IDENTITY_ADDRESS_INFORMATION, addr_type as u8,
+     bd_addr[0], bd_addr[1], bd_addr[2], bd_addr[3], bd_addr[4], bd_addr[5]]
+
+// Signing Information: the Connection Signature Resolving Key
+// (Section 3.6.6).
+@tier(embedded)
+fn build_signing_information(csrk: [u8]) -> [u8]
+    build_value16(SMP_OP_SIGNING_INFORMATION, csrk)
+
+// Security Request: AuthReq (Section 3.6.7).
+pub @tier(embedded)
+fn build_security_request(auth_req: Int) -> [u8]
+    [SMP_OP_SECURITY_REQUEST, auth_req as u8]
+
+// Pairing Public Key: the X and Y coordinates, 32 octets each
+// (Section 3.5.6).
+pub @tier(embedded)
+fn build_pairing_public_key(x: [u8], y: [u8]) -> [u8]
+    var out: [u8] = [SMP_OP_PAIRING_PUBLIC_KEY]
+    for i in 0..32
+        list.push(out, x[i])
+    for j in 0..32
+        list.push(out, y[j])
+    out
+
+// Pairing DHKey Check: Ea or Eb (Section 3.5.7).
+pub @tier(embedded)
+fn build_pairing_dhkey_check(check: [u8]) -> [u8]
+    build_value16(SMP_OP_PAIRING_DHKEY_CHECK, check)
+
+// Keypress Notification: Notification Type (Section 3.5.8).
+@tier(embedded)
+fn build_keypress_notification(notification_type: Int) -> [u8]
+    [SMP_OP_PAIRING_KEYPRESS_NOTIFICATION, notification_type as u8]
+
+// `count` octets of a command from octet `at`, as a new list.
+@tier(embedded)
+fn field_bytes(pdu: [u8], at: Int, count: Int) -> [u8]
+    var out: [u8] = []
+    for i in 0..count
+        list.push(out, pdu[at + i])
+    out
+
+// ── Readers ─────────────────────────────────────────────────────────
+//
+// Each reader takes a whole command, Code octet first, and answers one
+// field, or -1 when the command is too short to hold it.
+
+@tier(embedded)
+@no_alloc
+fn smp_opcode(pdu: [u8]) -> Int
+    if list.len(pdu) >= 1
+        pdu[0] as Int
+    else
+        -1
+
+@tier(embedded)
+@no_alloc
+fn is_pairing_request(pdu: [u8]) -> Bool
+    smp_opcode(pdu) == SMP_OP_PAIRING_REQUEST
+
+@tier(embedded)
+@no_alloc
+fn is_pairing_response(pdu: [u8]) -> Bool
+    smp_opcode(pdu) == SMP_OP_PAIRING_RESPONSE
+
+@tier(embedded)
+@no_alloc
+fn is_pairing_confirm(pdu: [u8]) -> Bool
+    smp_opcode(pdu) == SMP_OP_PAIRING_CONFIRM
+
+@tier(embedded)
+@no_alloc
+fn is_pairing_random(pdu: [u8]) -> Bool
+    smp_opcode(pdu) == SMP_OP_PAIRING_RANDOM
+
+@tier(embedded)
+@no_alloc
+fn is_pairing_failed(pdu: [u8]) -> Bool
+    smp_opcode(pdu) == SMP_OP_PAIRING_FAILED
+
+// The fields of a Pairing Request or Pairing Response, which share a
+// layout.
+@tier(embedded)
+@no_alloc
+fn pairing_io_cap(pdu: [u8]) -> Int
+    if list.len(pdu) >= 7
+        pdu[1] as Int
+    else
+        -1
+
+@tier(embedded)
+@no_alloc
+fn pairing_oob(pdu: [u8]) -> Int
+    if list.len(pdu) >= 7
+        pdu[2] as Int
+    else
+        -1
+
+@tier(embedded)
+@no_alloc
+fn pairing_auth_req(pdu: [u8]) -> Int
+    if list.len(pdu) >= 7
+        pdu[3] as Int
+    else
+        -1
+
+@tier(embedded)
+@no_alloc
+fn pairing_max_key_size(pdu: [u8]) -> Int
+    if list.len(pdu) >= 7
+        pdu[4] as Int
+    else
+        -1
+
+@tier(embedded)
+@no_alloc
+fn pairing_init_key_dist(pdu: [u8]) -> Int
+    if list.len(pdu) >= 7
+        pdu[5] as Int
+    else
+        -1
+
+@tier(embedded)
+@no_alloc
+fn pairing_resp_key_dist(pdu: [u8]) -> Int
+    if list.len(pdu) >= 7
+        pdu[6] as Int
+    else
+        -1
+
+// The flags of an AuthReq field.
+@tier(embedded)
+@no_alloc
+fn auth_req_bonding(auth_req: Int) -> Bool
+    (auth_req & SMP_AUTHREQ_BONDING) != 0
+
+@tier(embedded)
+@no_alloc
+fn auth_req_mitm(auth_req: Int) -> Bool
+    (auth_req & SMP_AUTHREQ_MITM) != 0
+
+@tier(embedded)
+@no_alloc
+fn auth_req_sc(auth_req: Int) -> Bool
+    (auth_req & SMP_AUTHREQ_SC) != 0
+
+// Octet `i` of the value a Pairing Confirm or Pairing Random carries.
+@tier(embedded)
+@no_alloc
+fn pairing_confirm_byte(pdu: [u8], i: Int) -> Int
+    if list.len(pdu) >= 17
+        pdu[1 + i] as Int
+    else
+        -1
+
+@tier(embedded)
+@no_alloc
+fn pairing_random_byte(pdu: [u8], i: Int) -> Int
+    if list.len(pdu) >= 17
+        pdu[1 + i] as Int
+    else
+        -1
+
+// The Reason of a Pairing Failed.
+@tier(embedded)
+@no_alloc
+fn pairing_failed_reason(pdu: [u8]) -> Int
+    if list.len(pdu) >= 2
+        pdu[1] as Int
+    else
+        -1
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+@test
+fn test_opcodes_match_spec_table()
+    test.assert_eq(SMP_OP_PAIRING_REQUEST, 0x01)
+    test.assert_eq(SMP_OP_PAIRING_RESPONSE, 0x02)
+    test.assert_eq(SMP_OP_PAIRING_CONFIRM, 0x03)
+    test.assert_eq(SMP_OP_PAIRING_RANDOM, 0x04)
+    test.assert_eq(SMP_OP_PAIRING_FAILED, 0x05)
+
+@test
+fn test_command_variants_map_to_their_codes_and_back()
+    for code in 0..0x10
+        match command_of(code)
+            Some(c) => test.assert_eq(command_code(c), code)
+            None => test.assert(code == 0 or code > SMP_OP_PAIRING_KEYPRESS_NOTIFICATION)
+    test.assert_eq(command_code(Command.PairingFailed), SMP_OP_PAIRING_FAILED)
+    test.assert(command_of(0x0F) == None)
+    test.assert(command_of(0xFF) == None)
+
+@test
+fn test_reason_variants_map_to_table_3_7()
+    test.assert_eq(reason_code(Reason.PasskeyEntryFailed), 0x01)
+    test.assert_eq(reason_code(Reason.ConfirmValueFailed), 0x04)
+    test.assert_eq(reason_code(Reason.UnspecifiedReason), 0x08)
+    test.assert_eq(reason_code(Reason.DhKeyCheckFailed), 0x0B)
+    test.assert_eq(reason_code(Reason.Busy), 0x10)
+
+@test
+fn test_io_cap_constants_match_spec()
+    test.assert_eq(SMP_IO_CAP_DISPLAY_ONLY, 0x00)
+    test.assert_eq(SMP_IO_CAP_DISPLAY_YES_NO, 0x01)
+    test.assert_eq(SMP_IO_CAP_KEYBOARD_ONLY, 0x02)
+    test.assert_eq(SMP_IO_CAP_NO_INPUT_NO_OUTPUT, 0x03)
+    test.assert_eq(SMP_IO_CAP_KEYBOARD_DISPLAY, 0x04)
+
+@test
+fn test_authreq_bit_flags_match_spec()
+    test.assert_eq(SMP_AUTHREQ_NO_BONDING, 0x00)
+    test.assert_eq(SMP_AUTHREQ_BONDING, 0x01)
+    test.assert_eq(SMP_AUTHREQ_MITM, 0x04)
+    test.assert_eq(SMP_AUTHREQ_SC, 0x08)
+
+@test
+fn test_pdu_sizes_match_spec()
+    test.assert_eq(SMP_PAIRING_REQUEST_SIZE, 7)
+    test.assert_eq(SMP_PAIRING_RESPONSE_SIZE, 7)
+    test.assert_eq(SMP_PAIRING_CONFIRM_SIZE, 17)
+    test.assert_eq(SMP_PAIRING_RANDOM_SIZE, 17)
+    test.assert_eq(SMP_PAIRING_FAILED_SIZE, 2)
+
+@test
+fn test_build_pairing_request_round_trips_via_accessors()
+    let pdu = build_pairing_request(
+        SMP_IO_CAP_DISPLAY_YES_NO,
+        SMP_OOB_NOT_PRESENT,
+        SMP_AUTHREQ_BONDING | SMP_AUTHREQ_MITM,
+        SMP_MAX_ENC_KEY_SIZE,
+        SMP_KEY_DIST_ENC,
+        SMP_KEY_DIST_ID)
+    test.assert_eq(list.len(pdu), 7)
+    test.assert(is_pairing_request(pdu))
+    test.assert_eq(pairing_io_cap(pdu), SMP_IO_CAP_DISPLAY_YES_NO)
+    test.assert_eq(pairing_oob(pdu), SMP_OOB_NOT_PRESENT)
+    test.assert_eq(pairing_auth_req(pdu), SMP_AUTHREQ_BONDING | SMP_AUTHREQ_MITM)
+    test.assert_eq(pairing_max_key_size(pdu), 16)
+    test.assert_eq(pairing_init_key_dist(pdu), SMP_KEY_DIST_ENC)
+    test.assert_eq(pairing_resp_key_dist(pdu), SMP_KEY_DIST_ID)
+
+@test
+fn test_build_pairing_response_just_works_shape()
+    let pdu = build_pairing_response_just_works()
+    test.assert_eq(list.len(pdu), 7)
+    test.assert(is_pairing_response(pdu))
+    test.assert_eq(pairing_io_cap(pdu), SMP_IO_CAP_NO_INPUT_NO_OUTPUT)
+    test.assert_eq(pairing_oob(pdu), SMP_OOB_NOT_PRESENT)
+    test.assert_eq(pairing_auth_req(pdu), SMP_AUTHREQ_BONDING)
+    test.assert_eq(pairing_max_key_size(pdu), 16)
+    test.assert_eq(pairing_init_key_dist(pdu), SMP_KEY_DIST_NONE)
+    test.assert_eq(pairing_resp_key_dist(pdu), SMP_KEY_DIST_NONE)
+
+@test
+fn test_auth_req_bit_decoders()
+    let bonding_only = SMP_AUTHREQ_BONDING
+    test.assert(auth_req_bonding(bonding_only))
+    test.assert(not auth_req_mitm(bonding_only))
+    test.assert(not auth_req_sc(bonding_only))
+
+    let bond_mitm_sc = (SMP_AUTHREQ_BONDING | SMP_AUTHREQ_MITM) | SMP_AUTHREQ_SC
+    test.assert(auth_req_bonding(bond_mitm_sc))
+    test.assert(auth_req_mitm(bond_mitm_sc))
+    test.assert(auth_req_sc(bond_mitm_sc))
+
+@test
+fn test_build_pairing_confirm_carries_16_bytes()
+    let cv: [u8] = [
+        0xC0, 0xC1, 0xC2, 0xC3,
+        0xC4, 0xC5, 0xC6, 0xC7,
+        0xC8, 0xC9, 0xCA, 0xCB,
+        0xCC, 0xCD, 0xCE, 0xCF]
+    let pdu = build_pairing_confirm(cv)
+    test.assert_eq(list.len(pdu), 17)
+    test.assert(is_pairing_confirm(pdu))
+    test.assert_eq(pairing_confirm_byte(pdu, 0), 0xC0)
+    test.assert_eq(pairing_confirm_byte(pdu, 7), 0xC7)
+    test.assert_eq(pairing_confirm_byte(pdu, 15), 0xCF)
+
+@test
+fn test_build_pairing_random_carries_16_bytes()
+    let rv: [u8] = [
+        0xA0, 0xA1, 0xA2, 0xA3,
+        0xA4, 0xA5, 0xA6, 0xA7,
+        0xA8, 0xA9, 0xAA, 0xAB,
+        0xAC, 0xAD, 0xAE, 0xAF]
+    let pdu = build_pairing_random(rv)
+    test.assert_eq(list.len(pdu), 17)
+    test.assert(is_pairing_random(pdu))
+    test.assert_eq(pairing_random_byte(pdu, 0), 0xA0)
+    test.assert_eq(pairing_random_byte(pdu, 7), 0xA7)
+    test.assert_eq(pairing_random_byte(pdu, 15), 0xAF)
+
+@test
+fn test_build_pairing_failed_reason_round_trips()
+    let pdu = build_pairing_failed(SMP_FAIL_AUTH_REQUIREMENTS)
+    test.assert_eq(list.len(pdu), 2)
+    test.assert(is_pairing_failed(pdu))
+    test.assert_eq(pairing_failed_reason(pdu), SMP_FAIL_AUTH_REQUIREMENTS)
+
+@test
+fn test_short_pdu_returns_negative_one_from_accessors()
+    let stub: [u8] = [SMP_OP_PAIRING_REQUEST]
+    test.assert_eq(pairing_io_cap(stub), -1)
+    test.assert_eq(pairing_auth_req(stub), -1)
+    test.assert_eq(pairing_failed_reason(stub), -1)
+    test.assert_eq(pairing_confirm_byte(stub, 0), -1)
+
+@test
+fn test_empty_pdu_smp_opcode_returns_negative_one()
+    let empty: [u8] = []
+    test.assert_eq(smp_opcode(empty), -1)
+    test.assert(not is_pairing_request(empty))
+    test.assert(not is_pairing_failed(empty))
+
+@test
+fn test_command_lengths_match_the_section_3_formats()
+    test.assert_eq(command_length(SMP_OP_PAIRING_REQUEST), 7)
+    test.assert_eq(command_length(SMP_OP_PAIRING_RANDOM), 17)
+    test.assert_eq(command_length(SMP_OP_CENTRAL_IDENTIFICATION), 11)
+    test.assert_eq(command_length(SMP_OP_IDENTITY_ADDRESS_INFORMATION), 8)
+    test.assert_eq(command_length(SMP_OP_SECURITY_REQUEST), 2)
+    test.assert_eq(command_length(SMP_OP_PAIRING_PUBLIC_KEY), 65)
+    test.assert_eq(command_length(SMP_OP_PAIRING_DHKEY_CHECK), 17)
+    test.assert_eq(command_length(SMP_OP_PAIRING_KEYPRESS_NOTIFICATION), 2)
+    test.assert_eq(command_length(0x0F), -1)
+    test.assert_eq(command_length(0x00), -1)
+
+@test
+fn test_key_distribution_builders_lay_out_their_fields()
+    var key: [u8] = []
+    for i in 0..16
+        list.push(key, i as u8)
+    let enc = build_encryption_information(key)
+    test.assert_eq(list.len(enc), 17)
+    test.assert_eq(enc[0] as Int, 0x06)
+    test.assert_eq(enc[16] as Int, 15)
+    let rand8: [u8] = [1, 2, 3, 4, 5, 6, 7, 8]
+    let cid = build_central_identification(0xBEEF, rand8)
+    test.assert_eq(list.len(cid), 11)
+    test.assert_eq(cid[1] as Int, 0xEF)
+    test.assert_eq(cid[2] as Int, 0xBE)
+    test.assert_eq(cid[10] as Int, 8)
+    let addr: [u8] = [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xC5]
+    let ia = build_identity_address_information(SMP_ADDR_TYPE_STATIC_RANDOM, addr)
+    test.assert_eq(list.len(ia), 8)
+    test.assert_eq(ia[1] as Int, 1)
+    test.assert_eq(ia[7] as Int, 0xC5)
+    test.assert_eq(build_identity_information(key)[0] as Int, 0x08)
+    test.assert_eq(build_signing_information(key)[0] as Int, 0x0A)
+    test.assert_eq(build_pairing_dhkey_check(key)[0] as Int, 0x0D)
+    let sr = build_security_request(SMP_AUTHREQ_BONDING | SMP_AUTHREQ_MITM)
+    test.assert_eq(sr[0] as Int, 0x0B)
+    test.assert_eq(sr[1] as Int, 0x05)
+    let kp = build_keypress_notification(SMP_KEYPRESS_ENTRY_COMPLETED)
+    test.assert_eq(kp[1] as Int, 4)
+    test.assert_eq(field_bytes(cid, 3, 8)[7] as Int, 8)
+
+@test
+fn test_public_key_builder_carries_x_then_y()
+    var x: [u8] = []
+    var y: [u8] = []
+    for i in 0..32
+        list.push(x, i as u8)
+        list.push(y, (0x80 + i) as u8)
+    let pk = build_pairing_public_key(x, y)
+    test.assert_eq(list.len(pk), 65)
+    test.assert_eq(pk[0] as Int, 0x0C)
+    test.assert_eq(pk[1] as Int, 0)
+    test.assert_eq(pk[32] as Int, 31)
+    test.assert_eq(pk[33] as Int, 0x80)
+    test.assert_eq(pk[64] as Int, 0x9F)
+
+@test
+fn test_short_commands_answer_negative_one_from_every_reader()
+    let stub: [u8] = [SMP_OP_PAIRING_REQUEST]
+    test.assert_eq(pairing_oob(stub), -1)
+    test.assert_eq(pairing_max_key_size(stub), -1)
+    test.assert_eq(pairing_init_key_dist(stub), -1)
+    test.assert_eq(pairing_resp_key_dist(stub), -1)
+    test.assert_eq(pairing_random_byte(stub, 0), -1)
+    test.assert_eq(command_length(SMP_OP_SIGNING_INFORMATION), 17)
+    test.assert_eq(command_length(SMP_OP_ENCRYPTION_INFORMATION), 17)

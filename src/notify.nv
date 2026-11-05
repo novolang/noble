@@ -1,0 +1,40 @@
+// notify.nv — the notifications a change of a service's
+// state owes the clients.
+//
+// The state of the control services is the same for every client, so a change
+// is announced to every connection that subscribed.  A serve function of a
+// service returns the handles whose values changed, and the program calls
+// `notify_changed` for each connection it holds, the writer included
+// ([VCS] 3.1.4: "notify clients that have enabled" the notification).
+
+use std.test
+use gatt_server
+
+// The notifications of `changed`, in order, for the client of `link`: one for
+// each handle the client subscribed to.
+pub fn notify_changed(var db: GattDb, var link: AttLink, changed: [Int], now_ms: Int) -> [[u8]]
+    var out: [[u8]] = []
+    for handle in changed
+        list.append(out, gatt_server.send_value(var db, var link, handle, now_ms))
+    out
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+@test
+fn test_only_subscribed_handles_are_notified_in_order()
+    var s = gatt_server.new_server([], 247)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    gatt_server.set_mtu(var s.link, 0, 247)
+    let a = gatt_server.add_service(var s.db, false, gatt_server.le16(0x1234))
+    test.assert_eq(a, 1)
+    let first = gatt_server.add_characteristic(var s.db, gatt_server.PROP_READ | gatt_server.PROP_NOTIFY, 0, gatt_server.le16(0x2A00))
+    let first_cccd = gatt_server.add_configuration(var s.db, gatt_server.open_permissions())
+    let second = gatt_server.add_characteristic(var s.db, gatt_server.PROP_READ | gatt_server.PROP_NOTIFY, 0, gatt_server.le16(0x2A01))
+    let _ = gatt_server.add_configuration(var s.db, gatt_server.open_permissions())
+    test.assert(gatt_server.set_value(var s.db, first + 1, [7]))
+    test.assert(gatt_server.set_value(var s.db, second + 1, [8]))
+    let _ = gatt_server.receive(var s.db, var s.link, [0x12, (first_cccd & 0xFF) as u8, (first_cccd >>> 8) as u8, 1, 0], 0)
+    let out = notify_changed(var s.db, var s.link, [second + 1, first + 1], 0)
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0][0] as Int, 0x1B)
+    test.assert_eq(out[0][3] as Int, 7)

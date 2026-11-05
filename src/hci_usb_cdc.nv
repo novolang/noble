@@ -1,0 +1,230 @@
+// hci_usb_cdc.nv — `HciUsbCdc` transport.
+//
+// **DRAFT — this transport does not move any bytes.**  The
+// data-shape side of the USB CDC-ACM HCI transport is in place so
+// the trait surface is reviewable, and `impl HciTransport for
+// HciUsbCdc` compiles, but every `hal.usb.*` call it makes is a
+// placeholder against a surface the runtime does not implement.
+// See `docs/orbit/ble-usb-cdc-driver.md` for the runtime-side
+// checklist.
+//
+// What has to exist before this transport works:
+//   1. An nRF52840-DK (nRF52832 has no USB peripheral).
+//   2. `hal.usb.*` in the stdlib plus an nRF52840 USBD driver,
+//      descriptor table and class compliance in the runtime.
+//   3. This file's stubs swapped for real `hal.usb.*` calls.
+//   4. A `btattach -B /dev/novo-usb -P h4` bring-up against the
+//      USB-attached firmware.
+//
+// USB CDC-ACM wire layout for HCI (per Bluetooth HCI USB
+// Transport Layer spec, Vol 4 Part B):
+//
+//   - Endpoint 0 (control)    HCI Command packets
+//   - Endpoint 1 IN  (bulk)   HCI Event packets (controller → host)
+//   - Endpoint 2 OUT (bulk)   ACL Data packets (host → controller)
+//   - Endpoint 2 IN  (bulk)   ACL Data packets (controller → host)
+//   - Endpoint 3 IN  (interrupt) Vendor-specific events (unused here)
+//
+// HCI command packets DON'T use H4 framing here — they're carried
+// in USB control transfers' setup packet payload directly.  Events
+// arrive as bulk-IN transfers with the event_code as the first
+// byte.  See `encode_hci_cmd_usb_control` / `decode_hci_evt_usb`
+// below.
+//
+// Satisfies (when shipped):
+//   - REQ-BLE-ARCH-002 — HCI host-controller boundary as a
+//     first-class type (HciUsbCdc) with trait conformance.
+//   - REQ-BLE-USB-001 — USB CDC-ACM transport per Vol 4 Part B.
+//   - REQ-BLE-USB-002 — Endpoint multiplexing (CMD/EVT/ACL).
+
+use std.test
+use hci_frame
+use hci_transport
+
+// ── USB endpoint addresses (per HCI USB Transport spec) ─────────────
+//
+// Endpoint addresses are 4 bits + direction bit (0x80 = IN).
+// Names follow the BLE HCI USB Transport spec naming.
+
+const USB_EP_CTRL = 0x00  // bidirectional
+const USB_EP_HCI_EVENT_IN = 0x81  // bulk IN
+const USB_EP_HCI_ACL_OUT = 0x02  // bulk OUT
+const USB_EP_HCI_ACL_IN = 0x82  // bulk IN
+const USB_EP_HCI_VENDOR_IN = 0x83  // interrupt IN (unused)
+
+// ── USB control-transfer setup packet for HCI commands ──────────────
+//
+// HCI Commands are delivered via control transfer (Vol 4 Part B
+// §2.2.1).  The setup packet's bRequestType + bRequest + wValue
+// + wIndex fields carry no HCI data; the wLength + payload phase
+// carries the HCI Command packet (without H4 prefix).
+
+const USB_BMREQUESTTYPE_HCI = 0x20  // Class | Host-to-device | Interface
+const USB_BREQUEST_HCI_COMMAND = 0x00  // HCI command (vendor 0)
+const USB_WVALUE_HCI = 0x0000
+const USB_WINDEX_HCI = 0x0000  // interface 0
+
+// ── HciUsbCdc struct ────────────────────────────────────────────────
+//
+// Marker struct holding instance state.  `interface_num` lets
+// multi-interface USB configurations target the right HCI
+// interface (single-controller setups always use 0).  `is_attached`
+// reflects the runtime's current detach/attach status — set by
+// the USBD ISR through a `hal.usb.is_configured()` query.
+
+struct HciUsbCdc
+    interface_num: Int
+
+@tier(embedded)
+fn new_hci_usb_cdc(interface_num: Int) -> HciUsbCdc
+    HciUsbCdc { interface_num: interface_num }
+
+// ── Encode helpers ──────────────────────────────────────────────────
+//
+// HCI Command via USB control transfer: setup packet header (8
+// bytes) followed by the HCI Command body bytes (no H4 prefix).
+// The body is the same as `hci_frame.encode_hci_cmd_msg(cmd)`'s
+// output — opcode_lo + opcode_hi + param_len + params.
+//
+// Setup packet layout (USB 2.0 §9.3):
+//   byte 0    bmRequestType
+//   byte 1    bRequest
+//   bytes 2-3 wValue   (LE)
+//   bytes 4-5 wIndex   (LE)
+//   bytes 6-7 wLength  (LE)  — length of the data phase (HCI body)
+
+// Take body_len as an Int rather than reading cmd.params here —
+// the OCaml backend's record-field inference can't disambiguate
+// `cmd.params` across multiple record types that share the field
+// name (HciCmdMsg, HciEvtMsg, frame-generated hcicmd, etc.).
+// Caller computes body_len from `list.len(hci_frame.encode_hci_cmd_msg(cmd))`.
+
+@tier(embedded)
+fn encode_hci_cmd_usb_setup(body_len: Int, interface_num: Int) -> [u8]
+    [
+        USB_BMREQUESTTYPE_HCI,
+        USB_BREQUEST_HCI_COMMAND,
+        // wValue (LE) — always 0 for HCI commands
+        (USB_WVALUE_HCI & 0xFF) as u8,
+        ((USB_WVALUE_HCI >>> 8) & 0xFF) as u8,
+        // wIndex (LE) — interface number
+        (interface_num & 0xFF) as u8,
+        ((interface_num >>> 8) & 0xFF) as u8,
+        // wLength (LE) — body length
+        (body_len & 0xFF) as u8,
+        ((body_len >>> 8) & 0xFF) as u8]
+
+// ── impl HciTransport for HciUsbCdc ─────────────────────────────────
+//
+// Send-side wires the typed frame through encode + USB control
+// transfer (for cmd) or bulk-OUT (for ACL).  Receive-side queries
+// the bulk-IN endpoint via hal.usb.read_bulk; returns None if
+// nothing pending.  Every `hal.usb.*` call below is a placeholder
+// against a surface that does not exist yet, so these methods
+// describe the intended wiring rather than perform it.
+
+impl HciTransport for HciUsbCdc
+    type CmdFrame = HciCmdMsg
+    type EvtFrame = HciEvtMsg
+    fn send_command(self, cmd: HciCmdMsg) -> Bool [hw]
+        // 1. Encode the HCI Command body (no H4 prefix on USB).
+        let body = hci_frame.encode_hci_cmd_msg(cmd)
+        // 2. Build setup packet for the control transfer.  Pass
+        //    body length explicitly to sidestep cross-record
+        //    field-inference on the OCaml backend.
+        let setup = encode_hci_cmd_usb_setup(list.len(body), self.interface_num)
+        // 3. Hand both off to the USBD control endpoint.  Returns
+        //    true on host ACK, false on stall / device not
+        //    configured / runtime stub.
+        hal.usb.control_transfer(setup, body)
+
+    fn recv_event(self) -> ?HciEvtMsg [hw]
+        // hal.usb.read_bulk(EP) returns ?[u8] — the next pending
+        // bulk-IN transfer payload, or None if the endpoint is
+        // empty.  Decode the wire bytes back to the typed event.
+        match hal.usb.read_bulk(USB_EP_HCI_EVENT_IN)
+            Some(b) => Some(hci_frame.decode_hci_evt_msg(b))
+            None    => None
+
+    fn send_acl(self, acl: [u8]) -> Bool [hw]
+        // ACL frames go through bulk-OUT EP 0x02.  Same shape
+        // as send_command's body but no setup packet — bulk
+        // transfers have implicit framing.
+        hal.usb.write_bulk(USB_EP_HCI_ACL_OUT, acl)
+
+    fn recv_acl(self) -> ?[u8] [hw]
+        // ACL frames arrive on bulk-IN EP 0x82.
+        hal.usb.read_bulk(USB_EP_HCI_ACL_IN)
+
+    fn is_open(self) -> Bool [hw]
+        // True when the host has enumerated + configured the
+        // device.  hal.usb.is_configured() returns the USBD
+        // device-state register's CONFIGURED bit.
+        hal.usb.is_configured()
+
+    fn close(self) [hw]
+        // Detach from the bus by clearing the USBD pull-up.
+        hal.usb.detach()
+
+// ── Tests (data-shape only — no I/O) ────────────────────────────────
+
+@test
+fn test_new_hci_usb_cdc_records_interface_num()
+    let t = new_hci_usb_cdc(0)
+    test.assert_eq(t.interface_num, 0)
+
+@test
+fn test_endpoint_address_constants_match_spec()
+    // Per BLE HCI USB Transport spec Vol 4 Part B §2.1.
+    test.assert_eq(USB_EP_CTRL, 0x00)
+    test.assert_eq(USB_EP_HCI_EVENT_IN, 0x81)
+    test.assert_eq(USB_EP_HCI_ACL_OUT, 0x02)
+    test.assert_eq(USB_EP_HCI_ACL_IN, 0x82)
+    test.assert_eq(USB_EP_HCI_VENDOR_IN, 0x83)
+
+@test
+fn test_setup_packet_carries_hci_command_class_request()
+    let cmd = HciCmdMsg { opcode: 0x0C03, params: [] }   // HCI_Reset
+    let body = hci_frame.encode_hci_cmd_msg(cmd)
+    let setup = encode_hci_cmd_usb_setup(list.len(body), 0)
+    test.assert_eq(list.len(setup), 8)
+    test.assert_eq(setup[0] as Int, USB_BMREQUESTTYPE_HCI)   // 0x20
+    test.assert_eq(setup[1] as Int, USB_BREQUEST_HCI_COMMAND)   // 0x00
+    test.assert_eq(setup[2] as Int, 0x00)   // wValue lo
+    test.assert_eq(setup[3] as Int, 0x00)   // wValue hi
+    test.assert_eq(setup[4] as Int, 0x00)   // wIndex lo (iface 0)
+    test.assert_eq(setup[6] as Int, 0x03)   // wLength = 3 (opcode + len)
+    test.assert_eq(setup[7] as Int, 0x00)
+
+@test
+fn test_setup_packet_wlength_includes_params()
+    let cmd = HciCmdMsg {
+        opcode: 0x200A,
+        params: [0x01] }
+    let body = hci_frame.encode_hci_cmd_msg(cmd)
+    let setup = encode_hci_cmd_usb_setup(list.len(body), 0)
+    // wLength should be 3 (opcode + len) + 1 (param) = 4.
+    test.assert_eq(setup[6] as Int, 0x04)
+
+@test
+fn test_setup_packet_encodes_interface_num_in_windex()
+    let setup = encode_hci_cmd_usb_setup(3, 0x0042)
+    test.assert_eq(setup[4] as Int, 0x42)   // wIndex lo
+    test.assert_eq(setup[5] as Int, 0x00)   // wIndex hi
+
+@test
+fn test_trait_recv_returns_none_until_runtime_lands()
+    let t = new_hci_usb_cdc(0)
+    match HciUsbCdc.recv_event(t)
+        Some(_) => test.fail("recv_event stubbed; should be None")
+        None    => test.assert(true)
+    match HciUsbCdc.recv_acl(t)
+        Some(_) => test.fail("recv_acl stubbed; should be None")
+        None    => test.assert(true)
+
+@test
+fn test_trait_is_open_false_until_usbd_runtime()
+    let t = new_hci_usb_cdc(0)
+    // Stubbed false because hal.usb.is_configured() doesn't exist
+    // yet.  Flips to a real query when the runtime patch lands.
+    test.assert_eq(HciUsbCdc.is_open(t), false)

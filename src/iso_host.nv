@@ -1,0 +1,525 @@
+// iso_host.nv -- the isochronous half of the Host: its three tables
+// and the routing of HCI events to them.
+//
+// `IsoHost` holds the CIS table, the BIG table and the pool of HCI ISO Data
+// packet credits.  `iso_host_event` takes an HCI event packet, without its
+// packet indicator, that the Controller sent unasked: an LE Meta event of
+// the isochronous channels, Disconnection Complete, Number Of Completed
+// Packets.  `iso_host_answer` takes the Command Complete or Command Status
+// event that answers an isochronous command.  Each returns the one `IsoEvent`
+// that says what the tables did, and then lets the credit pool follow the
+// tables: a stream that exists gets a credit entry, one that ended gives
+// its packets back.  An event of another kind, and one a table does not
+// follow, change nothing and answer `Unrelated`.
+//
+// The LE CIS Request event needs the ACL link of the stream, which the link
+// registry knows and this module does not, so `iso_host_cis_request` takes
+// the link beside the event.
+//
+// Satisfies: REQ-BLE-ISO-003, REQ-BLE-ISO-004, REQ-BLE-ISO-005.
+
+use std.test
+use hci_commands
+use hci_frame
+use hci_codec
+use iso_big
+use iso_cis
+use iso_event
+use iso_flow
+use noble_config
+use links
+
+// The Host's isochronous state: the CIS table, the BIG table and the credits of the Controller's ISO buffers.
+pub @value
+struct IsoHost
+    cis: iso_cis.CisTable
+    big: iso_big.BigTable
+    credits: iso_flow.IsoCredits
+
+// An `IsoHost` with no stream, no group and no credit.
+pub @tier(embedded)
+fn iso_host_new() -> IsoHost
+    IsoHost { cis: iso_cis.cis_table_new(), big: iso_big.big_table_new(), credits: iso_flow.iso_credits_new() }
+
+// Whether the credit pool should hold `handle`: a CIS that exists or is
+// closing, or a BIS of a group that is up.
+@tier(embedded)
+@no_alloc
+fn iso_host_stream_exists(var h: IsoHost, handle: Int) -> Bool
+    let c = iso_cis.cis_row(var h.cis, handle)
+    if c >= 0
+        return h.cis.state[c] == iso_cis.CisState.Established or h.cis.state[c] == iso_cis.CisState.Closing
+    let b = iso_big.bis_row(var h.big, handle)
+    if b < 0
+        return false
+    let owner = iso_big.big_row(var h.big, h.big.bis_big[b] as Int)
+    owner >= 0 and (h.big.state[owner] == iso_big.BigState.Broadcasting or h.big.state[owner] == iso_big.BigState.Synchronized or h.big.state[owner] == iso_big.BigState.Terminating)
+
+// Make the credit pool agree with the tables: open an entry for every
+// stream that exists and has none, and close the entry of every stream that
+// no longer exists, which gives its packets back.
+@satisfies("REQ-BLE-ISO-005")
+@tier(embedded)
+@no_alloc
+fn iso_host_reconcile(var h: IsoHost)
+    for i in 0..h.credits.used.len()
+        if h.credits.used[i] and not iso_host_stream_exists(var h, h.credits.handles[i] as Int)
+            let _n = iso_flow.iso_credits_close(var h.credits, h.credits.handles[i] as Int)
+    for i in 0..h.cis.state.len()
+        if h.cis.state[i] != iso_cis.CisState.Unused and iso_host_stream_exists(var h, h.cis.handle[i] as Int)
+            if iso_flow.iso_stream_slot(var h.credits, h.cis.handle[i] as Int) < 0
+                let _o = iso_flow.iso_credits_open(var h.credits, h.cis.handle[i] as Int)
+    for i in 0..h.big.bis_used.len()
+        if h.big.bis_used[i] and iso_host_stream_exists(var h, h.big.bis_handle[i] as Int)
+            if iso_flow.iso_stream_slot(var h.credits, h.big.bis_handle[i] as Int) < 0
+                let _p = iso_flow.iso_credits_open(var h.credits, h.big.bis_handle[i] as Int)
+
+// The ACL connection of a Central or Peripheral ended.
+pub @satisfies("REQ-BLE-ISO-003")
+@tier(embedded)
+@no_alloc
+fn iso_host_acl_closed(var h: IsoHost, acl: links.LinkId) -> Int
+    let n = iso_cis.cis_acl_closed(var h.cis, acl)
+    iso_host_reconcile(var h)
+    n
+
+// The LE CIS Request event, with the link it arrived on.
+pub @satisfies("REQ-BLE-ISO-003")
+@tier(embedded)
+fn iso_host_cis_request(var h: IsoHost, evt: [u8], acl: iso_cis.AclRef) -> iso_event.IsoEvent
+    match hci_codec.le_cis_request(evt)
+        None      => iso_event.unrelated(0)
+        Some(req) => iso_cis.cis_request(var h.cis, req, acl)
+
+// The packets an SDU of `sdu_octets` octets takes in the stream `handle`,
+// with their credits taken: the stream exists and has its input data path,
+// the pool is configured and enough buffers are free.  0 when any of those
+// fails, and nothing is taken then.  An SDU longer than the Host's SDU buffer
+// (`noble_config.ISO_SDU_OCTETS`) is refused too.  The Controller's
+// ISO_Data_Packet_Length, which can be longer than that, only decides the
+// number of packets: the SDU itself is bounded by the Host's buffer.
+pub @satisfies("REQ-BLE-ISO-005")
+@tier(embedded)
+@no_alloc
+fn iso_host_reserve_sdu(var h: IsoHost, handle: Int, sdu_octets: Int, has_time_stamp: Bool) -> Int
+    if sdu_octets > noble_config.ISO_SDU_OCTETS
+        return 0
+    if not iso_cis.cis_may_send(var h.cis, handle) and not iso_big.bis_may_send(var h.big, handle)
+        return 0
+    let packets = iso_flow.iso_packets_for_sdu(sdu_octets, iso_flow.iso_packet_length(var h.credits), has_time_stamp)
+    if packets < 1 or not iso_flow.iso_credits_take(var h.credits, handle, packets)
+        return 0
+    packets
+
+// An HCI event the Controller sent unasked.  Returns what the tables did.
+pub @satisfies("REQ-BLE-ISO-003")
+@tier(embedded)
+fn iso_host_event(var h: IsoHost, evt: [u8]) -> iso_event.IsoEvent
+    let code = hci_codec.event_code(evt)
+    if code == hci_frame.EVT_NUMBER_OF_COMPLETED_PACKETS
+        match hci_codec.number_of_completed_packets(evt)
+            None        => return iso_event.unrelated(0)
+            Some(pairs) =>
+                let _n = iso_flow.iso_credits_on_completed(var h.credits, pairs)
+                return iso_event.iso_event(iso_event.IsoEventKind.Nothing, -1, 0, iso_event.STATUS_SUCCESS)
+    if code == hci_frame.EVT_DISCONNECTION_COMPLETE
+        match hci_codec.disconnection_complete(evt)
+            None    => return iso_event.unrelated(0)
+            Some(d) =>
+                if d.status != iso_event.STATUS_SUCCESS
+                    return iso_event.unrelated(d.connection_handle)
+                let e = iso_cis.cis_disconnected(var h.cis, d.connection_handle, d.reason)
+                iso_host_reconcile(var h)
+                return e
+    if code != hci_frame.EVT_LE_META_EVENT
+        return iso_event.unrelated(0)
+    let sub = hci_codec.le_meta_subevent(evt)
+    var out = iso_event.unrelated(0)
+    if sub == hci_codec.LE_SUBEVENT_CIS_ESTABLISHED or sub == hci_codec.LE_SUBEVENT_CIS_ESTABLISHED_V2
+        match hci_codec.le_cis_established(evt)
+            None    => out = iso_event.unrelated(0)
+            Some(e) => out = iso_cis.cis_established(var h.cis, e)
+    else if sub == hci_codec.LE_SUBEVENT_CREATE_BIG_COMPLETE
+        match hci_codec.le_create_big_complete(evt)
+            None    => out = iso_event.unrelated(0)
+            Some(e) => out = iso_big.big_create_complete(var h.big, e)
+    else if sub == hci_codec.LE_SUBEVENT_TERMINATE_BIG_COMPLETE
+        match hci_codec.le_terminate_big_complete(evt)
+            None    => out = iso_event.unrelated(0)
+            Some(e) => out = iso_big.big_terminate_complete(var h.big, e)
+    else if sub == hci_codec.LE_SUBEVENT_BIG_SYNC_ESTABLISHED
+        match hci_codec.le_big_sync_established(evt)
+            None    => out = iso_event.unrelated(0)
+            Some(e) => out = iso_big.big_sync_established(var h.big, e)
+    else if sub == hci_codec.LE_SUBEVENT_BIG_SYNC_LOST
+        match hci_codec.le_big_sync_lost(evt)
+            None    => out = iso_event.unrelated(0)
+            Some(e) => out = iso_big.big_sync_lost(var h.big, e)
+    iso_host_reconcile(var h)
+    out
+
+// The Command Complete or Command Status event that answers an isochronous
+// command.  The opcode says which table the answer is for.
+pub @satisfies("REQ-BLE-ISO-003")
+@tier(embedded)
+fn iso_host_answer(var h: IsoHost, evt: [u8]) -> iso_event.IsoEvent
+    let op = hci_codec.answered_opcode(evt)
+    let status = hci_codec.answered_status(evt)
+    if op < 0 or status < 0
+        return iso_event.unrelated(0)
+    let complete = hci_codec.is_command_complete(evt)
+    let rp = hci_codec.command_complete_return_parameters(evt)
+    var out = iso_event.unrelated(0)
+    if op == hci_commands.opcode_le_set_cig_parameters() or op == hci_commands.opcode_le_set_cig_parameters_test()
+        if status != iso_event.STATUS_SUCCESS
+            out = iso_cis.cig_set_failed(var h.cis, status)
+        else
+            match hci_codec.le_set_cig_parameters_return(rp)
+                None      => out = iso_event.unrelated(0)
+                Some(ret) => out = iso_cis.cig_set_complete(var h.cis, status, ret.cig_id, ret.connection_handles)
+    else if op == hci_commands.opcode_le_create_cis() and not complete
+        out = iso_cis.cis_create_status(var h.cis, status)
+    else if op == hci_commands.opcode_le_remove_cig()
+        out = iso_cis.cig_remove_complete(var h.cis, status, h.cis.pending_cig as Int)
+    else if op == hci_commands.opcode_le_accept_cis_request() and not complete
+        out = iso_cis.cis_accept_status(var h.cis, status)
+    else if op == hci_commands.opcode_le_reject_cis_request()
+        out = iso_cis.cis_reject_complete(var h.cis, status, h.cis.pending_handle as Int)
+    else if op == hci_commands.opcode_le_create_big() or op == hci_commands.opcode_le_create_big_test()
+        out = iso_big.big_create_status(var h.big, status)
+    else if op == hci_commands.opcode_le_terminate_big()
+        out = iso_big.big_terminate_status(var h.big, status)
+    else if op == hci_commands.opcode_le_big_create_sync()
+        out = iso_big.big_sync_status(var h.big, status)
+    else if op == hci_commands.opcode_le_big_terminate_sync()
+        out = iso_big.big_sync_terminate_complete(var h.big, status, h.big.pending_big as Int)
+    else if op == 0x0406 and not complete
+        out = iso_cis.cis_disconnect_status(var h.cis, status)
+    else if op == hci_commands.opcode_le_setup_iso_data_path()
+        if h.cis.pending == iso_cis.CisPending.SetCisPath
+            out = iso_cis.data_path_setup_complete(var h.cis, status, h.cis.pending_handle as Int)
+        else
+            out = iso_big.bis_data_path_setup_complete(var h.big, status, h.big.pending_handle as Int)
+    else if op == hci_commands.opcode_le_remove_iso_data_path()
+        if h.cis.pending == iso_cis.CisPending.RemoveCisPath
+            out = iso_cis.data_path_remove_complete(var h.cis, status, h.cis.pending_handle as Int)
+        else
+            out = iso_big.bis_data_path_remove_complete(var h.big, status, h.big.pending_handle as Int)
+    iso_host_reconcile(var h)
+    out
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+@tier(app)
+fn le16(v: Int) -> [u8]
+    [(v & 0xFF) as u8, ((v >>> 8) & 0xFF) as u8]
+
+// The bytes of a Command Complete event for `opcode` with `status` and the return parameters `rp`, as a Controller
+// sends it.  For fakes and tests.
+pub @tier(app)
+fn command_complete(opcode: Int, status: Int, rp: [u8]) -> [u8]
+    var evt: [u8] = [0x0E, (4 + list.len(rp)) as u8, 0x01, (opcode & 0xFF) as u8, ((opcode >>> 8) & 0xFF) as u8, status as u8]
+    list.append(evt, rp)
+    evt
+
+// The bytes of a Command Status event for `opcode` with `status`, as a Controller sends it.  For fakes and tests.
+pub @tier(app)
+fn command_status(opcode: Int, status: Int) -> [u8]
+    [0x0F, 0x04, status as u8, 0x01, (opcode & 0xFF) as u8, ((opcode >>> 8) & 0xFF) as u8]
+
+@tier(app)
+fn zeros(n: Int) -> [u8]
+    var out: [u8] = []
+    for _ in 0..n
+        list.push(out, 0)
+    out
+
+// An LE CIS Established [v1] event: status, handle, the twelve octets of
+// delays and latencies, PHYs, NSE, the burst numbers, flush timeouts,
+// Max_PDU and ISO_Interval.
+pub @tier(app)
+fn cis_established_bytes(handle: Int, status: Int, bn_c: Int, bn_p: Int) -> [u8]
+    var params: [u8] = [status as u8]
+    list.append(params, le16(handle))
+    list.append(params, zeros(12))
+    list.append(params, [0x02, 0x02, 0x02, bn_c as u8, bn_p as u8, 0x01, 0x01])
+    list.append(params, [0x64, 0x00, 0x64, 0x00, 0x08, 0x00])
+    hci_codec.le_meta_event(hci_codec.LE_SUBEVENT_CIS_ESTABLISHED, params)
+
+// The bytes of an LE Create BIG Complete event for the group `big_handle` with `status` and the BIS `handles`.  For
+// fakes and tests.
+pub @tier(app)
+fn create_big_complete_bytes(big_handle: Int, status: Int, handles: [Int]) -> [u8]
+    var params: [u8] = [status as u8, big_handle as u8]
+    list.append(params, zeros(6))
+    list.append(params, [0x02, 0x02, 0x01, 0x00, 0x01, 0x64, 0x00, 0x08, 0x00, list.len(handles) as u8])
+    for hd in handles
+        list.append(params, le16(hd))
+    hci_codec.le_meta_event(hci_codec.LE_SUBEVENT_CREATE_BIG_COMPLETE, params)
+
+// The bytes of an LE BIG Sync Established event for the group `big_handle` with `status` and the BIS `handles`.  For
+// fakes and tests.
+pub @tier(app)
+fn big_sync_established_bytes(big_handle: Int, status: Int, handles: [Int]) -> [u8]
+    var params: [u8] = [status as u8, big_handle as u8]
+    list.append(params, zeros(3))
+    list.append(params, [0x02, 0x01, 0x00, 0x01, 0x64, 0x00, 0x08, 0x00, list.len(handles) as u8])
+    for hd in handles
+        list.append(params, le16(hd))
+    hci_codec.le_meta_event(hci_codec.LE_SUBEVENT_BIG_SYNC_ESTABLISHED, params)
+
+// The bytes of a Number Of Completed Packets event for `pairs`, a handle and a count in turn.  For fakes and tests.
+pub @tier(app)
+fn completed_packets_bytes(pairs: [Int]) -> [u8]
+    var out: [u8] = [0x13, (1 + 2 * list.len(pairs)) as u8, (list.len(pairs) / 2) as u8]
+    for v in pairs
+        list.append(out, le16(v))
+    out
+
+// The bytes of a Disconnection Complete event for `handle` with the `reason`.  For fakes and tests.
+pub @tier(app)
+fn disconnection_bytes(handle: Int, reason: Int) -> [u8]
+    [0x05, 0x04, 0x00, (handle & 0xFF) as u8, ((handle >>> 8) & 0xFF) as u8, reason as u8]
+
+@tier(app)
+fn host_cig(var h: IsoHost)
+    h.cis.host_support = true
+    test.assert_eq(iso_cis.cig_set_parameters(var h.cis, iso_cis.cig_fixture(1), [iso_cis.cis_cfg(0, 100, 100)]), 0)
+    let a = iso_host_answer(var h, command_complete(0x2062, 0, [0x01, 0x01, 0x10, 0x00]))
+    test.assert(a.kind == iso_event.IsoEventKind.CigConfigured)
+
+@test
+@satisfies("REQ-BLE-ISO-003")
+fn test_a_new_iso_host_has_three_empty_tables()
+    var h = iso_host_new()
+    test.assert_eq(iso_cis.cis_free_rows(var h.cis), noble_config.MAX_CIS)
+    test.assert_eq(iso_big.bis_free_rows(var h.big), noble_config.MAX_BIS)
+    test.assert_eq(iso_big.big_count_in(var h.big, iso_big.BigState.Vacant), noble_config.MAX_BIG)
+    test.assert(not iso_flow.iso_credits_ready(var h.credits))
+
+@test
+@satisfies("REQ-BLE-ISO-003")
+fn test_the_central_procedure_runs_from_events_alone()
+    var h = iso_host_new()
+    test.assert(iso_flow.iso_credits_configure(var h.credits, hci_codec.LeBufferSizeV2 {
+        acl_data_packet_length: 251, total_acl_data_packets: 3, iso_data_packet_length: 255, total_iso_data_packets: 3 }))
+    host_cig(var h)
+    let acl = iso_cis.AclRef { handle: 1, link: links.link_id(0, 1), central: true }
+    // Create CIS: Command Status, then the CIS Established event.
+    test.assert_eq(iso_cis.cis_create(var h.cis, [0x0010], [acl]), 0)
+    test.assert(iso_host_answer(var h, command_status(0x2064, 0)).kind == iso_event.IsoEventKind.CommandDone)
+    let e = iso_host_event(var h, cis_established_bytes(0x0010, 0, 1, 1))
+    test.assert(e.kind == iso_event.IsoEventKind.CisEstablished)
+    // The pool holds the stream; the data path lets it send.
+    test.assert_eq(iso_flow.iso_in_flight(var h.credits, 0x0010), 0)
+    test.assert_eq(iso_host_reserve_sdu(var h, 0x0010, 100, false), 0)
+    test.assert_eq(iso_cis.data_path_setup(var h.cis, 0x0010, iso_cis.PATH_INPUT, 0x06, 0), 0)
+    let p = iso_host_answer(var h, command_complete(0x206E, 0, [0x10, 0x00]))
+    test.assert(p.kind == iso_event.IsoEventKind.DataPathSet)
+    // An SDU takes one packet; an SDU of 300 octets takes two, and one above the Host's buffer none.
+    test.assert_eq(iso_host_reserve_sdu(var h, 0x0010, 100, false), 1)
+    test.assert_eq(iso_flow.iso_in_flight(var h.credits, 0x0010), 1)
+    test.assert_eq(iso_host_reserve_sdu(var h, 0x0010, 600, false), 0)
+    test.assert_eq(iso_host_reserve_sdu(var h, 0x0010, 300, false), 2)
+    // The Controller completes them.
+    let n = iso_host_event(var h, completed_packets_bytes([0x0010, 3]))
+    test.assert(n.kind == iso_event.IsoEventKind.Nothing)
+    test.assert_eq(iso_flow.iso_in_flight(var h.credits, 0x0010), 0)
+    test.assert_eq(h.credits.free as Int, 3)
+    // The stream ends with Disconnection Complete: the entry goes.
+    test.assert_eq(iso_host_reserve_sdu(var h, 0x0010, 100, false), 1)
+    let d = iso_host_event(var h, disconnection_bytes(0x0010, 0x13))
+    test.assert(d.kind == iso_event.IsoEventKind.CisClosed)
+    test.assert_eq(iso_flow.iso_in_flight(var h.credits, 0x0010), -1)
+    test.assert_eq(h.credits.free as Int, 3)
+
+@test
+@satisfies("REQ-BLE-ISO-003")
+fn test_a_failed_cis_gets_no_credit_entry()
+    var h = iso_host_new()
+    host_cig(var h)
+    let acl = iso_cis.AclRef { handle: 1, link: links.link_id(0, 1), central: true }
+    test.assert_eq(iso_cis.cis_create(var h.cis, [0x0010], [acl]), 0)
+    test.assert(iso_host_answer(var h, command_status(0x2064, 0)).kind == iso_event.IsoEventKind.CommandDone)
+    test.assert(iso_host_event(var h, cis_established_bytes(0x0010, 0x3E, 0, 0)).kind == iso_event.IsoEventKind.CisFailed)
+    test.assert_eq(iso_flow.iso_in_flight(var h.credits, 0x0010), -1)
+
+@test
+@satisfies("REQ-BLE-ISO-003")
+fn test_the_peripheral_procedure_runs_from_events_alone()
+    var h = iso_host_new()
+    let acl = iso_cis.AclRef { handle: 1, link: links.link_id(0, 1), central: false }
+    // LE CIS Request: ACL 1, CIS 0x0030, CIG 3, CIS 4.
+    let req = hci_codec.le_meta_event(hci_codec.LE_SUBEVENT_CIS_REQUEST, [0x01, 0x00, 0x30, 0x00, 0x03, 0x04])
+    let r = iso_host_cis_request(var h, req, acl)
+    test.assert(r.kind == iso_event.IsoEventKind.CisRequested)
+    test.assert_eq(iso_cis.cis_accept(var h.cis, 0x0030), 0)
+    test.assert(iso_host_answer(var h, command_status(0x2066, 0)).kind == iso_event.IsoEventKind.CommandDone)
+    test.assert(iso_host_event(var h, cis_established_bytes(0x0030, 0, 1, 1)).kind == iso_event.IsoEventKind.CisEstablished)
+    test.assert_eq(iso_flow.iso_in_flight(var h.credits, 0x0030), 0)
+    // A malformed request is ignored.
+    test.assert(iso_host_cis_request(var h, [0x3E, 0x01, 0x1A], acl).kind == iso_event.IsoEventKind.Unrelated)
+    // The link ending takes the stream with it, and the entry.
+    test.assert_eq(iso_host_acl_closed(var h, links.link_id(0, 1)), 1)
+    test.assert_eq(iso_flow.iso_in_flight(var h.credits, 0x0030), -1)
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_the_broadcaster_procedure_runs_from_events_alone()
+    var h = iso_host_new()
+    test.assert(iso_flow.iso_credits_configure(var h.credits, hci_codec.LeBufferSizeV2 {
+        acl_data_packet_length: 251, total_acl_data_packets: 3, iso_data_packet_length: 255, total_iso_data_packets: 3 }))
+    test.assert_eq(iso_big.big_create(var h.big, 1, 1, 2, 10000, 100, 20, 2, 0x02, 0, 0, false, iso_big.zero_code()), 0)
+    test.assert(iso_host_answer(var h, command_status(0x2068, 0)).kind == iso_event.IsoEventKind.CommandDone)
+    let e = iso_host_event(var h, create_big_complete_bytes(1, 0, [0x0100, 0x0101]))
+    test.assert(e.kind == iso_event.IsoEventKind.BigCreated)
+    test.assert_eq(iso_flow.iso_in_flight(var h.credits, 0x0100), 0)
+    test.assert_eq(iso_flow.iso_in_flight(var h.credits, 0x0101), 0)
+    test.assert_eq(iso_big.bis_data_path_setup(var h.big, 0x0100, iso_big.PATH_INPUT, 0x06, 0), 0)
+    test.assert(iso_host_answer(var h, command_complete(0x206E, 0, [0x00, 0x01])).kind == iso_event.IsoEventKind.DataPathSet)
+    test.assert_eq(iso_host_reserve_sdu(var h, 0x0100, 100, true), 1)
+    test.assert_eq(iso_host_reserve_sdu(var h, 0x0101, 100, true), 0)
+    // Terminate: Command Status, then the Complete event; the entries go.
+    test.assert_eq(iso_big.big_terminate(var h.big, 1, 0x16), 0)
+    test.assert(iso_host_answer(var h, command_status(0x206A, 0)).kind == iso_event.IsoEventKind.CommandDone)
+    test.assert_eq(iso_flow.iso_in_flight(var h.credits, 0x0100), 1)
+    let t = iso_host_event(var h, hci_codec.le_meta_event(hci_codec.LE_SUBEVENT_TERMINATE_BIG_COMPLETE, [0x01, 0x16]))
+    test.assert(t.kind == iso_event.IsoEventKind.BigTerminated)
+    test.assert_eq(iso_flow.iso_in_flight(var h.credits, 0x0100), -1)
+    test.assert_eq(h.credits.free as Int, 3)
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_the_receiver_procedure_runs_from_events_alone()
+    var h = iso_host_new()
+    test.assert_eq(iso_big.big_sync_create(var h.big, 1, 0x20, false, iso_big.zero_code(), 0, 100, [1, 2]), 0)
+    test.assert(iso_host_answer(var h, command_status(0x206B, 0)).kind == iso_event.IsoEventKind.CommandDone)
+    test.assert(iso_host_event(var h, big_sync_established_bytes(1, 0, [0x0100, 0x0101])).kind == iso_event.IsoEventKind.BigSynced)
+    test.assert_eq(iso_flow.iso_in_flight(var h.credits, 0x0101), 0)
+    test.assert_eq(iso_big.bis_data_path_setup(var h.big, 0x0100, iso_big.PATH_OUTPUT, 0x06, 0), 0)
+    test.assert(iso_host_answer(var h, command_complete(0x206E, 0, [0x00, 0x01])).kind == iso_event.IsoEventKind.DataPathSet)
+    test.assert_eq(iso_big.bis_data_path_remove(var h.big, 0x0100, 2), 0)
+    test.assert(iso_host_answer(var h, command_complete(0x206F, 0, [0x00, 0x01])).kind == iso_event.IsoEventKind.DataPathRemoved)
+    // The BIG is lost.
+    let lost = iso_host_event(var h, hci_codec.le_meta_event(hci_codec.LE_SUBEVENT_BIG_SYNC_LOST, [0x01, 0x08]))
+    test.assert(lost.kind == iso_event.IsoEventKind.BigSyncLost)
+    test.assert_eq(iso_flow.iso_in_flight(var h.credits, 0x0100), -1)
+    // Synchronize again and end it with Terminate Sync.
+    test.assert_eq(iso_big.big_sync_create(var h.big, 1, 0x20, false, iso_big.zero_code(), 0, 100, [1]), 0)
+    test.assert(iso_host_answer(var h, command_status(0x206B, 0)).kind == iso_event.IsoEventKind.CommandDone)
+    test.assert(iso_host_event(var h, big_sync_established_bytes(1, 0, [0x0100])).kind == iso_event.IsoEventKind.BigSynced)
+    test.assert_eq(iso_big.big_sync_terminate(var h.big, 1), 0)
+    test.assert(iso_host_answer(var h, command_complete(0x206C, 0, [0x01])).kind == iso_event.IsoEventKind.BigSyncTerminated)
+    test.assert_eq(iso_flow.iso_in_flight(var h.credits, 0x0100), -1)
+
+@test
+@satisfies("REQ-BLE-ISO-003")
+fn test_the_cig_commands_are_routed_by_opcode()
+    var h = iso_host_new()
+    host_cig(var h)
+    // Set CIG Parameters Test answers the same way.
+    test.assert_eq(iso_cis.cig_set_parameters(var h.cis, iso_cis.cig_fixture(1), [iso_cis.cis_cfg(0, 100, 100)]), 0)
+    test.assert(iso_host_answer(var h, command_complete(0x2063, 0, [0x01, 0x01, 0x10, 0x00])).kind == iso_event.IsoEventKind.CigConfigured)
+    // A failure of Set CIG Parameters carries no return parameters.
+    test.assert_eq(iso_cis.cig_set_parameters(var h.cis, iso_cis.cig_fixture(1), [iso_cis.cis_cfg(0, 100, 100)]), 0)
+    let f = iso_host_answer(var h, command_complete(0x2062, 0x0C, [0x01, 0x00]))
+    test.assert(f.kind == iso_event.IsoEventKind.CommandFailed)
+    test.assert_eq(f.status, 0x0C)
+    // Remove CIG.
+    test.assert_eq(iso_cis.cig_remove(var h.cis, 1), 0)
+    test.assert(iso_host_answer(var h, command_complete(0x2065, 0, [0x01])).kind == iso_event.IsoEventKind.CigRemoved)
+    // Reject CIS Request and Disconnect are routed to the CIS table too.
+    let acl = iso_cis.AclRef { handle: 1, link: links.link_id(0, 1), central: false }
+    let req = hci_codec.le_meta_event(hci_codec.LE_SUBEVENT_CIS_REQUEST, [0x01, 0x00, 0x30, 0x00, 0x03, 0x04])
+    test.assert(iso_host_cis_request(var h, req, acl).kind == iso_event.IsoEventKind.CisRequested)
+    test.assert_eq(iso_cis.cis_reject(var h.cis, 0x0030, 0x0D), 0)
+    test.assert(iso_host_answer(var h, command_complete(0x2067, 0, [0x30, 0x00])).kind == iso_event.IsoEventKind.CommandDone)
+    test.assert_eq(iso_cis.cis_row(var h.cis, 0x0030), -1)
+
+@test
+@satisfies("REQ-BLE-ISO-003")
+fn test_disconnect_status_is_routed_to_the_cis_table()
+    var h = iso_host_new()
+    host_cig(var h)
+    let acl = iso_cis.AclRef { handle: 1, link: links.link_id(0, 1), central: true }
+    test.assert_eq(iso_cis.cis_create(var h.cis, [0x0010], [acl]), 0)
+    test.assert(iso_host_answer(var h, command_status(0x2064, 0)).kind == iso_event.IsoEventKind.CommandDone)
+    test.assert(iso_host_event(var h, cis_established_bytes(0x0010, 0, 1, 1)).kind == iso_event.IsoEventKind.CisEstablished)
+    test.assert_eq(iso_cis.cis_disconnect(var h.cis, 0x0010), 0)
+    let f = iso_host_answer(var h, command_status(0x0406, 0x0C))
+    test.assert(f.kind == iso_event.IsoEventKind.CommandFailed)
+    test.assert(h.cis.state[iso_cis.cis_row(var h.cis, 0x0010)] == iso_cis.CisState.Established)
+
+@test
+@satisfies("REQ-BLE-ISO-003")
+fn test_events_the_tables_do_not_follow_are_ignored()
+    var h = iso_host_new()
+    // Not isochronous events, a malformed Disconnection Complete, a failed
+    // one, an event of a subevent that is not isochronous, a truncated one.
+    test.assert(iso_host_event(var h, [0x0E, 0x04, 0x01, 0x01, 0x10, 0x00]).kind == iso_event.IsoEventKind.Unrelated)
+    test.assert(iso_host_event(var h, [0x05, 0x01]).kind == iso_event.IsoEventKind.Unrelated)
+    test.assert(iso_host_event(var h, [0x05, 0x04, 0x01, 0x10, 0x00, 0x13]).kind == iso_event.IsoEventKind.Unrelated)
+    test.assert(iso_host_event(var h, hci_codec.le_meta_event(0x01, [0x00])).kind == iso_event.IsoEventKind.Unrelated)
+    test.assert(iso_host_event(var h, [0x3E, 0x01, 0x1B]).kind == iso_event.IsoEventKind.Unrelated)
+    test.assert(iso_host_event(var h, [0x13, 0x09, 0x02]).kind == iso_event.IsoEventKind.Unrelated)
+    // Events for streams the tables do not hold.
+    test.assert(iso_host_event(var h, cis_established_bytes(0x0010, 0, 1, 1)).kind == iso_event.IsoEventKind.Unrelated)
+    test.assert(iso_host_event(var h, create_big_complete_bytes(1, 0, [0x0100])).kind == iso_event.IsoEventKind.Unrelated)
+    test.assert(iso_host_event(var h, disconnection_bytes(0x0010, 0x13)).kind == iso_event.IsoEventKind.Unrelated)
+    // Answers of commands that are not isochronous, and with nothing pending.
+    test.assert(iso_host_answer(var h, command_complete(0x0C03, 0, [])).kind == iso_event.IsoEventKind.Unrelated)
+    test.assert(iso_host_answer(var h, [0x0E]).kind == iso_event.IsoEventKind.Unrelated)
+    test.assert(iso_host_answer(var h, command_status(0x2064, 0)).kind == iso_event.IsoEventKind.Unrelated)
+    test.assert(iso_host_answer(var h, command_complete(0x206E, 0, [0x00, 0x00])).kind == iso_event.IsoEventKind.Unrelated)
+
+@test
+@satisfies("REQ-BLE-ISO-005")
+fn test_reserve_sdu_needs_a_stream_a_path_and_a_configured_pool()
+    var h = iso_host_new()
+    host_cig(var h)
+    // No stream, no path, no pool: nothing is taken.
+    test.assert_eq(iso_host_reserve_sdu(var h, 0x0010, 10, false), 0)
+    let acl = iso_cis.AclRef { handle: 1, link: links.link_id(0, 1), central: true }
+    test.assert_eq(iso_cis.cis_create(var h.cis, [0x0010], [acl]), 0)
+    test.assert(iso_host_answer(var h, command_status(0x2064, 0)).kind == iso_event.IsoEventKind.CommandDone)
+    test.assert(iso_host_event(var h, cis_established_bytes(0x0010, 0, 1, 1)).kind == iso_event.IsoEventKind.CisEstablished)
+    test.assert_eq(iso_cis.data_path_setup(var h.cis, 0x0010, iso_cis.PATH_INPUT, 0x06, 0), 0)
+    test.assert(iso_host_answer(var h, command_complete(0x206E, 0, [0x10, 0x00])).kind == iso_event.IsoEventKind.DataPathSet)
+    // The pool is not configured: no ISO buffer is known.
+    test.assert_eq(iso_host_reserve_sdu(var h, 0x0010, 10, false), 0)
+    test.assert(iso_flow.iso_credits_configure(var h.credits, hci_codec.LeBufferSizeV2 {
+        acl_data_packet_length: 251, total_acl_data_packets: 3, iso_data_packet_length: 255, total_iso_data_packets: 1 }))
+    test.assert_eq(iso_host_reserve_sdu(var h, 0x0010, 10, false), 1)
+    // The one buffer is taken: the next SDU waits.
+    test.assert_eq(iso_host_reserve_sdu(var h, 0x0010, 10, false), 0)
+    test.assert_eq(iso_flow.iso_in_flight(var h.credits, 0x0010), 1)
+    // An SDU that cannot be cut at all.
+    test.assert_eq(iso_host_reserve_sdu(var h, 0x0010, 5000, false), 0)
+
+@test
+@satisfies("REQ-BLE-HCI-059")
+fn test_reserve_sdu_refuses_an_sdu_longer_than_the_host_buffer_whatever_the_controller_takes()
+    var h = iso_host_new()
+    host_cig(var h)
+    let acl = iso_cis.AclRef { handle: 1, link: links.link_id(0, 1), central: true }
+    test.assert_eq(iso_cis.cis_create(var h.cis, [0x0010], [acl]), 0)
+    test.assert(iso_host_answer(var h, command_status(0x2064, 0)).kind == iso_event.IsoEventKind.CommandDone)
+    test.assert(iso_host_event(var h, cis_established_bytes(0x0010, 0, 1, 1)).kind == iso_event.IsoEventKind.CisEstablished)
+    test.assert_eq(iso_cis.data_path_setup(var h.cis, 0x0010, iso_cis.PATH_INPUT, 0x06, 0), 0)
+    test.assert(iso_host_answer(var h, command_complete(0x206E, 0, [0x10, 0x00])).kind == iso_event.IsoEventKind.DataPathSet)
+    // A mock Controller whose ISO packets hold 0x3FFF octets and that has 8 buffers.
+    test.assert(iso_flow.iso_credits_configure(var h.credits, hci_codec.LeBufferSizeV2 {
+        acl_data_packet_length: 27, total_acl_data_packets: 3, iso_data_packet_length: 0x3FFF, total_iso_data_packets: 8 }))
+    test.assert_eq(iso_host_reserve_sdu(var h, 0x0010, noble_config.ISO_SDU_OCTETS + 1, false), 0)
+    test.assert_eq(iso_host_reserve_sdu(var h, 0x0010, noble_config.ISO_SDU_OCTETS, false), 1)
+    // A mock Controller whose ISO packets hold 27 octets: the same SDU takes more packets.
+    var g = iso_host_new()
+    host_cig(var g)
+    test.assert_eq(iso_cis.cis_create(var g.cis, [0x0010], [acl]), 0)
+    test.assert(iso_host_answer(var g, command_status(0x2064, 0)).kind == iso_event.IsoEventKind.CommandDone)
+    test.assert(iso_host_event(var g, cis_established_bytes(0x0010, 0, 1, 1)).kind == iso_event.IsoEventKind.CisEstablished)
+    test.assert_eq(iso_cis.data_path_setup(var g.cis, 0x0010, iso_cis.PATH_INPUT, 0x06, 0), 0)
+    test.assert(iso_host_answer(var g, command_complete(0x206E, 0, [0x10, 0x00])).kind == iso_event.IsoEventKind.DataPathSet)
+    test.assert(iso_flow.iso_credits_configure(var g.credits, hci_codec.LeBufferSizeV2 {
+        acl_data_packet_length: 27, total_acl_data_packets: 3, iso_data_packet_length: 27, total_iso_data_packets: 32 }))
+    test.assert_eq(iso_host_reserve_sdu(var g, 0x0010, 100, false), 4)

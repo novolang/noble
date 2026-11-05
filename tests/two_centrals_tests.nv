@@ -1,0 +1,244 @@
+// tests/two_centrals_tests.nv — one peripheral, two centrals.
+//
+// The GATT server holds its attribute database once (`GattDb`) and the
+// state of each connected client apart (`AttLink`).  Every test here builds
+// one database, pairs it with two links and drives the two clients through
+// the same Attribute Protocol entry point, `gatt_server.receive`, as two
+// centrals connected at once would:
+//
+//   * a service added once is found by both clients, and both read the same
+//     Database Hash;
+//   * the Client Characteristic Configuration values, ATT_MTU, prepare
+//     queue, link security and change-awareness of one client leave the
+//     other's alone;
+//   * an attribute made per connection (`make_per_link`, the shape of an
+//     ASE of the Audio Stream Control Service) reads a different value for
+//     each client;
+//   * two `LeLink`s on one database keep their own bearer tables and
+//     connection handles.
+//
+
+use std.test
+use att
+use gatt_db
+use gatt_server
+use hci_codec
+use l2cap
+use le_link
+use links
+
+// The one response of `link` to `pdu`.
+fn ask(var db: gatt_server.GattDb, var link: gatt_server.AttLink, pdu: [Int]) -> [u8]
+    gatt_server.one(gatt_server.receive(var db, var link, gatt_server.octets(pdu), 0))
+
+fn read_pdu(handle: Int) -> [Int]
+    [0x0A, handle & 0xFF, handle >>> 8]
+
+fn write_pdu(handle: Int, value: [Int]) -> [Int]
+    var out: [Int] = [0x12, handle & 0xFF, handle >>> 8]
+    for v in value
+        list.push(out, v)
+    out
+
+fn prepare_pdu(handle: Int, offset: Int, value: [Int]) -> [Int]
+    var out: [Int] = [0x16, handle & 0xFF, handle >>> 8, offset & 0xFF, offset >>> 8]
+    for v in value
+        list.push(out, v)
+    out
+
+@test
+fn test_a_service_added_once_is_found_by_both_centrals()
+    var s = gatt_server.host_server()
+    var b = gatt_server.new_att_link(s.db)
+    let handle = gatt_server.add_service(var s.db, false, gatt_server.le16(0xAA00))
+    test.assert(handle > 0)
+    let by_group = [0x10, handle & 0xFF, handle >>> 8, 0xFF, 0xFF, 0x00, 0x28]
+    let want = [0x11, 6, handle & 0xFF, handle >>> 8, handle & 0xFF, handle >>> 8, 0x00, 0xAA]
+    gatt_server.assert_bytes(ask(var s.db, var s.link, by_group), want)
+    gatt_server.assert_bytes(ask(var s.db, var b, by_group), want)
+
+@test
+fn test_both_centrals_read_one_database_hash()
+    var s = gatt_server.host_server()
+    var b = gatt_server.new_att_link(s.db)
+    let _ = gatt_server.add_service(var s.db, false, gatt_server.le16(0xAA00))
+    let hash_read = [0x08, 0x01, 0x00, 0xFF, 0xFF, 0x2A, 0x2B]
+    let first = ask(var s.db, var s.link, hash_read)
+    let second = ask(var s.db, var b, hash_read)
+    test.assert(gatt_server.same_bytes(first, second))
+    test.assert(gatt_server.same_bytes(first[4:4 + gatt_server.HASH_OCTETS], gatt_server.database_hash(s.db)))
+
+@test
+fn test_each_central_keeps_its_own_configuration_descriptor()
+    var s = gatt_server.test_server()
+    var b = gatt_server.new_att_link(s.db)
+    // The first central enables notifications of 0x0012, the second
+    // indications.
+    gatt_server.assert_bytes(ask(var s.db, var s.link, write_pdu(0x0013, [0x01, 0x00])), [0x13])
+    gatt_server.assert_bytes(ask(var s.db, var s.link, read_pdu(0x0013)), [0x0B, 0x01, 0x00])
+    gatt_server.assert_bytes(ask(var s.db, var b, read_pdu(0x0013)), [0x0B, 0x00, 0x00])
+    // Only the first central hears the value.
+    test.assert_eq(list.len(gatt_server.send_value(var s.db, var s.link, 0x0012, 0)), 1)
+    test.assert_eq(list.len(gatt_server.send_value(var s.db, var b, 0x0012, 0)), 0)
+    var other = b
+    gatt_server.assert_bytes(ask(var s.db, var other, write_pdu(0x0013, [0x02, 0x00])), [0x13])
+    gatt_server.assert_bytes(ask(var s.db, var s.link, read_pdu(0x0013)), [0x0B, 0x01, 0x00])
+    gatt_server.assert_bytes(ask(var s.db, var other, read_pdu(0x0013)), [0x0B, 0x02, 0x00])
+    let ind = gatt_server.send_value(var s.db, var other, 0x0012, 0)
+    test.assert_eq(ind[0][0] as Int, 0x1D)
+
+@test
+fn test_each_central_keeps_its_own_att_mtu()
+    var s = gatt_server.test_server()
+    var b = gatt_server.new_att_link(s.db)
+    var long: [u8] = []
+    for _ in 0..40
+        list.push(long, 0x5A)
+    test.assert(gatt_server.set_value(var s.db, 0x000A, long))
+    gatt_server.assert_bytes(ask(var s.db, var s.link, [0x02, 100, 0]), [0x03, 65, 0])
+    test.assert_eq(gatt_server.mtu_of(s.link, 0), 65)
+    test.assert_eq(gatt_server.mtu_of(b, 0), gatt_server.ATT_DEFAULT_MTU)
+    // A Read Request is cut to ATT_MTU - 1 octets of the client's own.
+    test.assert_eq(list.len(ask(var s.db, var s.link, read_pdu(0x000A))), 41)
+    test.assert_eq(list.len(ask(var s.db, var b, read_pdu(0x000A))), 23)
+    // The second client's exchange does not move the first's.
+    gatt_server.assert_bytes(ask(var s.db, var b, [0x02, 30, 0]), [0x03, 65, 0])
+    test.assert_eq(gatt_server.mtu_of(b, 0), 30)
+    test.assert_eq(gatt_server.mtu_of(s.link, 0), 65)
+
+@test
+fn test_each_central_keeps_its_own_prepare_queue()
+    var s = gatt_server.test_server()
+    var b = gatt_server.new_att_link(s.db)
+    var zeros: [u8] = []
+    for _ in 0..8
+        list.push(zeros, 0x00)
+    test.assert(gatt_server.set_value(var s.db, 0x000A, zeros))
+    // Both clients prepare a write of the same attribute.
+    let _ = ask(var s.db, var s.link, prepare_pdu(0x000A, 0, [1, 2, 3]))
+    let _ = gatt_server.receive(var s.db, var b, gatt_server.octets(prepare_pdu(0x000A, 0, [9, 9])), 0)
+    test.assert_eq(list.len(s.link.prepare_queue), 1)
+    test.assert_eq(list.len(b.prepare_queue), 1)
+    // The second client cancels: the first client's queue is untouched and
+    // writes what it prepared.
+    gatt_server.assert_bytes(ask(var s.db, var b, [0x18, 0x00]), [0x19])
+    test.assert_eq(list.len(b.prepare_queue), 0)
+    test.assert_eq(list.len(s.link.prepare_queue), 1)
+    gatt_server.assert_bytes(ask(var s.db, var s.link, [0x18, 0x01]), [0x19])
+    gatt_server.assert_bytes(s.db.attributes[gatt_server.index_of(s.db, 0x000A)].value, [1, 2, 3])
+    // An Execute Write of the second client, whose queue is empty, writes
+    // nothing.
+    gatt_server.assert_bytes(ask(var s.db, var b, [0x18, 0x01]), [0x19])
+    gatt_server.assert_bytes(s.db.attributes[gatt_server.index_of(s.db, 0x000A)].value, [1, 2, 3])
+
+@test
+fn test_link_security_is_each_centrals_own()
+    var s = gatt_server.test_server()
+    var b = gatt_server.new_att_link(s.db)
+    gatt_server.set_security(var s.link, gatt_server.link_security(true, 2, 16, true))
+    // 0x000C needs an encrypted link: the first central reads it, the second
+    // is refused.
+    gatt_server.assert_bytes(ask(var s.db, var s.link, read_pdu(0x000C)), [0x0B, 0x11])
+    gatt_server.assert_error(gatt_server.receive(var s.db, var b, gatt_server.octets(read_pdu(0x000C)), 0), 0x0A, 0x000C, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    // The second central's link key makes the refusal Insufficient
+    // Encryption, and encrypting its link opens the attribute to it.
+    gatt_server.set_security(var b, gatt_server.link_security(false, 1, 0, true))
+    gatt_server.assert_error(gatt_server.receive(var s.db, var b, gatt_server.octets(read_pdu(0x000C)), 0), 0x0A, 0x000C, att.ATT_ERR_INSUFFICIENT_ENCRYPTION)
+    gatt_server.set_security(var b, gatt_server.link_security(true, 2, 16, true))
+    gatt_server.assert_bytes(ask(var s.db, var b, read_pdu(0x000C)), [0x0B, 0x11])
+
+@test
+fn test_change_awareness_is_each_centrals_own()
+    var s = gatt_server.host_server()
+    var b = gatt_server.new_att_link(s.db)
+    // Both clients ask for Robust Caching.
+    let _ = ask(var s.db, var s.link, [0x12, gatt_db.GAP_SERVER_CLIENT_SUPPORTED_FEATURES_HANDLE & 0xFF, gatt_db.GAP_SERVER_CLIENT_SUPPORTED_FEATURES_HANDLE >>> 8, 0x01])
+    let _ = gatt_server.receive(var s.db, var b, gatt_server.octets([0x12, gatt_db.GAP_SERVER_CLIENT_SUPPORTED_FEATURES_HANDLE & 0xFF, gatt_db.GAP_SERVER_CLIENT_SUPPORTED_FEATURES_HANDLE >>> 8, 0x01]), 0)
+    let _ = gatt_server.add_service(var s.db, false, gatt_server.le16(0xAA00))
+    // The change makes both change-unaware.
+    test.assert(gatt_server.is_change_unaware(s.db, var s.link))
+    test.assert(gatt_server.is_change_unaware(s.db, var b))
+    // The second client reads the Database Hash and so becomes
+    // change-aware; the first has heard nothing and is still refused.
+    let ah = gatt_server.receive(var s.db, var b, gatt_server.octets([0x08, 0x01, 0x00, 0xFF, 0xFF, 0x2A, 0x2B]), 0)
+    test.assert_eq(list.len(ah), 1)
+    gatt_server.assert_bytes(ask(var s.db, var b, read_pdu(0x0003)), [0x0B, 'T' as Int, 'e' as Int, 's' as Int, 't' as Int])
+    test.assert(not gatt_server.is_change_unaware(s.db, var b))
+    test.assert(gatt_server.is_change_unaware(s.db, var s.link))
+    gatt_server.assert_error(gatt_server.receive(var s.db, var s.link, gatt_server.octets(read_pdu(0x0003)), 0), 0x0A, 0x0003, att.ATT_ERR_DATABASE_OUT_OF_SYNC)
+    // A second change makes the second client change-unaware again, once.
+    let _ = gatt_server.add_service(var s.db, false, gatt_server.le16(0xBB00))
+    gatt_server.assert_error(gatt_server.receive(var s.db, var b, gatt_server.octets(read_pdu(0x0003)), 0), 0x0A, 0x0003, att.ATT_ERR_DATABASE_OUT_OF_SYNC)
+
+@test
+fn test_a_per_connection_value_reads_differently_for_each_central()
+    var s = gatt_server.test_server()
+    var b = gatt_server.new_att_link(s.db)
+    var c = gatt_server.new_att_link(s.db)
+    // 0x000A holds [1, 2, 3, 4]; made per connection, a connection that has
+    // set no value reads that one.
+    test.assert(gatt_server.make_per_link(var s.db, 0x000A))
+    test.assert(gatt_server.set_link_value(s.db, var s.link, 0x000A, gatt_server.octets([0xAA])))
+    test.assert(gatt_server.set_link_value(s.db, var b, 0x000A, gatt_server.octets([0xBB, 0xCC])))
+    gatt_server.assert_bytes(ask(var s.db, var s.link, read_pdu(0x000A)), [0x0B, 0xAA])
+    gatt_server.assert_bytes(ask(var s.db, var b, read_pdu(0x000A)), [0x0B, 0xBB, 0xCC])
+    gatt_server.assert_bytes(ask(var s.db, var c, read_pdu(0x000A)), [0x0B, 1, 2, 3, 4])
+    // A write by one client lands in that client's value alone.
+    gatt_server.assert_bytes(ask(var s.db, var s.link, write_pdu(0x000A, [0x77])), [0x13])
+    gatt_server.assert_bytes(ask(var s.db, var s.link, read_pdu(0x000A)), [0x0B, 0x77])
+    gatt_server.assert_bytes(ask(var s.db, var b, read_pdu(0x000A)), [0x0B, 0xBB, 0xCC])
+    gatt_server.assert_bytes(s.db.attributes[gatt_server.index_of(s.db, 0x000A)].value, [1, 2, 3, 4])
+    // An attribute that is not per connection has no value of the
+    // connection to set, and a connection's values start afresh with it.
+    test.assert(not gatt_server.set_link_value(s.db, var s.link, 0x000C, gatt_server.octets([1])))
+    gatt_server.reset_bearer(s.db, var s.link)
+    gatt_server.assert_bytes(ask(var s.db, var s.link, read_pdu(0x000A)), [0x0B, 1, 2, 3, 4])
+
+@test
+fn test_a_bond_saved_by_one_slot_is_restored_on_another()
+    var s = gatt_server.test_server()
+    var b = gatt_server.new_att_link(s.db)
+    let addr = gatt_server.octets([1, 2, 3, 4, 5, 6])
+    gatt_server.assert_bytes(ask(var s.db, var s.link, write_pdu(0x0013, [0x01, 0x00])), [0x13])
+    gatt_server.save_configuration(var s.db, s.link, 0, addr)
+    // The peer reconnects on the other slot and finds its subscription.
+    gatt_server.restore_configuration(s.db, var b, 0, addr)
+    gatt_server.assert_bytes(ask(var s.db, var b, read_pdu(0x0013)), [0x0B, 0x01, 0x00])
+    test.assert_eq(list.len(gatt_server.send_value(var s.db, var b, 0x0012, 0)), 1)
+
+fn acl_on(handle: Int, data: [u8]) -> [u8]
+    hci_codec.build_h4_acl(handle, hci_codec.ACL_PB_FIRST_FLUSHABLE, data)
+
+fn payload(pkt: [u8]) -> [u8]
+    pkt[9:]
+
+@test
+fn test_two_links_serve_one_database_and_keep_their_own_bearers()
+    var first = le_link.new_link(le_link.test_db())
+    var second = le_link.new_link_on(first.db, links.link_id(1, 0))
+    le_link.set_buffers(var first, 27, 2)
+    le_link.set_buffers(var second, 27, 2)
+    le_link.connect(var first, 0x0040, false)
+    le_link.connect(var second, 0x0041, false)
+    test.assert(not links.same_link(first.id, second.id))
+    test.assert_eq(second.id.slot, 1)
+    // An MTU exchange on the first link leaves the second at the default.
+    let rx = le_link.receive_acl(var first, acl_on(0x0040, l2cap.build_b_frame(l2cap.CID_ATT, [0x02, 0x30, 0x00])), 0)
+    test.assert_eq(list.len(rx), 1)
+    test.assert_eq(gatt_server.mtu_of(first.att, 0), 0x30)
+    test.assert_eq(gatt_server.mtu_of(second.att, 0), gatt_server.ATT_DEFAULT_MTU)
+    // A service added through the first link's database is read over the
+    // second link.
+    let handle = gatt_server.add_service(var first.db, false, gatt_server.le16(0xAA00))
+    let req = l2cap.build_b_frame(l2cap.CID_ATT, gatt_server.octets([0x10, handle & 0xFF, handle >>> 8, 0xFF, 0xFF, 0x00, 0x28]))
+    let seen = le_link.receive_acl(var second, acl_on(0x0041, req), 0)
+    test.assert_eq(list.len(seen), 1)
+    test.assert_eq(payload(seen[0])[0] as Int, 0x11)
+    test.assert_eq(payload(seen[0])[6] as Int, 0x00)
+    test.assert_eq(payload(seen[0])[7] as Int, 0xAA)
+    // Disconnecting the first link starts its bearers afresh and leaves the
+    // second's.
+    let _ = le_link.receive_acl(var second, acl_on(0x0041, l2cap.build_b_frame(l2cap.CID_ATT, [0x02, 0x20, 0x00])), 0)
+    le_link.disconnect(var first)
+    test.assert_eq(gatt_server.mtu_of(first.att, 0), gatt_server.ATT_DEFAULT_MTU)
+    test.assert_eq(gatt_server.mtu_of(second.att, 0), 0x20)

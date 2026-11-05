@@ -1,0 +1,14 @@
+# The Host core's part of the profile configs/audio_server.toml of orbit/ble, for the tests of this package (tests/ and src/ run with
+# `novo test --config configs/audio_server.toml`).  orbit/ble/configs/audio_server.toml holds the same [noble] section; tests/orbit/test_ble_config_equals_limits.sh holds the two to each other.
+
+[noble]
+max_connections = 3
+max_prepared_bytes = 256
+max_client_links = 0
+client_bearers = 0
+client_cache_records = 0
+client_queue = 0
+client_value_bytes = 0
+max_bcast_sources = 0
+max_unicast_streams = 2
+max_bcast_sinks = 2

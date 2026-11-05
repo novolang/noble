@@ -1,0 +1,156 @@
+// iso_event.nv -- what the isochronous tables tell their caller.
+//
+// The tables of `iso_cis.nv` and `iso_big.nv` take an HCI event or the
+// answer of an HCI command, change their state, and return one `IsoEvent`:
+// a payload-free kind, the table row it concerns, the Connection_Handle (or
+// BIG_Handle) and a status.  Nothing is allocated for it, so the Host's
+// event loop can hand it to the application's policy without a queue.
+//
+// A command a table refuses before it reaches the Controller answers the
+// Controller error code the Controller would have used for the same fault
+// ([Vol 1] Part F, and the Errors table of each command in [Vol 4] Part E,
+// Section 7.8), so a caller treats a refusal and a Controller's answer alike.
+
+use std.test
+
+// Controller error codes ([Vol 1] Part F, Section 1.3) the isochronous
+// commands and events use.
+pub const STATUS_SUCCESS = 0x00
+
+// The Controller error code Unknown Connection Identifier.
+pub const STATUS_UNKNOWN_CONNECTION_IDENTIFIER = 0x02
+
+const STATUS_MEMORY_CAPACITY_EXCEEDED = 0x07
+
+const STATUS_CONNECTION_ALREADY_EXISTS = 0x0B
+
+// The Controller error code Command Disallowed.
+pub const STATUS_COMMAND_DISALLOWED = 0x0C
+
+// The Controller error code Connection Rejected Due To Limited Resources.
+pub const STATUS_REJECTED_LIMITED_RESOURCES = 0x0D
+
+const STATUS_CONNECTION_ACCEPT_TIMEOUT_EXCEEDED = 0x10
+
+const STATUS_UNSUPPORTED_FEATURE_OR_PARAMETER = 0x11
+
+const STATUS_INVALID_COMMAND_PARAMETERS = 0x12
+
+// The Controller error code Connection Terminated By Local Host.
+pub const STATUS_CONNECTION_TERMINATED_BY_LOCAL_HOST = 0x16
+
+const STATUS_ENCRYPTION_MODE_NOT_ACCEPTABLE = 0x25
+
+const STATUS_UNKNOWN_ADVERTISING_IDENTIFIER = 0x42
+
+const STATUS_OPERATION_CANCELLED_BY_HOST = 0x44
+
+// What an event or an answer did to a table.
+//   Nothing            the table changed in no way a caller sees
+//   Unrelated          the event named a handle or a state the table does
+//                      not hold; the table did not change
+//   CommandDone        an answer to a command that leaves a state change
+//                      to a later event (a Command Status with success)
+//   CommandFailed      the Controller refused a command; `status` is its code
+//   CigConfigured      LE Set CIG Parameters completed; the CIS handles are
+//                      in the table
+//   CigRemoved         LE Remove CIG completed
+//   CisRequested       a Peripheral's Controller reports a CIS request that
+//                      the application accepts or rejects
+//   CisRequestRefused  a CIS request the table cannot hold; the caller
+//                      sends LE Reject CIS Request with `status` as Reason
+//   CisEstablished     a CIS is up
+//   CisFailed          a CIS was not established; `status` says why
+//   CisClosed          an established CIS ended
+//   DataPathSet        an ISO data path is in place for a handle
+//   DataPathRemoved    an ISO data path was removed
+//   BigCreated         the Broadcaster's BIG is up
+//   BigCreateFailed    LE Create BIG Complete with a failure, or a
+//                      creation the Host cancelled
+//   BigTerminated      the Broadcaster's BIG ended
+//   BigSynced          the Receiver follows a BIG
+//   BigSyncFailed      synchronization to a BIG failed or was cancelled
+//   BigSyncLost        a followed BIG ended or was lost
+//   BigSyncTerminated  the Host ended its synchronization to a BIG
+pub @value
+enum IsoEventKind
+    Nothing
+    Unrelated
+    CommandDone
+    CommandFailed
+    CigConfigured
+    CigRemoved
+    CisRequested
+    CisRequestRefused
+    CisEstablished
+    CisFailed
+    CisClosed
+    DataPathSet
+    DataPathRemoved
+    BigCreated
+    BigCreateFailed
+    BigTerminated
+    BigSynced
+    BigSyncFailed
+    BigSyncLost
+    BigSyncTerminated
+
+// One event for the caller.  `slot` is the row of the table the event
+// concerns, -1 when there is none; `handle` is the Connection_Handle of a
+// CIS or BIS, the BIG_Handle of a group, or the CIG_ID of a CIG event;
+// `status` is a Controller error code, 0 for success.
+@value
+struct IsoEvent
+    kind: IsoEventKind
+    slot: Int
+    handle: Int
+    status: Int
+
+@tier(embedded)
+fn iso_event(kind: IsoEventKind, slot: Int, handle: Int, status: Int) -> IsoEvent
+    IsoEvent { kind: kind, slot: slot, handle: handle, status: status }
+
+// An event that changed nothing.
+@tier(embedded)
+fn unrelated(handle: Int) -> IsoEvent
+    IsoEvent { kind: IsoEventKind.Unrelated, slot: -1, handle: handle, status: STATUS_SUCCESS }
+
+// The Controller refused a command with `status`.
+@tier(embedded)
+fn command_failed(handle: Int, status: Int) -> IsoEvent
+    IsoEvent { kind: IsoEventKind.CommandFailed, slot: -1, handle: handle, status: status }
+
+@test
+fn test_an_event_carries_its_four_fields()
+    let e = iso_event(IsoEventKind.CisEstablished, 1, 0x0040, 0)
+    test.assert(e.kind == IsoEventKind.CisEstablished)
+    test.assert_eq(e.slot, 1)
+    test.assert_eq(e.handle, 0x0040)
+    test.assert_eq(e.status, 0)
+
+@test
+fn test_an_unrelated_event_and_a_failed_command_name_no_row()
+    let a = unrelated(0x0041)
+    test.assert(a.kind == IsoEventKind.Unrelated)
+    test.assert_eq(a.slot, -1)
+    test.assert_eq(a.handle, 0x0041)
+    let b = command_failed(0x0042, STATUS_COMMAND_DISALLOWED)
+    test.assert(b.kind == IsoEventKind.CommandFailed)
+    test.assert_eq(b.status, 0x0C)
+    test.assert_eq(b.slot, -1)
+
+// The codes are those of [Vol 1] Part F, Section 1.3.
+@test
+fn test_the_status_codes_are_the_specified_ones()
+    test.assert_eq(STATUS_UNKNOWN_CONNECTION_IDENTIFIER, 0x02)
+    test.assert_eq(STATUS_MEMORY_CAPACITY_EXCEEDED, 0x07)
+    test.assert_eq(STATUS_CONNECTION_ALREADY_EXISTS, 0x0B)
+    test.assert_eq(STATUS_COMMAND_DISALLOWED, 0x0C)
+    test.assert_eq(STATUS_REJECTED_LIMITED_RESOURCES, 0x0D)
+    test.assert_eq(STATUS_CONNECTION_ACCEPT_TIMEOUT_EXCEEDED, 0x10)
+    test.assert_eq(STATUS_UNSUPPORTED_FEATURE_OR_PARAMETER, 0x11)
+    test.assert_eq(STATUS_INVALID_COMMAND_PARAMETERS, 0x12)
+    test.assert_eq(STATUS_CONNECTION_TERMINATED_BY_LOCAL_HOST, 0x16)
+    test.assert_eq(STATUS_ENCRYPTION_MODE_NOT_ACCEPTABLE, 0x25)
+    test.assert_eq(STATUS_UNKNOWN_ADVERTISING_IDENTIFIER, 0x42)
+    test.assert_eq(STATUS_OPERATION_CANCELLED_BY_HOST, 0x44)

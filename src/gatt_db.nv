@@ -1,0 +1,864 @@
+// gatt_db.nv — declarative attribute table.
+//
+// Per Bluetooth Core Vol 3 Part C §12, every GATT server MUST
+// expose Generic Access (0x1800) and Generic Attribute (0x1801)
+// services in addition to whatever vendor / profile services it
+// implements.  Without these, well-behaved scanners (nRF Connect,
+// iOS / Android GATT browsers) flag the device as malformed.
+//
+// Layout (3 services, 13 attributes):
+//
+//   0x0001  Primary Service   GAP service  (UUID 0x1800)
+//   0x0002  Characteristic    Device Name decl  (Read, val=0x0003, 0x2A00)
+//   0x0003  Device Name       "NovoBLE"
+//   0x0004  Characteristic    Appearance decl   (Read, val=0x0005, 0x2A01)
+//   0x0005  Appearance        0x0000  (Generic, no specific category)
+//
+//   0x0006  Primary Service   GATT service (UUID 0x1801)
+//   0x0007  Characteristic    Service Changed decl  (Indicate, val=0x0008, 0x2A05)
+//   0x0008  Service Changed   [0x0001, 0xFFFF]  (entire range invalidated once)
+//
+//   0x0009  Primary Service   Device Information (UUID 0x180A)
+//   0x000A  Characteristic    Manufacturer Name decl (Read, val=0x000B, 0x2A29)
+//   0x000B  Manufacturer Name "Novo"
+//   0x000C  Characteristic    Model Number decl     (Read, val=0x000D, 0x2A24)
+//   0x000D  Model Number      "M5-1.0"
+//
+// On-the-wire bytes are LE.  `build()` returns the flat blob
+// consumed by `att_server.handle_request` — see that module for
+// the record format.
+//
+// Satisfies: REQ-BLE-GATT-DB-001 (Device Information present),
+// -002 (Manufacturer Name = "Novo"), -003 (Model Number =
+// "M5-1.0"), -004 (mandatory GAP service), -005 (mandatory GATT
+// service).
+
+use std.test
+use std.bits
+use att
+use att_server
+
+// ── Standard 16-bit UUIDs we expose ─────────────────────────────────
+
+const UUID_PRIMARY_SERVICE = 0x2800
+const UUID_CHARACTERISTIC = 0x2803
+
+// Mandatory services (Vol 3 Part C §12)
+const UUID_GAP_SVC = 0x1800
+const UUID_GATT_SVC = 0x1801
+
+// GAP service characteristics
+const UUID_DEVICE_NAME = 0x2A00
+const UUID_APPEARANCE = 0x2A01
+
+// GATT service characteristics
+const UUID_SERVICE_CHANGED = 0x2A05
+const UUID_CLIENT_SUPPORTED_FEATURES = 0x2B29
+const UUID_DATABASE_HASH = 0x2B2A
+const UUID_SERVER_SUPPORTED_FEATURES = 0x2B3A
+
+// Device Information service + characteristics
+const UUID_DEVICE_INFO_SVC = 0x180A
+const UUID_MANUFACTURER_NAME = 0x2A29
+const UUID_MODEL_NUMBER = 0x2A24
+
+// Heart Rate service + characteristics
+const UUID_HRS_SVC = 0x180D
+const UUID_HEART_RATE_MEASUREMENT = 0x2A37
+const UUID_BODY_SENSOR_LOCATION = 0x2A38
+
+// Battery service + characteristics
+const UUID_BATTERY_SVC = 0x180F
+const UUID_BATTERY_LEVEL = 0x2A19
+
+// Client Characteristic Configuration Descriptor
+const UUID_CCCD = 0x2902
+
+// ── Characteristic properties (Vol 3 Part G §3.3.1.1) ───────────────
+
+const CHAR_PROP_READ = 0x02
+const CHAR_PROP_WRITE = 0x08
+const CHAR_PROP_NOTIFY = 0x10
+const CHAR_PROP_INDICATE = 0x20
+
+// ── Handle layout — three services, 13 attributes ───────────────────
+
+// GAP service (0x0001 .. 0x0005)
+const HANDLE_GAP_SVC = 0x0001
+const HANDLE_DEVICE_NAME_DECL = 0x0002
+const HANDLE_DEVICE_NAME_VALUE = 0x0003
+const HANDLE_APPEARANCE_DECL = 0x0004
+const HANDLE_APPEARANCE_VALUE = 0x0005
+const HANDLE_GAP_SVC_END_GROUP = 0x0005
+
+// GATT service (0x0006 .. 0x0008)
+const HANDLE_GATT_SVC = 0x0006
+const HANDLE_SERVICE_CHANGED_DECL = 0x0007
+const HANDLE_SERVICE_CHANGED_VALUE = 0x0008
+const HANDLE_GATT_SVC_END_GROUP = 0x0008
+
+// Device Information service (0x0009 .. 0x000D)
+const HANDLE_DEVICE_INFO_SVC = 0x0009
+const HANDLE_MFR_NAME_DECL = 0x000A
+const HANDLE_MFR_NAME_VALUE = 0x000B
+const HANDLE_MODEL_NUMBER_DECL = 0x000C
+const HANDLE_MODEL_NUMBER_VALUE = 0x000D
+const HANDLE_DEVICE_INFO_END_GROUP = 0x000D
+
+// Heart Rate service (0x000E .. 0x0013)
+const HANDLE_HRS_SVC = 0x000E
+const HANDLE_HRM_DECL = 0x000F
+const HANDLE_HRM_VALUE = 0x0010
+const HANDLE_HRM_CCCD = 0x0011
+const HANDLE_BSL_DECL = 0x0012
+const HANDLE_BSL_VALUE = 0x0013
+const HANDLE_HRS_END_GROUP = 0x0013
+
+// Battery service (0x0014 .. 0x0017)
+const HANDLE_BATTERY_SVC = 0x0014
+const HANDLE_BATTERY_LEVEL_DECL = 0x0015
+const HANDLE_BATTERY_LEVEL_VALUE = 0x0016
+const HANDLE_BATTERY_LEVEL_CCCD = 0x0017
+const HANDLE_BATTERY_END_GROUP = 0x0017
+
+// The size of the table `build` writes, in octets, so that it takes its list
+// at that size once.  A test pins it against the table.
+const GATT_DB_BLOB_BYTES = 242
+
+// The octets of `build_gap_server` that do not depend on its arguments: the
+// table less the device name, the appearance and the connection parameters.
+const GAP_SERVER_FIXED_BYTES = 243
+
+// ── Strings ────────────────────────────────────────────────────────
+//
+// Match the ADV_IND Local Name in `controller/ll_adv_pdu.nv`
+// so phones see the same name in scan results and after connect.
+@tier(embedded)
+fn device_name_bytes() -> [u8]
+    [0x4E, 0x6F, 0x76, 0x6F,
+     0x42, 0x4C, 0x45]   // "NovoBLE"
+
+@tier(embedded)
+fn manufacturer_name_bytes() -> [u8]
+    [0x4E, 0x6F, 0x76, 0x6F]   // "Novo"
+
+@tier(embedded)
+fn model_number_bytes() -> [u8]
+    [0x4D, 0x35, 0x2D, 0x31, 0x2E, 0x30]   // "M5-1.0"
+
+// ── Appearance: u16 LE.  0x0000 = Generic, no specific category. ──
+@tier(embedded)
+fn appearance_bytes() -> [u8]
+    [0x00, 0x00]
+
+// ── Service Changed value: pair of u16 handles (LE LE).
+//
+// Per Vol 3 Part G §7.1, "Indicates that this server has changed
+// any GATT services between this start_handle and end_handle".
+// Since our GATT db is static across boots, a one-time
+// "everything-changed" value (0x0001..0xFFFF) advertises that to
+// any peer that connects after a possible firmware update.
+@tier(embedded)
+fn service_changed_bytes() -> [u8]
+    [0x01, 0x00, 0xFF, 0xFF]
+
+// The Client Supported Features value in the record table: the default,
+// all bits zero ([Vol 3] Part G, Section 7.2).  Each client has a value
+// of its own and the server keeps it, not the record.
+@tier(embedded)
+fn client_supported_features_bytes() -> [u8]
+    [0x00]
+
+// The Server Supported Features value in the record table: the EATT
+// Supported bit of octet 0 ([Vol 3] Part G, Table 7.11), which says this
+// server supports the Enhanced ATT bearer and is what the EATT cases'
+// initial condition reads ("The IUT sets the EATT Supported bit set to 1
+// in the Server Supported Features characteristic", GATT Test Suite, the
+// Exchange MTU, Read Multiple Variable Length and Write Without Response
+// cases).  The characteristic is read-only and the server owns the value
+// ([Vol 3] Part G, Section 7.4); no other bit is set, so the value is one
+// octet.
+const SERVER_SUPPORTED_FEATURES_EATT = 0x01
+
+@satisfies("REQ-BLE-GATT-024")
+@tier(embedded)
+fn server_supported_features_bytes() -> [u8]
+    [SERVER_SUPPORTED_FEATURES_EATT]
+
+// The Database Hash value in the record table: 16 zero octets, which the
+// GATT server replaces with the hash of the definitions it holds
+// ([Vol 3] Part G, Section 7.3).
+@tier(embedded)
+fn database_hash_bytes() -> [u8]
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+
+// ── Build the characteristic-declaration value ──────────────────────
+//
+// 5 bytes: properties (1) | value handle (2 LE) | uuid16 (2 LE)
+@tier(embedded)
+fn build_char_decl_value(props: Int, value_handle: Int, uuid16: Int) -> [u8]
+    [
+        props as u8,
+        (value_handle & 0xFF) as u8,
+        ((value_handle >>> 8) & 0xFF) as u8,
+        (uuid16 & 0xFF) as u8,
+        ((uuid16 >>> 8) & 0xFF) as u8]
+
+// ── Build the 2-byte LE encoding of a 16-bit UUID ───────────────────
+@tier(embedded)
+fn uuid16_le_bytes(uuid16: Int) -> [u8]
+    [
+        (uuid16 & 0xFF) as u8,
+        ((uuid16 >>> 8) & 0xFF) as u8]
+
+// ── CCCD descriptor record helper ──────────────────────────────────
+//
+// Every Notify / Indicate characteristic gets a CCCD descriptor
+// immediately after its value attribute.  Initial value is 0x0000
+// (subscriptions off).  CCCDs are unconditionally writable per
+// spec — att_server's db_writable_at special-cases UUID 0x2902.
+@tier(embedded)
+fn build_cccd_record(handle: Int) -> [u8]
+    att_server.build_db_record(
+        handle,
+        UUID_CCCD,
+        handle,
+        [0x00, 0x00])   // off by default
+
+// The same record written onto the end of `out`.
+@tier(embedded)
+fn put_cccd_record(var out: [u8], handle: Int)
+    att_server.put_db_record(var out, handle, UUID_CCCD, handle, [0x00, 0x00])
+
+// ── Body Sensor Location: 1 byte enum.  0x01 = wrist. ──────────────
+@tier(embedded)
+fn body_sensor_location_bytes() -> [u8]
+    [0x01]
+
+// ── Heart Rate Measurement: 2 bytes (flags + bpm).  Flags=0x00
+//    (8-bit value, sensor contact unsupported), bpm=0 at boot. ──────
+@tier(embedded)
+fn heart_rate_measurement_bytes() -> [u8]
+    [0x00, 0x00]
+
+// ── Battery Level: 1 byte percentage.  100 at boot. ───────────────
+@tier(embedded)
+fn battery_level_bytes() -> [u8]
+    [0x64]   // 100%
+
+// ── Construct the 13-attribute table ────────────────────────────────
+pub @satisfies("REQ-BLE-GATT-DB-001")
+@satisfies("REQ-BLE-GATT-DB-002")
+@satisfies("REQ-BLE-GATT-DB-003")
+@satisfies("REQ-BLE-GATT-DB-004")
+@satisfies("REQ-BLE-GATT-DB-005")
+@tier(embedded)
+fn build() -> [u8]
+    // Exact size of the table (GATT_DB_BLOB_BYTES, pinned by a test), taken once:
+    // the records are written onto the end of it, no record is built as a list.
+    var db: [u8] = list.with_capacity(GATT_DB_BLOB_BYTES)
+    // ── GAP service ────────────────────────────────────────────────
+    att_server.put_db_record(var db,
+        HANDLE_GAP_SVC,
+        UUID_PRIMARY_SERVICE,
+        HANDLE_GAP_SVC_END_GROUP,
+        uuid16_le_bytes(UUID_GAP_SVC))
+    att_server.put_db_record(var db,
+        HANDLE_DEVICE_NAME_DECL,
+        UUID_CHARACTERISTIC,
+        HANDLE_DEVICE_NAME_DECL,
+        build_char_decl_value(CHAR_PROP_READ, HANDLE_DEVICE_NAME_VALUE, UUID_DEVICE_NAME))
+    att_server.put_db_record(var db,
+        HANDLE_DEVICE_NAME_VALUE,
+        UUID_DEVICE_NAME,
+        HANDLE_DEVICE_NAME_VALUE,
+        device_name_bytes())
+    att_server.put_db_record(var db,
+        HANDLE_APPEARANCE_DECL,
+        UUID_CHARACTERISTIC,
+        HANDLE_APPEARANCE_DECL,
+        build_char_decl_value(CHAR_PROP_READ, HANDLE_APPEARANCE_VALUE, UUID_APPEARANCE))
+    att_server.put_db_record(var db,
+        HANDLE_APPEARANCE_VALUE,
+        UUID_APPEARANCE,
+        HANDLE_APPEARANCE_VALUE,
+        appearance_bytes())
+
+    // ── GATT service ───────────────────────────────────────────────
+    att_server.put_db_record(var db,
+        HANDLE_GATT_SVC,
+        UUID_PRIMARY_SERVICE,
+        HANDLE_GATT_SVC_END_GROUP,
+        uuid16_le_bytes(UUID_GATT_SVC))
+    att_server.put_db_record(var db,
+        HANDLE_SERVICE_CHANGED_DECL,
+        UUID_CHARACTERISTIC,
+        HANDLE_SERVICE_CHANGED_DECL,
+        build_char_decl_value(CHAR_PROP_INDICATE, HANDLE_SERVICE_CHANGED_VALUE, UUID_SERVICE_CHANGED))
+    att_server.put_db_record(var db,
+        HANDLE_SERVICE_CHANGED_VALUE,
+        UUID_SERVICE_CHANGED,
+        HANDLE_SERVICE_CHANGED_VALUE,
+        service_changed_bytes())
+
+    // ── Device Information service ────────────────────────────────
+    att_server.put_db_record(var db,
+        HANDLE_DEVICE_INFO_SVC,
+        UUID_PRIMARY_SERVICE,
+        HANDLE_DEVICE_INFO_END_GROUP,
+        uuid16_le_bytes(UUID_DEVICE_INFO_SVC))
+    att_server.put_db_record(var db,
+        HANDLE_MFR_NAME_DECL,
+        UUID_CHARACTERISTIC,
+        HANDLE_MFR_NAME_DECL,
+        build_char_decl_value(CHAR_PROP_READ, HANDLE_MFR_NAME_VALUE, UUID_MANUFACTURER_NAME))
+    att_server.put_db_record(var db,
+        HANDLE_MFR_NAME_VALUE,
+        UUID_MANUFACTURER_NAME,
+        HANDLE_MFR_NAME_VALUE,
+        manufacturer_name_bytes())
+    att_server.put_db_record(var db,
+        HANDLE_MODEL_NUMBER_DECL,
+        UUID_CHARACTERISTIC,
+        HANDLE_MODEL_NUMBER_DECL,
+        build_char_decl_value(CHAR_PROP_READ, HANDLE_MODEL_NUMBER_VALUE, UUID_MODEL_NUMBER))
+    att_server.put_db_record(var db,
+        HANDLE_MODEL_NUMBER_VALUE,
+        UUID_MODEL_NUMBER,
+        HANDLE_MODEL_NUMBER_VALUE,
+        model_number_bytes())
+
+    // ── Heart Rate service ────────────────────────────────────────
+    att_server.put_db_record(var db,
+        HANDLE_HRS_SVC,
+        UUID_PRIMARY_SERVICE,
+        HANDLE_HRS_END_GROUP,
+        uuid16_le_bytes(UUID_HRS_SVC))
+    att_server.put_db_record(var db,
+        HANDLE_HRM_DECL,
+        UUID_CHARACTERISTIC,
+        HANDLE_HRM_DECL,
+        build_char_decl_value(CHAR_PROP_NOTIFY, HANDLE_HRM_VALUE, UUID_HEART_RATE_MEASUREMENT))
+    att_server.put_db_record(var db,
+        HANDLE_HRM_VALUE,
+        UUID_HEART_RATE_MEASUREMENT,
+        HANDLE_HRM_VALUE,
+        heart_rate_measurement_bytes())
+    put_cccd_record(var db, HANDLE_HRM_CCCD)
+    att_server.put_db_record(var db,
+        HANDLE_BSL_DECL,
+        UUID_CHARACTERISTIC,
+        HANDLE_BSL_DECL,
+        build_char_decl_value(CHAR_PROP_READ, HANDLE_BSL_VALUE, UUID_BODY_SENSOR_LOCATION))
+    att_server.put_db_record(var db,
+        HANDLE_BSL_VALUE,
+        UUID_BODY_SENSOR_LOCATION,
+        HANDLE_BSL_VALUE,
+        body_sensor_location_bytes())
+
+    // ── Battery service ───────────────────────────────────────────
+    att_server.put_db_record(var db,
+        HANDLE_BATTERY_SVC,
+        UUID_PRIMARY_SERVICE,
+        HANDLE_BATTERY_END_GROUP,
+        uuid16_le_bytes(UUID_BATTERY_SVC))
+    // Battery Level supports both Read (current value) and Notify
+    // (subscribe to changes).  Per BAS spec only one of those is
+    // strictly required, but exposing both is the common shape and
+    // exercises CCCD wiring against the GATT/SR/GAN tests.
+    att_server.put_db_record(var db,
+        HANDLE_BATTERY_LEVEL_DECL,
+        UUID_CHARACTERISTIC,
+        HANDLE_BATTERY_LEVEL_DECL,
+        build_char_decl_value(CHAR_PROP_READ + CHAR_PROP_NOTIFY,
+            HANDLE_BATTERY_LEVEL_VALUE, UUID_BATTERY_LEVEL))
+    att_server.put_db_record(var db,
+        HANDLE_BATTERY_LEVEL_VALUE,
+        UUID_BATTERY_LEVEL,
+        HANDLE_BATTERY_LEVEL_VALUE,
+        battery_level_bytes())
+    put_cccd_record(var db, HANDLE_BATTERY_LEVEL_CCCD)
+
+    db
+
+// ── The GAP and GATT services of a Peripheral's GATT Server ─────────
+//
+// A Peripheral's GATT Server contains one GAP service, with the Device
+// Name and Appearance characteristics, which a Peripheral shall have,
+// and the optional Peripheral Preferred Connection Parameters
+// characteristic ([Vol 3] Part C, Section 12, Table 12.2), and the Central
+// Address Resolution characteristic (Section 12.4), whose value 0 says
+// that the device does not resolve addresses (see
+// CENTRAL_ADDRESS_RESOLUTION_VALUE).
+// Each value is readable and none is writable.  The GATT service follows
+// with the Service Changed characteristic ([Vol 3] Part G, Section 7.1),
+// which is indicated, not read, and its Client Characteristic
+// Configuration descriptor, the Client Supported Features characteristic
+// (Section 7.2), which the client writes and only this client reads, the
+// Database Hash characteristic (Section 7.3), which the server fills with
+// the hash of the definitions, and the Server Supported Features
+// characteristic (Section 7.4), which is read-only and states the
+// features this server supports, the Enhanced ATT bearer among them
+// (Table 7.11).
+//
+//   0x0001  Primary Service     GAP service (0x1800)
+//   0x0002  Characteristic      Read, Write, 0x0003, Device Name (0x2A00)
+//   0x0003  Device Name         0 to 248 octets of UTF-8
+//   0x0004  Characteristic      Read, Write, 0x0005, Appearance (0x2A01)
+//   0x0005  Appearance          2 octets
+//   0x0006  Characteristic      Read, 0x0007, Peripheral Preferred
+//                               Connection Parameters (0x2A04)
+//   0x0007  Peripheral Preferred Connection Parameters, 8 octets
+//   0x0008  Characteristic      Read, 0x0009, Central Address Resolution
+//                               (0x2AA6)
+//   0x0009  Central Address Resolution, 1 octet
+//   0x000A  Characteristic      Read, 0x000B, LE GATT Security Levels
+//                               (0x2BF5)
+//   0x000B  LE GATT Security Levels, 2 octets
+//   0x000C  Characteristic      Read, 0x000D, Resolvable Private Address
+//                               Only (0x2AC9)
+//   0x000D  Resolvable Private Address Only, 1 octet
+//   0x000E  Primary Service     GATT service (0x1801)
+//   0x000F  Characteristic      Indicate, 0x0010, Service Changed (0x2A05)
+//   0x0010  Service Changed     the affected handle range
+//   0x0011  Client Characteristic Configuration descriptor
+//   0x0012  Characteristic      Read, Write, 0x0013, Client Supported
+//                               Features (0x2B29)
+//   0x0013  Client Supported Features, one octet (the client's)
+//   0x0014  Characteristic      Read, 0x0015, Database Hash (0x2B2A)
+//   0x0015  Database Hash       16 octets, the hash of the definitions
+//   0x0016  Characteristic      Read, 0x0017, Server Supported Features
+//                               (0x2B3A)
+//   0x0017  Server Supported Features, one octet, the server's
+
+const UUID_PERIPHERAL_PREFERRED_CONNECTION_PARAMETERS = 0x2A04
+const UUID_CENTRAL_ADDRESS_RESOLUTION = 0x2AA6
+// The LE GATT Security Levels characteristic states what the GATT
+// server asks of a client on an LE connection, a pair of octets per
+// security mode; the Resolvable Private Address Only one, a single zero
+// octet, says it uses only Resolvable Private Addresses ([Vol 3] Part C,
+// Sections 12.7 and 12.5).
+const UUID_LE_GATT_SECURITY_LEVELS = 0x2BF5
+const UUID_RESOLVABLE_PRIVATE_ADDRESS_ONLY = 0x2AC9
+
+// The handle of the Device Name value in the GAP service the GATT server builds.
+pub const GAP_SERVER_DEVICE_NAME_HANDLE = 0x0003
+const GAP_SERVER_APPEARANCE_HANDLE = 0x0005
+const GAP_SERVER_PPCP_HANDLE = 0x0007
+const GAP_SERVER_CAR_HANDLE = 0x0009
+const GAP_SERVER_SECURITY_LEVELS_DECL = 0x000A
+// The handle of the LE GATT Security Levels value in the GAP service the GATT server builds.
+pub const GAP_SERVER_SECURITY_LEVELS_HANDLE = 0x000B
+const GAP_SERVER_RPA_ONLY_DECL = 0x000C
+const GAP_SERVER_RPA_ONLY_HANDLE = 0x000D
+const GAP_SERVER_GAP_END = 0x000D
+const GAP_SERVER_GATT_SERVICE_HANDLE = 0x000E
+const GAP_SERVER_SERVICE_CHANGED_HANDLE = 0x0010
+const GAP_SERVER_SERVICE_CHANGED_DECL = 0x000F
+const GAP_SERVER_SERVICE_CHANGED_CCCD_HANDLE = 0x0011
+const GAP_SERVER_CLIENT_SUPPORTED_FEATURES_HANDLE = 0x0013
+const GAP_SERVER_CLIENT_SUPPORTED_FEATURES_DECL = 0x0012
+const GAP_SERVER_DATABASE_HASH_HANDLE = 0x0015
+const GAP_SERVER_DATABASE_HASH_DECL = 0x0014
+const GAP_SERVER_SERVER_SUPPORTED_FEATURES_HANDLE = 0x0017
+const GAP_SERVER_SERVER_SUPPORTED_FEATURES_DECL = 0x0016
+const GAP_SERVER_GATT_END = 0x0017
+
+// The Database Hash characteristic value is a 128-bit unsigned integer
+// ([Vol 3] Part G, Section 7.3.1, Table 7.8); the server fills it in
+// ([Vol 3] Part G, Section 7.3).
+const DATABASE_HASH_OCTETS = 16
+
+// The Central Address Resolution value ([Vol 3] Part C, Section 12.4): 0,
+// "address resolution is not supported in this device".  The Host
+// resolves a peer's address only after a connection is made; the
+// Controller is given no resolving list, so it cannot recognize directed
+// advertising aimed at a Resolvable Private Address of this device.
+const CENTRAL_ADDRESS_RESOLUTION_VALUE = 0x00
+
+// The Resolvable Private Address Only characteristic's single octet: zero
+// says the device uses only Resolvable Private Addresses when it is in a
+// resolvable-private-address mode ([Vol 3] Part C, Section 12.5).
+const RESOLVABLE_PRIVATE_ADDRESS_ONLY_VALUE = 0x00
+
+// The value of the LE GATT Security Levels characteristic: LE security
+// mode 1 ([Vol 3] Part C, Section 10.2.1) and the level the server asks
+// for, one octet each, mode first ([Vol 3] Part C, Section 12.7).  A
+// server that lets a client read and write what it holds with no
+// security asks for level 1, no security at all; the Host writes the
+// level the tester configures into this value
+// (`btp_session.configure`).
+pub const SECURITY_MODE_LE = 0x01
+const SECURITY_LEVEL_NO_SECURITY = 0x01
+
+// The value of the LE GATT Security Levels characteristic for `level`: the security mode, 1, and the level ([Vol 3]
+// Part C, Section 12.5).
+pub fn security_levels_bytes(level: Int) -> [u8]
+    [SECURITY_MODE_LE, level as u8]
+
+// The Device Name characteristic value is 0 to 248 octets ([Vol 3]
+// Part C, Section 12.1); a longer name is cut.
+pub const DEVICE_NAME_MAX = 248
+
+// The Peripheral Preferred Connection Parameters value ([Vol 3] Part C,
+// Section 12.3, Table 12.6): Interval_Min, Interval_Max, Latency and
+// Timeout, 2 octets each, least significant first.
+pub @tier(embedded)
+fn ppcp_value(interval_min: Int, interval_max: Int, latency: Int, timeout: Int) -> [u8]
+    var out = uuid16_le_bytes(interval_min)
+    list.append(out, uuid16_le_bytes(interval_max))
+    list.append(out, uuid16_le_bytes(latency))
+    list.append(out, uuid16_le_bytes(timeout))
+    out
+
+// The attribute table above for `device_name`, `appearance` (2 octets)
+// and `ppcp` (8 octets), in the record format of `att_server`.  The Device
+// Name and the Appearance are read-only unless `writable_identity` is set:
+// a writable name lets any client rename the device, which a program turns
+// on only when it means to ([Vol 3] Part C, Section 12.1 allows either).
+pub @tier(embedded)
+fn build_gap_server(device_name: [u8], appearance: [u8], ppcp: [u8], writable_identity: Bool) -> [u8]
+    let identity_properties = if writable_identity then CHAR_PROP_READ + CHAR_PROP_WRITE else CHAR_PROP_READ
+    let name = if list.len(device_name) > DEVICE_NAME_MAX then device_name[0:DEVICE_NAME_MAX] else device_name
+    var db: [u8] = list.with_capacity(GAP_SERVER_FIXED_BYTES + list.len(name) + list.len(appearance) + list.len(ppcp))
+    att_server.put_db_record(var db, HANDLE_GAP_SVC, UUID_PRIMARY_SERVICE, GAP_SERVER_GAP_END, uuid16_le_bytes(UUID_GAP_SVC))
+    // When `writable_identity` is set a client may set the name and the
+    // icon the device presents ([Vol 3] Part C, Section 12.1, and the
+    // GAP/GAT/BV-05-C and BV-06-C cases).
+    att_server.put_db_record(var db, 0x0002, UUID_CHARACTERISTIC, 0x0002,
+        build_char_decl_value(identity_properties, GAP_SERVER_DEVICE_NAME_HANDLE, UUID_DEVICE_NAME))
+    att_server.put_db_record(var db, GAP_SERVER_DEVICE_NAME_HANDLE, UUID_DEVICE_NAME, GAP_SERVER_DEVICE_NAME_HANDLE, name)
+    att_server.put_db_record(var db, 0x0004, UUID_CHARACTERISTIC, 0x0004,
+        build_char_decl_value(identity_properties, GAP_SERVER_APPEARANCE_HANDLE, UUID_APPEARANCE))
+    att_server.put_db_record(var db, GAP_SERVER_APPEARANCE_HANDLE, UUID_APPEARANCE, GAP_SERVER_APPEARANCE_HANDLE, appearance)
+    att_server.put_db_record(var db, 0x0006, UUID_CHARACTERISTIC, 0x0006,
+        build_char_decl_value(CHAR_PROP_READ, GAP_SERVER_PPCP_HANDLE, UUID_PERIPHERAL_PREFERRED_CONNECTION_PARAMETERS))
+    att_server.put_db_record(var db, GAP_SERVER_PPCP_HANDLE, UUID_PERIPHERAL_PREFERRED_CONNECTION_PARAMETERS, GAP_SERVER_PPCP_HANDLE, ppcp)
+    att_server.put_db_record(var db, 0x0008, UUID_CHARACTERISTIC, 0x0008,
+        build_char_decl_value(CHAR_PROP_READ, GAP_SERVER_CAR_HANDLE, UUID_CENTRAL_ADDRESS_RESOLUTION))
+    att_server.put_db_record(var db, GAP_SERVER_CAR_HANDLE, UUID_CENTRAL_ADDRESS_RESOLUTION, GAP_SERVER_CAR_HANDLE, [CENTRAL_ADDRESS_RESOLUTION_VALUE])
+    att_server.put_db_record(var db, GAP_SERVER_SECURITY_LEVELS_DECL, UUID_CHARACTERISTIC, GAP_SERVER_SECURITY_LEVELS_DECL,
+        build_char_decl_value(CHAR_PROP_READ, GAP_SERVER_SECURITY_LEVELS_HANDLE, UUID_LE_GATT_SECURITY_LEVELS))
+    att_server.put_db_record(var db, GAP_SERVER_SECURITY_LEVELS_HANDLE, UUID_LE_GATT_SECURITY_LEVELS, GAP_SERVER_SECURITY_LEVELS_HANDLE, security_levels_bytes(SECURITY_LEVEL_NO_SECURITY))
+    att_server.put_db_record(var db, GAP_SERVER_RPA_ONLY_DECL, UUID_CHARACTERISTIC, GAP_SERVER_RPA_ONLY_DECL,
+        build_char_decl_value(CHAR_PROP_READ, GAP_SERVER_RPA_ONLY_HANDLE, UUID_RESOLVABLE_PRIVATE_ADDRESS_ONLY))
+    att_server.put_db_record(var db, GAP_SERVER_RPA_ONLY_HANDLE, UUID_RESOLVABLE_PRIVATE_ADDRESS_ONLY, GAP_SERVER_RPA_ONLY_HANDLE, [RESOLVABLE_PRIVATE_ADDRESS_ONLY_VALUE])
+    att_server.put_db_record(var db, GAP_SERVER_GATT_SERVICE_HANDLE, UUID_PRIMARY_SERVICE, GAP_SERVER_GATT_END, uuid16_le_bytes(UUID_GATT_SVC))
+    att_server.put_db_record(var db, GAP_SERVER_SERVICE_CHANGED_DECL, UUID_CHARACTERISTIC, GAP_SERVER_SERVICE_CHANGED_DECL,
+        build_char_decl_value(CHAR_PROP_INDICATE, GAP_SERVER_SERVICE_CHANGED_HANDLE, UUID_SERVICE_CHANGED))
+    att_server.put_db_record(var db, GAP_SERVER_SERVICE_CHANGED_HANDLE, UUID_SERVICE_CHANGED, GAP_SERVER_SERVICE_CHANGED_HANDLE, service_changed_bytes())
+    put_cccd_record(var db, GAP_SERVER_SERVICE_CHANGED_CCCD_HANDLE)
+    att_server.put_db_record(var db, GAP_SERVER_CLIENT_SUPPORTED_FEATURES_DECL, UUID_CHARACTERISTIC, GAP_SERVER_CLIENT_SUPPORTED_FEATURES_DECL,
+        build_char_decl_value(CHAR_PROP_READ + CHAR_PROP_WRITE, GAP_SERVER_CLIENT_SUPPORTED_FEATURES_HANDLE, UUID_CLIENT_SUPPORTED_FEATURES))
+    att_server.put_db_record(var db, GAP_SERVER_CLIENT_SUPPORTED_FEATURES_HANDLE, UUID_CLIENT_SUPPORTED_FEATURES, GAP_SERVER_CLIENT_SUPPORTED_FEATURES_HANDLE, client_supported_features_bytes())
+    att_server.put_db_record(var db, GAP_SERVER_DATABASE_HASH_DECL, UUID_CHARACTERISTIC, GAP_SERVER_DATABASE_HASH_DECL,
+        build_char_decl_value(CHAR_PROP_READ, GAP_SERVER_DATABASE_HASH_HANDLE, UUID_DATABASE_HASH))
+    att_server.put_db_record(var db, GAP_SERVER_DATABASE_HASH_HANDLE, UUID_DATABASE_HASH, GAP_SERVER_DATABASE_HASH_HANDLE, database_hash_bytes())
+    att_server.put_db_record(var db, GAP_SERVER_SERVER_SUPPORTED_FEATURES_DECL, UUID_CHARACTERISTIC, GAP_SERVER_SERVER_SUPPORTED_FEATURES_DECL,
+        build_char_decl_value(CHAR_PROP_READ, GAP_SERVER_SERVER_SUPPORTED_FEATURES_HANDLE, UUID_SERVER_SUPPORTED_FEATURES))
+    att_server.put_db_record(var db, GAP_SERVER_SERVER_SUPPORTED_FEATURES_HANDLE, UUID_SERVER_SUPPORTED_FEATURES, GAP_SERVER_SERVER_SUPPORTED_FEATURES_HANDLE, server_supported_features_bytes())
+    db
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+@test
+fn test_gap_server_layout()
+    let name: [u8] = ['T', 'e', 's', 't']
+    let db = build_gap_server(name, appearance_bytes(), ppcp_value(0x0018, 0x0028, 0, 0x01F4), true)
+    test.assert_eq(att_server.db_count(db), 23)
+    // The GAP service groups handles 1 to 13, the GATT service 14 to 23.
+    test.assert_eq(att_server.db_end_group_at(db, 0), GAP_SERVER_GAP_END)
+    test.assert_eq(att_server.db_handle_at(db, 13), GAP_SERVER_GATT_SERVICE_HANDLE)
+    test.assert_eq(att_server.db_end_group_at(db, 13), GAP_SERVER_GATT_END)
+    let car = att_server.db_value_at(db, att_server.db_index_for_handle(db, GAP_SERVER_CAR_HANDLE))
+    test.assert_eq(list.len(car), 1)
+    test.assert_eq(car[0] as Int, CENTRAL_ADDRESS_RESOLUTION_VALUE)
+    let n = att_server.db_value_at(db, att_server.db_index_for_handle(db, GAP_SERVER_DEVICE_NAME_HANDLE))
+    test.assert_eq(list.len(n), 4)
+    test.assert_eq(n[0] as Int, 'T' as Int)
+    let p = att_server.db_value_at(db, att_server.db_index_for_handle(db, GAP_SERVER_PPCP_HANDLE))
+    test.assert_eq(list.len(p), 8)
+    test.assert_eq(p[0] as Int, 0x18)
+    test.assert_eq(p[6] as Int, 0xF4)
+    // The Device Name and the Appearance take a write; the Peripheral
+    // Preferred Connection Parameters, the two new GAP characteristics
+    // and the Database Hash do not.
+    test.assert_eq(att_server.db_writable_at(db, GAP_SERVER_DEVICE_NAME_HANDLE), true)
+    test.assert_eq(att_server.db_writable_at(db, GAP_SERVER_APPEARANCE_HANDLE), true)
+    // Without the option neither takes a write, and nothing else changes.
+    let fixed = build_gap_server(name, appearance_bytes(), ppcp_value(0x0018, 0x0028, 0, 0x01F4), false)
+    test.assert_eq(att_server.db_count(fixed), 23)
+    test.assert_eq(att_server.db_writable_at(fixed, GAP_SERVER_DEVICE_NAME_HANDLE), false)
+    test.assert_eq(att_server.db_writable_at(fixed, GAP_SERVER_APPEARANCE_HANDLE), false)
+    test.assert_eq(att_server.db_writable_at(fixed, GAP_SERVER_CLIENT_SUPPORTED_FEATURES_HANDLE), true)
+    test.assert_eq(att_server.db_writable_at(db, GAP_SERVER_PPCP_HANDLE), false)
+    test.assert_eq(att_server.db_writable_at(db, GAP_SERVER_SECURITY_LEVELS_HANDLE), false)
+    test.assert_eq(att_server.db_writable_at(db, GAP_SERVER_RPA_ONLY_HANDLE), false)
+    test.assert_eq(att_server.db_writable_at(db, GAP_SERVER_DATABASE_HASH_HANDLE), false)
+    test.assert_eq(att_server.db_writable_at(db, GAP_SERVER_SERVICE_CHANGED_CCCD_HANDLE), true)
+    test.assert_eq(att_server.db_writable_at(db, GAP_SERVER_CLIENT_SUPPORTED_FEATURES_HANDLE), true)
+    // The two new characteristics: their declarations name their values
+    // and their UUIDs.
+    let csf_decl = att_server.db_value_at(db, att_server.db_index_for_handle(db, GAP_SERVER_CLIENT_SUPPORTED_FEATURES_DECL))
+    test.assert_eq(csf_decl[0] as Int, CHAR_PROP_READ + CHAR_PROP_WRITE)
+    test.assert_eq(csf_decl[1] as Int, GAP_SERVER_CLIENT_SUPPORTED_FEATURES_HANDLE & 0xFF)
+    test.assert_eq(csf_decl[3] as Int, UUID_CLIENT_SUPPORTED_FEATURES & 0xFF)
+    test.assert_eq(csf_decl[4] as Int, UUID_CLIENT_SUPPORTED_FEATURES >>> 8)
+    let csf = att_server.db_value_at(db, att_server.db_index_for_handle(db, GAP_SERVER_CLIENT_SUPPORTED_FEATURES_HANDLE))
+    test.assert_eq(list.len(csf), 1)
+    test.assert_eq(csf[0] as Int, 0x00)
+    let hash_decl = att_server.db_value_at(db, att_server.db_index_for_handle(db, GAP_SERVER_DATABASE_HASH_DECL))
+    test.assert_eq(hash_decl[0] as Int, CHAR_PROP_READ)
+    test.assert_eq(hash_decl[1] as Int, GAP_SERVER_DATABASE_HASH_HANDLE & 0xFF)
+    test.assert_eq(hash_decl[3] as Int, UUID_DATABASE_HASH & 0xFF)
+    test.assert_eq(hash_decl[4] as Int, UUID_DATABASE_HASH >>> 8)
+    let hash_value = att_server.db_value_at(db, att_server.db_index_for_handle(db, GAP_SERVER_DATABASE_HASH_HANDLE))
+    test.assert_eq(list.len(hash_value), DATABASE_HASH_OCTETS)
+    // The two GAP characteristics of Part C's Sections 12.7 and 12.5.
+    let levels_decl = att_server.db_value_at(db, att_server.db_index_for_handle(db, GAP_SERVER_SECURITY_LEVELS_DECL))
+    test.assert_eq(levels_decl[0] as Int, CHAR_PROP_READ)
+    test.assert_eq(levels_decl[1] as Int, GAP_SERVER_SECURITY_LEVELS_HANDLE & 0xFF)
+    test.assert_eq(levels_decl[3] as Int, UUID_LE_GATT_SECURITY_LEVELS & 0xFF)
+    let levels = att_server.db_value_at(db, att_server.db_index_for_handle(db, GAP_SERVER_SECURITY_LEVELS_HANDLE))
+    test.assert_eq(list.len(levels), 2)
+    test.assert_eq(levels[0] as Int, SECURITY_MODE_LE)
+    test.assert_eq(levels[1] as Int, SECURITY_LEVEL_NO_SECURITY)
+    let rpa_decl = att_server.db_value_at(db, att_server.db_index_for_handle(db, GAP_SERVER_RPA_ONLY_DECL))
+    test.assert_eq(rpa_decl[0] as Int, CHAR_PROP_READ)
+    test.assert_eq(rpa_decl[3] as Int, UUID_RESOLVABLE_PRIVATE_ADDRESS_ONLY & 0xFF)
+    let rpa = att_server.db_value_at(db, att_server.db_index_for_handle(db, GAP_SERVER_RPA_ONLY_HANDLE))
+    test.assert_eq(list.len(rpa), 1)
+    test.assert_eq(rpa[0] as Int, RESOLVABLE_PRIVATE_ADDRESS_ONLY_VALUE)
+    // The Device Name and Appearance declarations carry the Write bit.
+    let name_decl = att_server.db_value_at(db, att_server.db_index_for_handle(db, 0x0002))
+    test.assert_eq(name_decl[0] as Int, CHAR_PROP_READ + CHAR_PROP_WRITE)
+    // The Server Supported Features characteristic: read-only, its value
+    // one octet with the EATT Supported bit, and no part of the Database
+    // Hash ([Vol 3] Part G, Sections 7.4 and 7.3.1).
+    let ssf_decl = att_server.db_value_at(db, att_server.db_index_for_handle(db, GAP_SERVER_SERVER_SUPPORTED_FEATURES_DECL))
+    test.assert_eq(ssf_decl[0] as Int, CHAR_PROP_READ)
+    test.assert_eq(ssf_decl[1] as Int, GAP_SERVER_SERVER_SUPPORTED_FEATURES_HANDLE & 0xFF)
+    test.assert_eq(ssf_decl[3] as Int, UUID_SERVER_SUPPORTED_FEATURES & 0xFF)
+    test.assert_eq(ssf_decl[4] as Int, UUID_SERVER_SUPPORTED_FEATURES >>> 8)
+    let ssf = att_server.db_value_at(db, att_server.db_index_for_handle(db, GAP_SERVER_SERVER_SUPPORTED_FEATURES_HANDLE))
+    test.assert_eq(list.len(ssf), 1)
+    test.assert_eq(ssf[0] as Int, SERVER_SUPPORTED_FEATURES_EATT)
+    test.assert_eq(att_server.db_writable_at(db, GAP_SERVER_SERVER_SUPPORTED_FEATURES_HANDLE), false)
+    // The characteristic is the last attribute of the GATT service, and
+    // the group the service declaration named moved with it.
+    test.assert_eq(att_server.db_count(db), 23)
+
+@test
+fn test_gap_server_device_name_is_cut_at_248_octets()
+    var long_name: [u8] = []
+    for _ in 0..300
+        list.push(long_name, 'x')
+    let db = build_gap_server(long_name, appearance_bytes(), ppcp_value(0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF), false)
+    test.assert_eq(att_server.db_value_len_at(db, att_server.db_index_for_handle(db, GAP_SERVER_DEVICE_NAME_HANDLE)), DEVICE_NAME_MAX)
+
+@test
+fn test_build_returns_twenty_four_attributes()
+    let db = build()
+    // GAP (5) + GATT (3) + DI (5) + HRS (6) + Battery (4) = 23.
+    // Double-check the arithmetic: HRS = svc + hrm_decl + hrm_val
+    // + hrm_cccd + bsl_decl + bsl_val = 6.  Battery = svc +
+    // bat_decl + bat_val + bat_cccd = 4.  Total = 5+3+5+6+4 = 23.
+    test.assert_eq(att_server.db_count(db), 23)
+
+@test
+@satisfies("REQ-BLE-GATT-DB-004")
+fn test_gap_service_at_handle_one()
+    let db = build()
+    test.assert_eq(att_server.db_handle_at(db, 0), HANDLE_GAP_SVC)
+    test.assert_eq(att_server.db_type16_at(db, 0), UUID_PRIMARY_SERVICE)
+    test.assert_eq(att_server.db_end_group_at(db, 0), HANDLE_GAP_SVC_END_GROUP)
+    let v = att_server.db_value_at(db, 0)
+    test.assert_eq(list.len(v), 2)
+    test.assert_eq(v[0] as Int, 0x00)   // 0x1800 lo
+    test.assert_eq(v[1] as Int, 0x18)   // 0x1800 hi
+
+@test
+@satisfies("REQ-BLE-GATT-DB-004")
+fn test_device_name_value_is_novoble()
+    let db = build()
+    let idx = att_server.db_index_for_handle(db, HANDLE_DEVICE_NAME_VALUE)
+    test.assert_eq(idx >= 0, true)
+    let v = att_server.db_value_at(db, idx)
+    test.assert_eq(list.len(v), 7)
+    test.assert_eq(v[0] as Int, 0x4E)   // 'N'
+    test.assert_eq(v[6] as Int, 0x45)   // 'E'
+
+@test
+@satisfies("REQ-BLE-GATT-DB-004")
+fn test_appearance_is_generic()
+    let db = build()
+    let idx = att_server.db_index_for_handle(db, HANDLE_APPEARANCE_VALUE)
+    let v = att_server.db_value_at(db, idx)
+    test.assert_eq(list.len(v), 2)
+    test.assert_eq(v[0] as Int, 0x00)
+    test.assert_eq(v[1] as Int, 0x00)
+
+@test
+@satisfies("REQ-BLE-GATT-DB-005")
+fn test_gatt_service_at_handle_six()
+    let db = build()
+    let idx = att_server.db_index_for_handle(db, HANDLE_GATT_SVC)
+    test.assert_eq(idx >= 0, true)
+    test.assert_eq(att_server.db_type16_at(db, idx), UUID_PRIMARY_SERVICE)
+    test.assert_eq(att_server.db_end_group_at(db, idx), HANDLE_GATT_SVC_END_GROUP)
+
+@test
+@satisfies("REQ-BLE-GATT-DB-005")
+fn test_service_changed_value_is_full_range()
+    let db = build()
+    let idx = att_server.db_index_for_handle(db, HANDLE_SERVICE_CHANGED_VALUE)
+    let v = att_server.db_value_at(db, idx)
+    test.assert_eq(list.len(v), 4)
+    test.assert_eq(v[0] as Int, 0x01)
+    test.assert_eq(v[1] as Int, 0x00)
+    test.assert_eq(v[2] as Int, 0xFF)
+    test.assert_eq(v[3] as Int, 0xFF)
+
+@test
+@satisfies("REQ-BLE-GATT-DB-005")
+fn test_service_changed_decl_is_indicate()
+    let db = build()
+    let idx = att_server.db_index_for_handle(db, HANDLE_SERVICE_CHANGED_DECL)
+    let v = att_server.db_value_at(db, idx)
+    test.assert_eq(v[0] as Int, CHAR_PROP_INDICATE)
+
+@test
+@satisfies("REQ-BLE-GATT-DB-001")
+fn test_device_info_service_at_handle_nine()
+    let db = build()
+    let idx = att_server.db_index_for_handle(db, HANDLE_DEVICE_INFO_SVC)
+    test.assert_eq(idx >= 0, true)
+    test.assert_eq(att_server.db_type16_at(db, idx), UUID_PRIMARY_SERVICE)
+    test.assert_eq(att_server.db_end_group_at(db, idx), HANDLE_DEVICE_INFO_END_GROUP)
+    let v = att_server.db_value_at(db, idx)
+    test.assert_eq(v[0] as Int, 0x0A)   // 0x180A lo
+    test.assert_eq(v[1] as Int, 0x18)
+
+@test
+@satisfies("REQ-BLE-GATT-DB-002")
+fn test_manufacturer_name_value_is_novo()
+    let db = build()
+    let idx = att_server.db_index_for_handle(db, HANDLE_MFR_NAME_VALUE)
+    test.assert_eq(idx >= 0, true)
+    let v = att_server.db_value_at(db, idx)
+    test.assert_eq(list.len(v), 4)
+    test.assert_eq(v[0] as Int, 0x4E)   // 'N'
+    test.assert_eq(v[1] as Int, 0x6F)   // 'o'
+    test.assert_eq(v[2] as Int, 0x76)   // 'v'
+    test.assert_eq(v[3] as Int, 0x6F)   // 'o'
+
+@test
+@satisfies("REQ-BLE-GATT-DB-003")
+fn test_model_number_value_is_m5_1_0()
+    let db = build()
+    let idx = att_server.db_index_for_handle(db, HANDLE_MODEL_NUMBER_VALUE)
+    test.assert_eq(idx >= 0, true)
+    let v = att_server.db_value_at(db, idx)
+    test.assert_eq(list.len(v), 6)
+    test.assert_eq(v[0] as Int, 0x4D)   // 'M'
+    test.assert_eq(v[5] as Int, 0x30)   // '0'
+
+@test
+fn test_characteristic_decl_shape_for_mfr_name()
+    let db = build()
+    let idx = att_server.db_index_for_handle(db, HANDLE_MFR_NAME_DECL)
+    let v = att_server.db_value_at(db, idx)
+    test.assert_eq(list.len(v), 5)
+    test.assert_eq(v[0] as Int, CHAR_PROP_READ)
+    test.assert_eq(v[1] as Int, 0x0B)   // value handle 0x000B lo
+    test.assert_eq(v[2] as Int, 0x00)
+    test.assert_eq(v[3] as Int, 0x29)   // UUID 0x2A29 lo
+    test.assert_eq(v[4] as Int, 0x2A)
+
+// ── Tests: HRS + Battery + CCCD presence ───────────────────────────
+
+@test
+fn test_hrs_service_and_chars_present()
+    let db = build()
+    let svc = att_server.db_index_for_handle(db, HANDLE_HRS_SVC)
+    test.assert_eq(svc >= 0, true)
+    test.assert_eq(att_server.db_type16_at(db, svc), UUID_PRIMARY_SERVICE)
+    test.assert_eq(att_server.db_end_group_at(db, svc), HANDLE_HRS_END_GROUP)
+    let svc_val = att_server.db_value_at(db, svc)
+    test.assert_eq(svc_val[0] as Int, 0x0D)   // 0x180D lo
+    test.assert_eq(svc_val[1] as Int, 0x18)
+
+    let hrm_idx = att_server.db_index_for_handle(db, HANDLE_HRM_VALUE)
+    test.assert_eq(att_server.db_type16_at(db, hrm_idx), UUID_HEART_RATE_MEASUREMENT)
+
+    let bsl_idx = att_server.db_index_for_handle(db, HANDLE_BSL_VALUE)
+    test.assert_eq(att_server.db_type16_at(db, bsl_idx), UUID_BODY_SENSOR_LOCATION)
+
+@test
+fn test_hrm_cccd_present_and_writable()
+    let db = build()
+    let idx = att_server.db_index_for_handle(db, HANDLE_HRM_CCCD)
+    test.assert_eq(idx >= 0, true)
+    test.assert_eq(att_server.db_type16_at(db, idx), UUID_CCCD)
+    let v = att_server.db_value_at(db, idx)
+    test.assert_eq(list.len(v), 2)
+    test.assert_eq(v[0] as Int, 0x00)   // off at boot
+    test.assert_eq(v[1] as Int, 0x00)
+    // CCCDs are writable by spec — att_server's perm check
+    // recognises UUID 0x2902.
+    test.assert_eq(att_server.db_writable_at(db, HANDLE_HRM_CCCD), true)
+
+@test
+fn test_battery_service_and_cccd()
+    let db = build()
+    let svc = att_server.db_index_for_handle(db, HANDLE_BATTERY_SVC)
+    test.assert_eq(svc >= 0, true)
+    let svc_val = att_server.db_value_at(db, svc)
+    test.assert_eq(svc_val[0] as Int, 0x0F)   // 0x180F lo
+    test.assert_eq(svc_val[1] as Int, 0x18)
+
+    let level_idx = att_server.db_index_for_handle(db, HANDLE_BATTERY_LEVEL_VALUE)
+    let v = att_server.db_value_at(db, level_idx)
+    test.assert_eq(list.len(v), 1)
+    test.assert_eq(v[0] as Int, 100)   // 100% at boot
+
+    // Decl should advertise Read + Notify.
+    let decl_idx = att_server.db_index_for_handle(db, HANDLE_BATTERY_LEVEL_DECL)
+    let dv = att_server.db_value_at(db, decl_idx)
+    test.assert_eq(dv[0] as Int, CHAR_PROP_READ + CHAR_PROP_NOTIFY)
+
+    // CCCD present.
+    let cccd_idx = att_server.db_index_for_handle(db, HANDLE_BATTERY_LEVEL_CCCD)
+    test.assert_eq(att_server.db_type16_at(db, cccd_idx), UUID_CCCD)
+
+@test
+fn test_writes_to_cccd_succeed()
+    // CCCD writes are how a peer subscribes to notify/indicate.
+    // Smoke-test the att_server write path against the HRM CCCD.
+    var db = build()
+    let queue: [u8] = []
+    let req: [u8] = [
+        att.ATT_OP_WRITE_REQ,
+        (HANDLE_HRM_CCCD & 0xFF) as u8,
+        ((HANDLE_HRM_CCCD >>> 8) & 0xFF) as u8,
+        0x01, 0x00]   // CCCD = NOTIFY
+    let r = att_server.handle_write_req(var db, queue, req)
+    test.assert_eq(r.rsp[0] as Int, att.ATT_OP_WRITE_RSP)
+    test.assert_eq(r.applied, true)
+
+    // Read back — value should be 0x0001.
+    let read: [u8] = [
+        att.ATT_OP_READ_REQ,
+        (HANDLE_HRM_CCCD & 0xFF) as u8,
+        ((HANDLE_HRM_CCCD >>> 8) & 0xFF) as u8]
+    let rsp = att_server.handle_request(r.new_blob, att_server.ATT_DEFAULT_MTU, read)
+    test.assert_eq(rsp[0] as Int, att.ATT_OP_READ_RSP)
+    test.assert_eq(rsp[1] as Int, 0x01)
+    test.assert_eq(rsp[2] as Int, 0x00)
+
+@test
+fn test_the_table_is_the_size_it_is_built_to()
+    test.assert_eq(list.len(build()), GATT_DB_BLOB_BYTES)
+    let gap = build_gap_server(device_name_bytes(), appearance_bytes(), ppcp_value(0x0018, 0x0028, 0, 0x01F4), false)
+    test.assert_eq(list.len(gap), GAP_SERVER_FIXED_BYTES + 7 + 2 + 8)

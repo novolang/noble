@@ -1,0 +1,2194 @@
+// gatt_client.nv — the GATT client engine: the client procedures of
+// [Vol 3] Part G, Section 4, for several links at once, in fixed storage.
+//
+// The engine is the client half of what `gatt_server.nv` is the server half
+// of.  It decides nothing about a peer: which services to discover, when to
+// subscribe and what to write are the caller's.  It runs the procedures the
+// caller asks for, keeps what discovery found, and reports how each one
+// ended.
+//
+// Storage.  All state is in one `ClientTable`, which the caller declares
+// once (a module-level `var` on a device) and passes by address to every
+// function.  A table holds `noble_config.MAX_CLIENT_LINKS` links.  A link has the
+// bearers `noble_config.CLIENT_BEARERS`: bearer 0 is the unenhanced ATT bearer and
+// the others are Enhanced ATT bearers ([Vol 3] Part F, Section 3.2.11).  A
+// link has one discovery cache of `noble_config.CLIENT_CACHE_RECORDS` records, and a
+// bearer has its own request queue, value buffer, payload buffer and PDU
+// buffer.  Nothing allocates after `init_table`; a request that does not fit is
+// answered with a negative code.
+//
+// Requests.  A `begin_` function queues a request on a bearer and answers its
+// ticket, a positive number that the completion repeats.  A bearer runs one
+// request at a time and keeps one ATT transaction outstanding, as the
+// Attribute Protocol demands ([Vol 3] Part F, Section 3.3.2); the requests
+// behind it wait in order in the bearer's queue.  A procedure that needs
+// several transactions (a discovery that pages, a long read, a long write)
+// sends them one after another.
+//
+// The caller moves PDUs.  `take_tx` copies the next PDU to send into a
+// caller's buffer; `on_pdu` takes a PDU received on the bearer and answers
+// what it meant: a request completed (`EV_DONE`), a notification or an
+// indication arrived, a Service Changed indication arrived, or the PDU is for
+// the server role of the same bearer (`EV_FOREIGN`).  After `EV_DONE` the
+// result (`result_status`, `value_len`, `value_at`) stays valid until the
+// next `on_pdu` or `tick` on that bearer.  An indication is confirmed by the
+// engine: the confirmation is the next PDU `take_tx` answers.
+//
+// Time.  `take_tx` takes the caller's monotonic clock in milliseconds when it
+// hands out a request, and `tick` ends the request that has waited for its
+// response for `TRANSACTION_TIMEOUT_MS`.  The bearer is then dead: the
+// specification ends its use ([Vol 3] Part F, Section 3.3.3), the queue is
+// dropped and `begin_` answers `ERR_DEAD` until the link is opened again.
+//
+// Awareness of the peer's database ([Vol 3] Part G, Section 2.5.2).  The
+// engine keeps the Database Hash it last read (`begin_database_hash`): a
+// different hash drops the cache and sets the changed flag.  A request the
+// peer answers with Database Out Of Sync marks the link stale, and the hash
+// read clears the mark.  A Service Changed indication on the handle the caller
+// registered (`set_service_changed_handle`) drops the cache records in the
+// range it names.
+//
+// Satisfies: REQ-BLE-GATT-CE-001 (links, bearers and fixed storage), -002
+// (discovery), -003 (reads), -004 (writes), -005 (notifications and
+// indications), -006 (one outstanding transaction, the queue and the timeout),
+// -007 (the peer's database changes) and -008 (error mapping).
+
+use std.test
+use att
+use noble_config
+use links
+
+// ── Capacities ──────────────────────────────────────────────────────
+//
+// The capacities of the table are the client keys of the package configuration (novo.toml), each at least 1: a `Vec` holds at least one
+// element, and a build with no client links (`max_client_links` 0) keeps one link of one bearer.  A `const` item cannot read the
+// configuration module, so each is a `const fn`; the capacity of a column is written as the expression of the function, since a
+// capacity cannot call a function of another module, and `test_the_capacities_are_the_limits` compares the two.
+
+const fn max1(n: Int) -> Int
+    if n > 1 then n else 1
+
+const fn links() -> Int
+    max1(noble_config.MAX_CLIENT_LINKS)
+
+const fn bearers() -> Int
+    max1(noble_config.CLIENT_BEARERS)
+
+// The discovery records a client link keeps, at least 1.
+pub const fn cache() -> Int
+    max1(noble_config.CLIENT_CACHE_RECORDS)
+
+// The requests a client bearer queues, at least 1.
+pub const fn queue() -> Int
+    max1(noble_config.CLIENT_QUEUE)
+
+// The octets of the value buffer and of the payload buffer of a client bearer, at least 1.
+pub const fn value_octets() -> Int
+    max1(noble_config.CLIENT_VALUE_BYTES)
+
+const fn pdu_octets() -> Int
+    noble_config.MAX_ATT_MTU
+
+// A value or a payload handed to a `begin_` function, `VALUE_OCTETS` long at
+// most, and a PDU buffer, `PDU_OCTETS` long.  A caller names them with these
+// aliases, so it does not repeat the literal.
+pub alias ClientPayload = Vec[u8; max1(noble_config.CLIENT_VALUE_BYTES)]
+// A PDU buffer of a client bearer, `MAX_ATT_MTU` octets long.
+pub alias ClientPdu = Vec[u8; noble_config.MAX_ATT_MTU]
+
+// The registers of one bearer's row, and the fields of one queue entry.
+const REGS = 41
+const QUEUE_FIELDS = 10
+
+// ── Operations and phases ───────────────────────────────────────────
+
+const OP_NONE = 0
+const OP_MTU = 1
+const OP_SERVICES = 2
+const OP_SERVICES_UUID = 3
+const OP_INCLUDED = 4
+const OP_CHARS = 5
+const OP_CHARS_UUID = 6
+const OP_DESCS = 7
+const OP_READ = 8
+const OP_READ_TYPE = 9
+const OP_READ_LONG = 10
+const OP_WRITE = 11
+const OP_WRITE_CMD = 12
+const OP_WRITE_LONG = 13
+const OP_RELIABLE = 14
+const OP_HASH = 15
+const OP_WRITE_SIGNED = 16
+const OP_READ_MULTI = 17
+const OP_READ_MULTI_VAR = 18
+
+// The phases of a request that takes more than one kind of transaction.
+const PHASE_MAIN = 0
+const PHASE_BLOB = 1
+const PHASE_RESOLVE = 1
+const PHASE_EXECUTE = 1
+const PHASE_CANCEL = 2
+
+// ── Registers of a bearer's row ─────────────────────────────────────
+
+const R_OPEN = 0
+const R_OP = 1
+const R_PHASE = 2
+const R_START = 3
+const R_END = 4
+const R_UUID_LO = 5
+const R_UUID_HI = 6
+const R_UUID_WIDE = 7
+const R_ARG = 8
+const R_TICKET = 9
+const R_PAY_OFF = 10
+const R_PAY_LEN = 11
+const R_SENT_MS = 12
+const R_TX_LEN = 13
+const R_REQ_OP = 14
+const R_AWAIT = 15
+const R_OUTSTANDING = 16
+const R_CFM = 17
+const R_MTU = 18
+const R_MTU_DONE = 19
+const R_DEAD = 20
+const R_NEXT_TICKET = 21
+const R_Q_HEAD = 22
+const R_Q_LEN = 23
+const R_WRITTEN = 24
+const R_AUX = 25
+const R_WORK = 26
+const R_PAY_USED = 27
+const R_PENDING = 28
+const R_FOUND = 29
+const R_STATUS = 30
+const R_DONE_TICKET = 31
+const R_DONE_OP = 32
+const R_DONE_FOUND = 33
+const R_ERR_HANDLE = 34
+const R_VAL_LEN = 35
+const R_ITEM_LEN = 36
+const R_EVT_HANDLE = 37
+const R_SC_FIRST = 38
+const R_SC_LAST = 39
+const R_RX_MTU = 40
+
+// The fields of one queue entry.
+const Q_OP = 0
+const Q_START = 1
+const Q_END = 2
+const Q_UUID_LO = 3
+const Q_UUID_HI = 4
+const Q_UUID_WIDE = 5
+const Q_ARG = 6
+const Q_PAY_OFF = 7
+const Q_PAY_LEN = 8
+const Q_TICKET = 9
+
+// ── Flags of a link ─────────────────────────────────────────────────
+
+// The link has read the peer's Database Hash.
+const F_HASH_KNOWN = 1
+// A request was answered Database Out Of Sync.
+const F_STALE = 2
+// The peer's database changed since `take_changed`.
+const F_CHANGED = 4
+
+// ── Kinds and flags of a cache record ───────────────────────────────
+
+// The cache record is a service.
+pub const KIND_SERVICE = 1
+// The cache record is an included service.
+pub const KIND_INCLUDE = 2
+// The cache record is a characteristic.
+pub const KIND_CHAR = 3
+// The cache record is a descriptor.
+pub const KIND_DESC = 4
+
+// The service was found by Secondary Service discovery.
+const CF_SECONDARY = 2
+// The included service's UUID is not known yet.
+const CF_UNRESOLVED = 4
+
+// ── What `take_tx` answers ──────────────────────────────────────────
+
+// There is nothing to send.
+pub const TX_NONE = 0
+// A request: a response is due.
+const TX_REQUEST = 1
+// A command: nothing is due.
+pub const TX_COMMAND = 2
+// The confirmation of an indication.
+const TX_CONFIRM = 3
+
+// ── What `on_pdu` and `tick` answer ─────────────────────────────────
+
+const EV_NONE = 0
+// The active request ended; see `result_status`.
+pub const EV_DONE = 1
+// A Handle Value Notification arrived.
+pub const EV_NOTIFICATION = 2
+// A Handle Value Indication arrived, and the engine owes the peer a confirmation.
+pub const EV_INDICATION = 3
+// An indication of the registered Service Changed handle; the cache lost the
+// range `service_changed_first` to `service_changed_last`.
+pub const EV_SERVICE_CHANGED = 4
+// A PDU of the server role, which the caller answers elsewhere.
+pub const EV_FOREIGN = 5
+
+// ── Status of a completed request ───────────────────────────────────
+//
+// 0 is success and 1 to 255 are the Error Code of the peer's Error Response.
+// The codes from 0x100 are the engine's own.
+
+// The request completed.
+pub const STATUS_OK = 0
+// The peer did not answer within the ATT transaction timeout.
+pub const STATUS_TIMEOUT = 0x100
+// The peer answered with a PDU the request does not allow or with a malformed one.
+pub const STATUS_PROTOCOL = 0x101
+// The discovery cache has no room for another record.
+pub const STATUS_CACHE_FULL = 0x102
+// The value was longer than the value buffer, and the buffer holds the part that fits.
+pub const STATUS_TRUNCATED = 0x103
+const STATUS_MISMATCH = 0x104
+// A discovery response whose handles go back or do not rise: a server reports
+// attributes in ascending order ([Vol 3] Part F, Section 3.4.3.2), and a client
+// that asked again for the same range would ask for as long as the peer cares to
+// repeat it.
+const STATUS_ORDER = 0x105
+
+// ── Why a request is not queued ─────────────────────────────────────
+
+const ERR_NO_LINK = -1
+const ERR_QUEUE_FULL = -2
+const ERR_NO_ROOM = -3
+const ERR_ARGUMENT = -4
+const ERR_DEAD = -5
+const ERR_NO_BEARER = -6
+const ERR_REPEAT = -7
+
+// The Attribute Protocol transaction timeout, 30 s ([Vol 3] Part F,
+// Section 3.3.3).
+pub const TRANSACTION_TIMEOUT_MS = 30000
+
+// The default ATT_MTU of an LE bearer ([Vol 3] Part F, Section 3.2.8).
+const DEFAULT_MTU = 23
+
+// Attribute types and characteristic UUIDs of the GATT profile ([Vol 3]
+// Part G, Section 3.4 and Table 7.2).
+const UUID_PRIMARY_SERVICE = 0x2800
+const UUID_SECONDARY_SERVICE = 0x2801
+const UUID_INCLUDE = 0x2802
+const UUID_CHARACTERISTIC = 0x2803
+const UUID_CCCD = 0x2902
+const UUID_SERVICE_CHANGED = 0x2A05
+const UUID_CLIENT_SUPPORTED_FEATURES = 0x2B29
+const UUID_DATABASE_HASH = 0x2B2A
+
+// The values of a Client Characteristic Configuration descriptor.
+pub const CCCD_NOTIFY = 1
+// The Client Characteristic Configuration value that enables indications.
+pub const CCCD_INDICATE = 2
+
+// The octets of the Database Hash ([Vol 3] Part G, Table 7.8).
+const HASH_OCTETS = 16
+
+// ── UUIDs ───────────────────────────────────────────────────────────
+
+// A UUID as the engine compares it: a 16-bit value, or a 128-bit one held as
+// its low and high eight octets in the order they have on the air.  A 128-bit
+// value that is a 16-bit one on the Bluetooth Base UUID is always the 16-bit
+// form, so two forms of one UUID compare equal.
+pub @value
+struct Uuid
+    wide: Bool
+    lo: Int
+    hi: Int
+
+// The low eight octets of the Bluetooth Base UUID, as they are on the air.
+@tier(embedded)
+@no_alloc
+fn base_lo() -> Int
+    0x805F9B34FB | (0x80 << 56)
+
+// The 16-bit value of the 128-bit UUID `lo`, `hi` when it is on the Base UUID,
+// else -1.
+@tier(embedded)
+@no_alloc
+fn short_of(lo: Int, hi: Int) -> Int
+    if lo == base_lo() and (hi & 0xFFFF) == 0x1000 and ((hi >>> 16) & 0xFFFF) == 0 and (hi >>> 48) == 0
+        (hi >>> 32) & 0xFFFF
+    else
+        -1
+
+// The 16-bit UUID `value`.
+pub @tier(embedded)
+fn uuid16(value: Int) -> Uuid
+    Uuid { wide: false, lo: value & 0xFFFF, hi: 0 }
+
+// The 128-bit UUID whose octets on the air are `lo` and `hi`.
+pub @tier(embedded)
+fn uuid128(lo: Int, hi: Int) -> Uuid
+    let short = short_of(lo, hi)
+    if short >= 0
+        uuid16(short)
+    else
+        Uuid { wide: true, lo: lo, hi: hi }
+
+// Whether `a` and `b` are one UUID.
+@tier(embedded)
+@no_alloc
+fn uuid_same(a: Uuid, b: Uuid) -> Bool
+    a.wide == b.wide and a.lo == b.lo and a.hi == b.hi
+
+// ── The table ───────────────────────────────────────────────────────
+
+// All state of the client engine.  The per-link columns are indexed by the
+// link's slot, the per-bearer ones by `row`, the bearer's row, which is
+// `slot * BEARERS + bearer`.  `regs` holds REGS registers per row, `queue`
+// QUEUE entries of QUEUE_FIELDS fields per row.  The cache columns hold CACHE
+// records per link, record `i` of slot `s` at `s * CACHE + i`.
+pub @value
+struct ClientTable
+    generation: Vec[Int; max1(noble_config.MAX_CLIENT_LINKS)]
+    opened: Vec[Int; max1(noble_config.MAX_CLIENT_LINKS)]
+    flags: Vec[Int; max1(noble_config.MAX_CLIENT_LINKS)]
+    sc_handle: Vec[Int; max1(noble_config.MAX_CLIENT_LINKS)]
+    cache_n: Vec[Int; max1(noble_config.MAX_CLIENT_LINKS)]
+    hash: Vec[u8; max1(noble_config.MAX_CLIENT_LINKS) * 16]
+    c_kind: Vec[u8; max1(noble_config.MAX_CLIENT_LINKS) * max1(noble_config.CLIENT_CACHE_RECORDS)]
+    c_flags: Vec[u8; max1(noble_config.MAX_CLIENT_LINKS) * max1(noble_config.CLIENT_CACHE_RECORDS)]
+    c_handle: Vec[u16; max1(noble_config.MAX_CLIENT_LINKS) * max1(noble_config.CLIENT_CACHE_RECORDS)]
+    c_a: Vec[u16; max1(noble_config.MAX_CLIENT_LINKS) * max1(noble_config.CLIENT_CACHE_RECORDS)]
+    c_b: Vec[u16; max1(noble_config.MAX_CLIENT_LINKS) * max1(noble_config.CLIENT_CACHE_RECORDS)]
+    c_lo: Vec[Int; max1(noble_config.MAX_CLIENT_LINKS) * max1(noble_config.CLIENT_CACHE_RECORDS)]
+    c_hi: Vec[Int; max1(noble_config.MAX_CLIENT_LINKS) * max1(noble_config.CLIENT_CACHE_RECORDS)]
+    regs: Vec[Int; max1(noble_config.MAX_CLIENT_LINKS) * max1(noble_config.CLIENT_BEARERS) * 41]
+    queue: Vec[Int; max1(noble_config.MAX_CLIENT_LINKS) * max1(noble_config.CLIENT_BEARERS) * max1(noble_config.CLIENT_QUEUE) * 10]
+    value: Vec[u8; max1(noble_config.MAX_CLIENT_LINKS) * max1(noble_config.CLIENT_BEARERS) * max1(noble_config.CLIENT_VALUE_BYTES)]
+    payload: Vec[u8; max1(noble_config.MAX_CLIENT_LINKS) * max1(noble_config.CLIENT_BEARERS) * max1(noble_config.CLIENT_VALUE_BYTES)]
+    tx: Vec[u8; max1(noble_config.MAX_CLIENT_LINKS) * max1(noble_config.CLIENT_BEARERS) * noble_config.MAX_ATT_MTU]
+
+// The literal `ClientTable { generation: Vec.new(), ... }` of every column
+// empty is the table before `init_table`: no column has a length yet, and an
+// index into one panics.  `init_table` gives each column its length, so every
+// slot, row and record exists, and sets the whole table to its first state: no
+// link open, every cache empty.  It may be called again on a table in use, to
+// return it to that state.  A caller that keeps the table where the literal is
+// written (a module-level variable, or a field of a boxed value) calls it
+// there; `new_table` is the literal and `init_table` for a caller that holds
+// the table in a local and can take it by value.
+pub @satisfies("REQ-BLE-GATT-CE-001")
+@tier(embedded)
+@no_alloc
+fn init_table(var t: ClientTable)
+    t.generation.clear()
+    t.opened.clear()
+    t.flags.clear()
+    t.sc_handle.clear()
+    t.cache_n.clear()
+    t.hash.clear()
+    t.c_kind.clear()
+    t.c_flags.clear()
+    t.c_handle.clear()
+    t.c_a.clear()
+    t.c_b.clear()
+    t.c_lo.clear()
+    t.c_hi.clear()
+    t.regs.clear()
+    t.queue.clear()
+    t.value.clear()
+    t.payload.clear()
+    t.tx.clear()
+    for i in 0..links()
+        let _ = t.generation.push(0)
+        let _ = t.opened.push(0)
+        let _ = t.flags.push(0)
+        let _ = t.sc_handle.push(0)
+        let _ = t.cache_n.push(0)
+    for i in 0..(links() * HASH_OCTETS)
+        let _ = t.hash.push(0)
+    for i in 0..(links() * cache())
+        let _ = t.c_kind.push(0)
+        let _ = t.c_flags.push(0)
+        let _ = t.c_handle.push(0 as u16)
+        let _ = t.c_a.push(0 as u16)
+        let _ = t.c_b.push(0 as u16)
+        let _ = t.c_lo.push(0)
+        let _ = t.c_hi.push(0)
+    for i in 0..(links() * bearers() * REGS)
+        let _ = t.regs.push(0)
+    for i in 0..(links() * bearers() * queue() * QUEUE_FIELDS)
+        let _ = t.queue.push(0)
+    for i in 0..(links() * bearers() * value_octets())
+        let _ = t.value.push(0)
+        let _ = t.payload.push(0)
+    for i in 0..(links() * bearers() * pdu_octets())
+        let _ = t.tx.push(0)
+
+// A table with no link open, made in the caller's frame and passed back by
+// value.  The table is large, and a function that returns one copies it as an
+// aggregate of every element, which takes the compiler minutes on the `pc`
+// profile's sizes: a caller that builds a table once, in a place it keeps,
+// writes the literal there and calls `init_table`, as `btp/btp_gatt_client.nv`
+// does.
+pub @tier(embedded)
+fn new_table() -> ClientTable
+    var t = ClientTable {
+        generation: Vec.new(), opened: Vec.new(), flags: Vec.new(), sc_handle: Vec.new(), cache_n: Vec.new(),
+        hash: Vec.new(), c_kind: Vec.new(), c_flags: Vec.new(), c_handle: Vec.new(), c_a: Vec.new(),
+        c_b: Vec.new(), c_lo: Vec.new(), c_hi: Vec.new(), regs: Vec.new(), queue: Vec.new(),
+        value: Vec.new(), payload: Vec.new(), tx: Vec.new() }
+    init_table(var t)
+    t
+
+// ── Registers ───────────────────────────────────────────────────────
+
+@tier(embedded)
+@no_alloc
+fn rd(var t: ClientTable, row: Int, r: Int) -> Int
+    t.regs[row * REGS + r]
+
+@tier(embedded)
+@no_alloc
+fn wr(var t: ClientTable, row: Int, r: Int, v: Int)
+    t.regs[row * REGS + r] = v
+
+@tier(embedded)
+@no_alloc
+fn queue_at(var t: ClientTable, row: Int, index: Int, field: Int) -> Int
+    t.queue[(row * queue() + index) * QUEUE_FIELDS + field]
+
+@tier(embedded)
+@no_alloc
+fn queue_put(var t: ClientTable, row: Int, index: Int, field: Int, v: Int)
+    t.queue[(row * queue() + index) * QUEUE_FIELDS + field] = v
+
+// The bearer's row to its idle state, closed.
+@tier(embedded)
+@no_alloc
+fn reset_row(var t: ClientTable, row: Int)
+    for r in 0..REGS
+        wr(var t, row, r, 0)
+    wr(var t, row, R_MTU, DEFAULT_MTU)
+    wr(var t, row, R_RX_MTU, pdu_octets())
+    wr(var t, row, R_NEXT_TICKET, 1)
+
+// The link's slot to its idle state, its cache empty and its bearers closed.
+@tier(embedded)
+@no_alloc
+fn reset_slot(var t: ClientTable, slot: Int)
+    t.flags[slot] = 0
+    t.sc_handle[slot] = 0
+    t.cache_n[slot] = 0
+    for b in 0..bearers()
+        reset_row(var t, slot * bearers() + b)
+
+// The slot of `link` when it is open here, else -1.  An id from a link that
+// ended names nothing once its slot holds another link or none.
+@tier(embedded)
+@no_alloc
+fn slot_of(var t: ClientTable, link: links.LinkId) -> Int
+    if link.slot < 0 or link.slot >= links()
+        -1
+    else if t.opened[link.slot] == 0 or t.generation[link.slot] != link.generation
+        -1
+    else
+        link.slot
+
+// The row of bearer `bearer` of `link` when both exist and the bearer is
+// open, else -1.
+@tier(embedded)
+@no_alloc
+fn row_of(var t: ClientTable, link: links.LinkId, bearer: Int) -> Int
+    let slot = slot_of(var t, link)
+    if slot < 0 or bearer < 0 or bearer >= bearers()
+        -1
+    else if rd(var t, slot * bearers() + bearer, R_OPEN) == 0
+        -1
+    else
+        slot * bearers() + bearer
+
+// Open `link` for the client role, with its unenhanced bearer at the default
+// ATT_MTU and an empty cache.  A slot that holds an older link is taken over.
+// False for a slot the table does not have.
+pub @satisfies("REQ-BLE-GATT-CE-001")
+@tier(embedded)
+@no_alloc
+fn open(var t: ClientTable, link: links.LinkId) -> Bool
+    if link.slot < 0 or link.slot >= links()
+        false
+    else
+        reset_slot(var t, link.slot)
+        t.opened[link.slot] = 1
+        t.generation[link.slot] = link.generation
+        wr(var t, link.slot * bearers(), R_OPEN, 1)
+        true
+
+// End the client role on `link`.  What it had queued or outstanding is
+// dropped without a completion.
+pub @satisfies("REQ-BLE-GATT-CE-001")
+@tier(embedded)
+@no_alloc
+fn close(var t: ClientTable, link: links.LinkId)
+    let slot = slot_of(var t, link)
+    if slot >= 0
+        reset_slot(var t, slot)
+        t.opened[slot] = 0
+
+// Open the Enhanced ATT bearer `bearer` (1 or more) of `link` with its
+// ATT_MTU, which is the channel's ([Vol 3] Part F, Section 3.2.8).  The bearer
+// starts idle.  False for a link or bearer that does not exist or an ATT_MTU
+// below the default.
+@satisfies("REQ-BLE-GATT-CE-001")
+@tier(embedded)
+@no_alloc
+fn open_bearer(var t: ClientTable, link: links.LinkId, bearer: Int, mtu: Int) -> Bool
+    let slot = slot_of(var t, link)
+    if slot < 0 or bearer < 1 or bearer >= bearers() or mtu < DEFAULT_MTU or mtu > pdu_octets()
+        false
+    else
+        let row = slot * bearers() + bearer
+        reset_row(var t, row)
+        wr(var t, row, R_OPEN, 1)
+        wr(var t, row, R_MTU, mtu)
+        wr(var t, row, R_MTU_DONE, 1)
+        true
+
+// Close an Enhanced ATT bearer.  What it had queued is dropped.
+@satisfies("REQ-BLE-GATT-CE-001")
+@tier(embedded)
+@no_alloc
+fn close_bearer(var t: ClientTable, link: links.LinkId, bearer: Int)
+    let slot = slot_of(var t, link)
+    if slot >= 0 and bearer >= 1 and bearer < bearers()
+        reset_row(var t, slot * bearers() + bearer)
+
+// Name the handle of the peer's Service Changed characteristic value.  An
+// indication of it drops the cache records of the range it carries.  0 names
+// none.
+@satisfies("REQ-BLE-GATT-CE-007")
+@tier(embedded)
+@no_alloc
+fn set_service_changed_handle(var t: ClientTable, link: links.LinkId, handle: Int)
+    let slot = slot_of(var t, link)
+    if slot >= 0
+        t.sc_handle[slot] = handle
+
+// Name the Rx MTU the unenhanced bearer 0 of `link` offers in an Exchange MTU
+// Request, `DEFAULT_MTU` to `PDU_OCTETS`: the largest PDU the caller's L2CAP
+// receives.  The default is `PDU_OCTETS`.  False for a link or bearer that
+// does not exist and for a value out of range.
+pub @satisfies("REQ-BLE-GATT-CE-001")
+@tier(embedded)
+@no_alloc
+fn set_rx_mtu(var t: ClientTable, link: links.LinkId, bearer: Int, mtu: Int) -> Bool
+    let row = row_of(t, link, bearer)
+    if row < 0 or mtu < DEFAULT_MTU or mtu > pdu_octets()
+        false
+    else
+        wr(var t, row, R_RX_MTU, mtu)
+        true
+
+// Set the ATT_MTU of `bearer`, for a caller that learns the MTU of its channel
+// elsewhere: an Enhanced ATT channel has its own, and a caller that carries
+// the requests of one link over several channels in turn sets the MTU of the
+// channel the next PDU leaves on before it queues a request or hands over a
+// response.  The requests the engine builds after the call are shaped after
+// `mtu`.  False for a link or bearer that does not exist and for a value out of
+// range.
+pub @satisfies("REQ-BLE-GATT-CE-001")
+@tier(embedded)
+@no_alloc
+fn set_mtu(var t: ClientTable, link: links.LinkId, bearer: Int, mtu: Int) -> Bool
+    let row = row_of(t, link, bearer)
+    if row < 0 or mtu < DEFAULT_MTU or mtu > pdu_octets()
+        false
+    else
+        wr(var t, row, R_MTU, mtu)
+        true
+
+// ── Reading PDUs ────────────────────────────────────────────────────
+
+@tier(embedded)
+@no_alloc
+fn le16(var pdu: ClientPdu, at: Int) -> Int
+    (pdu[at] as Int) | ((pdu[at + 1] as Int) << 8)
+
+// The eight octets from `at`, least significant first.
+@tier(embedded)
+@no_alloc
+fn le64(var pdu: ClientPdu, at: Int) -> Int
+    var v = 0
+    for k in 0..8
+        v = v | ((pdu[at + k] as Int) << (8 * k))
+    v
+
+// The UUID at `at`: 16 octets when `wide`, else 2.
+@tier(embedded)
+fn uuid_at(var pdu: ClientPdu, at: Int, wide: Bool) -> Uuid
+    if wide
+        uuid128(le64(var pdu, at), le64(var pdu, at + 8))
+    else
+        uuid16(le16(pdu, at))
+
+// ── Building PDUs ───────────────────────────────────────────────────
+
+@tier(embedded)
+@no_alloc
+fn tx_put(var t: ClientTable, row: Int, pos: Int, v: Int)
+    t.tx[row * pdu_octets() + pos] = (v & 0xFF) as u8
+
+@tier(embedded)
+@no_alloc
+fn tx_put16(var t: ClientTable, row: Int, pos: Int, v: Int)
+    tx_put(var t, row, pos, v & 0xFF)
+    tx_put(var t, row, pos + 1, v >>> 8)
+
+// The UUID at `pos`, 16 octets when `wide`; answers the position after it.
+@tier(embedded)
+@no_alloc
+fn tx_put_uuid(var t: ClientTable, row: Int, pos: Int, lo: Int, hi: Int, wide: Bool) -> Int
+    if wide
+        for k in 0..8
+            tx_put(var t, row, pos + k, lo >>> (8 * k))
+            tx_put(var t, row, pos + 8 + k, hi >>> (8 * k))
+        pos + 16
+    else
+        tx_put16(var t, row, pos, lo)
+        pos + 2
+
+// A request of the form opcode, two handles and a 16-bit type, in place.
+@tier(embedded)
+@no_alloc
+fn tx_range(var t: ClientTable, row: Int, opcode: Int, start: Int, end: Int, type16: Int) -> Int
+    tx_put(var t, row, 0, opcode)
+    tx_put16(var t, row, 1, start)
+    tx_put16(var t, row, 3, end)
+    tx_put16(var t, row, 5, type16)
+    7
+
+// ── The cache ───────────────────────────────────────────────────────
+
+// The number of records the cache of `link` holds, 0 for a link that is not
+// open.
+@tier(embedded)
+@no_alloc
+fn cache_count(var t: ClientTable, link: links.LinkId) -> Int
+    let slot = slot_of(var t, link)
+    if slot < 0 then 0 else t.cache_n[slot]
+
+@tier(embedded)
+@no_alloc
+fn cache_clear_slot(var t: ClientTable, slot: Int)
+    t.cache_n[slot] = 0
+
+// Empty the cache of `link`.
+pub @tier(embedded)
+@no_alloc
+fn cache_clear(var t: ClientTable, link: links.LinkId)
+    let slot = slot_of(var t, link)
+    if slot >= 0
+        cache_clear_slot(var t, slot)
+
+// The index of the record of `kind` and `handle` in the cache of `slot`,
+// else -1.
+@tier(embedded)
+@no_alloc
+fn cache_index(var t: ClientTable, slot: Int, kind: Int, handle: Int) -> Int
+    var found = -1
+    for i in 0..t.cache_n[slot]
+        let at = slot * cache() + i
+        if (t.c_kind[at] as Int) == kind and (t.c_handle[at] as Int) == handle
+            found = i
+            break
+    found
+
+// Store a record: replace the one of the same kind and handle, else append.
+// False when the cache is full.
+pub @tier(embedded)
+@no_alloc
+fn cache_put(var t: ClientTable, slot: Int, kind: Int, handle: Int, a: Int, b: Int, uuid: Uuid, flags: Int) -> Bool
+    var index = cache_index(var t, slot, kind, handle)
+    if index < 0
+        if t.cache_n[slot] >= cache()
+            return false
+        index = t.cache_n[slot]
+        t.cache_n[slot] = index + 1
+    let at = slot * cache() + index
+    t.c_kind[at] = kind as u8
+    t.c_flags[at] = (flags | (if uuid.wide then 1 else 0)) as u8
+    t.c_handle[at] = handle as u16
+    t.c_a[at] = a as u16
+    t.c_b[at] = b as u16
+    t.c_lo[at] = uuid.lo
+    t.c_hi[at] = uuid.hi
+    true
+
+// Move record `from` of `slot` to position `to`.
+@tier(embedded)
+@no_alloc
+fn cache_move(var t: ClientTable, slot: Int, from: Int, to: Int)
+    let f = slot * cache() + from
+    let d = slot * cache() + to
+    t.c_kind[d] = t.c_kind[f]
+    t.c_flags[d] = t.c_flags[f]
+    t.c_handle[d] = t.c_handle[f]
+    t.c_a[d] = t.c_a[f]
+    t.c_b[d] = t.c_b[f]
+    t.c_lo[d] = t.c_lo[f]
+    t.c_hi[d] = t.c_hi[f]
+
+// Whether the record at `at` overlaps the handles `first` to `last`: a
+// service by its range, any other record by its handle.
+@tier(embedded)
+@no_alloc
+fn record_overlaps(var t: ClientTable, at: Int, first: Int, last: Int) -> Bool
+    let handle = t.c_handle[at] as Int
+    if (t.c_kind[at] as Int) == KIND_SERVICE
+        handle <= last and (t.c_a[at] as Int) >= first
+    else
+        handle >= first and handle <= last
+
+// Drop the records of `slot` that overlap the handles `first` to `last`.
+@tier(embedded)
+@no_alloc
+fn cache_drop(var t: ClientTable, slot: Int, first: Int, last: Int)
+    var kept = 0
+    for i in 0..t.cache_n[slot]
+        if not record_overlaps(var t, slot * cache() + i, first, last)
+            if kept != i
+                cache_move(var t, slot, i, kept)
+            kept = kept + 1
+    t.cache_n[slot] = kept
+
+@tier(embedded)
+@no_alloc
+fn cache_at(var t: ClientTable, link: links.LinkId, index: Int) -> Int
+    let slot = slot_of(var t, link)
+    if slot < 0 or index < 0 or index >= t.cache_n[slot]
+        -1
+    else
+        slot * cache() + index
+
+// The kind of record `index` of the cache of `link`: `KIND_SERVICE`,
+// `KIND_INCLUDE`, `KIND_CHAR` or `KIND_DESC`, 0 for none.
+pub @tier(embedded)
+@no_alloc
+fn cache_kind_at(var t: ClientTable, link: links.LinkId, index: Int) -> Int
+    let at = cache_at(var t, link, index)
+    if at < 0 then 0 else t.c_kind[at] as Int
+
+// The handle of the record: a service's first handle, a declaration's handle
+// or a descriptor's handle.
+pub @tier(embedded)
+@no_alloc
+fn cache_handle_at(var t: ClientTable, link: links.LinkId, index: Int) -> Int
+    let at = cache_at(var t, link, index)
+    if at < 0 then 0 else t.c_handle[at] as Int
+
+// The record's first extra value: a service's last handle, an included
+// service's first handle or a characteristic's value handle.
+pub @tier(embedded)
+@no_alloc
+fn cache_a_at(var t: ClientTable, link: links.LinkId, index: Int) -> Int
+    let at = cache_at(var t, link, index)
+    if at < 0 then 0 else t.c_a[at] as Int
+
+// The record's second extra value: an included service's last handle or a
+// characteristic's properties.
+pub @tier(embedded)
+@no_alloc
+fn cache_b_at(var t: ClientTable, link: links.LinkId, index: Int) -> Int
+    let at = cache_at(var t, link, index)
+    if at < 0 then 0 else t.c_b[at] as Int
+
+// The UUID of the record: the service's, the included service's, the
+// characteristic's or the descriptor's.
+pub @tier(embedded)
+fn cache_uuid_at(var t: ClientTable, link: links.LinkId, index: Int) -> Uuid
+    let at = cache_at(var t, link, index)
+    if at < 0
+        uuid16(0)
+    else
+        Uuid { wide: ((t.c_flags[at] as Int) & 1) != 0, lo: t.c_lo[at], hi: t.c_hi[at] }
+
+// Whether the record is a secondary service.
+@tier(embedded)
+@no_alloc
+fn cache_secondary_at(var t: ClientTable, link: links.LinkId, index: Int) -> Bool
+    let at = cache_at(var t, link, index)
+    at >= 0 and ((t.c_flags[at] as Int) & CF_SECONDARY) != 0
+
+// The index of the first record of `kind` and `uuid` at or after `from`, else
+// -1.
+pub @tier(embedded)
+@no_alloc
+fn cache_find(var t: ClientTable, link: links.LinkId, kind: Int, uuid: Uuid, from: Int) -> Int
+    let slot = slot_of(var t, link)
+    var found = -1
+    if slot >= 0
+        for i in from..t.cache_n[slot]
+            let at = slot * cache() + i
+            let wide = (((t.c_flags[at] as Int) & 1) != 0)
+            let same = wide == uuid.wide and t.c_lo[at] == uuid.lo and t.c_hi[at] == uuid.hi
+            if (t.c_kind[at] as Int) == kind and same
+                found = i
+                break
+    found
+
+// The first handle after characteristic record `index` that begins something
+// else: the next declaration or service of the cache, else 0xFFFF + 1.
+pub @tier(embedded)
+@no_alloc
+fn boundary_after(var t: ClientTable, slot: Int, value_handle: Int) -> Int
+    var bound = 0x10000
+    for i in 0..t.cache_n[slot]
+        let at = slot * cache() + i
+        let kind = t.c_kind[at] as Int
+        let h = t.c_handle[at] as Int
+        if (kind == KIND_CHAR or kind == KIND_SERVICE) and h > value_handle and h < bound
+            bound = h
+    bound
+
+// The handle of the descriptor of 16-bit type `type16` that belongs to the
+// characteristic at `index`, else 0: one the cache holds between the
+// characteristic's value and the next declaration.
+@tier(embedded)
+@no_alloc
+fn descriptor_of(var t: ClientTable, link: links.LinkId, index: Int, type16: Int) -> Int
+    let slot = slot_of(var t, link)
+    let at = cache_at(var t, link, index)
+    var found = 0
+    if slot >= 0 and at >= 0 and (t.c_kind[at] as Int) == KIND_CHAR
+        let value_handle = t.c_a[at] as Int
+        let bound = boundary_after(var t, slot, value_handle)
+        let want = uuid16(type16)
+        for i in 0..t.cache_n[slot]
+            let d = slot * cache() + i
+            let h = t.c_handle[d] as Int
+            let same = ((t.c_flags[d] as Int) & 1) == 0 and t.c_lo[d] == want.lo
+            if (t.c_kind[d] as Int) == KIND_DESC and h > value_handle and h < bound and same
+                found = h
+                break
+    found
+
+// The handle of the Client Characteristic Configuration descriptor of the
+// characteristic at `index`, 0 when discovery did not find one.
+pub @tier(embedded)
+@no_alloc
+fn cccd_of(var t: ClientTable, link: links.LinkId, index: Int) -> Int
+    descriptor_of(var t, link, index, UUID_CCCD)
+
+// ── Queueing requests ───────────────────────────────────────────────
+
+// The row a request on `bearer` of `link` can be queued on, or the negative
+// reason it cannot: no such link or bearer, a dead bearer, a full queue, or
+// `payload` octets that do not fit the bearer's payload buffer.
+@tier(embedded)
+@no_alloc
+fn prepare_row(var t: ClientTable, link: links.LinkId, bearer: Int, payload: Int) -> Int
+    let slot = slot_of(var t, link)
+    if slot < 0
+        return ERR_NO_LINK
+    if bearer < 0 or bearer >= bearers()
+        return ERR_NO_BEARER
+    let row = slot * bearers() + bearer
+    if rd(var t, row, R_OPEN) == 0
+        return ERR_NO_BEARER
+    if rd(var t, row, R_DEAD) != 0
+        return ERR_DEAD
+    if rd(var t, row, R_Q_LEN) >= queue()
+        return ERR_QUEUE_FULL
+    if payload > 0 and rd(var t, row, R_PAY_USED) + payload > value_octets()
+        return ERR_NO_ROOM
+    row
+
+// Queue a request on `row` and start it when the bearer is idle.  Answers
+// the ticket.
+@tier(embedded)
+@no_alloc
+fn push_entry(var t: ClientTable, row: Int, op: Int, start: Int, end: Int, uuid: Uuid, arg: Int, pay_off: Int, pay_len: Int) -> Int
+    let length = rd(var t, row, R_Q_LEN)
+    let index = (rd(var t, row, R_Q_HEAD) + length) % queue()
+    let ticket = rd(var t, row, R_NEXT_TICKET)
+    wr(var t, row, R_NEXT_TICKET, ticket + 1)
+    queue_put(var t, row, index, Q_OP, op)
+    queue_put(var t, row, index, Q_START, start)
+    queue_put(var t, row, index, Q_END, end)
+    queue_put(var t, row, index, Q_UUID_LO, uuid.lo)
+    queue_put(var t, row, index, Q_UUID_HI, uuid.hi)
+    queue_put(var t, row, index, Q_UUID_WIDE, if uuid.wide then 1 else 0)
+    queue_put(var t, row, index, Q_ARG, arg)
+    queue_put(var t, row, index, Q_PAY_OFF, pay_off)
+    queue_put(var t, row, index, Q_PAY_LEN, pay_len)
+    queue_put(var t, row, index, Q_TICKET, ticket)
+    wr(var t, row, R_Q_LEN, length + 1)
+    activate(t, row)
+    ticket
+
+// Queue a request that carries no payload.
+@tier(embedded)
+@no_alloc
+fn queue_plain(var t: ClientTable, link: links.LinkId, bearer: Int, op: Int, start: Int, end: Int, uuid: Uuid, arg: Int) -> Int
+    let row = prepare_row(var t, link, bearer, 0)
+    if row < 0
+        row
+    else
+        push_entry(var t, row, op, start, end, uuid, arg, 0, 0)
+
+// Queue a request that carries the first `length` octets of `data`.
+@tier(embedded)
+@no_alloc
+fn queue_with_payload(var t: ClientTable, link: links.LinkId, bearer: Int, op: Int, handle: Int, data: ClientPayload, length: Int, arg: Int) -> Int
+    if length < 0 or length > value_octets() or handle < 1 or handle > 0xFFFF
+        return ERR_ARGUMENT
+    let row = prepare_row(var t, link, bearer, length)
+    if row < 0
+        return row
+    let off = rd(var t, row, R_PAY_USED)
+    for i in 0..length
+        t.payload[row * value_octets() + off + i] = data[i]
+    wr(var t, row, R_PAY_USED, off + length)
+    push_entry(var t, row, op, handle, handle, uuid16(0), arg, off, length)
+
+// Queue a request whose payload is `length` octets of `data` and that names no
+// handle of its own: the handles of a Read Multiple Request, at least `least`
+// of them.
+@tier(embedded)
+@no_alloc
+fn queue_handles(var t: ClientTable, link: links.LinkId, bearer: Int, op: Int, data: ClientPayload, length: Int, least: Int) -> Int
+    if length < 2 * least or length % 2 != 0 or length > value_octets() or length > pdu_octets() - 1
+        return ERR_ARGUMENT
+    let row = prepare_row(var t, link, bearer, length)
+    if row < 0
+        return row
+    if length > rd(var t, row, R_MTU) - 1
+        return ERR_ARGUMENT
+    let off = rd(var t, row, R_PAY_USED)
+    for i in 0..length
+        t.payload[row * value_octets() + off + i] = data[i]
+    wr(var t, row, R_PAY_USED, off + length)
+    push_entry(var t, row, op, 0, 0, uuid16(0), 0, off, length)
+
+@tier(embedded)
+@no_alloc
+fn valid_range(start: Int, end: Int) -> Bool
+    start >= 1 and end >= start and end <= 0xFFFF
+
+// Exchange the ATT_MTU of the unenhanced bearer, offering `noble_config.MAX_ATT_MTU`
+// ([Vol 3] Part F, Section 3.4.2).  The procedure runs once per bearer;
+// `ERR_REPEAT` answers a second.  An Enhanced ATT bearer has its MTU from its
+// channel and refuses it.
+pub @satisfies("REQ-BLE-GATT-CE-001")
+@tier(embedded)
+@no_alloc
+fn begin_exchange_mtu(var t: ClientTable, link: links.LinkId, bearer: Int) -> Int
+    let row = prepare_row(var t, link, bearer, 0)
+    if row < 0
+        row
+    else if bearer != 0
+        ERR_ARGUMENT
+    else if rd(var t, row, R_MTU_DONE) != 0
+        ERR_REPEAT
+    else
+        push_entry(var t, row, OP_MTU, 0, 0, uuid16(0), 0, 0, 0)
+
+// Let the unenhanced bearer 0 of `link` exchange its MTU once more.  The
+// Attribute Protocol has the client exchange once per connection ([Vol 3] Part
+// F, Section 3.4.2.2), so `begin_exchange_mtu` answers `ERR_REPEAT` the second
+// time; a caller whose job is to send what a tester asks, which may be a second
+// exchange to see how the peer answers it, lifts the refusal here.  The engine
+// never lifts it on its own.  False for a link or bearer that does not exist.
+pub @satisfies("REQ-BLE-GATT-CE-001")
+@tier(embedded)
+@no_alloc
+fn allow_another_mtu_exchange(var t: ClientTable, link: links.LinkId, bearer: Int) -> Bool
+    let row = row_of(t, link, bearer)
+    if row < 0 or bearer != 0
+        false
+    else
+        wr(var t, row, R_MTU_DONE, 0)
+        true
+
+// Discover the primary services in `start` to `end`, or the secondary ones
+// when `secondary` ([Vol 3] Part G, Section 4.4.1).  The services found are
+// in the cache.
+pub @satisfies("REQ-BLE-GATT-CE-002")
+@tier(embedded)
+@no_alloc
+fn begin_discover_services(var t: ClientTable, link: links.LinkId, bearer: Int, start: Int, end: Int, secondary: Bool) -> Int
+    if not valid_range(start, end)
+        ERR_ARGUMENT
+    else
+        queue_plain(var t, link, bearer, OP_SERVICES, start, end, uuid16(0), if secondary then UUID_SECONDARY_SERVICE else UUID_PRIMARY_SERVICE)
+
+// Discover the primary services of one UUID in `start` to `end` ([Vol 3]
+// Part G, Section 4.4.2).
+pub @satisfies("REQ-BLE-GATT-CE-002")
+@tier(embedded)
+@no_alloc
+fn begin_discover_services_by_uuid(var t: ClientTable, link: links.LinkId, bearer: Int, start: Int, end: Int, uuid: Uuid) -> Int
+    if not valid_range(start, end)
+        ERR_ARGUMENT
+    else
+        queue_plain(var t, link, bearer, OP_SERVICES_UUID, start, end, uuid, 0)
+
+// Find the services included by the service in `start` to `end` ([Vol 3]
+// Part G, Section 4.5.1).  An included service whose UUID is 128 bits wide
+// costs one Read Request more.
+pub @satisfies("REQ-BLE-GATT-CE-002")
+@tier(embedded)
+@no_alloc
+fn begin_find_included(var t: ClientTable, link: links.LinkId, bearer: Int, start: Int, end: Int) -> Int
+    if not valid_range(start, end)
+        ERR_ARGUMENT
+    else
+        queue_plain(var t, link, bearer, OP_INCLUDED, start, end, uuid16(0), 0)
+
+// Discover the characteristics in `start` to `end` ([Vol 3] Part G, Section
+// 4.6.1).
+pub @satisfies("REQ-BLE-GATT-CE-002")
+@tier(embedded)
+@no_alloc
+fn begin_discover_characteristics(var t: ClientTable, link: links.LinkId, bearer: Int, start: Int, end: Int) -> Int
+    if not valid_range(start, end)
+        ERR_ARGUMENT
+    else
+        queue_plain(var t, link, bearer, OP_CHARS, start, end, uuid16(0), 0)
+
+// Discover the characteristics of one UUID in `start` to `end` ([Vol 3]
+// Part G, Section 4.6.2).  Only those are cached.
+pub @satisfies("REQ-BLE-GATT-CE-002")
+@tier(embedded)
+@no_alloc
+fn begin_discover_characteristics_by_uuid(var t: ClientTable, link: links.LinkId, bearer: Int, start: Int, end: Int, uuid: Uuid) -> Int
+    if not valid_range(start, end)
+        ERR_ARGUMENT
+    else
+        queue_plain(var t, link, bearer, OP_CHARS_UUID, start, end, uuid, 0)
+
+// Discover the descriptors in `start` to `end`, which is a characteristic's
+// handles after its value ([Vol 3] Part G, Section 4.7.1).
+pub @satisfies("REQ-BLE-GATT-CE-002")
+@tier(embedded)
+@no_alloc
+fn begin_discover_descriptors(var t: ClientTable, link: links.LinkId, bearer: Int, start: Int, end: Int) -> Int
+    if not valid_range(start, end)
+        ERR_ARGUMENT
+    else
+        queue_plain(var t, link, bearer, OP_DESCS, start, end, uuid16(0), 0)
+
+// Read the value of `handle` with one Read Request ([Vol 3] Part G, Section
+// 4.8.1).
+pub @satisfies("REQ-BLE-GATT-CE-003")
+@tier(embedded)
+@no_alloc
+fn begin_read(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int) -> Int
+    if handle < 1 or handle > 0xFFFF
+        ERR_ARGUMENT
+    else
+        queue_plain(var t, link, bearer, OP_READ, handle, handle, uuid16(0), 0)
+
+// Read the values of the characteristics of one UUID in `start` to `end` with
+// one Read By Type Request ([Vol 3] Part G, Section 4.8.2).  The value buffer
+// holds the handle and value pairs of the answer, `result_item_len` octets
+// each.
+pub @satisfies("REQ-BLE-GATT-CE-003")
+@tier(embedded)
+@no_alloc
+fn begin_read_by_type(var t: ClientTable, link: links.LinkId, bearer: Int, start: Int, end: Int, uuid: Uuid) -> Int
+    if not valid_range(start, end)
+        ERR_ARGUMENT
+    else
+        queue_plain(var t, link, bearer, OP_READ_TYPE, start, end, uuid, 0)
+
+// Read a value that may be longer than ATT_MTU - 1: a Read Request, then Read
+// Blob Requests while the answer fills an ATT_MTU ([Vol 3] Part G, Section
+// 4.8.3).  A value longer than the value buffer ends with `STATUS_TRUNCATED`
+// and the part that fits.
+pub @satisfies("REQ-BLE-GATT-CE-003")
+@tier(embedded)
+@no_alloc
+fn begin_read_long(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int) -> Int
+    begin_read_long_from(var t, link, bearer, handle, 0)
+
+// Read a value from `offset`: at offset 0 the procedure is `begin_read_long`
+// and opens with a Read Request; from a later offset it opens with a Read Blob
+// Request at `offset` and goes on the same way ([Vol 3] Part G, Section 4.8.3).
+// The value buffer holds the octets from `offset` on.
+pub @satisfies("REQ-BLE-GATT-CE-003")
+@tier(embedded)
+@no_alloc
+fn begin_read_long_from(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int, offset: Int) -> Int
+    if handle < 1 or handle > 0xFFFF or offset < 0 or offset > 0xFFFF
+        ERR_ARGUMENT
+    else
+        queue_plain(var t, link, bearer, OP_READ_LONG, handle, handle, uuid16(0), offset)
+
+// Read the values of several characteristics with one Read Multiple Request
+// ([Vol 3] Part G, Section 4.8.4).  `data` holds the handles, two octets each,
+// least significant first, `length` octets in all.  The value buffer holds the
+// values as the peer's response gives them, one after another.
+pub @satisfies("REQ-BLE-GATT-CE-003")
+@tier(embedded)
+@no_alloc
+fn begin_read_multiple(var t: ClientTable, link: links.LinkId, bearer: Int, data: ClientPayload, length: Int) -> Int
+    queue_handles(var t, link, bearer, OP_READ_MULTI, data, length, 1)
+
+// Read the values of two or more characteristics, of any lengths, with one
+// Read Multiple Variable Request ([Vol 3] Part G, Section 4.8.5).  `data` is as
+// for `begin_read_multiple`.  The value buffer holds the response's length and
+// value pairs, each length two octets.
+pub @satisfies("REQ-BLE-GATT-CE-003")
+@tier(embedded)
+@no_alloc
+fn begin_read_multiple_variable(var t: ClientTable, link: links.LinkId, bearer: Int, data: ClientPayload, length: Int) -> Int
+    queue_handles(var t, link, bearer, OP_READ_MULTI_VAR, data, length, 2)
+
+// Read the peer's Database Hash with a Read By Type Request over all
+// handles ([Vol 3] Part G, Section 7.3.2) and compare it with the one the
+// link holds: a different hash drops the cache and sets the changed flag, and
+// the stale mark goes in any case.
+@satisfies("REQ-BLE-GATT-CE-007")
+@tier(embedded)
+@no_alloc
+fn begin_database_hash(var t: ClientTable, link: links.LinkId, bearer: Int) -> Int
+    queue_plain(var t, link, bearer, OP_HASH, 1, 0xFFFF, uuid16(UUID_DATABASE_HASH), 0)
+
+// Write the first `length` octets of `data` to `handle` with a Write Request
+// ([Vol 3] Part G, Section 4.9.3).  The value must fit ATT_MTU - 3; a longer
+// one is `begin_write_long`.
+pub @satisfies("REQ-BLE-GATT-CE-004")
+@tier(embedded)
+@no_alloc
+fn begin_write(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int, data: ClientPayload, length: Int) -> Int
+    let row = row_of(t, link, bearer)
+    if row >= 0 and length > rd(var t, row, R_MTU) - 3
+        ERR_ARGUMENT
+    else
+        queue_with_payload(var t, link, bearer, OP_WRITE, handle, data, length, 0)
+
+// Write the first `length` octets of `data` to `handle` with a Write Command,
+// which has no response ([Vol 3] Part G, Section 4.9.1).
+pub @satisfies("REQ-BLE-GATT-CE-004")
+@tier(embedded)
+@no_alloc
+fn begin_write_command(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int, data: ClientPayload, length: Int) -> Int
+    let row = row_of(t, link, bearer)
+    if row >= 0 and length > rd(var t, row, R_MTU) - 3
+        ERR_ARGUMENT
+    else
+        queue_with_payload(var t, link, bearer, OP_WRITE_CMD, handle, data, length, 0)
+
+// Write the first `length` octets of `data` to `handle` with a Signed Write
+// Command, which has no response ([Vol 3] Part G, Section 4.9.2).  The caller
+// signs: the engine holds no key.  `data` is the value followed by the 12 octets
+// of the Authentication Signature (the SignCounter and the MAC, [Vol 3] Part H,
+// Section 2.4.5) and `length` counts both, so the command is 3 + `length`
+// octets.
+pub @satisfies("REQ-BLE-GATT-CE-004")
+@tier(embedded)
+@no_alloc
+fn begin_signed_write(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int, data: ClientPayload, length: Int) -> Int
+    let row = row_of(t, link, bearer)
+    if length < 12 or (row >= 0 and length > rd(var t, row, R_MTU) - 3)
+        ERR_ARGUMENT
+    else
+        queue_with_payload(var t, link, bearer, OP_WRITE_SIGNED, handle, data, length, 0)
+
+// Write a value of any length with Prepare Write Requests of ATT_MTU - 5
+// octets and one Execute Write Request ([Vol 3] Part G, Section 4.9.4).  A
+// part the peer refuses after another was accepted is followed by an Execute
+// Write Request that cancels, and the request ends with the refusal.  The
+// value is at least one octet.
+pub @satisfies("REQ-BLE-GATT-CE-004")
+@tier(embedded)
+@no_alloc
+fn begin_write_long(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int, data: ClientPayload, length: Int) -> Int
+    begin_write_long_at(var t, link, bearer, handle, 0, data, length)
+
+// Write a value of any length from `offset` of the attribute: as
+// `begin_write_long`, with `offset` in the first Prepare Write Request and the
+// parts that follow it ([Vol 3] Part G, Section 4.9.4).
+pub @satisfies("REQ-BLE-GATT-CE-004")
+@tier(embedded)
+@no_alloc
+fn begin_write_long_at(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int, offset: Int, data: ClientPayload, length: Int) -> Int
+    if length < 1 or offset < 0 or offset > 0xFFFF
+        ERR_ARGUMENT
+    else
+        queue_with_payload(var t, link, bearer, OP_WRITE_LONG, handle, data, length, offset)
+
+// Write with a reliable write: as `begin_write_long`, and every Prepare Write
+// Response is checked against what was sent; a difference cancels the queue
+// and ends the request with `STATUS_MISMATCH` ([Vol 3] Part G, Section
+// 4.9.5).
+@satisfies("REQ-BLE-GATT-CE-004")
+@tier(embedded)
+@no_alloc
+fn begin_reliable_write(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int, data: ClientPayload, length: Int) -> Int
+    begin_reliable_write_at(var t, link, bearer, handle, 0, data, length)
+
+// A reliable write from `offset` of the attribute; see `begin_write_long_at`.
+pub @satisfies("REQ-BLE-GATT-CE-004")
+@tier(embedded)
+@no_alloc
+fn begin_reliable_write_at(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int, offset: Int, data: ClientPayload, length: Int) -> Int
+    if length < 1 or offset < 0 or offset > 0xFFFF
+        ERR_ARGUMENT
+    else
+        queue_with_payload(var t, link, bearer, OP_RELIABLE, handle, data, length, offset)
+
+// Write the Client Characteristic Configuration descriptor `cccd` with `mode`,
+// `CCCD_NOTIFY`, `CCCD_INDICATE` or 0 ([Vol 3] Part G, Section 4.10 and 4.11).
+pub @satisfies("REQ-BLE-GATT-CE-005")
+@tier(embedded)
+@no_alloc
+fn begin_subscribe(var t: ClientTable, link: links.LinkId, bearer: Int, cccd: Int, mode: Int) -> Int
+    if mode < 0 or mode > 3
+        ERR_ARGUMENT
+    else
+        var data: ClientPayload = Vec.new()
+        let _ = data.push((mode & 0xFF) as u8)
+        let _ = data.push(0)
+        queue_with_payload(var t, link, bearer, OP_WRITE, cccd, data, 2, 0)
+
+// ── Running requests ────────────────────────────────────────────────
+
+// Start the request at the head of the queue of `row` when the bearer is idle
+// and alive.
+@tier(embedded)
+@no_alloc
+fn activate(var t: ClientTable, row: Int)
+    if rd(var t, row, R_OP) != OP_NONE or rd(var t, row, R_Q_LEN) == 0 or rd(var t, row, R_DEAD) != 0
+        return
+    let head = rd(var t, row, R_Q_HEAD)
+    wr(var t, row, R_OP, queue_at(var t, row, head, Q_OP))
+    wr(var t, row, R_START, queue_at(var t, row, head, Q_START))
+    wr(var t, row, R_END, queue_at(var t, row, head, Q_END))
+    wr(var t, row, R_UUID_LO, queue_at(var t, row, head, Q_UUID_LO))
+    wr(var t, row, R_UUID_HI, queue_at(var t, row, head, Q_UUID_HI))
+    wr(var t, row, R_UUID_WIDE, queue_at(var t, row, head, Q_UUID_WIDE))
+    wr(var t, row, R_ARG, queue_at(var t, row, head, Q_ARG))
+    wr(var t, row, R_PAY_OFF, queue_at(var t, row, head, Q_PAY_OFF))
+    wr(var t, row, R_PAY_LEN, queue_at(var t, row, head, Q_PAY_LEN))
+    wr(var t, row, R_TICKET, queue_at(var t, row, head, Q_TICKET))
+    wr(var t, row, R_Q_HEAD, (head + 1) % queue())
+    wr(var t, row, R_Q_LEN, rd(var t, row, R_Q_LEN) - 1)
+    wr(var t, row, R_PHASE, PHASE_MAIN)
+    wr(var t, row, R_WRITTEN, 0)
+    wr(var t, row, R_AUX, 0)
+    wr(var t, row, R_WORK, 0)
+    wr(var t, row, R_FOUND, 0)
+    build_request(var t, row)
+
+// The request of `row` ended with `status`; `handle` is the handle of the
+// Error Response, else 0.  The next queued request starts.
+@tier(embedded)
+@no_alloc
+fn finish(var t: ClientTable, row: Int, status: Int, handle: Int) -> Int
+    let op = rd(var t, row, R_OP)
+    wr(var t, row, R_STATUS, status)
+    wr(var t, row, R_DONE_TICKET, rd(var t, row, R_TICKET))
+    wr(var t, row, R_DONE_OP, op)
+    wr(var t, row, R_DONE_FOUND, rd(var t, row, R_FOUND))
+    wr(var t, row, R_ERR_HANDLE, handle)
+    let keeps_value = (op == OP_READ or op == OP_READ_TYPE or op == OP_READ_LONG or op == OP_READ_MULTI or op == OP_READ_MULTI_VAR) and (status == STATUS_OK or status == STATUS_TRUNCATED)
+    if not keeps_value
+        wr(var t, row, R_VAL_LEN, 0)
+    wr(var t, row, R_OP, OP_NONE)
+    wr(var t, row, R_PHASE, PHASE_MAIN)
+    wr(var t, row, R_OUTSTANDING, 0)
+    wr(var t, row, R_AWAIT, 0)
+    wr(var t, row, R_TX_LEN, 0)
+    if rd(var t, row, R_Q_LEN) == 0
+        wr(var t, row, R_PAY_USED, 0)
+    activate(t, row)
+    EV_DONE
+
+// Put the request of `row` into its PDU buffer: the next transaction of the
+// request, by its operation and phase.
+@tier(embedded)
+@no_alloc
+fn build_request(var t: ClientTable, row: Int)
+    let op = rd(var t, row, R_OP)
+    let phase = rd(var t, row, R_PHASE)
+    let start = rd(var t, row, R_START)
+    let end = rd(var t, row, R_END)
+    var opcode = 0
+    var length = 0
+    var awaits = true
+    if op == OP_MTU
+        opcode = att.ATT_OP_EXCHANGE_MTU_REQ
+        tx_put(var t, row, 0, opcode)
+        tx_put16(var t, row, 1, rd(var t, row, R_RX_MTU))
+        length = 3
+    else if op == OP_SERVICES
+        opcode = att.ATT_OP_READ_BY_GROUP_TYPE_REQ
+        length = tx_range(var t, row, opcode, start, end, rd(var t, row, R_ARG))
+    else if op == OP_SERVICES_UUID
+        opcode = att.ATT_OP_FIND_BY_TYPE_VALUE_REQ
+        tx_put(var t, row, 0, opcode)
+        tx_put16(var t, row, 1, start)
+        tx_put16(var t, row, 3, end)
+        tx_put16(var t, row, 5, UUID_PRIMARY_SERVICE)
+        length = tx_put_uuid(var t, row, 7, rd(var t, row, R_UUID_LO), rd(var t, row, R_UUID_HI), rd(var t, row, R_UUID_WIDE) != 0)
+    else if op == OP_INCLUDED
+        if phase == PHASE_RESOLVE
+            opcode = att.ATT_OP_READ_REQ
+            tx_put(var t, row, 0, opcode)
+            tx_put16(var t, row, 1, rd(var t, row, R_WORK))
+            length = 3
+        else
+            opcode = att.ATT_OP_READ_BY_TYPE_REQ
+            length = tx_range(var t, row, opcode, start, end, UUID_INCLUDE)
+    else if op == OP_CHARS or op == OP_CHARS_UUID
+        opcode = att.ATT_OP_READ_BY_TYPE_REQ
+        length = tx_range(var t, row, opcode, start, end, UUID_CHARACTERISTIC)
+    else if op == OP_DESCS
+        opcode = att.ATT_OP_FIND_INFORMATION_REQ
+        tx_put(var t, row, 0, opcode)
+        tx_put16(var t, row, 1, start)
+        tx_put16(var t, row, 3, end)
+        length = 5
+    else if op == OP_READ
+        opcode = att.ATT_OP_READ_REQ
+        tx_put(var t, row, 0, opcode)
+        tx_put16(var t, row, 1, start)
+        length = 3
+    else if op == OP_READ_TYPE or op == OP_HASH
+        opcode = att.ATT_OP_READ_BY_TYPE_REQ
+        tx_put(var t, row, 0, opcode)
+        tx_put16(var t, row, 1, start)
+        tx_put16(var t, row, 3, end)
+        length = tx_put_uuid(var t, row, 5, rd(var t, row, R_UUID_LO), rd(var t, row, R_UUID_HI), rd(var t, row, R_UUID_WIDE) != 0)
+    else if op == OP_READ_LONG
+        if phase == PHASE_BLOB or rd(var t, row, R_ARG) > 0
+            opcode = att.ATT_OP_READ_BLOB_REQ
+            tx_put(var t, row, 0, opcode)
+            tx_put16(var t, row, 1, start)
+            tx_put16(var t, row, 3, rd(var t, row, R_ARG) + rd(var t, row, R_WRITTEN))
+            length = 5
+        else
+            opcode = att.ATT_OP_READ_REQ
+            tx_put(var t, row, 0, opcode)
+            tx_put16(var t, row, 1, start)
+            length = 3
+    else if op == OP_READ_MULTI or op == OP_READ_MULTI_VAR
+        opcode = if op == OP_READ_MULTI then att.ATT_OP_READ_MULTIPLE_REQ else att.ATT_OP_READ_MULTIPLE_VARIABLE_REQ
+        tx_put(var t, row, 0, opcode)
+        let n = rd(var t, row, R_PAY_LEN)
+        let off = rd(var t, row, R_PAY_OFF)
+        for i in 0..n
+            tx_put(var t, row, 1 + i, t.payload[row * value_octets() + off + i] as Int)
+        length = 1 + n
+    else if op == OP_WRITE or op == OP_WRITE_CMD or op == OP_WRITE_SIGNED
+        awaits = op == OP_WRITE
+        opcode = if op == OP_WRITE then att.ATT_OP_WRITE_REQ else if op == OP_WRITE_CMD then att.ATT_OP_WRITE_CMD else att.ATT_OP_SIGNED_WRITE_CMD
+        tx_put(var t, row, 0, opcode)
+        tx_put16(var t, row, 1, start)
+        let n = rd(var t, row, R_PAY_LEN)
+        let off = rd(var t, row, R_PAY_OFF)
+        for i in 0..n
+            tx_put(var t, row, 3 + i, t.payload[row * value_octets() + off + i] as Int)
+        length = 3 + n
+    else
+        // OP_WRITE_LONG and OP_RELIABLE
+        if phase == PHASE_MAIN
+            opcode = att.ATT_OP_PREPARE_WRITE_REQ
+            let sent = rd(var t, row, R_WRITTEN)
+            let room = rd(var t, row, R_MTU) - 5
+            let left = rd(var t, row, R_PAY_LEN) - sent
+            let part = if left < room then left else room
+            wr(var t, row, R_AUX, part)
+            tx_put(var t, row, 0, opcode)
+            tx_put16(var t, row, 1, start)
+            tx_put16(var t, row, 3, rd(var t, row, R_ARG) + sent)
+            let off = rd(var t, row, R_PAY_OFF) + sent
+            for i in 0..part
+                tx_put(var t, row, 5 + i, t.payload[row * value_octets() + off + i] as Int)
+            length = 5 + part
+        else
+            opcode = att.ATT_OP_EXECUTE_WRITE_REQ
+            tx_put(var t, row, 0, opcode)
+            tx_put(var t, row, 1, if phase == PHASE_EXECUTE then att.ATT_EXECUTE_WRITE_FLAG_WRITE else att.ATT_EXECUTE_WRITE_FLAG_CANCEL)
+            length = 2
+    wr(var t, row, R_REQ_OP, opcode)
+    wr(var t, row, R_TX_LEN, length)
+    wr(var t, row, R_AWAIT, if awaits then 1 else 0)
+
+// Copy the next PDU the bearer has to send into `out` and answer what it is:
+// `TX_CONFIRM` (the confirmation of an indication, which goes first),
+// `TX_REQUEST` (a response is due; its timer starts at `now_ms`),
+// `TX_COMMAND` (a command; the request ends with it, successfully), or
+// `TX_NONE` when there is nothing to send.  The caller calls it again until it
+// answers `TX_NONE`.
+pub @satisfies("REQ-BLE-GATT-CE-006")
+@no_alloc
+@tier(embedded)
+fn take_tx(var t: ClientTable, link: links.LinkId, bearer: Int, now_ms: Int, var out: ClientPdu) -> Int
+    let row = row_of(t, link, bearer)
+    if row < 0
+        return TX_NONE
+    out.clear()
+    if rd(var t, row, R_CFM) != 0
+        wr(var t, row, R_CFM, 0)
+        let _ = out.push(att.ATT_OP_HANDLE_VALUE_CFM)
+        return TX_CONFIRM
+    let length = rd(var t, row, R_TX_LEN)
+    if length == 0 or rd(var t, row, R_DEAD) != 0
+        return TX_NONE
+    for i in 0..length
+        let _ = out.push(t.tx[row * pdu_octets() + i])
+    wr(var t, row, R_TX_LEN, 0)
+    if rd(var t, row, R_AWAIT) != 0
+        wr(var t, row, R_OUTSTANDING, 1)
+        wr(var t, row, R_SENT_MS, now_ms)
+        TX_REQUEST
+    else
+        let _ = finish(t, row, STATUS_OK, 0)
+        TX_COMMAND
+
+// End the request on `bearer` that has waited `TRANSACTION_TIMEOUT_MS` for its
+// response: answers `EV_DONE` with `STATUS_TIMEOUT`, drops the queue and
+// marks the bearer dead ([Vol 3] Part F, Section 3.3.3).  `EV_NONE` otherwise.
+pub @satisfies("REQ-BLE-GATT-CE-006")
+@no_alloc
+@tier(embedded)
+fn tick(var t: ClientTable, link: links.LinkId, bearer: Int, now_ms: Int) -> Int
+    let row = row_of(t, link, bearer)
+    if row < 0 or rd(var t, row, R_OUTSTANDING) == 0 or now_ms - rd(var t, row, R_SENT_MS) < TRANSACTION_TIMEOUT_MS
+        return EV_NONE
+    wr(var t, row, R_DEAD, 1)
+    wr(var t, row, R_Q_LEN, 0)
+    finish(t, row, STATUS_TIMEOUT, 0)
+
+// ── Receiving PDUs ──────────────────────────────────────────────────
+
+// Whether the opcode is a response to a request of the client role.
+@tier(embedded)
+@no_alloc
+fn is_response(op: Int) -> Bool
+    op == att.ATT_OP_ERROR_RSP or op == att.ATT_OP_EXCHANGE_MTU_RSP or op == att.ATT_OP_FIND_INFORMATION_RSP
+        or op == att.ATT_OP_FIND_BY_TYPE_VALUE_RSP or op == att.ATT_OP_READ_BY_TYPE_RSP or op == att.ATT_OP_READ_RSP
+        or op == att.ATT_OP_READ_BLOB_RSP or op == att.ATT_OP_READ_BY_GROUP_TYPE_RSP or op == att.ATT_OP_WRITE_RSP
+        or op == att.ATT_OP_PREPARE_WRITE_RSP or op == att.ATT_OP_EXECUTE_WRITE_RSP
+        or op == att.ATT_OP_READ_MULTIPLE_RSP or op == att.ATT_OP_READ_MULTIPLE_VARIABLE_RSP
+
+// Take the first `length` octets of `pdu`, a PDU received on `bearer` of
+// `link`, and answer what it meant (`EV_NONE`, `EV_DONE`, `EV_NOTIFICATION`,
+// `EV_INDICATION`, `EV_SERVICE_CHANGED` or `EV_FOREIGN`).  The PDU is read and
+// not changed; it is passed by address.  A notification or an indication
+// leaves its handle in `event_handle`, and its value is `pdu` from octet 3.
+// A response with no request waiting, or too short to read, is dropped.
+pub @satisfies("REQ-BLE-GATT-CE-005")
+@no_alloc
+@tier(embedded)
+fn on_pdu(var t: ClientTable, link: links.LinkId, bearer: Int, var pdu: ClientPdu, length: Int) -> Int
+    let row = row_of(t, link, bearer)
+    if row < 0 or length < 1 or length > pdu_octets()
+        return EV_NONE
+    let op = pdu[0] as Int
+    if op == att.ATT_OP_HANDLE_VALUE_NTF
+        if length < 3
+            return EV_NONE
+        wr(var t, row, R_EVT_HANDLE, le16(pdu, 1))
+        return EV_NOTIFICATION
+    if op == att.ATT_OP_HANDLE_VALUE_IND
+        if length < 3
+            return EV_NONE
+        let handle = le16(pdu, 1)
+        wr(var t, row, R_EVT_HANDLE, handle)
+        wr(var t, row, R_CFM, 1)
+        let slot = row / bearers()
+        if handle == t.sc_handle[slot] and length >= 7
+            let first = le16(pdu, 3)
+            let last = le16(pdu, 5)
+            wr(var t, row, R_SC_FIRST, first)
+            wr(var t, row, R_SC_LAST, last)
+            cache_drop(var t, slot, first, last)
+            t.flags[slot] = t.flags[slot] | F_CHANGED
+            return EV_SERVICE_CHANGED
+        return EV_INDICATION
+    if not is_response(op)
+        return EV_FOREIGN
+    if rd(var t, row, R_OUTSTANDING) == 0
+        return EV_NONE
+    on_response(var t, row, var pdu, length)
+
+// The response `pdu` of `length` octets to the request outstanding on `row`.
+@tier(embedded)
+@no_alloc
+fn on_response(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -> Int
+    let op = pdu[0] as Int
+    if op == att.ATT_OP_ERROR_RSP
+        if length < 5 or (pdu[1] as Int) != rd(var t, row, R_REQ_OP)
+            return finish(t, row, STATUS_PROTOCOL, 0)
+        return on_error(var t, row, pdu[4] as Int, le16(pdu, 2))
+    if op != rd(var t, row, R_REQ_OP) + 1
+        return finish(t, row, STATUS_PROTOCOL, 0)
+    wr(var t, row, R_OUTSTANDING, 0)
+    let request = rd(var t, row, R_OP)
+    if request == OP_MTU
+        rsp_mtu(var t, row, var pdu, length)
+    else if request == OP_SERVICES or request == OP_SERVICES_UUID
+        rsp_services(var t, row, var pdu, length)
+    else if request == OP_INCLUDED
+        rsp_included(var t, row, var pdu, length)
+    else if request == OP_CHARS or request == OP_CHARS_UUID
+        rsp_characteristics(var t, row, var pdu, length)
+    else if request == OP_DESCS
+        rsp_descriptors(var t, row, var pdu, length)
+    else if request == OP_READ or request == OP_READ_MULTI or request == OP_READ_MULTI_VAR
+        rsp_read(var t, row, var pdu, length)
+    else if request == OP_READ_TYPE
+        rsp_read_type(var t, row, var pdu, length)
+    else if request == OP_HASH
+        rsp_hash(var t, row, var pdu, length)
+    else if request == OP_READ_LONG
+        rsp_read_long(var t, row, var pdu, length)
+    else if request == OP_WRITE
+        finish(t, row, STATUS_OK, 0)
+    else
+        rsp_prepare(var t, row, var pdu, length)
+
+// The Error Response `code` for `handle` ended the transaction.  A discovery
+// that finds nothing more ends well; a long read ends well at the end of the
+// value; a long write cancels what it queued; the rest end with the code.
+// Database Out Of Sync marks the link stale.
+@satisfies("REQ-BLE-GATT-CE-008")
+@tier(embedded)
+@no_alloc
+fn on_error(var t: ClientTable, row: Int, code: Int, handle: Int) -> Int
+    wr(var t, row, R_OUTSTANDING, 0)
+    let op = rd(var t, row, R_OP)
+    let phase = rd(var t, row, R_PHASE)
+    let slot = row / bearers()
+    if code == att.ATT_ERR_DATABASE_OUT_OF_SYNC
+        t.flags[slot] = t.flags[slot] | F_STALE
+    let discovery = op == OP_SERVICES or op == OP_SERVICES_UUID or op == OP_CHARS or op == OP_CHARS_UUID or op == OP_DESCS
+    if code == att.ATT_ERR_ATTRIBUTE_NOT_FOUND and (discovery or (op == OP_INCLUDED and phase == PHASE_MAIN))
+        return finish_discovery(var t, row)
+    if op == OP_READ_LONG and phase == PHASE_BLOB and (code == att.ATT_ERR_INVALID_OFFSET or code == att.ATT_ERR_ATTRIBUTE_NOT_LONG)
+        return finish(t, row, STATUS_OK, 0)
+    if (op == OP_WRITE_LONG or op == OP_RELIABLE) and phase == PHASE_MAIN and rd(var t, row, R_WRITTEN) > 0
+        return start_cancel(var t, row, code)
+    if (op == OP_WRITE_LONG or op == OP_RELIABLE) and phase == PHASE_CANCEL
+        return finish(t, row, rd(var t, row, R_PENDING), handle)
+    finish(t, row, code, handle)
+
+// A discovery that has nothing more to find: when an included service still
+// needs its UUID read, that comes first.
+@tier(embedded)
+@no_alloc
+fn finish_discovery(var t: ClientTable, row: Int) -> Int
+    if rd(var t, row, R_OP) == OP_INCLUDED and next_unresolved(var t, row) >= 0
+        wr(var t, row, R_AUX, 1)
+        wr(var t, row, R_PHASE, PHASE_RESOLVE)
+        wr(var t, row, R_WORK, next_unresolved(var t, row))
+        build_request(var t, row)
+        EV_NONE
+    else
+        finish(t, row, STATUS_OK, 0)
+
+// Continue a discovery after a response whose last handle was `last`: the
+// next request starts after it, unless the range is done.
+@tier(embedded)
+@no_alloc
+fn next_discovery(var t: ClientTable, row: Int, last: Int) -> Int
+    if last >= rd(var t, row, R_END) or last >= 0xFFFF
+        finish_discovery(var t, row)
+    else
+        wr(var t, row, R_START, last + 1)
+        build_request(var t, row)
+        EV_NONE
+
+// Cancel the prepared writes with an Execute Write Request, then end with
+// `status`.
+@tier(embedded)
+@no_alloc
+fn start_cancel(var t: ClientTable, row: Int, status: Int) -> Int
+    wr(var t, row, R_PENDING, status)
+    wr(var t, row, R_PHASE, PHASE_CANCEL)
+    build_request(var t, row)
+    EV_NONE
+
+// ── Responses by operation ──────────────────────────────────────────
+
+@tier(embedded)
+@no_alloc
+fn rsp_mtu(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -> Int
+    if length < 3
+        return finish(t, row, STATUS_PROTOCOL, 0)
+    let server = le16(pdu, 1)
+    let offered = rd(var t, row, R_RX_MTU)
+    var mtu = if server < offered then server else offered
+    if mtu < DEFAULT_MTU
+        mtu = DEFAULT_MTU
+    wr(var t, row, R_MTU, mtu)
+    wr(var t, row, R_MTU_DONE, 1)
+    finish(t, row, STATUS_OK, 0)
+
+// The UUID the active request asks about.
+@tier(embedded)
+fn request_uuid(var t: ClientTable, row: Int) -> Uuid
+    if rd(var t, row, R_UUID_WIDE) != 0
+        Uuid { wide: true, lo: rd(var t, row, R_UUID_LO), hi: rd(var t, row, R_UUID_HI) }
+    else
+        uuid16(rd(var t, row, R_UUID_LO))
+
+// A Read By Group Type Response or a Find By Type Value Response.
+@tier(embedded)
+@no_alloc
+fn rsp_services(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -> Int
+    let slot = row / bearers()
+    let by_uuid = rd(var t, row, R_OP) == OP_SERVICES_UUID
+    let first = if by_uuid then 1 else 2
+    let item = if by_uuid then 4 else (if length > 1 then pdu[1] as Int else 0)
+    let wide = item == 20
+    if item != 4 and item != 6 and item != 20
+        return finish(t, row, STATUS_PROTOCOL, 0)
+    if length < first + item or (length - first) % item != 0
+        return finish(t, row, STATUS_PROTOCOL, 0)
+    let flags = if rd(var t, row, R_ARG) == UUID_SECONDARY_SERVICE then CF_SECONDARY else 0
+    var last = 0
+    for k in 0..((length - first) / item)
+        let at = first + k * item
+        let handle = le16(pdu, at)
+        let end = le16(pdu, at + 2)
+        if handle < rd(var t, row, R_START) or end < handle
+            return finish(t, row, STATUS_ORDER, 0)
+        let uuid = if by_uuid then request_uuid(var t, row) else uuid_at(pdu, at + 4, wide)
+        if not cache_put(var t, slot, KIND_SERVICE, handle, end, 0, uuid, flags)
+            return finish(t, row, STATUS_CACHE_FULL, 0)
+        wr(var t, row, R_FOUND, rd(var t, row, R_FOUND) + 1)
+        last = end
+    next_discovery(var t, row, last)
+
+// The index of an included service in the cache whose UUID is still to read,
+// else -1.
+@tier(embedded)
+@no_alloc
+fn next_unresolved(var t: ClientTable, row: Int) -> Int
+    let slot = row / bearers()
+    var found = -1
+    for i in 0..t.cache_n[slot]
+        let at = slot * cache() + i
+        if (t.c_kind[at] as Int) == KIND_INCLUDE and ((t.c_flags[at] as Int) & CF_UNRESOLVED) != 0
+            found = (t.c_a[at] as Int)
+            break
+    found
+
+@tier(embedded)
+@no_alloc
+fn rsp_included(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -> Int
+    let slot = row / bearers()
+    if rd(var t, row, R_PHASE) == PHASE_RESOLVE
+        return rsp_resolve(var t, row, var pdu, length)
+    let item = if length > 1 then pdu[1] as Int else 0
+    if (item != 6 and item != 8) or length < 2 + item or (length - 2) % item != 0
+        return finish(t, row, STATUS_PROTOCOL, 0)
+    var last = 0
+    for k in 0..((length - 2) / item)
+        let at = 2 + k * item
+        let handle = le16(pdu, at)
+        if handle < rd(var t, row, R_START)
+            return finish(t, row, STATUS_ORDER, 0)
+        let uuid = if item == 8 then uuid16(le16(pdu, at + 6)) else uuid16(0)
+        let flags = if item == 8 then 0 else CF_UNRESOLVED
+        if not cache_put(var t, slot, KIND_INCLUDE, handle, le16(pdu, at + 2), le16(pdu, at + 4), uuid, flags)
+            return finish(t, row, STATUS_CACHE_FULL, 0)
+        wr(var t, row, R_FOUND, rd(var t, row, R_FOUND) + 1)
+        last = handle
+    next_discovery(var t, row, last)
+
+// The Read Response that carries the UUID of an included service.
+@tier(embedded)
+@no_alloc
+fn rsp_resolve(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -> Int
+    let slot = row / bearers()
+    let target = rd(var t, row, R_WORK)
+    var uuid = uuid16(0)
+    if length == 17
+        uuid = uuid_at(pdu, 1, true)
+    else if length == 3
+        uuid = uuid_at(pdu, 1, false)
+    else
+        return finish(t, row, STATUS_PROTOCOL, 0)
+    for i in 0..t.cache_n[slot]
+        let at = slot * cache() + i
+        if (t.c_kind[at] as Int) == KIND_INCLUDE and (t.c_a[at] as Int) == target and ((t.c_flags[at] as Int) & CF_UNRESOLVED) != 0
+            t.c_flags[at] = ((((t.c_flags[at] as Int) & 0xFA) | (if uuid.wide then 1 else 0))) as u8
+            t.c_lo[at] = uuid.lo
+            t.c_hi[at] = uuid.hi
+    let more = next_unresolved(var t, row)
+    if more >= 0
+        wr(var t, row, R_WORK, more)
+        build_request(var t, row)
+        EV_NONE
+    else if rd(var t, row, R_AUX) != 0
+        finish(t, row, STATUS_OK, 0)
+    else
+        wr(var t, row, R_PHASE, PHASE_MAIN)
+        build_request(var t, row)
+        EV_NONE
+
+@tier(embedded)
+@no_alloc
+fn rsp_characteristics(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -> Int
+    let slot = row / bearers()
+    let item = if length > 1 then pdu[1] as Int else 0
+    if (item != 7 and item != 21) or length < 2 + item or (length - 2) % item != 0
+        return finish(t, row, STATUS_PROTOCOL, 0)
+    let filter = rd(var t, row, R_OP) == OP_CHARS_UUID
+    let want_uuid = request_uuid(var t, row)
+    var last = 0
+    for k in 0..((length - 2) / item)
+        let at = 2 + k * item
+        let handle = le16(pdu, at)
+        let value_handle = le16(pdu, at + 3)
+        if handle < rd(var t, row, R_START) or value_handle <= handle
+            return finish(t, row, STATUS_ORDER, 0)
+        let uuid = uuid_at(pdu, at + 5, item == 21)
+        if not filter or uuid_same(uuid, want_uuid)
+            if not cache_put(var t, slot, KIND_CHAR, handle, value_handle, pdu[at + 2] as Int, uuid, 0)
+                return finish(t, row, STATUS_CACHE_FULL, 0)
+            wr(var t, row, R_FOUND, rd(var t, row, R_FOUND) + 1)
+        last = handle
+    next_discovery(var t, row, last)
+
+@tier(embedded)
+@no_alloc
+fn rsp_descriptors(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -> Int
+    let slot = row / bearers()
+    let format = if length > 1 then pdu[1] as Int else 0
+    let wide = format == att.ATT_FIND_INFO_FORMAT_UUID128
+    if format != att.ATT_FIND_INFO_FORMAT_UUID16 and not wide
+        return finish(t, row, STATUS_PROTOCOL, 0)
+    let item = if wide then 18 else 4
+    if length < 2 + item or (length - 2) % item != 0
+        return finish(t, row, STATUS_PROTOCOL, 0)
+    var last = 0
+    for k in 0..((length - 2) / item)
+        let at = 2 + k * item
+        let handle = le16(pdu, at)
+        if handle < rd(var t, row, R_START)
+            return finish(t, row, STATUS_ORDER, 0)
+        if handle > rd(var t, row, R_END)
+            return finish_discovery(var t, row)
+        if not cache_put(var t, slot, KIND_DESC, handle, 0, 0, uuid_at(pdu, at + 2, wide), 0)
+            return finish(t, row, STATUS_CACHE_FULL, 0)
+        wr(var t, row, R_FOUND, rd(var t, row, R_FOUND) + 1)
+        last = handle
+    next_discovery(var t, row, last)
+
+// Copy `count` octets of `pdu` from `from` into the value buffer of `row` at
+// `at`; answers how many fit.
+@tier(embedded)
+@no_alloc
+fn copy_in(var t: ClientTable, row: Int, var pdu: ClientPdu, from: Int, count: Int, at: Int) -> Int
+    let room = value_octets() - at
+    let n = if count < room then count else room
+    for i in 0..n
+        t.value[row * value_octets() + at + i] = pdu[from + i]
+    n
+
+@tier(embedded)
+@no_alloc
+fn rsp_read(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -> Int
+    let got = copy_in(var t, row, var pdu, 1, length - 1, 0)
+    wr(var t, row, R_VAL_LEN, got)
+    finish(t, row, if got < length - 1 then STATUS_TRUNCATED else STATUS_OK, 0)
+
+@tier(embedded)
+@no_alloc
+fn rsp_read_type(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -> Int
+    if length < 4
+        return finish(t, row, STATUS_PROTOCOL, 0)
+    let got = copy_in(var t, row, var pdu, 2, length - 2, 0)
+    wr(var t, row, R_VAL_LEN, got)
+    wr(var t, row, R_ITEM_LEN, pdu[1] as Int)
+    finish(t, row, if got < length - 2 then STATUS_TRUNCATED else STATUS_OK, 0)
+
+// The Database Hash answer: one handle and 16 octets.
+@tier(embedded)
+@no_alloc
+fn rsp_hash(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -> Int
+    if length != 4 + HASH_OCTETS or (pdu[1] as Int) != 2 + HASH_OCTETS
+        return finish(t, row, STATUS_PROTOCOL, 0)
+    let slot = row / bearers()
+    var same = true
+    for i in 0..HASH_OCTETS
+        if t.hash[slot * HASH_OCTETS + i] != pdu[4 + i]
+            same = false
+        t.hash[slot * HASH_OCTETS + i] = pdu[4 + i]
+    let known = (t.flags[slot] & F_HASH_KNOWN) != 0
+    t.flags[slot] = (t.flags[slot] | F_HASH_KNOWN) & 0xFFFD
+    if known and not same
+        cache_clear_slot(var t, slot)
+        t.flags[slot] = t.flags[slot] | F_CHANGED
+    finish(t, row, STATUS_OK, 0)
+
+@tier(embedded)
+@no_alloc
+fn rsp_read_long(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -> Int
+    let full = rd(var t, row, R_MTU) - 1
+    let have = if rd(var t, row, R_PHASE) == PHASE_BLOB then rd(var t, row, R_WRITTEN) else 0
+    let part = length - 1
+    let got = copy_in(var t, row, var pdu, 1, part, have)
+    wr(var t, row, R_WRITTEN, have + got)
+    wr(var t, row, R_VAL_LEN, have + got)
+    if got < part
+        return finish(t, row, STATUS_TRUNCATED, 0)
+    if part < full or rd(var t, row, R_ARG) + have + got >= 0xFFFF
+        return finish(t, row, STATUS_OK, 0)
+    wr(var t, row, R_PHASE, PHASE_BLOB)
+    build_request(var t, row)
+    EV_NONE
+
+// The responses of a long or reliable write: a Prepare Write Response checked
+// against the part sent, then the Execute Write Response.
+@tier(embedded)
+@no_alloc
+fn rsp_prepare(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -> Int
+    let phase = rd(var t, row, R_PHASE)
+    if phase == PHASE_CANCEL
+        return finish(t, row, rd(var t, row, R_PENDING), 0)
+    if phase == PHASE_EXECUTE
+        return finish(t, row, STATUS_OK, 0)
+    let part = rd(var t, row, R_AUX)
+    let sent = rd(var t, row, R_WRITTEN)
+    if length != 5 + part or le16(pdu, 1) != rd(var t, row, R_START) or le16(pdu, 3) != ((rd(var t, row, R_ARG) + sent) & 0xFFFF)
+        return start_cancel(var t, row, STATUS_PROTOCOL)
+    if rd(var t, row, R_OP) == OP_RELIABLE
+        let off = rd(var t, row, R_PAY_OFF) + sent
+        for i in 0..part
+            if pdu[5 + i] != t.payload[row * value_octets() + off + i]
+                return start_cancel(var t, row, STATUS_MISMATCH)
+    wr(var t, row, R_WRITTEN, sent + part)
+    if sent + part >= rd(var t, row, R_PAY_LEN)
+        wr(var t, row, R_PHASE, PHASE_EXECUTE)
+    build_request(var t, row)
+    EV_NONE
+
+// ── Results and state ───────────────────────────────────────────────
+
+// The ATT_MTU of the bearer, 0 for a bearer that is not open.
+pub @tier(embedded)
+@no_alloc
+fn mtu(var t: ClientTable, link: links.LinkId, bearer: Int) -> Int
+    let row = row_of(t, link, bearer)
+    if row < 0 then 0 else rd(var t, row, R_MTU)
+
+// Whether the bearer has a request running or queued.
+@tier(embedded)
+@no_alloc
+fn is_busy(var t: ClientTable, link: links.LinkId, bearer: Int) -> Bool
+    let row = row_of(t, link, bearer)
+    row >= 0 and (rd(var t, row, R_OP) != OP_NONE or rd(var t, row, R_Q_LEN) > 0)
+
+// Whether a transaction timed out on the bearer, which ends its use.
+pub @tier(embedded)
+@no_alloc
+fn is_dead(var t: ClientTable, link: links.LinkId, bearer: Int) -> Bool
+    let row = row_of(t, link, bearer)
+    row >= 0 and rd(var t, row, R_DEAD) != 0
+
+// The ticket of the request that ended last on the bearer.
+@tier(embedded)
+@no_alloc
+fn result_ticket(var t: ClientTable, link: links.LinkId, bearer: Int) -> Int
+    let row = row_of(t, link, bearer)
+    if row < 0 then 0 else rd(var t, row, R_DONE_TICKET)
+
+// How the request that ended last on the bearer ended: `STATUS_OK`, an ATT
+// Error Code or one of the engine's `STATUS_` codes.
+pub @tier(embedded)
+@no_alloc
+fn result_status(var t: ClientTable, link: links.LinkId, bearer: Int) -> Int
+    let row = row_of(t, link, bearer)
+    if row < 0 then 0 else rd(var t, row, R_STATUS)
+
+// The handle an Error Response named, else 0.
+@tier(embedded)
+@no_alloc
+fn result_handle(var t: ClientTable, link: links.LinkId, bearer: Int) -> Int
+    let row = row_of(t, link, bearer)
+    if row < 0 then 0 else rd(var t, row, R_ERR_HANDLE)
+
+// The number of records the request that ended last added to the cache.
+@tier(embedded)
+@no_alloc
+fn result_found(var t: ClientTable, link: links.LinkId, bearer: Int) -> Int
+    let row = row_of(t, link, bearer)
+    if row < 0 then 0 else rd(var t, row, R_DONE_FOUND)
+
+// The octets in each handle and value pair of a Read By Type answer.
+pub @tier(embedded)
+@no_alloc
+fn result_item_len(var t: ClientTable, link: links.LinkId, bearer: Int) -> Int
+    let row = row_of(t, link, bearer)
+    if row < 0 then 0 else rd(var t, row, R_ITEM_LEN)
+
+// The octets in the value buffer: the value a read produced.
+pub @tier(embedded)
+@no_alloc
+fn value_len(var t: ClientTable, link: links.LinkId, bearer: Int) -> Int
+    let row = row_of(t, link, bearer)
+    if row < 0 then 0 else rd(var t, row, R_VAL_LEN)
+
+// Octet `index` of the value buffer, 0 past its length.
+pub @tier(embedded)
+@no_alloc
+fn value_at(var t: ClientTable, link: links.LinkId, bearer: Int, index: Int) -> Int
+    let row = row_of(t, link, bearer)
+    if row < 0 or index < 0 or index >= rd(var t, row, R_VAL_LEN)
+        0
+    else
+        t.value[row * value_octets() + index] as Int
+
+// The handle of the notification or indication `on_pdu` reported last.
+pub @tier(embedded)
+@no_alloc
+fn event_handle(var t: ClientTable, link: links.LinkId, bearer: Int) -> Int
+    let row = row_of(t, link, bearer)
+    if row < 0 then 0 else rd(var t, row, R_EVT_HANDLE)
+
+// The first and the last handle of the Service Changed indication reported
+// last.
+@tier(embedded)
+@no_alloc
+fn service_changed_first(var t: ClientTable, link: links.LinkId, bearer: Int) -> Int
+    let row = row_of(t, link, bearer)
+    if row < 0 then 0 else rd(var t, row, R_SC_FIRST)
+
+@tier(embedded)
+@no_alloc
+fn service_changed_last(var t: ClientTable, link: links.LinkId, bearer: Int) -> Int
+    let row = row_of(t, link, bearer)
+    if row < 0 then 0 else rd(var t, row, R_SC_LAST)
+
+// Whether the peer answered a request Database Out Of Sync since the last
+// Database Hash read.
+@satisfies("REQ-BLE-GATT-CE-007")
+@tier(embedded)
+@no_alloc
+fn is_stale(var t: ClientTable, link: links.LinkId) -> Bool
+    let slot = slot_of(var t, link)
+    slot >= 0 and (t.flags[slot] & F_STALE) != 0
+
+// Whether the cache was dropped because the peer's database changed, and
+// clears the answer.
+@satisfies("REQ-BLE-GATT-CE-007")
+@tier(embedded)
+@no_alloc
+fn take_changed(var t: ClientTable, link: links.LinkId) -> Bool
+    let slot = slot_of(var t, link)
+    if slot < 0 or (t.flags[slot] & F_CHANGED) == 0
+        false
+    else
+        t.flags[slot] = t.flags[slot] & 0xFFFB
+        true
+
+// Whether a status is an ATT Error Code the peer sent.
+pub @satisfies("REQ-BLE-GATT-CE-008")
+@tier(embedded)
+@no_alloc
+fn is_peer_error(status: Int) -> Bool
+    status >= 1 and status <= 0xFF
+
+// Whether the peer refused for security: Insufficient Authentication,
+// Authorization, Encryption Key Size or Encryption.  A procedure ended this
+// way sent nothing more; whether to raise the link's security and retry is the
+// caller's.
+@satisfies("REQ-BLE-GATT-CE-008")
+@tier(embedded)
+@no_alloc
+fn needs_security(status: Int) -> Bool
+    status == att.ATT_ERR_INSUFFICIENT_AUTHENTICATION or status == att.ATT_ERR_INSUFFICIENT_AUTHORIZATION
+        or status == att.ATT_ERR_INSUFFICIENT_ENC_KEY_SIZE or status == att.ATT_ERR_INSUFFICIENT_ENCRYPTION
+
+// Whether the peer's database changed under the client: the cache and the
+// handles in it may be wrong until the Database Hash is read.
+@satisfies("REQ-BLE-GATT-CE-008")
+@tier(embedded)
+@no_alloc
+fn is_out_of_sync(status: Int) -> Bool
+    status == att.ATT_ERR_DATABASE_OUT_OF_SYNC
+
+// Whether the status is one the engine made: a timeout, a response it could
+// not read, a full cache, a value cut to fit or a reliable write that did not
+// echo.
+pub @satisfies("REQ-BLE-GATT-CE-008")
+@tier(embedded)
+@no_alloc
+fn is_local(status: Int) -> Bool
+    status >= 0x100
+
+// ── Tests ───────────────────────────────────────────────────────────
+//
+// The tests of the engine against a GATT server are in
+// tests/gatt_client_engine_tests.nv; these cover what needs no peer.
+
+@test
+fn test_the_capacities_are_the_limits()
+    var t = new_table()
+    test.assert_eq(links(), max1(noble_config.MAX_CLIENT_LINKS))
+    test.assert_eq(bearers(), max1(noble_config.CLIENT_BEARERS))
+    test.assert_eq(cache(), max1(noble_config.CLIENT_CACHE_RECORDS))
+    test.assert_eq(queue(), max1(noble_config.CLIENT_QUEUE))
+    test.assert_eq(value_octets(), max1(noble_config.CLIENT_VALUE_BYTES))
+    test.assert_eq(pdu_octets(), noble_config.MAX_ATT_MTU)
+    test.assert_eq(t.generation.capacity(), links())
+    test.assert_eq(t.opened.capacity(), links())
+    test.assert_eq(t.flags.capacity(), links())
+    test.assert_eq(t.sc_handle.capacity(), links())
+    test.assert_eq(t.cache_n.capacity(), links())
+    test.assert_eq(t.hash.capacity(), links() * HASH_OCTETS)
+    test.assert_eq(t.c_kind.capacity(), links() * cache())
+    test.assert_eq(t.c_flags.capacity(), links() * cache())
+    test.assert_eq(t.c_handle.capacity(), links() * cache())
+    test.assert_eq(t.c_a.capacity(), links() * cache())
+    test.assert_eq(t.c_b.capacity(), links() * cache())
+    test.assert_eq(t.c_lo.capacity(), links() * cache())
+    test.assert_eq(t.c_hi.capacity(), links() * cache())
+    test.assert_eq(t.regs.capacity(), links() * bearers() * REGS)
+    test.assert_eq(t.queue.capacity(), links() * bearers() * queue() * QUEUE_FIELDS)
+    test.assert_eq(t.value.capacity(), links() * bearers() * value_octets())
+    test.assert_eq(t.payload.capacity(), links() * bearers() * value_octets())
+    test.assert_eq(t.tx.capacity(), links() * bearers() * pdu_octets())
+
+@test
+fn test_every_column_is_filled_to_its_capacity()
+    var t = new_table()
+    test.assert(t.regs.is_full())
+    test.assert(t.queue.is_full())
+    test.assert(t.value.is_full())
+    test.assert(t.tx.is_full())
+    test.assert(t.c_lo.is_full())
+    test.assert(t.hash.is_full())
+
+@test
+fn test_init_table_fills_a_table_of_empty_columns_and_returns_one_in_use_to_its_first_state()
+    var t = ClientTable {
+        generation: Vec.new(), opened: Vec.new(), flags: Vec.new(), sc_handle: Vec.new(), cache_n: Vec.new(),
+        hash: Vec.new(), c_kind: Vec.new(), c_flags: Vec.new(), c_handle: Vec.new(), c_a: Vec.new(),
+        c_b: Vec.new(), c_lo: Vec.new(), c_hi: Vec.new(), regs: Vec.new(), queue: Vec.new(),
+        value: Vec.new(), payload: Vec.new(), tx: Vec.new() }
+    test.assert_eq(t.regs.len(), 0)
+    init_table(var t)
+    test.assert(t.regs.is_full())
+    test.assert(t.tx.is_full())
+    let id = links.link_id(0, 1)
+    test.assert(open(t, id))
+    test.assert_eq(slot_of(var t, id), 0)
+    t.regs[3] = 77
+    init_table(var t)
+    test.assert_eq(slot_of(var t, id), -1)
+    test.assert_eq(t.regs[3], 0)
+    test.assert(t.regs.is_full())
+
+@test
+fn test_a_uuid_on_the_base_is_its_short_form()
+    let lo = base_lo()
+    let hi = 0x1000 | (0x180F << 32)
+    let u = uuid128(lo, hi)
+    test.assert(not u.wide)
+    test.assert(uuid_same(u, uuid16(0x180F)))
+    test.assert_eq(short_of(lo, hi), 0x180F)
+    test.assert_eq(short_of(lo + 1, hi), -1)
+    test.assert_eq(short_of(lo, hi | 0x10000), -1)
+
+@test
+fn test_other_uuids_stay_wide_and_compare_by_value()
+    let a = uuid128(0x1122334455667788, 0x0102030405060708)
+    let b = uuid128(0x1122334455667788, 0x0102030405060708)
+    let c = uuid128(0x1122334455667788, 0x0102030405060709)
+    test.assert(a.wide)
+    test.assert(uuid_same(a, b))
+    test.assert(not uuid_same(a, c))
+    test.assert(not uuid_same(a, uuid16(0x1122)))
+
+@test
+fn test_a_link_is_named_by_its_slot_and_generation()
+    var t = new_table()
+    let first = links.link_id(1, 4)
+    test.assert(open(t, first))
+    test.assert_eq(slot_of(var t, first), 1)
+    test.assert_eq(slot_of(var t, links.link_id(1, 5)), -1)
+    test.assert_eq(slot_of(var t, links.link_id(0, 4)), -1)
+    test.assert(open(t, links.link_id(1, 5)))
+    test.assert_eq(slot_of(var t, first), -1)
+    test.assert_eq(slot_of(var t, links.link_id(1, 5)), 1)
+
+@test
+fn test_a_slot_the_table_does_not_have_does_not_open()
+    var t = new_table()
+    test.assert(not open(t, links.link_id(links(), 0)))
+    test.assert(not open(t, links.link_id(-1, 0)))
+    test.assert_eq(slot_of(var t, links.no_link()), -1)
+
+@test
+fn test_a_closed_link_names_nothing()
+    var t = new_table()
+    let id = links.link_id(0, 1)
+    test.assert(open(t, id))
+    close(var t, id)
+    test.assert_eq(slot_of(var t, id), -1)
+    test.assert_eq(begin_read(t, id, 0, 3), ERR_NO_LINK)
+
+@test
+fn test_a_request_on_a_bearer_that_is_not_open_is_refused()
+    var t = new_table()
+    let id = links.link_id(0, 1)
+    test.assert(open(t, id))
+    test.assert_eq(begin_read(t, id, 1, 3), ERR_NO_BEARER)
+    test.assert_eq(begin_read(t, id, bearers(), 3), ERR_NO_BEARER)
+    test.assert_eq(begin_read(t, id, -1, 3), ERR_NO_BEARER)
+    test.assert(open_bearer(t, id, 1, 100))
+    test.assert_eq(mtu(var t, id, 1), 100)
+    test.assert(begin_read(t, id, 1, 3) > 0)
+
+@test
+fn test_an_enhanced_bearer_takes_the_mtu_of_its_channel_and_no_exchange()
+    var t = new_table()
+    let id = links.link_id(0, 1)
+    test.assert(open(t, id))
+    test.assert(not open_bearer(t, id, 0, 100))
+    test.assert(not open_bearer(t, id, bearers(), 100))
+    test.assert(not open_bearer(t, id, 1, DEFAULT_MTU - 1))
+    test.assert(not open_bearer(t, id, 1, pdu_octets() + 1))
+    test.assert(open_bearer(t, id, 1, 64))
+    test.assert_eq(begin_exchange_mtu(var t, id, 1), ERR_ARGUMENT)
+    close_bearer(var t, id, 1)
+    test.assert_eq(mtu(var t, id, 1), 0)
+
+@test
+fn test_a_range_is_checked_before_a_request_is_queued()
+    var t = new_table()
+    let id = links.link_id(0, 1)
+    test.assert(open(t, id))
+    test.assert_eq(begin_discover_services(var t, id, 0, 0, 5, false), ERR_ARGUMENT)
+    test.assert_eq(begin_discover_services(var t, id, 0, 6, 5, false), ERR_ARGUMENT)
+    test.assert_eq(begin_discover_characteristics(var t, id, 0, 1, 0x10000), ERR_ARGUMENT)
+    test.assert_eq(begin_read(t, id, 0, 0), ERR_ARGUMENT)
+    test.assert_eq(begin_read_long(var t, id, 0, 0x10000), ERR_ARGUMENT)
+    test.assert_eq(begin_subscribe(var t, id, 0, 9, 4), ERR_ARGUMENT)
+    test.assert(not is_busy(var t, id, 0))
+
+@test
+fn test_status_codes_map_to_what_a_caller_does_about_them()
+    test.assert(is_peer_error(att.ATT_ERR_READ_NOT_PERMITTED))
+    test.assert(not is_peer_error(STATUS_OK))
+    test.assert(not is_peer_error(STATUS_TIMEOUT))
+    test.assert(needs_security(att.ATT_ERR_INSUFFICIENT_AUTHENTICATION))
+    test.assert(needs_security(att.ATT_ERR_INSUFFICIENT_AUTHORIZATION))
+    test.assert(needs_security(att.ATT_ERR_INSUFFICIENT_ENC_KEY_SIZE))
+    test.assert(needs_security(att.ATT_ERR_INSUFFICIENT_ENCRYPTION))
+    test.assert(not needs_security(att.ATT_ERR_WRITE_NOT_PERMITTED))
+    test.assert(is_out_of_sync(att.ATT_ERR_DATABASE_OUT_OF_SYNC))
+    test.assert(is_local(STATUS_TIMEOUT))
+    test.assert(is_local(STATUS_MISMATCH))
+    test.assert(not is_local(att.ATT_ERR_INVALID_HANDLE))

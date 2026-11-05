@@ -1,0 +1,37 @@
+# The Host core's part of the profile configs/pc.toml of orbit/ble, for the tests of this package (tests/ and src/ run with
+# `novo test --config configs/pc.toml`).  orbit/ble/configs/pc.toml holds the same [noble] section; tests/orbit/test_ble_config_equals_limits.sh holds the two to each other.
+
+[noble]
+max_connections = 4
+acl_buffers = 7
+max_attributes = 256
+max_value_bytes = 8192
+max_uuid128 = 32
+max_cccd = 64
+max_prepared_bytes = 512
+max_bearers = 5
+max_coc_channels = 8
+max_bonds = 8
+max_pairing = 2
+max_cis = 4
+max_big = 2
+max_bis = 4
+iso_buffers = 7
+max_ases = 4
+max_aics = 4
+max_vocs = 4
+max_presets = 16
+max_set_size = 8
+sequenced_slots = 8
+max_client_links = 4
+client_bearers = 3
+client_cache_records = 128
+client_queue = 8
+client_value_bytes = 512
+max_bcast_sources = 4
+max_unicast_streams = 4
+max_bcast_sinks = 4
+max_gaf_clients = 4
+max_ctl_instances = 8
+max_bas = 4
+max_has_cache = 16

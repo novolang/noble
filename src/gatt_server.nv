@@ -1,0 +1,3700 @@
+// gatt_server.nv — the GATT server: its attribute database and the
+// Attribute Protocol server that answers from it.
+//
+// The database is a list of attributes in handle order ([Vol 3] Part F,
+// Section 3.2): each has a handle, an attribute type (a 16-bit or 128-bit
+// UUID, least significant octet first), a value and permissions.  The GAP
+// and GATT services come first, from the record table of
+// `gatt_db.build_gap_server` (`from_records`); every other service is added
+// at run time by `add_service`, `add_characteristic`, `add_descriptor` and
+// `add_included`, which the BTP GATT commands call, with the permissions
+// the command carries.
+//
+// Permissions are the bits of the BTP GATT service (auto-pts
+// doc/btp_gatt.txt): Read, Write, Read and Write with Encryption, with
+// Authentication and with Authorization, and two bits more for LE Secure
+// Connections.  A program that is not driven over BTP names the access of
+// an attribute with `Access` and `Permissions`, which `permission_bits`
+// turns into the bits.  An attribute that asks for
+// encryption or authentication can also name the encryption key size it
+// needs (`set_key_size`).  Against a request the server checks, in this
+// order ([Vol 3] Part F, Section 3.2.5, and [Vol 3] Part C, Section
+// 10.3.1): that the attribute may be read or written at all (Read Not
+// Permitted, Write Not Permitted); that the link is encrypted when
+// encryption or authentication is required, answering Insufficient
+// Encryption when the Host holds a key for the peer and Insufficient
+// Authentication when it does not; that the link is authenticated (LE
+// security mode 1 level 3 or 4) when authentication is required; that
+// the client is authorized, which no client is; and that the encryption
+// key size is large enough (Encryption Key Size Too Short).  A Secure
+// Connections attribute needs security mode 1 level 4 and answers
+// Insufficient Authentication below it.
+//
+// The Attribute Protocol runs over one or more ATT bearers ([Vol 3] Part
+// F, Section 3.2.11): the unenhanced bearer, the Attribute Protocol fixed
+// channel CID 0x0004, and, per channel of the Enhanced ATT PSM 0x0027, an
+// enhanced bearer ([Vol 3] Part G, Section 5.3).  Each bearer has its own
+// ATT_MTU and its own transaction state, so `Bearer` holds both: the MTU
+// the bearer's PDUs are cut to and the indication waiting for its
+// confirmation.  The ATT_MTU is 23 on the unenhanced bearer until an MTU
+// exchange changes it and the smallest of the two L2CAP MTUs on an
+// enhanced one, which is where an enhanced bearer gets it (Section 5.3.1)
+// and why an ATT_EXCHANGE_MTU_REQ on it is answered Request Not Supported.
+// The bearer table is opened and closed by the link that owns the
+// channels (`open_bearer` and `retain_bearers`), and bearer 0 is always
+// the unenhanced one.
+//
+// The module keeps two things apart.  `GattDb` is the database and the
+// rules on it, held once however many clients are connected.  `AttLink` is
+// the state of the Attribute Protocol for one connection: the bearer table,
+// the Client Characteristic Configuration descriptor values of that client
+// ([Vol 3] Part G, Section 3.3.3.3), the prepare queue of queued writes
+// ([Vol 3] Part F, Section 3.4.6), which belongs to the client rather than
+// to one bearer -- an Execute Write Request on any bearer writes what was
+// prepared on all of them -- the security of the link, which the Security
+// Manager reports through `set_security`, the Robust Caching state and the
+// values of attributes that are per connection.  A function that reads or
+// writes only the database takes a `GattDb`, one that concerns only a
+// connection takes an `AttLink`, and a request handler takes both.
+// `GattServer` pairs one of each for a program with one client.
+//
+// Satisfies: REQ-BLE-EATT-001 (the bearer table and its channels), -002
+// (an enhanced bearer's ATT_MTU and the exchange it refuses), -003 (one
+// ATT PDU per K-frame), -004 (a bearer's own transaction state), -005
+// (the client's Enhanced ATT bearer bit), -006 (a signed write on an
+// enhanced bearer) and -007 (the bearers the client role speaks on).
+//
+// A write can also be checked against the state a service holds
+// (`add_write_guard`): the control services of the Generic Audio Framework
+// answer a stale Change_Counter, a gain out of range or a lock held by
+// another client with an Application Error Code, and the response to a write
+// cannot wait for the program.  The rules belong to the service that adds the
+// guard and reach this module as a `GuardRule` (`gaf/control_rules.nv` holds
+// those of the control services); this module imports none of them.
+//
+// `receive` answers one ATT PDU of the unenhanced bearer and
+// `receive_on` one of the bearer it names, and both return the PDUs to
+// send in order.  The module performs no I/O and holds no clock:
+// functions that time take the caller's monotonic clock in milliseconds.
+
+use std.test
+use att
+use att_server
+use gatt_db
+use smp_keys
+use uuid
+use prims.aes_cmac
+
+// Attribute types of the GATT profile ([Vol 3] Part G, Section 3.4).
+pub const UUID_PRIMARY_SERVICE = 0x2800
+const UUID_SECONDARY_SERVICE = 0x2801
+const UUID_INCLUDE = 0x2802
+const UUID_CHARACTERISTIC = 0x2803
+// The 16-bit UUID of the Characteristic Extended Properties descriptor ([Vol 3] Part G, Section 3.3.3.1).
+pub const UUID_CHARACTERISTIC_EXTENDED_PROPERTIES = 0x2900
+// The 16-bit UUID of the Characteristic User Description descriptor ([Vol 3] Part G, Section 3.3.3.2).
+pub const UUID_CHARACTERISTIC_USER_DESCRIPTION = 0x2901
+// The 16-bit UUID of the Client Characteristic Configuration descriptor ([Vol 3] Part G, Section 3.3.3.3).
+pub const UUID_CLIENT_CHARACTERISTIC_CONFIGURATION = 0x2902
+const UUID_SERVER_CHARACTERISTIC_CONFIGURATION = 0x2903
+// The 16-bit UUID of the Characteristic Presentation Format descriptor ([Vol 3] Part G, Section 3.3.3.5).
+pub const UUID_CHARACTERISTIC_PRESENTATION_FORMAT = 0x2904
+const UUID_CHARACTERISTIC_AGGREGATE_FORMAT = 0x2905
+const UUID_SERVICE_CHANGED = 0x2A05
+const UUID_CLIENT_SUPPORTED_FEATURES = 0x2B29
+const UUID_DATABASE_HASH = 0x2B2A
+
+// Permission bits, as the BTP GATT service carries them.
+pub const PERM_READ = 0x01
+// The attribute can be written.
+pub const PERM_WRITE = 0x02
+// The attribute can be read only on an encrypted link.
+pub const PERM_READ_ENCRYPT = 0x04
+// The attribute can be written only on an encrypted link.
+pub const PERM_WRITE_ENCRYPT = 0x08
+const PERM_READ_AUTHEN = 0x10
+const PERM_WRITE_AUTHEN = 0x20
+const PERM_READ_AUTHOR = 0x40
+const PERM_WRITE_AUTHOR = 0x80
+
+// Two bits above the BTP set: the attribute needs LE Secure Connections
+// pairing, security mode 1 level 4 ([Vol 3] Part C, Section 10.2.1), to be
+// read or written.  They are set together with the authentication bit of
+// the same direction, so every check that asks for authentication holds for
+// them too.
+const PERM_READ_SC = 0x100
+const PERM_WRITE_SC = 0x200
+
+// What a client must have to read or to write an attribute.  Denied: the
+// attribute cannot be read (written) at all.  Open: any link.  Authorized:
+// any link, but the application authorizes the client, so the request is
+// answered Insufficient Authorization.  Encrypted: an encrypted link.
+// Authenticated: an encrypted link whose key came from authenticated
+// pairing, security mode 1 level 3.  SecureConnections: the same with LE
+// Secure Connections pairing, level 4.
+pub enum Access
+    Denied
+    Open
+    Authorized
+    Encrypted
+    Authenticated
+    SecureConnections
+
+// The read and the write access of one attribute.
+pub struct Permissions
+    read: Access
+    write: Access
+
+// The same access in both directions.
+pub fn both_ways(access: Access) -> Permissions
+    Permissions { read: access, write: access }
+
+// Readable and writable on any link.
+pub fn open_permissions() -> Permissions
+    both_ways(Access.Open)
+
+// The permission bits that grant `access` for reading (`write` false) or
+// for writing (`write` true).
+fn access_bits(access: Access, write: Bool) -> Int
+    match access
+        Denied => 0
+        Open => if write then PERM_WRITE else PERM_READ
+        Authorized => if write then PERM_WRITE_AUTHOR else PERM_READ_AUTHOR
+        Encrypted => if write then PERM_WRITE_ENCRYPT else PERM_READ_ENCRYPT
+        Authenticated => if write then PERM_WRITE_AUTHEN else PERM_READ_AUTHEN
+        SecureConnections => if write then PERM_WRITE_AUTHEN | PERM_WRITE_SC else PERM_READ_AUTHEN | PERM_READ_SC
+
+// The permission bits of `permissions`, for `add_characteristic` and
+// `add_descriptor`.
+fn permission_bits(permissions: Permissions) -> Int
+    access_bits(permissions.read, false) | access_bits(permissions.write, true)
+
+// Characteristic Properties ([Vol 3] Part G, Section 3.3.1.1).
+pub const PROP_READ = 0x02
+// The characteristic property Write Without Response.
+pub const PROP_WRITE_WO_RESP = 0x04
+// The characteristic property Write.
+pub const PROP_WRITE = 0x08
+// The characteristic property Notify.
+pub const PROP_NOTIFY = 0x10
+// The characteristic property Indicate.
+pub const PROP_INDICATE = 0x20
+// The characteristic property Extended Properties: a Characteristic Extended Properties descriptor follows.
+pub const PROP_EXTENDED_PROPERTIES = 0x80
+
+// Client Characteristic Configuration bits ([Vol 3] Part G, Table 3.11).
+pub const CCC_NOTIFICATION = 0x0001
+// The Client Characteristic Configuration bit that enables indications.
+pub const CCC_INDICATION = 0x0002
+
+// Client Supported Features bits ([Vol 3] Part G, Table 7.6): Robust
+// Caching and the Enhanced ATT bearer, the features this device offers a
+// client.  The Enhanced ATT bearer bit is what a client sets to tell the
+// server it supports the fixed PSM 0x0027 (Section 5.3).  A client that
+// sets any other bit, RFU included, hears the bit cleared back.
+const CSF_ROBUST_CACHING = 0x01
+const CSF_ENHANCED_ATT = 0x02
+const CSF_SUPPORTED = CSF_ROBUST_CACHING | CSF_ENHANCED_ATT
+
+// The octets of the Authentication Signature of ATT_SIGNED_WRITE_CMD
+// ([Vol 3] Part F, Table 3.33): a 4-octet SignCounter and the 8-octet
+// MAC.  The Attribute Value of the command is at most ATT_MTU - 15.
+pub const SIGNATURE_OCTETS = 12
+const SIGNED_WRITE_HEADER = 3 + SIGNATURE_OCTETS
+
+// The default ATT_MTU of the unenhanced ATT bearer ([Vol 3] Part G,
+// Section 5.2.1).  An enhanced ATT bearer takes its ATT_MTU from the two
+// L2CAP MTUs of its channel (Section 5.3.1), which are never below the 64
+// octets the fixed PSM's channel is created with.
+pub const ATT_DEFAULT_MTU = 23
+
+// The Attribute Protocol fixed channel, CID 0x0004 ([Vol 3] Part G,
+// Section 5.2.2): the channel of the unenhanced ATT bearer, which is the
+// key its entry in the bearer table is held under.
+const CID_ATT_BEARER = 0x0004
+
+// The longest attribute value ([Vol 3] Part F, Section 3.2.9).
+pub const ATT_VALUE_MAX = 512
+
+// The Database Hash value is a 128-bit unsigned integer ([Vol 3] Part G,
+// Table 7.8).
+const HASH_OCTETS = 16
+
+// The Attribute Protocol transaction timeout, 30 s ([Vol 3] Part F,
+// Section 3.3.3): an indication not confirmed within it ends the use of
+// the bearer ([Vol 3] Part G, Section 4.14).
+const ATT_TRANSACTION_TIMEOUT_MS = 30000
+
+// The number of prepared writes the prepare queue holds; one more is
+// answered with Prepare Queue Full ([Vol 3] Part F, Section 3.4.6.1).
+const PREPARE_QUEUE_CAPACITY = 64
+
+// One attribute.  `max_len` is the longest value a client may write: the
+// length the value had when the tester set it, or ATT_VALUE_MAX for an
+// attribute that never got one.  `key_size` is the encryption key size
+// the attribute needs, 0 for none.  `tester` marks an attribute added
+// over BTP, whose writes the tester hears of.  `included` is, for an
+// include declaration, the handle of the service it includes.  `per_link`
+// marks an attribute whose value belongs to each connection
+// (`make_per_link`): `value` is then the value a connection that has set
+// none reads, and a write by a client lands in that client's own
+// `AttLink.link_values`.
+pub struct GattAttribute
+    handle: Int
+    type_uuid: [u8]
+    var value: [u8]
+    var max_len: Int
+    permissions: Int
+    var key_size: Int
+    tester: Bool
+    included: Int
+    var per_link: Bool
+
+// A rule on the first octet of the writes to one attribute: a write whose
+// first octet is not in `allowed` is answered with the Error Code `error`.
+struct OctetRule
+    handle: Int
+    allowed: [Int]
+    error: Int
+
+// A rule on the format of the writes to one attribute: a write must be
+// `length` octets long (any length when `length` is -1), must start at
+// offset 0 and must have none of the bits of `reserved_mask` set in its
+// little-endian value, or it is answered with the Error Code `error`.
+struct ValueRule
+    handle: Int
+    length: Int
+    reserved_mask: Int
+    error: Int
+
+// The hook a service registers with `add_write_guard`: a named function that
+// decides one access to a guarded attribute.  `kind` is the service's own name
+// for the rule, `read` is true for a read of the attribute and false for a
+// write, `value` and `offset` are the written value and its offset, `state` and
+// `props` are the values of the two attributes the rule reads, `data` its
+// standing data (a read has no value and reads no attribute, and passes the
+// standing data in the three lists and 0 as the offset, so that it allocates
+// none), `ccc` the writer's configuration of
+// the attribute, `owner` the holder the rule records and `writer` the identity
+// of the writing client.  The result is an ATT Error Code, 0 to let the access
+// go ahead.  A named function, not a closure: the embedded tier admits it and
+// a guard holds no more than the address.
+alias GuardRule = fn(Int, Bool, [u8], Int, [u8], [u8], [u8], Int, Int, Int) -> Int
+
+// A rule on the writes to one attribute, or on the reads of it, that depends
+// on the state a service keeps (`add_write_guard`).  `rule` decides it and
+// `kind` is the name the service gives it.  `state` and `props` are the handles of the
+// attributes whose values the rule reads (0 for none), `data` the standing
+// data the service keeps up to date, and `owner` the identity of the client
+// that holds the resource the rule guards, 0 for none.
+struct WriteGuard
+    handle: Int
+    rule: GuardRule
+    kind: Int
+    state: Int
+    props: Int
+    var data: [u8]
+    var owner: Int
+
+// One prepared write of the prepare queue.
+struct PreparedWrite
+    handle: Int
+    offset: Int
+    value: [u8]
+
+// One ATT bearer.  `channel` names the channel that carries it: the
+// Attribute Protocol fixed channel CID 0x0004 for the unenhanced bearer,
+// and the number towards the upper layer of the L2CAP channel for an
+// enhanced one ([Vol 3] Part F, Section 3.2.11).  A bearer's own state is
+// its ATT_MTU, the indication waiting for its confirmation, when that
+// indication's transaction times out ([Vol 3] Part G, Section 4.14), the
+// indications queued behind it, and whether a transaction has timed out
+// on it, after which nothing more is sent over it.
+struct Bearer
+    channel: Int
+    enhanced: Bool
+    var mtu: Int
+    var indicating: Int
+    var deadline_ms: Int
+    var waiting: [[u8]]
+    var timed_out: Bool
+
+fn new_bearer(channel: Int, enhanced: Bool, mtu: Int) -> Bearer
+    Bearer { channel: channel, enhanced: enhanced, mtu: mtu, indicating: 0, deadline_ms: 0, waiting: [], timed_out: false }
+
+// The security of the link: whether it is encrypted, its LE security mode
+// 1 level ([Vol 3] Part C, Section 10.2.1), the encryption key size, and
+// whether the Host holds a Long Term Key for the peer.
+struct LinkSecurity
+    encrypted: Bool
+    level: Int
+    key_size: Int
+    has_ltk: Bool
+
+// The Client Characteristic Configuration values of a bonded client,
+// its Client Supported Features value ([Vol 3] Part G, Section 7.2:
+// "For clients with a trusted relationship, the characteristic value
+// shall be persistent across connections"), the database generation it
+// was last change-aware at (Section 2.5.2.1) and the last SignCounter
+// verified with its CSRK (Section 7.2 of Part H, Section 2.4.5), kept
+// across connections.
+struct SavedConfiguration
+    address_type: Int
+    address: [u8]
+    values: [Int]
+    csf: Int
+    generation: Int
+    sign_counter: Int
+    client_sign_counter: Int
+
+// The part of a GATT server that every connection shares: the attribute
+// database and the rules on it.  `attributes` is the table in handle
+// order; `rx_mtu` the Server Rx MTU an ATT_EXCHANGE_MTU_REQ is answered
+// with; `generation` counts the changes to the database definitions, and a
+// connection compares it with the generation it last saw (`AttLink`).
+// `saved` is the configuration the bond store keeps for each bonded client
+// across connections.  `indication_rules` holds the handles of the control
+// points that need an indication (`require_indication`), three entries
+// each: the handle, the Error Code for a client that has not enabled
+// indications and the Error Code for a write while an indication of the
+// handle is unconfirmed; `octet_rules` the first-octet rules of
+// `restrict_first_octet`; `value_rules` the format rules of
+// `require_value_format`.  The database is stored once however many
+// connections the Host holds: every `AttLink` is paired with it by the
+// caller of each handler.
+pub struct GattDb
+    var attributes: [GattAttribute]
+    rx_mtu: Int
+    var saved: [SavedConfiguration]
+    var generation: Int
+    var indication_rules: [Int]
+    var octet_rules: [OctetRule]
+    var value_rules: [ValueRule]
+    var guards: [WriteGuard]
+    var long_reads: [Int]
+
+// The value of a per-connection attribute (`make_per_link`) for the client
+// of one connection.
+pub struct LinkValue
+    handle: Int
+    value: [u8]
+
+// The state of the Attribute Protocol for the client of one connection.
+// `bearers` is its ATT bearer table, the unenhanced bearer first; `cccd`
+// holds handle and value pairs for the client of the connection.
+// `changed` lists the handles of tester attributes the client wrote since
+// `take_changed`; `client_rx` the PDUs that belong to the client role
+// (responses, notifications and indications from the peer's server).
+// `link_values` holds the values of the attributes that are per
+// connection (`make_per_link`).
+//
+// `csf` is the Client Supported Features value of this client and
+// `peer_csrk` its Connection Signature Resolving Key, empty when the
+// peer distributed none ([Vol 3] Part G, Section 7.2; Part H, Section
+// 2.4.5).  `aware_generation` is the database generation this client is
+// change-aware of, and `change_unaware`, `hash_read` and
+// `robust_error_sent` the Robust Caching state of Section 2.5.2.1: whether
+// the client is change-unaware, whether it has read the Database Hash
+// since the last change, and whether the Database Out Of Sync response has
+// already been sent for it.  `seen_generation` is the database generation
+// that state was last brought up to (`sync`): a change of the definitions
+// makes every connected client change-unaware, and a connection learns of
+// it at its next handler call.  `sign_counter` is the last SignCounter
+// verified with `peer_csrk`, -1 while the peer has signed nothing yet: the
+// first signed command of a device carries SignCounter 0 ([Vol 3] Part H,
+// Section 2.4.5), so 0 cannot stand for "none".
+pub struct AttLink
+    var bearers: [Bearer]
+    var cccd: [Int]
+    var prepare_queue: [PreparedWrite]
+    var security: LinkSecurity
+    var changed: [Int]
+    var client_rx: [[u8]]
+    var link_values: [LinkValue]
+    var csf: Int
+    var peer_csrk: [u8]
+    var sign_counter: Int
+    // The CSRK this device distributed to the bonded peer and the
+    // SignCounter of the last signed command sent with it, -1 while none
+    // has been sent ([Vol 3] Part H, Section 2.4.5): the peer refuses a
+    // counter it has seen, so the two belong together.
+    var client_csrk: [u8]
+    var client_sign_counter: Int
+    // The generation the definitions had when the prepare queue took its
+    // first part, -1 while the queue is empty: an Execute Write Request
+    // that arrives after the database changed cannot apply parts that
+    // were checked against definitions that are gone ([Vol 3] Part F,
+    // Section 3.4.6.3, and GATT/SR/GAW/BI-41-C).
+    var prepare_generation: Int
+    var aware_generation: Int
+    var seen_generation: Int
+    var change_unaware: Bool
+    var hash_read: Bool
+    var robust_error_sent: Bool
+    // The identity of the client, 0 until the program names it
+    // (`set_identity`): the same number for a bonded peer on every
+    // connection and a number of its own for a peer that is not bonded.
+    var identity: Int
+    // The Read Long rule (`add_read_long_rule`): for each guarded attribute the
+    // handle and a stamp of the value this client read last at offset 0.
+    var read_stamps: [Int]
+
+// A database and the state of one connection to it: what a program with a
+// single client holds, and what the tests of one connection build.  A
+// program with several connections holds one `GattDb` and one `AttLink`
+// for each.
+pub struct GattServer
+    var db: GattDb
+    var link: AttLink
+
+// The security state of a link: whether it is encrypted, the security level and the key size of that encryption, and
+// whether the Host holds the long term key.
+pub fn link_security(encrypted: Bool, level: Int, key_size: Int, has_ltk: Bool) -> LinkSecurity
+    LinkSecurity { encrypted: encrypted, level: level, key_size: key_size, has_ltk: has_ltk }
+
+// The security state of a link that is not encrypted and has no key.
+pub fn no_security() -> LinkSecurity
+    link_security(false, 1, 0, false)
+
+// A database with the attributes of `records`, the record table of
+// `att_server.build_db_record`, which answers ATT_EXCHANGE_MTU_REQ with
+// `rx_mtu`.
+pub fn new_db(records: [u8], rx_mtu: Int) -> GattDb
+    var db = GattDb {
+        attributes: from_records(records), rx_mtu: rx_mtu, saved: [], generation: 0,
+        indication_rules: [], octet_rules: [], value_rules: [], guards: [], long_reads: [] }
+    refresh_hash(var db)
+    db
+
+// The state of a new connection to `db`: the unenhanced bearer at the
+// default ATT_MTU, no configuration, no security, and change-aware of the
+// database as it is now.
+pub fn new_att_link(db: GattDb) -> AttLink
+    var link = AttLink {
+        bearers: [], cccd: [], prepare_queue: [], security: no_security(), changed: [], client_rx: [],
+        link_values: [], csf: 0, peer_csrk: [], sign_counter: -1, client_csrk: [], client_sign_counter: -1,
+        prepare_generation: -1, aware_generation: 0, seen_generation: 0, change_unaware: false,
+        hash_read: false, robust_error_sent: false, identity: 0, read_stamps: [] }
+    reset_bearer(db, var link)
+    link
+
+// A server with the attributes of `records` and one connection to it.
+pub fn new_server(records: [u8], rx_mtu: Int) -> GattServer
+    let db = new_db(records, rx_mtu)
+    GattServer { db: db, link: new_att_link(db) }
+
+// The attributes of a record table.  Declarations are readable; a
+// Characteristic Value is readable when its declaration has the Read
+// property ([Vol 3] Part G, Section 3.3.1.1), so the Service Changed
+// value, which is indicated, is not; nothing is writable but a Client
+// Characteristic Configuration descriptor and the Client Supported
+// Features value, which the client updates (Section 7.2, Table 7.5).
+fn from_records(records: [u8]) -> [GattAttribute]
+    var out: [GattAttribute] = []
+    var value_handle = 0
+    var readable = true
+    var writable = false
+    for i in 0..att_server.db_count(records)
+        let t = att_server.db_type16_at(records, i)
+        let handle = att_server.db_handle_at(records, i)
+        let value = att_server.db_value_at(records, i)
+        if t == UUID_CHARACTERISTIC and list.len(value) >= 3
+            value_handle = read_le16(value, 1)
+            readable = ((value[0] as Int) & PROP_READ) != 0
+            // The declaration's Write and Write Without Response bits say
+            // whether the value takes a write; a characteristic that
+            // declares only a write has no read permission at all.
+            writable = ((value[0] as Int) & (PROP_WRITE | PROP_WRITE_WO_RESP)) != 0
+        let perms = if t == UUID_CLIENT_CHARACTERISTIC_CONFIGURATION
+            PERM_READ | PERM_WRITE
+        else if t == UUID_CLIENT_SUPPORTED_FEATURES
+            PERM_READ | PERM_WRITE
+        else if handle == value_handle
+            (if readable then PERM_READ else 0) | (if writable then PERM_WRITE else 0)
+        else
+            PERM_READ
+        list.push(out, GattAttribute {
+            handle: handle, type_uuid: le16(t), value: value[:],
+            max_len: list.len(value), permissions: perms, key_size: 0, tester: false, included: 0, per_link: false })
+    out
+
+// A new connection, or the end of one: the ATT bearers start afresh with
+// the default ATT_MTU, no configuration and no security ([Vol 3] Part G,
+// Section 3.3.3.3: the configuration of a client that is not bonded is the
+// default at each connection).  The unenhanced bearer is the only one
+// until the link opens the channels of the Enhanced ATT PSM.  A client
+// without a trusted relationship starts change-aware ([Vol 3] Part G,
+// Section 2.5.2.1), and the Client Supported Features default is all bits
+// zero (Section 7.2); a bonded client's value and change-aware state come
+// back with its kept configuration.
+fn reset_bearer(db: GattDb, var link: AttLink)
+    link.bearers = [new_bearer(CID_ATT_BEARER, false, ATT_DEFAULT_MTU)]
+    link.cccd = []
+    link.prepare_queue = []
+    link.prepare_generation = -1
+    link.security = no_security()
+    link.changed = []
+    link.client_rx = []
+    link.link_values = []
+    link.csf = 0
+    link.peer_csrk = []
+    link.sign_counter = -1
+    link.change_unaware = false
+    link.hash_read = false
+    link.robust_error_sent = false
+    link.aware_generation = db.generation
+    link.seen_generation = db.generation
+
+// ── The ATT bearer table ────────────────────────────────────────────
+//
+// The table follows the channels of the link: the unenhanced bearer and
+// one bearer per channel of the Enhanced ATT PSM.  The link that owns the
+// channels calls `open_bearer` for each of them and `retain_bearers` with
+// the ones it still holds, so the table never disagrees with the channel
+// table.
+
+// How many ATT bearers the server has, the unenhanced one included.
+@satisfies("REQ-BLE-EATT-001")
+fn bearer_count(link: AttLink) -> Int
+    list.len(link.bearers)
+
+// The bearer at `index`, or None: the unenhanced bearer is 0.
+fn bearer_at(link: AttLink, index: Int) -> ?Bearer
+    if index < 0 or index >= list.len(link.bearers)
+        None
+    else
+        Some(link.bearers[index])
+
+// The index of the bearer carried by `channel`, or -1.  `enhanced` tells
+// the two kinds apart, because a channel's number towards the upper layer
+// and the fixed channel's 0x0004 can be the same number.
+pub fn bearer_of_channel(link: AttLink, channel: Int, enhanced: Bool) -> Int
+    for i in 0..list.len(link.bearers)
+        if link.bearers[i].channel == channel and link.bearers[i].enhanced == enhanced
+            return i
+    -1
+
+// The ATT_MTU of the bearer at `index`: for the unenhanced bearer the one
+// an MTU exchange left, for an enhanced one the smallest of the channel's
+// two L2CAP MTUs ([Vol 3] Part G, Section 5.3.1).
+pub fn mtu_of(link: AttLink, index: Int) -> Int
+    if index < 0 or index >= list.len(link.bearers)
+        ATT_DEFAULT_MTU
+    else
+        link.bearers[index].mtu
+
+// The channel that carries the bearer at `index`, 0 for none: CID 0x0004
+// for the unenhanced bearer, the L2CAP channel's number for an enhanced
+// one.
+fn channel_of_bearer(link: AttLink, index: Int) -> Int
+    if index < 0 or index >= list.len(link.bearers)
+        0
+    else
+        link.bearers[index].channel
+
+// Open the ATT bearer carried by `channel` with the ATT_MTU `mtu`, or
+// leave the one already there with that MTU: the index of the bearer.  An
+// enhanced bearer's MTU follows the channel's, so a channel whose L2CAP
+// MTU changed moves it here; the unenhanced bearer's MTU is an MTU
+// exchange's, which `exchange_mtu` sets.
+@satisfies("REQ-BLE-EATT-001")
+fn open_bearer(var link: AttLink, channel: Int, enhanced: Bool, mtu: Int) -> Int
+    let i = bearer_of_channel(link, channel, enhanced)
+    if i >= 0
+        if mtu > 0
+            var b = link.bearers[i]
+            b.mtu = mtu
+        return i
+    let index = list.len(link.bearers)
+    var fresh = new_bearer(channel, enhanced, if mtu > 0 then mtu else ATT_DEFAULT_MTU)
+    if not enhanced
+        fresh.mtu = ATT_DEFAULT_MTU
+    list.push(link.bearers, fresh)
+    index
+
+// Drop every enhanced bearer whose channel is not in `channels`: the ATT
+// bearers of the channels the link still holds.  The unenhanced bearer
+// stays.
+@satisfies("REQ-BLE-EATT-001")
+fn retain_bearers(var link: AttLink, channels: [Int])
+    var kept: [Bearer] = []
+    for b in link.bearers
+        if not b.enhanced
+            list.push(kept, b)
+        else if holds_channel(channels, b.channel)
+            list.push(kept, b)
+    link.bearers = kept
+
+// Whether `channel` is one of `channels`.
+fn holds_channel(channels: [Int], channel: Int) -> Bool
+    for c in channels
+        if c == channel
+            return true
+    false
+
+// Set the ATT_MTU of the bearer at `index`: what an MTU exchange over it
+// left ([Vol 3] Part F, Section 3.4.2.2).
+pub fn set_mtu(var link: AttLink, index: Int, mtu: Int)
+    if index >= 0 and index < list.len(link.bearers)
+        var b = link.bearers[index]
+        b.mtu = mtu
+
+// Name the client of `link`.  A rule that tells clients apart, such as the
+// lock of a Coordinated Set, compares these numbers; 0 is no identity and a
+// client without one never holds a lock.
+pub fn set_identity(var link: AttLink, identity: Int)
+    link.identity = identity
+
+// Record the security state of `link`, as the Security Manager reports it.
+pub fn set_security(var link: AttLink, security: LinkSecurity)
+    link.security = security
+
+// The Connection Signature Resolving Key the peer distributed ([Vol 3]
+// Part H, Section 2.4.5); empty when it distributed none.  A signed write
+// is verified with it and ignored without it.
+pub fn set_peer_csrk(var link: AttLink, csrk: [u8])
+    link.peer_csrk = csrk[:]
+
+// The Connection Signature Resolving Key this device distributed to the
+// peer, which its own signed commands are signed with; empty while the
+// peer holds none.
+pub fn set_client_csrk(var link: AttLink, csrk: [u8])
+    link.client_csrk = csrk[:]
+
+// ── Octets and UUIDs ────────────────────────────────────────────────
+
+// The two octets of `v`, least significant first.
+pub fn le16(v: Int) -> [u8]
+    [(v & 0xFF) as u8, ((v >>> 8) & 0xFF) as u8]
+
+// The little-endian value of the two octets of `b` at `at`.
+pub fn read_le16(b: [u8], at: Int) -> Int
+    (b[at] as Int) | ((b[at + 1] as Int) << 8)
+
+fn read_le32(b: [u8], at: Int) -> Int
+    (b[at] as Int) | ((b[at + 1] as Int) << 8) | ((b[at + 2] as Int) << 16) | ((b[at + 3] as Int) << 24)
+
+// True when `a` and `b` hold the same octets.
+pub fn same_bytes(a: [u8], b: [u8]) -> Bool
+    if list.len(a) != list.len(b)
+        return false
+    for i in 0..list.len(a)
+        if a[i] != b[i]
+            return false
+    true
+
+// Whether two UUIDs are the same: a 16-bit UUID equals its 128-bit form
+// on the Bluetooth Base UUID.
+pub fn uuid_equal(a: [u8], b: [u8]) -> Bool
+    let na = list.len(a)
+    let nb = list.len(b)
+    if na == nb
+        same_bytes(a, b)
+    else if na == 2 and nb == 16
+        uuid.uuid_eq_short_full(read_le16(a, 0), b)
+    else if na == 16 and nb == 2
+        uuid.uuid_eq_short_full(read_le16(b, 0), a)
+    else
+        false
+
+// True when the type UUID of `a` is the 16-bit UUID `uuid16`.
+pub fn is_type(a: GattAttribute, uuid16: Int) -> Bool
+    uuid_equal(a.type_uuid, le16(uuid16))
+
+fn is_service(a: GattAttribute) -> Bool
+    is_type(a, UUID_PRIMARY_SERVICE) or is_type(a, UUID_SECONDARY_SERVICE)
+
+fn reversed(b: [u8]) -> [u8]
+    var out: [u8] = []
+    var i = list.len(b)
+    while i > 0
+        i = i - 1
+        list.push(out, b[i])
+    out
+
+// ── The Database Hash ───────────────────────────────────────────────
+//
+// The Database Hash characteristic holds AES-CMAC of the service
+// definitions, keyed with 128 zero bits ([Vol 3] Part G, Section 7.3.1,
+// which is AES-CMAC of RFC 4493).  The message `m` is built in ascending
+// handle order: the Attribute Handle, Attribute Type and Attribute Value
+// of a «Primary Service», «Secondary Service», «Included Service»,
+// «Characteristic» or «Characteristic Extended Properties» attribute,
+// the first two of a «Characteristic User Description», «Client
+// Characteristic Configuration», «Server Characteristic
+// Configuration», «Characteristic Presentation Format» or
+// «Characteristic Aggregate Format» attribute, and nothing of any other
+// attribute -- so the values of the Client Supported Features and of the
+// Database Hash characteristics themselves do not enter it.  Every field
+// is least significant octet first, subfields in the order of Part G,
+// Section 3.  Only attributes whose type is a 16-bit UUID enter, as in
+// the example database of Part G, Appendix B.  AES-CMAC gives the tag
+// most significant octet first and the characteristic value is a
+// 128-bit unsigned integer (Section 7.3.1, Table 7.8), so the value is
+// the tag reversed.
+
+fn hash_with_value(t: Int) -> Bool
+    t == UUID_PRIMARY_SERVICE or t == UUID_SECONDARY_SERVICE or t == UUID_INCLUDE
+        or t == UUID_CHARACTERISTIC or t == UUID_CHARACTERISTIC_EXTENDED_PROPERTIES
+
+fn hash_with_type_only(t: Int) -> Bool
+    t == UUID_CHARACTERISTIC_USER_DESCRIPTION or t == UUID_CLIENT_CHARACTERISTIC_CONFIGURATION
+        or t == UUID_SERVER_CHARACTERISTIC_CONFIGURATION
+        or t == UUID_CHARACTERISTIC_PRESENTATION_FORMAT
+        or t == UUID_CHARACTERISTIC_AGGREGATE_FORMAT
+
+// The `m` of Section 7.3.1: the handles, types and values of the
+// database's service definitions, least significant octet first.
+fn hash_input(db: GattDb) -> [u8]
+    var m: [u8] = []
+    for i in 0..list.len(db.attributes)
+        let a = db.attributes[i]
+        if list.len(a.type_uuid) == 2
+            let t = read_le16(a.type_uuid, 0)
+            if hash_with_value(t)
+                list.append(m, le16(a.handle))
+                list.append(m, a.type_uuid)
+                list.append(m, if t == UUID_INCLUDE then include_value(db, a) else a.value)
+            else if hash_with_type_only(t)
+                list.append(m, le16(a.handle))
+                list.append(m, a.type_uuid)
+    m
+
+fn zero_key() -> [u8]
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+
+// The Database Hash of the database's definitions.
+fn database_hash(db: GattDb) -> [u8]
+    reversed(aes_cmac.aes_cmac(zero_key(), hash_input(db)))
+
+// Put the Database Hash of the current definitions into the Database Hash
+// characteristic, when the database has one ([Vol 3] Part G, Section 7.3:
+// "If any of the input fields to the hash function ... have changed, the
+// server shall calculate a new Database Hash and update the
+// characteristic value").
+fn refresh_hash(var db: GattDb)
+    let index = index_of(db, handle_of_type(db, le16(UUID_DATABASE_HASH)))
+    if index >= 0
+        var a = db.attributes[index]
+        a.value = database_hash(db)
+        a.max_len = HASH_OCTETS
+
+// The database definitions changed: the Database Hash follows, and every
+// client is change-unaware and hears the Database Out Of Sync response
+// once more ([Vol 3] Part G, Section 2.5.2.1, "Whenever the server
+// updates the database definitions, all connected clients become
+// change-unaware").  A change to an attribute value is not a change of
+// the definitions (Section 7.1), and the values of the Service Changed
+// and Client Supported Features characteristics are changes to no
+// service definition either (Section 2.5.2).
+fn definitions_changed(var db: GattDb)
+    db.generation = db.generation + 1
+    refresh_hash(var db)
+
+// Bring the Robust Caching state of the connection up to the database.
+// `definitions_changed` makes every connected client change-unaware
+// ([Vol 3] Part G, Section 2.5.2.1), and the database knows no
+// connection: each handler that reads the state calls this first, and a
+// connection that has not seen the current generation becomes
+// change-unaware, with the Database Hash unread and the Database Out Of
+// Sync response due again.
+fn sync(db: GattDb, var link: AttLink)
+    if link.seen_generation != db.generation
+        link.seen_generation = db.generation
+        link.change_unaware = true
+        link.hash_read = false
+        link.robust_error_sent = false
+
+// ── The database ────────────────────────────────────────────────────
+
+// The position of the attribute with `handle` in `db`, or -1 when there is none.
+pub fn index_of(db: GattDb, handle: Int) -> Int
+    for i in 0..list.len(db.attributes)
+        if db.attributes[i].handle == handle
+            return i
+    -1
+
+// The handle of the last attribute of `db`, or 0 when it is empty.
+pub fn last_handle(db: GattDb) -> Int
+    let n = list.len(db.attributes)
+    if n == 0 then 0 else db.attributes[n - 1].handle
+
+// The handle of the last attribute of the service whose declaration is at
+// `idx`: the attribute before the next service declaration, or the last
+// one ([Vol 3] Part G, Section 3.1).
+pub fn group_end(db: GattDb, idx: Int) -> Int
+    let n = list.len(db.attributes)
+    for j in idx + 1..n
+        if is_service(db.attributes[j])
+            return db.attributes[j - 1].handle
+    db.attributes[n - 1].handle
+
+// The group end of the attribute at `idx`: its service's for a service
+// declaration, its own handle otherwise.
+fn end_of(db: GattDb, idx: Int) -> Int
+    if is_service(db.attributes[idx]) then group_end(db, idx) else db.attributes[idx].handle
+
+fn append(var db: GattDb, type_uuid: [u8], value: [u8], permissions: Int, tester: Bool, included: Int) -> Int
+    let handle = last_handle(db) + 1
+    let max = if list.len(value) == 0 then ATT_VALUE_MAX else list.len(value)
+    list.push(db.attributes, GattAttribute {
+        handle: handle, type_uuid: type_uuid[:], value: value[:], max_len: max, permissions: permissions,
+        key_size: 0, tester: tester, included: included, per_link: false })
+    handle
+
+fn valid_uuid(u: [u8]) -> Bool
+    list.len(u) == 2 or list.len(u) == 16
+
+// Add a primary or secondary service declaration for `service_uuid`
+// ([Vol 3] Part G, Section 3.1) after the last attribute: its handle, or
+// -1 for a UUID that is neither 16 nor 128 bits.
+pub fn add_service(var db: GattDb, secondary: Bool, service_uuid: [u8]) -> Int
+    if not valid_uuid(service_uuid) or last_handle(db) >= 0xFFFF
+        return -1
+    let t = if secondary then UUID_SECONDARY_SERVICE else UUID_PRIMARY_SERVICE
+    let handle = append(var db, le16(t), service_uuid, PERM_READ, false, 0)
+    definitions_changed(var db)
+    handle
+
+// An authorization permission alone still lets the request through the
+// access check, so that the client hears Insufficient Authorization
+// rather than Read or Write Not Permitted.
+fn access_permissions(permissions: Int) -> Int
+    var p = permissions
+    if (p & PERM_READ_AUTHOR) != 0 and (p & (PERM_READ_ENCRYPT | PERM_READ_AUTHEN)) == 0
+        p = p | PERM_READ
+    if (p & PERM_WRITE_AUTHOR) != 0 and (p & (PERM_WRITE_ENCRYPT | PERM_WRITE_AUTHEN)) == 0
+        p = p | PERM_WRITE
+    p
+
+// Add a characteristic ([Vol 3] Part G, Section 3.3): its declaration,
+// readable, whose value is `properties`, the value handle and the UUID,
+// then the Characteristic Value declaration with `permissions`.  The
+// declaration's handle, or -1 when no service has been added or the UUID
+// is neither 16 nor 128 bits.
+pub fn add_characteristic(var db: GattDb, properties: Int, permissions: Int, char_uuid: [u8]) -> Int
+    if not valid_uuid(char_uuid) or not has_service(db) or last_handle(db) >= 0xFFFE
+        return -1
+    var decl: [u8] = [properties as u8]
+    list.append(decl, le16(last_handle(db) + 2))
+    list.append(decl, char_uuid)
+    let handle = append(var db, le16(UUID_CHARACTERISTIC), decl, PERM_READ, false, 0)
+    let _ = append(var db, char_uuid, [], access_permissions(permissions), true, 0)
+    definitions_changed(var db)
+    handle
+
+fn has_service(db: GattDb) -> Bool
+    for a in db.attributes
+        if is_service(a)
+            return true
+    false
+
+// The index of the characteristic declaration the last attribute belongs
+// to, or -1 when a service declaration comes first.
+fn last_characteristic(db: GattDb) -> Int
+    let n = list.len(db.attributes)
+    for k in 0..n
+        let i = n - 1 - k
+        let a = db.attributes[i]
+        if is_service(a)
+            return -1
+        if is_type(a, UUID_CHARACTERISTIC)
+            return i
+    -1
+
+// Add a characteristic descriptor to the last characteristic ([Vol 3]
+// Part G, Section 3.3.3): its handle, or -1.  A Client Characteristic
+// Configuration descriptor needs the Notify or Indicate property and is
+// the characteristic's only one; its value is per client and readable
+// and writable whatever `permissions` say.  A Characteristic Extended
+// Properties descriptor needs the Extended Properties property, is
+// readable only and starts as 0x0000.
+pub fn add_descriptor(var db: GattDb, permissions: Int, desc_uuid: [u8]) -> Int
+    let c = last_characteristic(db)
+    if not valid_uuid(desc_uuid) or c < 0 or last_handle(db) >= 0xFFFF
+        return -1
+    let properties = db.attributes[c].value[0] as Int
+    if uuid_equal(desc_uuid, le16(UUID_CLIENT_CHARACTERISTIC_CONFIGURATION))
+        if (properties & (PROP_NOTIFY | PROP_INDICATE)) == 0
+            return -1
+        for i in c + 1..list.len(db.attributes)
+            if is_type(db.attributes[i], UUID_CLIENT_CHARACTERISTIC_CONFIGURATION)
+                return -1
+        return append_configuration(var db, PERM_READ | PERM_WRITE)
+    if uuid_equal(desc_uuid, le16(UUID_CHARACTERISTIC_EXTENDED_PROPERTIES))
+        if (properties & PROP_EXTENDED_PROPERTIES) == 0
+            return -1
+        let handle = append(var db, desc_uuid, [0x00, 0x00], PERM_READ, false, 0)
+        definitions_changed(var db)
+        return handle
+    let handle = append(var db, desc_uuid, [], access_permissions(permissions), true, 0)
+    definitions_changed(var db)
+    handle
+
+fn append_configuration(var db: GattDb, permissions: Int) -> Int
+    let handle = append(var db, le16(UUID_CLIENT_CHARACTERISTIC_CONFIGURATION), [0x00, 0x00], access_permissions(permissions), false, 0)
+    definitions_changed(var db)
+    handle
+
+// Add the Client Characteristic Configuration descriptor to the last
+// characteristic with the access the application chooses: its handle, or
+// -1 when the characteristic neither notifies nor indicates, has the
+// descriptor already or the table is full.  A client that cannot write it
+// at its access never enables a notification, and one that has enabled it
+// on a link that no longer grants the write is sent nothing
+// (`send_value`).  `add_descriptor` adds the same descriptor readable and
+// writable by any client.
+fn add_configuration(var db: GattDb, permissions: Permissions) -> Int
+    let c = last_characteristic(db)
+    if c < 0 or last_handle(db) >= 0xFFFF
+        return -1
+    let properties = db.attributes[c].value[0] as Int
+    if (properties & (PROP_NOTIFY | PROP_INDICATE)) == 0
+        return -1
+    for i in c + 1..list.len(db.attributes)
+        if is_type(db.attributes[i], UUID_CLIENT_CHARACTERISTIC_CONFIGURATION)
+            return -1
+    append_configuration(var db, permission_bits(permissions))
+
+// Add an include declaration for the service declared at
+// `service_handle` ([Vol 3] Part G, Section 3.2): its handle, or -1 when
+// that handle is not a service declaration.
+pub fn add_included(var db: GattDb, service_handle: Int) -> Int
+    let i = index_of(db, service_handle)
+    if i < 0 or not has_service(db) or last_handle(db) >= 0xFFFF
+        return -1
+    if not is_service(db.attributes[i])
+        return -1
+    let handle = append(var db, le16(UUID_INCLUDE), [], PERM_READ, false, service_handle)
+    definitions_changed(var db)
+    handle
+
+// The attribute `handle` names, the last one for 0.
+fn target(db: GattDb, handle: Int) -> Int
+    if handle == 0 then list.len(db.attributes) - 1 else index_of(db, handle)
+
+// Set the value of the attribute `handle` (0 for the last one), at most
+// ATT_VALUE_MAX octets: false when there is no such attribute or it is a
+// declaration.  The value of a Client Characteristic Configuration
+// descriptor is the client's and is left alone.  The first value a tester
+// attribute gets fixes the longest value a client may write.
+pub fn set_value(var db: GattDb, handle: Int, value: [u8]) -> Bool
+    let i = target(db, handle)
+    if i < 0 or list.len(value) > ATT_VALUE_MAX
+        return false
+    var a = db.attributes[i]
+    if is_service(a) or is_type(a, UUID_CHARACTERISTIC) or is_type(a, UUID_INCLUDE)
+        return false
+    if is_type(a, UUID_CLIENT_CHARACTERISTIC_CONFIGURATION)
+        return true
+    if a.tester and list.len(a.value) == 0
+        a.max_len = list.len(value)
+    a.value = value[:]
+    true
+
+// The encryption key size the attribute `handle` (0 for the last one)
+// needs: 7 to 16 octets ([Vol 3] Part H, Section 2.3.4), only for an
+// attribute whose permissions ask for encryption or authentication.
+pub fn set_key_size(var db: GattDb, handle: Int, key_size: Int) -> Bool
+    let i = target(db, handle)
+    if i < 0 or key_size < 7 or key_size > 16
+        return false
+    var a = db.attributes[i]
+    let secured = PERM_READ_ENCRYPT | PERM_WRITE_ENCRYPT | PERM_READ_AUTHEN | PERM_WRITE_AUTHEN
+    if (a.permissions & secured) == 0
+        return false
+    a.key_size = key_size
+    true
+
+// Remove the attributes from `first` to `last`, handles included.
+pub fn remove_range(var db: GattDb, first: Int, last: Int)
+    var kept: [GattAttribute] = []
+    var removed = false
+    for a in db.attributes
+        if a.handle < first or a.handle > last
+            list.push(kept, a)
+        else
+            removed = true
+    db.attributes = kept
+    if removed
+        definitions_changed(var db)
+
+// The handle of the first attribute whose type is `type_uuid`, 0 for none.
+pub fn handle_of_type(db: GattDb, type_uuid: [u8]) -> Int
+    for a in db.attributes
+        if uuid_equal(a.type_uuid, type_uuid)
+            return a.handle
+    0
+
+// ── Values and access ───────────────────────────────────────────────
+
+// The client's Client Characteristic Configuration value for the
+// descriptor `handle`.
+pub fn configuration(link: AttLink, handle: Int) -> Int
+    let n = list.len(link.cccd) / 2
+    for k in 0..n
+        if link.cccd[2 * k] == handle
+            return link.cccd[2 * k + 1]
+    0
+
+// Set the Client Characteristic Configuration value of `link` for the descriptor at `handle`.
+pub fn set_configuration(var link: AttLink, handle: Int, value: Int)
+    var out: [Int] = []
+    let n = list.len(link.cccd) / 2
+    for k in 0..n
+        if link.cccd[2 * k] != handle
+            list.push(out, link.cccd[2 * k])
+            list.push(out, link.cccd[2 * k + 1])
+    if value != 0
+        list.push(out, handle)
+        list.push(out, value)
+    link.cccd = out
+
+// The value of the include declaration `a`: the included service's
+// handle, its End Group Handle and, for a 16-bit UUID only, the UUID
+// ([Vol 3] Part G, Section 3.2).
+fn include_value(db: GattDb, a: GattAttribute) -> [u8]
+    var s = index_of(db, a.included)
+    if s < 0
+        return []
+    var v = le16(a.included)
+    list.append(v, le16(group_end(db, s)))
+    let svc = db.attributes[s].value
+    if list.len(svc) == 2
+        list.append(v, svc)
+    v
+
+// Make the attribute `handle` (0 for the last one) a per-connection
+// value: each client reads the value its own connection set
+// (`set_link_value`), and the value the attribute holds now until it does.
+// The attribute must be a characteristic value or a descriptor with no
+// meaning of its own to the server: false for a declaration, a Client
+// Characteristic Configuration descriptor or the Client Supported
+// Features value, which are per connection already.
+pub fn make_per_link(var db: GattDb, handle: Int) -> Bool
+    let i = target(db, handle)
+    if i < 0
+        return false
+    var a = db.attributes[i]
+    if is_service(a) or is_type(a, UUID_CHARACTERISTIC) or is_type(a, UUID_INCLUDE)
+        return false
+    if is_type(a, UUID_CLIENT_CHARACTERISTIC_CONFIGURATION) or is_type(a, UUID_CLIENT_SUPPORTED_FEATURES)
+        return false
+    a.per_link = true
+    true
+
+// The position in `link.link_values` of the value of `handle`, or -1.
+fn link_value_index(link: AttLink, handle: Int) -> Int
+    for k in 0..list.len(link.link_values)
+        if link.link_values[k].handle == handle
+            return k
+    -1
+
+// Give the connection its own value of the per-connection attribute
+// `handle`, at most ATT_VALUE_MAX octets: false when the attribute is not
+// one (`make_per_link`) or the value is too long.
+pub fn set_link_value(db: GattDb, var link: AttLink, handle: Int, value: [u8]) -> Bool
+    let i = index_of(db, handle)
+    if i < 0 or not db.attributes[i].per_link or list.len(value) > ATT_VALUE_MAX
+        return false
+    let k = link_value_index(link, handle)
+    if k >= 0
+        link.link_values[k] = LinkValue { handle: handle, value: value[:] }
+    else
+        list.push(link.link_values, LinkValue { handle: handle, value: value[:] })
+    true
+
+// The value of the attribute at `idx` as this client reads it.  The value
+// of a Client Characteristic Configuration descriptor and of the Client
+// Supported Features characteristic is the client's, one octet for the
+// features it set of those the server offers ([Vol 3] Part G, Sections
+// 3.3.3.3 and 7.2); so is the value of a per-connection attribute, once
+// its connection has set one.  An include declaration holds the included
+// service's handle, its End Group Handle and the UUID ([Vol 3] Part G,
+// Section 3.2).
+pub fn value_at(db: GattDb, link: AttLink, idx: Int) -> [u8]
+    let a = db.attributes[idx]
+    if is_type(a, UUID_CLIENT_CHARACTERISTIC_CONFIGURATION)
+        return le16(configuration(link, a.handle))
+    if is_type(a, UUID_CLIENT_SUPPORTED_FEATURES)
+        return [link.csf as u8]
+    if is_type(a, UUID_INCLUDE)
+        return include_value(db, a)
+    let k = if a.per_link then link_value_index(link, a.handle) else -1
+    let source = if k >= 0 then link.link_values[k].value else a.value
+    source[:]
+
+// The Error Code that refuses the client access to the attribute at
+// `idx`, 0 when it may read it (`write` false) or write it (`write` true).
+pub fn access_error(db: GattDb, link: AttLink, idx: Int, write: Bool) -> Int
+    let p = db.attributes[idx].permissions
+    let any = if write then PERM_WRITE | PERM_WRITE_ENCRYPT | PERM_WRITE_AUTHEN else PERM_READ | PERM_READ_ENCRYPT | PERM_READ_AUTHEN
+    if (p & any) == 0
+        return if write then att.ATT_ERR_WRITE_NOT_PERMITTED else att.ATT_ERR_READ_NOT_PERMITTED
+    let encrypt = if write then PERM_WRITE_ENCRYPT else PERM_READ_ENCRYPT
+    let authen = if write then PERM_WRITE_AUTHEN else PERM_READ_AUTHEN
+    let author = if write then PERM_WRITE_AUTHOR else PERM_READ_AUTHOR
+    let sec = link.security
+    let secure = if write then PERM_WRITE_SC else PERM_READ_SC
+    if (p & (encrypt | authen)) != 0
+        if not sec.encrypted
+            return if sec.has_ltk then att.ATT_ERR_INSUFFICIENT_ENCRYPTION else att.ATT_ERR_INSUFFICIENT_AUTHENTICATION
+        if (p & authen) != 0 and sec.level < 3
+            return att.ATT_ERR_INSUFFICIENT_AUTHENTICATION
+        if (p & secure) != 0 and sec.level < 4
+            return att.ATT_ERR_INSUFFICIENT_AUTHENTICATION
+    if (p & author) != 0
+        return att.ATT_ERR_INSUFFICIENT_AUTHORIZATION
+    if (p & (encrypt | authen)) != 0 and db.attributes[idx].key_size > sec.key_size
+        return att.ATT_ERR_INSUFFICIENT_ENC_KEY_SIZE
+    if write then indication_error(db, link, idx) else guard_read_error(db, db.attributes[idx].handle)
+
+// Make writes to the characteristic value `handle` depend on the client's
+// subscription, as the control points of the cycling, running and fitness
+// services require: a write from a client that has not enabled
+// indications on the characteristic is answered with `subscription_error`,
+// and one that arrives while an indication of the value is unconfirmed
+// with `busy_error`.  False when `handle` is not a value whose
+// characteristic has a Client Characteristic Configuration descriptor.
+pub fn require_indication(var db: GattDb, handle: Int, subscription_error: Int, busy_error: Int) -> Bool
+    let i = index_of(db, handle)
+    if i < 0 or configuration_of(db, i) < 0
+        return false
+    list.push(db.indication_rules, handle)
+    list.push(db.indication_rules, subscription_error)
+    list.push(db.indication_rules, busy_error)
+    true
+
+// The Error Code `require_indication` asks for on a write to the attribute
+// at `idx`, 0 for none.
+fn indication_error(db: GattDb, link: AttLink, idx: Int) -> Int
+    let handle = db.attributes[idx].handle
+    let n = list.len(db.indication_rules) / 3
+    for k in 0..n
+        if db.indication_rules[3 * k] == handle
+            let c = configuration_of(db, idx)
+            if c < 0 or (configuration(link, db.attributes[c].handle) & CCC_INDICATION) == 0
+                return db.indication_rules[3 * k + 1]
+            for b in link.bearers
+                if b.indicating == handle
+                    return db.indication_rules[3 * k + 2]
+    0
+
+// Refuse writes to the attribute `handle` whose first octet is not one of
+// `allowed`, answering `error` (an Error Code of the application range or
+// one of the Common Profile and Service Error Codes).  False when there is
+// no such attribute.
+pub fn restrict_first_octet(var db: GattDb, handle: Int, allowed: [Int], error: Int) -> Bool
+    if index_of(db, handle) < 0
+        return false
+    list.push(db.octet_rules, OctetRule { handle: handle, allowed: allowed[:], error: error })
+    true
+
+// The Error Code of a write of `value` to the attribute `handle` under
+// `restrict_first_octet`, 0 when the value may be written.
+fn octet_error(db: GattDb, handle: Int, value: [u8]) -> Int
+    for r in db.octet_rules
+        if r.handle == handle
+            if list.len(value) == 0
+                return r.error
+            for a in r.allowed
+                if a == (value[0] as Int)
+                    return 0
+            return r.error
+    0
+
+// Make writes to the attribute `handle` carry a value of exactly `length`
+// octets (any length when `length` is -1) written from offset 0 with none of
+// the bits of `reserved_mask` set in the little-endian value; a write that
+// breaks the rule is answered with `error` and the value is not changed.
+// The Audio Locations characteristics of the Published Audio Capabilities
+// Service are the use: four octets, the Reserved for Future Use bits clear,
+// Write Request Rejected otherwise.  False when there is no such attribute.
+pub fn require_value_format(var db: GattDb, handle: Int, length: Int, reserved_mask: Int, error: Int) -> Bool
+    if index_of(db, handle) < 0
+        return false
+    list.push(db.value_rules, ValueRule { handle: handle, length: length, reserved_mask: reserved_mask, error: error })
+    true
+
+// The Error Code of a write of `value` at `offset` to the attribute `handle`
+// under `require_value_format`, 0 when the write may go ahead.
+fn value_format_error(db: GattDb, handle: Int, offset: Int, value: [u8]) -> Int
+    for r in db.value_rules
+        if r.handle == handle
+            if offset != 0 or (r.length >= 0 and list.len(value) != r.length)
+                return r.error
+            var v = 0
+            for k in 0..list.len(value)
+                if k < 8
+                    v = v | ((value[k] as Int) << (8 * k))
+            if (v & r.reserved_mask) != 0
+                return r.error
+    0
+
+// Run `rule` (named `kind` by the service) on the writes to the
+// attribute `handle`, and on the reads of it for the rule that refuses them.
+// `state` and `props` name the attributes whose values the rule reads (0 for
+// none) and `data` is its standing data.  A service with a control point or a
+// lock adds one for it; the control services' Application Error Codes depend
+// on the state they hold, which the write response cannot wait for.  False
+// when there is no such attribute.
+pub fn add_write_guard(var db: GattDb, handle: Int, rule: GuardRule, kind: Int, state: Int, props: Int, data: [u8]) -> Bool
+    if index_of(db, handle) < 0
+        return false
+    list.push(db.guards, WriteGuard { handle: handle, rule: rule, kind: kind, state: state, props: props, data: data[:], owner: 0 })
+    true
+
+// The position of the rule on `handle`, -1 for none.
+fn guard_index(db: GattDb, handle: Int) -> Int
+    for k in 0..list.len(db.guards)
+        if db.guards[k].handle == handle
+            return k
+    -1
+
+// The standing data of the rule on `handle`, empty for none.
+pub fn guard_data(db: GattDb, handle: Int) -> [u8]
+    let k = guard_index(db, handle)
+    if k < 0 then [] else db.guards[k].data[:]
+
+// Replace the standing data of the rule on `handle`; false for none.
+pub fn set_guard_data(var db: GattDb, handle: Int, data: [u8]) -> Bool
+    let k = guard_index(db, handle)
+    if k < 0
+        return false
+    db.guards[k].data = data[:]
+    true
+
+// The identity of the holder the rule on `handle` records, 0 for none.
+pub fn guard_owner(db: GattDb, handle: Int) -> Int
+    let k = guard_index(db, handle)
+    if k < 0 then 0 else db.guards[k].owner
+
+// Record the holder of the resource the rule on `handle` guards; false for
+// no rule.
+pub fn set_guard_owner(var db: GattDb, handle: Int, owner: Int) -> Bool
+    let k = guard_index(db, handle)
+    if k < 0
+        return false
+    db.guards[k].owner = owner
+    true
+
+// The Error Code of a write of `value` at `offset` to the attribute `handle`
+// under its `add_write_guard` rule as the client of `link` makes it, 0 when
+// the write may go ahead or no rule is on the attribute.
+fn guard_error(db: GattDb, link: AttLink, handle: Int, offset: Int, value: [u8]) -> Int
+    let k = guard_index(db, handle)
+    if k < 0
+        return 0
+    let g = db.guards[k]
+    let state_at = if g.state == 0 then -1 else index_of(db, g.state)
+    let props_at = if g.props == 0 then -1 else index_of(db, g.props)
+    let state = if state_at < 0 then [] else value_at(db, link, state_at)
+    let props = if props_at < 0 then [] else value_at(db, link, props_at)
+    let i = index_of(db, handle)
+    let c = configuration_of(db, i)
+    let ccc = if c < 0 then 0 else configuration(link, db.attributes[c].handle)
+    g.rule(g.kind, false, value, offset, state, props, g.data, ccc, g.owner, link.identity)
+
+// The Error Code a read of the attribute `handle` gets under its rule, 0
+// for none.
+fn guard_read_error(db: GattDb, handle: Int) -> Int
+    let k = guard_index(db, handle)
+    if k < 0
+        return 0
+    let g = db.guards[k]
+    g.rule(g.kind, true, g.data, 0, g.data, g.data, g.data, 0, g.owner, 0)
+
+// Allow a client to write at most `max_length` octets to the attribute
+// `handle`; false when there is no such attribute or it is a declaration.
+// The first value a tester attribute is given fixes the longest value a
+// client may write, so a text a client may replace with a longer one needs
+// this call.
+pub fn set_max_length(var db: GattDb, handle: Int, max_length: Int) -> Bool
+    let i = index_of(db, handle)
+    if i < 0 or max_length < 0 or max_length > ATT_VALUE_MAX
+        return false
+    var a = db.attributes[i]
+    if is_service(a) or is_type(a, UUID_CHARACTERISTIC) or is_type(a, UUID_INCLUDE)
+        return false
+    a.max_len = max_length
+    true
+
+// The Application Error Code of the Telephone Bearer Service and the Media
+// Control Service for a Read Blob that continues a read of a value that has
+// changed since the client read it from offset 0 ([MCS] 1.4, 1.6; [TBS] 1.6).
+const ERR_VALUE_CHANGED_DURING_READ_LONG = 0x80
+
+// Hold the reads of the attribute `handle` to the Read Long rule: a Read Blob
+// at a non-zero offset is answered Value Changed During Read Long (0x80) when
+// the value is not the one this client read last from offset 0.  False when
+// there is no such attribute or it is a declaration.
+pub fn add_read_long_rule(var db: GattDb, handle: Int) -> Bool
+    let i = index_of(db, handle)
+    if i < 0
+        return false
+    let a = db.attributes[i]
+    if is_service(a) or is_type(a, UUID_CHARACTERISTIC) or is_type(a, UUID_INCLUDE)
+        return false
+    if not long_rule_on(db, handle)
+        list.push(db.long_reads, handle)
+    true
+
+// Whether the Read Long rule holds the reads of `handle`.
+fn long_rule_on(db: GattDb, handle: Int) -> Bool
+    for h in db.long_reads
+        if h == handle
+            return true
+    false
+
+// A stamp of the octets of a value: two values of different octets or length
+// have different stamps, to the chance of a 31-bit collision.
+fn value_stamp(v: [u8]) -> Int
+    var h = list.len(v)
+    for b in v
+        h = ((h * 31) + (b as Int) + 1) & 0x7FFFFFFF
+    h
+
+// The client read the attribute `handle` from offset 0: remember what it read.
+fn note_long_read(db: GattDb, var link: AttLink, handle: Int, v: [u8])
+    if not long_rule_on(db, handle)
+        return
+    let stamp = value_stamp(v)
+    var k = 0
+    while k < list.len(link.read_stamps)
+        if link.read_stamps[k] == handle
+            link.read_stamps[k + 1] = stamp
+            return
+        k = k + 2
+    list.push(link.read_stamps, handle)
+    let _ = list.push(link.read_stamps, stamp)
+
+// The Error Code a Read Blob at a non-zero offset of `handle` gets under the
+// Read Long rule, 0 when the value is the one the client read from offset 0 or
+// the client has read none or the attribute has no rule.
+fn long_read_error(db: GattDb, link: AttLink, handle: Int, v: [u8]) -> Int
+    if not long_rule_on(db, handle)
+        return 0
+    var k = 0
+    while k < list.len(link.read_stamps)
+        if link.read_stamps[k] == handle
+            return if link.read_stamps[k + 1] == value_stamp(v) then 0 else ERR_VALUE_CHANGED_DURING_READ_LONG
+        k = k + 2
+    // No read from offset 0 came first, so no value changed under the client.
+    0
+
+// The value of the attribute `handle` as the tester asks for it (BTP Get
+// Attribute Value): the Error Code a read of it gives without the access
+// check of the link, which BTP does not ask for, then the value.  An
+// attribute that needs authorization answers Insufficient Authorization,
+// and one that needs a larger key than the link has, or any key when
+// there is no connection, Encryption Key Size Too Short.
+pub fn tester_read(db: GattDb, link: AttLink, handle: Int, connected: Bool) -> (Int, [u8])
+    let i = index_of(db, handle)
+    if i < 0
+        return (att.ATT_ERR_INVALID_HANDLE, [])
+    let a = db.attributes[i]
+    if (a.permissions & PERM_READ_AUTHOR) != 0
+        return (att.ATT_ERR_INSUFFICIENT_AUTHORIZATION, [])
+    if a.key_size > 0 and (not connected or a.key_size > link.security.key_size)
+        return (att.ATT_ERR_INSUFFICIENT_ENC_KEY_SIZE, value_at(db, link, i))
+    if (a.permissions & (PERM_READ | PERM_READ_ENCRYPT | PERM_READ_AUTHEN)) == 0
+        return (att.ATT_ERR_READ_NOT_PERMITTED, [])
+    (0, value_at(db, link, i))
+
+// ── The Attribute Protocol server ───────────────────────────────────
+
+// The ATT Error Response to the request `op` for `handle` with the error `code`, as the one PDU of an answer.
+pub fn error(op: Int, handle: Int, code: Int) -> [[u8]]
+    [att.build_error_rsp(op, handle, code)]
+
+// The opcodes of the PDUs a server receives as a client's peer: responses,
+// notifications and indications ([Vol 3] Part F, Section 3.4.8).  They
+// belong to the client role.
+fn is_client_pdu(op: Int) -> Bool
+    match op
+        0x01 | 0x03 | 0x05 | 0x07 | 0x09 | 0x0B | 0x0D | 0x0F | 0x11 | 0x13 | 0x17 | 0x19 | 0x1B | 0x1D | 0x21 | 0x23 => true
+        _ => false
+
+// Whether the client of `link` is change-unaware of `db`
+// ([Vol 3] Part G, Section 2.5.2.1), brought up to the database's
+// current generation first.
+fn is_change_unaware(db: GattDb, var link: AttLink) -> Bool
+    sync(db, var link)
+    link.change_unaware
+
+// Whether the client's Robust Caching bit is set ([Vol 3] Part G,
+// Section 7.2, Table 7.6, bit 0 of octet 0).
+fn robust_caching(link: AttLink) -> Bool
+    (link.csf & CSF_ROBUST_CACHING) != 0
+
+// The client has been made change-aware of the current definitions
+// ([Vol 3] Part G, Section 2.5.2.1), and the Database Out Of Sync
+// response is due again after the next change.
+fn aware_now(db: GattDb, var link: AttLink)
+    link.seen_generation = db.generation
+    link.change_unaware = false
+    link.hash_read = false
+    link.robust_error_sent = false
+    link.aware_generation = db.generation
+
+// Whether the client may not be served now, and how: -1 to ignore the
+// PDU, 0 to answer it normally, else the Error Code of the response.
+//
+// A change-unaware client's ATT command is ignored, and the requests
+// that name an attribute, or a list of them, are answered with Database
+// Out Of Sync ([Vol 3] Part G, Section 2.5.2.1) -- once per bearer and
+// change, the response coming due again when the database changes again
+// before the client becomes change-aware.  The ATT_ERROR_RSP PDU is sent
+// once, and the next request is answered normally: that request is what
+// makes the client change-aware, as does a request after it read the
+// Database Hash, which it reads with Read Using Characteristic UUID
+// (Section 7.3), or a Service Changed indication it confirms.
+fn admit(db: GattDb, var link: AttLink, pdu: [u8]) -> Int
+    sync(db, var link)
+    if not robust_caching(link) or not link.change_unaware
+        return 0
+    let op = pdu[0] as Int
+    if (op & 0x40) != 0
+        return -1
+    if link.hash_read or link.robust_error_sent
+        aware_now(db, var link)
+        return 0
+    if is_hash_read(pdu)
+        link.hash_read = true
+        return 0
+    if not names_a_handle(pdu)
+        return 0
+    link.robust_error_sent = true
+    att.ATT_ERR_DATABASE_OUT_OF_SYNC
+
+// The requests a change-unaware client's server refuses: the reads and
+// writes of a value at an Attribute Handle or a list of them (Read
+// Request, Read Blob, Read Multiple, Read Multiple Variable, Write
+// Request, Prepare Write), and a Read Using Characteristic UUID of any
+// type but «Include» and «Characteristic» over any range but the whole
+// database ([Vol 3] Part G, Section 2.5.2.1).  A Read By Type of a
+// service definition, and the Find and Read By Group Type procedures
+// that discover one, are answered: what a client does to rebuild the
+// cache it no longer trusts.
+fn names_a_handle(pdu: [u8]) -> Bool
+    let op = pdu[0] as Int
+    if op == 0x0A or op == 0x0C or op == 0x0E or op == 0x12 or op == 0x16 or op == 0x20
+        return true
+    if op != 0x08 or list.len(pdu) < 5
+        return false
+    if read_le16(pdu, 1) == 0x0001 and read_le16(pdu, 3) == 0xFFFF
+        return false
+    let t = pdu[5:list.len(pdu)]
+    not (uuid_equal(t, le16(UUID_INCLUDE)) or uuid_equal(t, le16(UUID_CHARACTERISTIC)))
+
+// A Read Using Characteristic UUID of the Database Hash characteristic,
+// the procedure a client reads the hash with ([Vol 3] Part G, Section
+// 7.3).
+fn is_hash_read(pdu: [u8]) -> Bool
+    list.len(pdu) >= 5 and pdu[0] as Int == 0x08
+        and uuid_equal(pdu[5:list.len(pdu)], le16(UUID_DATABASE_HASH))
+
+// The handle a refused request named: its own for a request that names
+// one, the first of the range for Read By Type, none otherwise.
+fn refused_handle(pdu: [u8]) -> Int
+    let op = pdu[0] as Int
+    if op == 0x08 or op == 0x10 or op == 0x04 or op == 0x06
+        return if list.len(pdu) >= 3 then read_le16(pdu, 1) else 0
+    if op == 0x0A or op == 0x0C or op == 0x12 or op == 0x16
+        return if list.len(pdu) >= 3 then read_le16(pdu, 1) else 0
+    0
+
+// Answer one ATT PDU of the unenhanced bearer: the entry point of a
+// device that has one bearer, and what the fixed channel's PDUs take.
+pub fn receive(var db: GattDb, var link: AttLink, pdu: [u8], now_ms: Int) -> [[u8]]
+    receive_on(var db, var link, 0, pdu, now_ms)
+
+// Answer one ATT PDU from the client on the bearer at `index`, `now_ms`
+// from the caller's clock.  A command the server does not support is
+// ignored, and a request it does not support is answered with Request Not
+// Supported ([Vol 3] Part F, Section 3.4.1.1).  Once a transaction has
+// timed out on that bearer nothing more is sent over it ([Vol 3] Part G,
+// Section 4.14).
+pub @satisfies("REQ-BLE-EATT-003")
+@satisfies("REQ-BLE-EATT-004")
+fn receive_on(var db: GattDb, var link: AttLink, index: Int, pdu: [u8], now_ms: Int) -> [[u8]]
+    let n = list.len(pdu)
+    if n == 0 or index < 0 or index >= list.len(link.bearers) or link.bearers[index].timed_out
+        return []
+    let op = pdu[0] as Int
+    if is_client_pdu(op)
+        list.push(link.client_rx, pdu[:])
+        return []
+    let enhanced = link.bearers[index].enhanced
+    sync(db, var link)
+    if op == att.ATT_OP_HANDLE_VALUE_CFM
+        if confirms_service_changed(db, link, index)
+            aware_now(db, var link)
+        return confirmed(var link, index, now_ms)
+    let admitted = admit(db, var link, pdu)
+    if admitted == -1
+        return []
+    if admitted != 0
+        return error(op, refused_handle(pdu), admitted)
+    if op == att.ATT_OP_WRITE_CMD
+        let _ = write(db, link, pdu, false)
+        return []
+    if op == att.ATT_OP_SIGNED_WRITE_CMD
+        // The command shall not be used on an Enhanced ATT bearer, and a
+        // server that receives it there ignores it ([Vol 3] Part F,
+        // Section 3.4.5.4).
+        if not enhanced
+            let _ = signed_write(var db, var link, pdu)
+        return []
+    if (op & 0x40) != 0
+        return []
+    match op
+        0x02 => exchange_mtu(var db, var link, index, pdu)
+        0x04 => find_information(db, link, index, pdu)
+        0x06 => find_by_type_value(db, link, index, pdu)
+        0x08 => read_by_type(db, link, index, pdu)
+        0x0A => read(db, link, index, pdu)
+        0x0C => read_blob(db, var link, index, pdu)
+        0x0E => read_multiple(db, link, index, pdu, false)
+        0x10 => read_by_group_type(db, link, index, pdu)
+        0x12 => write(db, link, pdu, true)
+        0x16 => prepare_write(var db, var link, pdu)
+        0x18 => execute_write(var db, var link, pdu)
+        0x20 => read_multiple(db, link, index, pdu, true)
+        _    => error(op, 0, att.ATT_ERR_REQUEST_NOT_SUPPORTED)
+
+// ATT_EXCHANGE_MTU_REQ: ATT_MTU becomes the smaller of the Client Rx MTU
+// and the Server Rx MTU, and stays the default when the client's is below
+// it ([Vol 3] Part F, Section 3.4.2.2).  The MTU exchange is not one of
+// an Enhanced ATT bearer's procedures: its ATT_MTU comes from the L2CAP
+// MTUs of the channel ([Vol 3] Part G, Section 5.3.1), so a request that
+// arrives on one is answered Request Not Supported ([Vol 3] Part G,
+// Section 5.3; GATT Test Suite, Section 4.2.5).
+@satisfies("REQ-BLE-EATT-002")
+fn exchange_mtu(var db: GattDb, var link: AttLink, index: Int, pdu: [u8]) -> [[u8]]
+    if link.bearers[index].enhanced
+        return error(0x02, 0, att.ATT_ERR_REQUEST_NOT_SUPPORTED)
+    if list.len(pdu) != 3
+        return error(0x02, 0, att.ATT_ERR_INVALID_PDU)
+    let client = read_le16(pdu, 1)
+    if client >= ATT_DEFAULT_MTU
+        let mtu = if client < db.rx_mtu then client else db.rx_mtu
+        set_mtu(link, index, mtu)
+    [att.build_exchange_mtu_rsp(db.rx_mtu)]
+
+// The Starting Handle and Ending Handle of a request, checked: an error
+// response with Invalid Handle names the Starting Handle when it is 0x0000
+// or greater than the Ending Handle ([Vol 3] Part F, Section 3.4.3.1).
+fn bad_range(start: Int, end: Int) -> Bool
+    start == 0 or start > end
+
+// ATT_FIND_INFORMATION_REQ ([Vol 3] Part F, Sections 3.4.3.1 and
+// 3.4.3.2): the handles and types in the range, all 16-bit or all
+// 128-bit, as many as fit.
+fn find_information(db: GattDb, link: AttLink, index: Int, pdu: [u8]) -> [[u8]]
+    let op = 0x04
+    if list.len(pdu) != 5
+        return error(op, 0, att.ATT_ERR_INVALID_PDU)
+    let start = read_le16(pdu, 1)
+    let end = read_le16(pdu, 3)
+    if bad_range(start, end)
+        return error(op, start, att.ATT_ERR_INVALID_HANDLE)
+    var data: [u8] = []
+    var width = 0
+    for a in db.attributes
+        if a.handle >= start and a.handle <= end
+            let w = list.len(a.type_uuid)
+            if width == 0
+                width = w
+            if w != width or 2 + list.len(data) + 2 + w > mtu_of(link, index)
+                break
+            list.append(data, le16(a.handle))
+            list.append(data, a.type_uuid)
+    if width == 0
+        return error(op, start, att.ATT_ERR_ATTRIBUTE_NOT_FOUND)
+    [att.build_find_info_rsp(if width == 2 then 0x01 else 0x02, data)]
+
+// ATT_FIND_BY_TYPE_VALUE_REQ ([Vol 3] Part F, Sections 3.4.3.3 and
+// 3.4.3.4): the attributes of the 16-bit type whose value equals the one
+// given, each with its group end, as many as fit.
+fn find_by_type_value(db: GattDb, link: AttLink, index: Int, pdu: [u8]) -> [[u8]]
+    let op = 0x06
+    if list.len(pdu) < 7
+        return error(op, 0, att.ATT_ERR_INVALID_PDU)
+    let start = read_le16(pdu, 1)
+    let end = read_le16(pdu, 3)
+    if bad_range(start, end)
+        return error(op, start, att.ATT_ERR_INVALID_HANDLE)
+    let wanted_type = pdu[5:7]
+    let wanted = pdu[7:]
+    var data: [u8] = []
+    for i in 0..list.len(db.attributes)
+        let a = db.attributes[i]
+        if a.handle >= start and a.handle <= end and uuid_equal(a.type_uuid, wanted_type)
+            if same_bytes(value_at(db, link, i), wanted)
+                if 1 + list.len(data) + 4 > mtu_of(link, index)
+                    break
+                list.append(data, le16(a.handle))
+                list.append(data, le16(end_of(db, i)))
+    if list.len(data) == 0
+        return error(op, start, att.ATT_ERR_ATTRIBUTE_NOT_FOUND)
+    [att.build_find_by_type_value_rsp(data)]
+
+// ATT_READ_BY_TYPE_REQ ([Vol 3] Part F, Sections 3.4.4.1 and 3.4.4.2).
+// The first attribute of the type in the range that the client may not
+// read is answered with an error; after it, the response stops at an
+// attribute it may not read, at a value of another length, or when full.
+// A value is cut to ATT_MTU - 4 octets and to 253, the most a pair's
+// Length of 255 holds.
+fn read_by_type(db: GattDb, link: AttLink, index: Int, pdu: [u8]) -> [[u8]]
+    let op = 0x08
+    let n = list.len(pdu)
+    if n != 7 and n != 21
+        return error(op, 0, att.ATT_ERR_INVALID_PDU)
+    let start = read_le16(pdu, 1)
+    let end = read_le16(pdu, 3)
+    if bad_range(start, end)
+        return error(op, start, att.ATT_ERR_INVALID_HANDLE)
+    let wanted = pdu[5:n]
+    var data: [u8] = []
+    var width = -1
+    for i in 0..list.len(db.attributes)
+        let a = db.attributes[i]
+        if a.handle >= start and a.handle <= end and uuid_equal(a.type_uuid, wanted)
+            let refused = access_error(db, link, i, false)
+            if refused != 0
+                if width < 0
+                    return error(op, a.handle, refused)
+                break
+            var v = value_at(db, link, i)
+            let mtu = mtu_of(link, index)
+            let cap = if mtu - 4 < 253 then mtu - 4 else 253
+            if list.len(v) > cap
+                v = v[0:cap]
+            if width < 0
+                width = list.len(v)
+            if list.len(v) != width or 2 + list.len(data) + 2 + width > mtu_of(link, index)
+                break
+            list.append(data, le16(a.handle))
+            list.append(data, v)
+    if width < 0
+        return error(op, start, att.ATT_ERR_ATTRIBUTE_NOT_FOUND)
+    [att.build_read_by_type_rsp(2 + width, data)]
+
+// ATT_READ_REQ ([Vol 3] Part F, Sections 3.4.4.3 and 3.4.4.4): the value,
+// cut to ATT_MTU - 1 octets.
+fn read(db: GattDb, var link: AttLink, index: Int, pdu: [u8]) -> [[u8]]
+    let op = 0x0A
+    if list.len(pdu) != 3
+        return error(op, 0, att.ATT_ERR_INVALID_PDU)
+    let handle = read_le16(pdu, 1)
+    let i = index_of(db, handle)
+    if i < 0
+        return error(op, handle, att.ATT_ERR_INVALID_HANDLE)
+    let refused = access_error(db, link, i, false)
+    if refused != 0
+        return error(op, handle, refused)
+    let v = value_at(db, link, i)
+    note_long_read(db, var link, handle, v)
+    let cap = mtu_of(link, index) - 1
+    [att.build_read_rsp(if list.len(v) > cap then v[0:cap] else v)]
+
+// ATT_READ_BLOB_REQ ([Vol 3] Part F, Sections 3.4.4.5 and 3.4.4.6): the
+// value from Value Offset, cut to ATT_MTU - 1 octets.  An offset past the
+// end of the value is Invalid Offset; one at its end gives an empty part.
+fn read_blob(db: GattDb, var link: AttLink, index: Int, pdu: [u8]) -> [[u8]]
+    let op = 0x0C
+    if list.len(pdu) != 5
+        return error(op, 0, att.ATT_ERR_INVALID_PDU)
+    let handle = read_le16(pdu, 1)
+    let offset = read_le16(pdu, 3)
+    let i = index_of(db, handle)
+    if i < 0
+        return error(op, handle, att.ATT_ERR_INVALID_HANDLE)
+    let refused = access_error(db, link, i, false)
+    if refused != 0
+        return error(op, handle, refused)
+    let v = value_at(db, link, i)
+    if offset == 0
+        note_long_read(db, var link, handle, v)
+    else
+        let stale = long_read_error(db, link, handle, v)
+        if stale != 0
+            return error(op, handle, stale)
+    if offset > list.len(v)
+        return error(op, handle, att.ATT_ERR_INVALID_OFFSET)
+    let cap = mtu_of(link, index) - 1
+    let stop = if list.len(v) - offset > cap then offset + cap else list.len(v)
+    [att.build_read_blob_rsp(v[offset:stop])]
+
+// ATT_READ_MULTIPLE_REQ and ATT_READ_MULTIPLE_VARIABLE_REQ ([Vol 3] Part
+// F, Sections 3.4.4.7, 3.4.4.8, 3.4.4.11 and 3.4.4.12): two or more
+// handles, every one valid and readable, else an error naming the first
+// that is not.  The values are joined, or, for the variable form, each
+// follows its 2-octet length; the list is cut to ATT_MTU - 1 octets, the
+// variable form at the start of a tuple whose length would be cut.
+fn read_multiple(db: GattDb, link: AttLink, index: Int, pdu: [u8], variable: Bool) -> [[u8]]
+    let op = if variable then 0x20 else 0x0E
+    let n = list.len(pdu)
+    if n < 5 or (n - 1) % 2 != 0
+        return error(op, 0, att.ATT_ERR_INVALID_PDU)
+    var data: [u8] = []
+    let cap = mtu_of(link, index) - 1
+    var full = false
+    for k in 0..(n - 1) / 2
+        let handle = read_le16(pdu, 1 + 2 * k)
+        let i = index_of(db, handle)
+        if i < 0
+            return error(op, handle, att.ATT_ERR_INVALID_HANDLE)
+        let refused = access_error(db, link, i, false)
+        if refused != 0
+            return error(op, handle, refused)
+        if not full
+            let v = value_at(db, link, i)
+            if variable
+                if list.len(data) + 2 > cap
+                    full = true
+                else
+                    list.append(data, le16(list.len(v)))
+                    list.append(data, v)
+            else
+                list.append(data, v)
+            if list.len(data) >= cap
+                full = true
+    let body = if list.len(data) > cap then data[0:cap] else data
+    var rsp: [u8] = [(op + 1) as u8]
+    list.append(rsp, body)
+    [rsp]
+
+// ATT_READ_BY_GROUP_TYPE_REQ ([Vol 3] Part F, Sections 3.4.4.9 and
+// 3.4.4.10): the grouping types are the primary and secondary service
+// declarations ([Vol 3] Part G, Section 2.5.3); any other type is
+// Unsupported Group Type.  Each service with its End Group Handle and
+// UUID, all of one length, as many as fit.
+fn read_by_group_type(db: GattDb, link: AttLink, index: Int, pdu: [u8]) -> [[u8]]
+    let op = 0x10
+    let n = list.len(pdu)
+    if n != 7 and n != 21
+        return error(op, 0, att.ATT_ERR_INVALID_PDU)
+    let start = read_le16(pdu, 1)
+    let end = read_le16(pdu, 3)
+    if bad_range(start, end)
+        return error(op, start, att.ATT_ERR_INVALID_HANDLE)
+    let group = pdu[5:n]
+    if not uuid_equal(group, le16(UUID_PRIMARY_SERVICE)) and not uuid_equal(group, le16(UUID_SECONDARY_SERVICE))
+        return error(op, start, att.ATT_ERR_UNSUPPORTED_GROUP_TYPE)
+    var data: [u8] = []
+    var width = -1
+    for i in 0..list.len(db.attributes)
+        let a = db.attributes[i]
+        if a.handle >= start and a.handle <= end and uuid_equal(a.type_uuid, group)
+            let v = a.value
+            if width < 0
+                width = list.len(v)
+            if list.len(v) != width or 2 + list.len(data) + 4 + width > mtu_of(link, index)
+                break
+            list.append(data, le16(a.handle))
+            list.append(data, le16(group_end(db, i)))
+            list.append(data, v)
+    if width < 0
+        return error(op, start, att.ATT_ERR_ATTRIBUTE_NOT_FOUND)
+    [att.build_read_by_group_type_rsp(4 + width, data)]
+
+// The Client Supported Features value a write of `value` asks for: an
+// array of octets, of which this server offers the Robust Caching bit
+// ([Vol 3] Part G, Section 7.2, Table 7.6).  A bit the server does not
+// support stays zero in the value it keeps.
+@satisfies("REQ-BLE-EATT-005")
+fn csf_of(value: [u8]) -> Int
+    if list.len(value) == 0 then 0 else (value[0] as Int) & CSF_SUPPORTED
+
+// Check a write of `value` at `offset` into the attribute at `idx`: the
+// Error Code, 0 when it may go ahead.  A Client Characteristic
+// Configuration value is written whole, one or two octets, as the Zephyr
+// Host takes it; a Client Supported Features value is one octet, the
+// size of the bit field ([Vol 3] Part G, Table 7.5), written whole, and
+// is never allowed to clear a bit the client set (Section 7.2: "A client
+// shall not clear any bits it has set.  The server shall respond to any
+// such request with the Error Code parameter set to Value Not Allowed");
+// another value may not be longer than its `max_len`, nor start past its
+// end ([Vol 3] Part F, Section 3.4.5.1).  `guarded` runs the rule of
+// `add_write_guard` on `value`: a part of a long write is not guarded, the
+// value the queue makes is (`execute_write`).
+fn value_error(db: GattDb, link: AttLink, idx: Int, current: [u8], offset: Int, value: [u8], guarded: Bool) -> Int
+    let a = db.attributes[idx]
+    let restricted = octet_error(db, a.handle, value)
+    if restricted != 0 and offset == 0
+        return restricted
+    let malformed = value_format_error(db, a.handle, offset, value)
+    if malformed != 0
+        return malformed
+    if guarded
+        let refused = guard_error(db, link, a.handle, offset, value)
+        if refused != 0
+            return refused
+    if is_type(a, UUID_CLIENT_CHARACTERISTIC_CONFIGURATION)
+        if offset != 0
+            return att.ATT_ERR_INVALID_OFFSET
+        let n = list.len(value)
+        return if n == 0 or n > 2 then att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN else 0
+    if is_type(a, UUID_CLIENT_SUPPORTED_FEATURES)
+        if offset != 0
+            return att.ATT_ERR_INVALID_OFFSET
+        if list.len(value) != 1
+            return att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN
+        if (link.csf & (0xFF ^ csf_of(value))) != 0
+            return att.ATT_ERR_VALUE_NOT_ALLOWED
+        return 0
+    if offset > list.len(current)
+        return att.ATT_ERR_INVALID_OFFSET
+    if offset + list.len(value) > a.max_len
+        return att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN
+    0
+
+// Store a checked write: the first `offset` octets of the value stay and
+// `value` follows them.  A Client Supported Features value belongs to the
+// client, not to the attribute table: what the server keeps is the bits
+// it supports ([Vol 3] Part G, Section 7.2).
+fn apply(var db: GattDb, var link: AttLink, idx: Int, offset: Int, value: [u8])
+    var a = db.attributes[idx]
+    if is_type(a, UUID_CLIENT_CHARACTERISTIC_CONFIGURATION)
+        let config = if list.len(value) == 2 then read_le16(value, 0) else value[0] as Int
+        set_configuration(var link, a.handle, config)
+        return
+    if is_type(a, UUID_CLIENT_SUPPORTED_FEATURES)
+        link.csf = csf_of(value)
+        return
+    if a.per_link
+        let current = value_at(db, link, idx)
+        var kept = current[0:offset]
+        list.append(kept, value)
+        let _ = set_link_value(db, var link, a.handle, kept)
+    else
+        var v = a.value[0:offset]
+        list.append(v, value)
+        a.value = v
+    if a.tester
+        let _ = list.push(link.changed, a.handle)
+
+// ATT_WRITE_REQ and ATT_WRITE_CMD ([Vol 3] Part F, Sections 3.4.5.1 and
+// 3.4.5.3).  A command gets no response, whatever happens.
+fn write(var db: GattDb, var link: AttLink, pdu: [u8], respond: Bool) -> [[u8]]
+    let op = 0x12
+    if list.len(pdu) < 3
+        return if respond then error(op, 0, att.ATT_ERR_INVALID_PDU) else []
+    let handle = read_le16(pdu, 1)
+    let value = pdu[3:]
+    let i = index_of(db, handle)
+    var code = if i < 0 then att.ATT_ERR_INVALID_HANDLE else access_error(db, link, i, true)
+    if code == 0
+        code = value_error(db, link, i, value_at(db, link, i), 0, value, true)
+    if code != 0
+        return if respond then error(op, handle, code) else []
+    apply(var db, var link, i, 0, value)
+    if respond then [att.build_write_rsp()] else []
+
+// The Authentication Signature of a signed write ([Vol 3] Part H,
+// Section 2.4.5): AES-CMAC of the message and its 4-octet SignCounter,
+// least significant octet first, keyed with the peer's CSRK.  The 64-bit
+// result is the 64 most significant bits of the 16-octet tag, written
+// least significant octet first.
+//
+// The worked example of [Vol 3] Part F, Section 3.4.5.4 fixes the octet
+// order: for the message 'D212001337' with SignCounter 1 and key
+// 611B64EBFBCD1FD372EC9196DF425E50 the tag is F20F903C931E87F159B64F01257
+// 4B4D0 and the Authentication Signature is '01000000F1871E933C900FF2',
+// whose MAC is that tag's first eight octets reversed.  AES-CMAC here
+// takes key and message most significant octet first, so both the
+// message the command carries and the CSRK the Signing Information
+// command carried, which are least significant octet first, are
+// reversed into it.  The example's key is written the way AES-CMAC takes
+// it, the way the specification's text prints such a value; a CSRK on
+// the wire is that value's octets the other way round.
+pub fn signature_mac(message: [u8], csrk: [u8]) -> [u8]
+    let tag = aes_cmac.aes_cmac(reversed(csrk), reversed(message))
+    reversed(tag[0:8])
+
+// An ATT_SIGNED_WRITE_CMD the client sends: the opcode, the handle, the
+// value, the SignCounter and the Authentication Signature ([Vol 3] Part
+// F, Sections 3.3.1 and 3.4.5.4).  The signature is computed over the
+// command as far as the counter, with the CSRK of the device that sends
+// it.  `counter` is that device's SignCounter for this command, which
+// starts at zero with the key and rises by one for every command
+// (Section 2.4.5 of Part H).
+pub fn build_signed_write(link: AttLink, handle: Int, value: [u8], counter: Int) -> [u8]
+    var message: [u8] = [att.ATT_OP_SIGNED_WRITE_CMD]
+    list.append(message, le16(handle))
+    list.append(message, value)
+    list.append(message, le32(counter))
+    var pdu = message[:]
+    list.append(pdu, signature_mac(message, link.client_csrk))
+    pdu
+
+// The four octets of `v`, least significant first, as the ATT fields
+// carry them ([Vol 3] Part F, Section 3.3).
+fn le32(v: Int) -> [u8]
+    [(v & 0xFF) as u8, ((v >>> 8) & 0xFF) as u8, ((v >>> 16) & 0xFF) as u8, ((v >>> 24) & 0xFF) as u8]
+
+// Whether the signature of the signed write `pdu` verifies with
+// `link.peer_csrk`: the message signed is the command's opcode, handle
+// and value, and the SignCounter that follows them ([Vol 3] Part F,
+// Section 3.3.1, Part H, Section 2.4.5).  The counter must be greater
+// than the last one verified; with none verified yet (`sign_counter`
+// -1) any counter passes, including the 0 a client starts at.
+fn signature_ok(link: AttLink, pdu: [u8]) -> Bool
+    let n = list.len(pdu)
+    if list.len(link.peer_csrk) != 16 or n < SIGNED_WRITE_HEADER
+        return false
+    let message = pdu[0:n - 8]
+    let counter = read_le32(pdu, n - SIGNATURE_OCTETS)
+    if counter <= link.sign_counter
+        return false
+    // The whole signature is compared whatever the first octets held, so
+    // the time taken does not tell how many leading octets a forgery got right.
+    smp_keys.equal_ct(signature_mac(message, link.peer_csrk), pdu[n - 8:n])
+
+// ATT_SIGNED_WRITE_CMD ([Vol 3] Part F, Section 3.4.5.4, and [Vol 3] Part
+// G, Section 4.9.2): a write without response of an attribute value the
+// peer signed with its CSRK, which authenticates the client on a link
+// that is not encrypted.  There is no response whatever happens: an
+// unverifiable signature, a handle that may not be written or a value too
+// long leave the attribute alone, and a counter the peer has used
+// already leaves it alone too (Section 2.4.5 of Part H: "The device
+// performing verification should store the last verified SignCounter ...
+// to prevent replay attacks").
+@satisfies("REQ-BLE-EATT-006")
+fn signed_write(var db: GattDb, var link: AttLink, pdu: [u8]) -> Bool
+    let n = list.len(pdu)
+    if n < SIGNED_WRITE_HEADER or n > mtu_of(link, 0) or list.len(link.peer_csrk) != 16
+        return false
+    if not signature_ok(link, pdu)
+        return false
+    let handle = read_le16(pdu, 1)
+    let i = index_of(db, handle)
+    if i < 0
+        return false
+    let a = db.attributes[i]
+    if (a.permissions & (PERM_WRITE | PERM_WRITE_ENCRYPT | PERM_WRITE_AUTHEN)) == 0
+        return false
+    if (a.permissions & PERM_WRITE_AUTHOR) != 0
+        return false
+    let value = pdu[3:n - SIGNATURE_OCTETS]
+    if value_error(db, link, i, value_at(db, link, i), 0, value, true) != 0
+        return false
+    link.sign_counter = read_le32(pdu, n - SIGNATURE_OCTETS)
+    apply(var db, var link, i, 0, value)
+    true
+
+// ATT_PREPARE_WRITE_REQ ([Vol 3] Part F, Sections 3.4.6.1 and 3.4.6.2):
+// the handle and the access are checked now, the offset and the length
+// when the queue is executed.  A full queue answers Prepare Queue Full.
+fn prepare_write(var db: GattDb, var link: AttLink, pdu: [u8]) -> [[u8]]
+    let op = 0x16
+    if list.len(pdu) < 5
+        return error(op, 0, att.ATT_ERR_INVALID_PDU)
+    let handle = read_le16(pdu, 1)
+    let offset = read_le16(pdu, 3)
+    let value = pdu[5:]
+    let i = index_of(db, handle)
+    if i < 0
+        return error(op, handle, att.ATT_ERR_INVALID_HANDLE)
+    let refused = access_error(db, link, i, true)
+    if refused != 0
+        return error(op, handle, refused)
+    if list.len(link.prepare_queue) >= PREPARE_QUEUE_CAPACITY
+        return error(op, handle, att.ATT_ERR_PREPARE_QUEUE_FULL)
+    if list.len(link.prepare_queue) == 0
+        // The definitions the whole queue is checked against, remembered
+        // for the Execute Write Request to come.
+        link.prepare_generation = db.generation
+    list.push(link.prepare_queue, PreparedWrite { handle: handle, offset: offset, value: value[:] })
+    [att.build_prepare_write_rsp(handle, offset, value)]
+
+// ATT_EXECUTE_WRITE_REQ ([Vol 3] Part F, Sections 3.4.6.3 and 3.4.6.4):
+// Flags 0x00 cancels the queue; 0x01 writes it, in the order received,
+// once every prepared write has been checked against the value the ones
+// before it leave.  A write that fails the check is answered with an
+// error naming its handle, and the queue is discarded with nothing
+// written.  The queue is empty afterwards either way.
+//
+// A queue whose database changed since its first part was prepared is
+// discarded unanswered: the offsets and lengths the parts were checked
+// against are those of definitions that are no longer there, and the
+// client is told to discover the database again -- Error Code Database
+// Out Of Sync, 0x12, with the handle of the first part ([Vol 3] Part F,
+// Section 3.4.6.3 as the ATT v6.1 text has it, and GATT/SR/GAW/BI-41-C,
+// which prepares a write, has its IUT remove the attribute and reads the
+// 0x12 off the Execute Write Request).
+fn execute_write(var db: GattDb, var link: AttLink, pdu: [u8]) -> [[u8]]
+    let op = 0x18
+    if list.len(pdu) != 2 or (pdu[1] as Int) > 1
+        return error(op, 0, att.ATT_ERR_INVALID_PDU)
+    let queue = link.prepare_queue
+    link.prepare_queue = []
+    let prepared_at = link.prepare_generation
+    link.prepare_generation = -1
+    if pdu[1] as Int == 0
+        return [att.build_execute_write_rsp()]
+    if list.len(queue) > 0 and prepared_at != db.generation
+        return error(op, queue[0].handle, att.ATT_ERR_DATABASE_OUT_OF_SYNC)
+    // The values as the writes before each one leave them.
+    var handles: [Int] = []
+    var values: [[u8]] = []
+    for w in queue
+        let i = index_of(db, w.handle)
+        var slot = -1
+        for k in 0..list.len(handles)
+            if handles[k] == w.handle
+                slot = k
+        let current = if slot >= 0 then values[slot] else value_at(db, link, i)
+        let code = value_error(db, link, i, current, w.offset, w.value, false)
+        if code != 0
+            return error(op, w.handle, code)
+        var next = current[0:w.offset]
+        list.append(next, w.value)
+        if slot >= 0
+            values[slot] = next
+        else
+            list.push(handles, w.handle)
+            list.push(values, next)
+    // A rule on a characteristic (`add_write_guard`) reads the value the queue
+    // makes, not the part that came last: the parts of a long write are not a
+    // value of their own.
+    for k in 0..list.len(handles)
+        let refused = guard_error(db, link, handles[k], 0, values[k])
+        if refused != 0
+            return error(op, handles[k], refused)
+    for k in 0..list.len(handles)
+        apply(var db, var link, index_of(db, handles[k]), 0, values[k])
+    [att.build_execute_write_rsp()]
+
+// The handles of tester attributes the client wrote since the last call.
+pub fn take_changed(var link: AttLink) -> [Int]
+    let out = link.changed[:]
+    link.changed = []
+    out
+
+// The PDUs for the client role received since the last call.
+pub fn take_client_pdus(var link: AttLink) -> [[u8]]
+    let out = link.client_rx[:]
+    link.client_rx = []
+    out
+
+// ── Notifications and indications ───────────────────────────────────
+
+// The index of the Client Characteristic Configuration descriptor of the
+// characteristic whose value is at `idx`, or -1.
+fn configuration_of(db: GattDb, idx: Int) -> Int
+    for i in idx + 1..list.len(db.attributes)
+        let a = db.attributes[i]
+        if is_service(a) or is_type(a, UUID_CHARACTERISTIC)
+            return -1
+        if is_type(a, UUID_CLIENT_CHARACTERISTIC_CONFIGURATION)
+            return i
+    -1
+
+// Send the value of the attribute `handle` to the client as its Client
+// Characteristic Configuration asks: a notification when the Notification
+// bit is set, else an indication when the Indication bit is
+// ([Vol 3] Part G, Sections 3.3.3.3, 4.10 and 4.11).  The value is cut to
+// ATT_MTU - 3 octets.  Nothing is sent to a client that has not
+// configured it, nor over a link whose security the value's read
+// permissions ask for ([Vol 3] Part F, Section 3.2.5).  An indication
+// waits behind one that has not been confirmed.  A change-unaware client
+// that supports robust caching hears no notification and no indication,
+// the Service Changed indication excepted ([Vol 3] Part G, Section
+// 2.5.2.1).
+pub fn send_value(var db: GattDb, var link: AttLink, handle: Int, now_ms: Int) -> [[u8]]
+    send_value_on(db, var link, 0, handle, now_ms)
+
+// The same on the bearer at `index`: the value of an attribute may be sent
+// to the client over any of the bearers it configured ([Vol 3] Part G,
+// Section 3.2.11).
+@satisfies("REQ-BLE-EATT-004")
+fn send_value_on(db: GattDb, var link: AttLink, index: Int, handle: Int, now_ms: Int) -> [[u8]]
+    let i = index_of(db, handle)
+    if i < 0 or index < 0 or index >= list.len(link.bearers) or link.bearers[index].timed_out
+        return []
+    sync(db, var link)
+    if robust_caching(link) and link.change_unaware and not is_type(db.attributes[i], UUID_SERVICE_CHANGED)
+        return []
+    let c = configuration_of(db, i)
+    if c < 0
+        return []
+    let config = configuration(link, db.attributes[c].handle)
+    // The subscription holds only while the link grants the write of the
+    // descriptor that carries it; authorization is the application's.
+    let subscription = access_error(db, link, c, true)
+    if subscription != 0 and subscription != att.ATT_ERR_INSUFFICIENT_AUTHORIZATION
+        return []
+    let p = db.attributes[i].permissions
+    if (p & (PERM_READ_ENCRYPT | PERM_READ_AUTHEN)) != 0 and not link.security.encrypted
+        return []
+    let v = if db.attributes[i].per_link then value_at(db, link, i) else db.attributes[i].value
+    let room = mtu_of(link, index) - 3
+    let cut = if list.len(v) > room then v[0:room] else v
+    if (config & CCC_NOTIFICATION) != 0
+        return [att.build_handle_value_ntf(handle, cut)]
+    if (config & CCC_INDICATION) != 0
+        return indicate(var link, index, att.build_handle_value_ind(handle, cut), handle, now_ms)
+    []
+
+fn indicate(var link: AttLink, index: Int, pdu: [u8], handle: Int, now_ms: Int) -> [[u8]]
+    var b = link.bearers[index]
+    if b.indicating != 0
+        list.push(b.waiting, pdu[:])
+        return []
+    b.indicating = handle
+    b.deadline_ms = now_ms + ATT_TRANSACTION_TIMEOUT_MS
+    [pdu[:]]
+
+// Whether an indication of the attribute `handle` has not yet been sent to
+// the client of `link`: the one waiting for its confirmation on a bearer, or
+// one queued behind it.  A service that answers a request with a run of
+// indications is busy until this is false again.
+pub fn indication_pending(link: AttLink, handle: Int) -> Bool
+    for b in link.bearers
+        if b.indicating == handle
+            return true
+        for pdu in b.waiting
+            if read_le16(pdu, 1) == handle
+                return true
+    false
+
+// Whether the indication waiting for its confirmation on the bearer at
+// `index` is the Service Changed one: confirming it makes a change-unaware
+// client change-aware ([Vol 3] Part G, Section 2.5.2.1, "a change-unaware
+// connected client using exactly one ATT bearer becomes change-aware when
+// ... The client receives and confirms a Handle Value Indication for the
+// Service Changed characteristic").
+fn confirms_service_changed(db: GattDb, link: AttLink, index: Int) -> Bool
+    if index < 0 or index >= list.len(link.bearers)
+        return false
+    let i = index_of(db, link.bearers[index].indicating)
+    i >= 0 and is_type(db.attributes[i], UUID_SERVICE_CHANGED)
+
+// ATT_HANDLE_VALUE_CFM ([Vol 3] Part F, Section 3.4.7.3): the indication
+// is confirmed, and the next one waiting goes.  A confirmation with no
+// indication outstanding is ignored.
+pub fn confirmed(var link: AttLink, index: Int, now_ms: Int) -> [[u8]]
+    var b = link.bearers[index]
+    if b.indicating == 0
+        return []
+    b.indicating = 0
+    if list.len(b.waiting) == 0
+        return []
+    let next = b.waiting[0]
+    b.waiting = b.waiting[1:]
+    indicate(var link, index, next, read_le16(next, 1), now_ms)
+
+// The Service Changed characteristic's indication of the range `first` to
+// `last` ([Vol 3] Part G, Section 7.1), when the client configured it.
+pub fn service_changed(var db: GattDb, var link: AttLink, first: Int, last: Int, now_ms: Int) -> [[u8]]
+    let handle = handle_of_type(db, le16(UUID_SERVICE_CHANGED))
+    if handle == 0
+        return []
+    var range = le16(first)
+    list.append(range, le16(last))
+    let _ = set_value(var db, handle, range)
+    send_value(var db, var link, handle, now_ms)
+
+// Advance the transaction timers: an indication not confirmed within
+// ATT_TRANSACTION_TIMEOUT_MS ends the use of its bearer, and that bearer
+// alone.
+pub @satisfies("REQ-BLE-EATT-004")
+fn tick(var link: AttLink, now_ms: Int)
+    for i in 0..list.len(link.bearers)
+        var b = link.bearers[i]
+        if b.indicating != 0 and now_ms >= b.deadline_ms
+            b.timed_out = true
+            b.indicating = 0
+            b.waiting = []
+
+// ── Configuration of bonded clients ─────────────────────────────────
+
+// Keep the client's configuration for the bonded device at
+// `address_type` and `address`, replacing what was kept before: the
+// Client Characteristic Configuration values, the Client Supported
+// Features value ([Vol 3] Part G, Section 7.2), the database generation
+// the client was last change-aware of (Section 2.5.2.1) and the last
+// SignCounter it used (Part H, Section 2.4.5).
+pub fn save_configuration(var db: GattDb, link: AttLink, address_type: Int, address: [u8])
+    var kept: [SavedConfiguration] = []
+    for s in db.saved
+        if not (s.address_type == address_type and same_bytes(s.address, address))
+            list.push(kept, s)
+    list.push(kept, SavedConfiguration {
+        address_type: address_type, address: address[:], values: link.cccd[:],
+        csf: link.csf, generation: link.aware_generation, sign_counter: link.sign_counter,
+        client_sign_counter: link.client_sign_counter })
+    db.saved = kept
+
+// Take back the configuration kept for a bonded device.  A bonded client
+// whose database has changed since its last connection starts
+// change-unaware ([Vol 3] Part G, Section 2.5.2.1).
+pub fn restore_configuration(db: GattDb, var link: AttLink, address_type: Int, address: [u8])
+    for s in db.saved
+        if s.address_type == address_type and same_bytes(s.address, address)
+            link.cccd = s.values[:]
+            link.csf = s.csf
+            link.sign_counter = s.sign_counter
+            link.client_sign_counter = s.client_sign_counter
+            link.aware_generation = s.generation
+            if s.generation < db.generation
+                link.change_unaware = true
+
+// ── Tests ───────────────────────────────────────────────────────────
+//
+// The test database: the GAP and GATT services of the record table
+// (handles 0x0001 to 0x000B, as `gatt_db.build_gap_server` lays them out,
+// built here from records so this module needs no other), then a service
+// added the way the BTP GATT commands add one.
+//
+// The functions below that carry no `@test` are the tests' fixtures.  They
+// are `@tier(app)`: they build their databases from lists, and no device
+// image calls them.
+
+@tier(app)
+fn records() -> [u8]
+    var db = att_server.build_db_record(0x0001, UUID_PRIMARY_SERVICE, 0x0003, le16(0x1800))
+    list.append(db, att_server.build_db_record(0x0002, UUID_CHARACTERISTIC, 0x0002, [0x02, 0x03, 0x00, 0x00, 0x2A]))
+    list.append(db, att_server.build_db_record(0x0003, 0x2A00, 0x0003, ['N', 'o', 'v', 'o']))
+    list.append(db, att_server.build_db_record(0x0004, UUID_PRIMARY_SERVICE, 0x0007, le16(0x1801)))
+    list.append(db, att_server.build_db_record(0x0005, UUID_CHARACTERISTIC, 0x0005, [0x20, 0x06, 0x00, 0x05, 0x2A]))
+    list.append(db, att_server.build_db_record(0x0006, UUID_SERVICE_CHANGED, 0x0006, [0x01, 0x00, 0xFF, 0xFF]))
+    list.append(db, att_server.build_db_record(0x0007, UUID_CLIENT_CHARACTERISTIC_CONFIGURATION, 0x0007, [0x00, 0x00]))
+    db
+
+@tier(app)
+fn uuid128(last: Int) -> [u8]
+    var u: [u8] = []
+    for k in 0..15
+        list.push(u, (0xA0 + k) as u8)
+    list.push(u, last as u8)
+    u
+
+// The test service at 0x0008: a readable and writable characteristic
+// (value 0x000A), one that needs encryption (0x000C), one authentication
+// (0x000E), one authorization (0x0010), one that notifies and indicates
+// with its configuration descriptor (0x0012, 0x0013), and a 128-bit one
+// (0x0015) that also needs a 16-octet key for encryption.
+@tier(app)
+fn test_server() -> GattServer
+    var s = new_server(records(), 65)
+    test.assert_eq(add_service(var s.db, false, le16(0xAA00)), 0x0008)
+    test.assert_eq(add_characteristic(var s.db, 0x0A, PERM_READ | PERM_WRITE, le16(0xAA01)), 0x0009)
+    test.assert(set_value(var s.db, 0, [0x01, 0x02, 0x03, 0x04]))
+    let _ = add_characteristic(var s.db, 0x0A, PERM_READ_ENCRYPT | PERM_WRITE_ENCRYPT, le16(0xAA02))
+    test.assert(set_value(var s.db, 0, [0x11]))
+    let _ = add_characteristic(var s.db, 0x0A, PERM_READ_AUTHEN | PERM_WRITE_AUTHEN, le16(0xAA03))
+    test.assert(set_value(var s.db, 0, [0x22]))
+    let _ = add_characteristic(var s.db, 0x0A, PERM_READ_AUTHOR | PERM_WRITE_AUTHOR, le16(0xAA04))
+    test.assert(set_value(var s.db, 0, [0x33]))
+    let _ = add_characteristic(var s.db, 0x3A, PERM_READ | PERM_WRITE, le16(0xAA05))
+    test.assert(set_value(var s.db, 0, [0x44, 0x45]))
+    test.assert_eq(add_descriptor(s.db, PERM_READ | PERM_WRITE, le16(UUID_CLIENT_CHARACTERISTIC_CONFIGURATION)), 0x0013)
+    test.assert_eq(add_characteristic(var s.db, 0x02, PERM_READ_ENCRYPT, uuid128(0x01)), 0x0014)
+    test.assert(set_value(var s.db, 0, [0x55]))
+    test.assert(set_key_size(var s.db, 0, 16))
+    s
+
+@tier(app)
+fn one(out: [[u8]]) -> [u8]
+    test.assert_eq(list.len(out), 1)
+    out[0][:]
+
+@tier(app)
+fn octets(v: [Int]) -> [u8]
+    var out: [u8] = []
+    for x in v
+        list.push(out, x as u8)
+    out
+
+@tier(app)
+fn assert_bytes(got: [u8], want: [Int])
+    test.assert(same_bytes(got, octets(want)))
+
+@tier(app)
+fn assert_error(out: [[u8]], op: Int, handle: Int, code: Int)
+    assert_bytes(one(out), [0x01, op, handle & 0xFF, (handle >>> 8) & 0xFF, code])
+
+@tier(app)
+fn encrypted(level: Int, key_size: Int) -> LinkSecurity
+    LinkSecurity { encrypted: true, level: level, key_size: key_size, has_ltk: true }
+
+@test
+fn test_records_become_readable_attributes()
+    var s = new_server(records(), 65)
+    test.assert_eq(list.len(s.db.attributes), 7)
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x0A, 0x03, 0x00]), 0)), [0x0B, 'N' as Int, 'o' as Int, 'v' as Int, 'o' as Int])
+    // Only the configuration descriptor is writable.
+    assert_error(receive(var s.db, var s.link, octets([0x12, 0x03, 0x00, 0x41]), 0), 0x12, 0x0003, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    test.assert_eq(last_handle(s.db), 7)
+
+@test
+fn test_building_the_database()
+    var s = test_server()
+    test.assert_eq(last_handle(s.db), 0x0015)
+    // The declaration names the value handle and the UUID.
+    assert_bytes(s.db.attributes[index_of(s.db, 0x0009)].value, [0x0A, 0x0A, 0x00, 0x01, 0xAA])
+    // Refusals: a bad UUID, a descriptor nothing allows, a second
+    // configuration descriptor, a service handle that is not one.
+    test.assert_eq(add_service(var s.db, false, [0x01]), -1)
+    test.assert_eq(add_characteristic(var s.db, 0x02, PERM_READ, [0x01, 0x02, 0x03]), -1)
+    test.assert_eq(add_included(var s.db, 0x0009), -1)
+    test.assert_eq(add_included(var s.db, 0x0999), -1)
+    test.assert_eq(add_descriptor(s.db, PERM_READ, le16(UUID_CLIENT_CHARACTERISTIC_CONFIGURATION)), -1)
+    test.assert_eq(add_descriptor(s.db, PERM_READ, le16(UUID_CHARACTERISTIC_EXTENDED_PROPERTIES)), -1)
+    test.assert_eq(add_descriptor(s.db, PERM_READ, [0x01]), -1)
+    test.assert_eq(set_value(var s.db, 0x0999, [0x00]), false)
+    test.assert_eq(set_value(var s.db, 0x0008, [0x00]), false)
+    test.assert_eq(set_key_size(var s.db, 0x000A, 16), false)
+    test.assert_eq(set_key_size(var s.db, 0x000C, 6), false)
+    test.assert_eq(set_key_size(var s.db, 0x0999, 7), false)
+    var long: [u8] = []
+    for _ in 0..ATT_VALUE_MAX + 1
+        list.push(long, 0x00)
+    test.assert_eq(set_value(var s.db, 0x000A, long), false)
+    // Setting a configuration descriptor's value leaves the client's.
+    test.assert(set_value(var s.db, 0x0013, [0x01, 0x00]))
+    test.assert_eq(configuration(s.link, 0x0013), 0)
+    // A secondary service, an include declaration, an extended
+    // properties descriptor and a plain descriptor.
+    test.assert_eq(add_service(var s.db, true, le16(0xBB00)), 0x0016)
+    test.assert_eq(add_included(var s.db, 0x0008), 0x0017)
+    test.assert_eq(add_characteristic(var s.db, 0x82, PERM_READ, le16(0xBB01)), 0x0018)
+    test.assert_eq(add_descriptor(s.db, PERM_READ, le16(UUID_CHARACTERISTIC_EXTENDED_PROPERTIES)), 0x001A)
+    test.assert_eq(add_descriptor(s.db, PERM_READ | PERM_WRITE, le16(0x2901)), 0x001B)
+    test.assert_eq(handle_of_type(s.db, le16(0x2901)), 0x001B)
+    test.assert_eq(handle_of_type(s.db, le16(0x2999)), 0)
+    // The include declaration: the service handle, its end and its UUID.
+    assert_bytes(value_at(s.db, s.link, index_of(s.db, 0x0017)), [0x08, 0x00, 0x15, 0x00, 0x00, 0xAA])
+    remove_range(var s.db, 0x0016, 0x001B)
+    test.assert_eq(last_handle(s.db), 0x0015)
+
+@test
+fn test_no_characteristic_before_a_service()
+    var s = new_server([], 65)
+    test.assert_eq(last_handle(s.db), 0)
+    test.assert_eq(has_service(s.db), false)
+    test.assert_eq(add_characteristic(var s.db, 0x02, PERM_READ, le16(0x1234)), -1)
+    test.assert_eq(add_descriptor(s.db, PERM_READ, le16(0x2901)), -1)
+    test.assert_eq(add_included(var s.db, 0x0001), -1)
+    test.assert_eq(add_service(var s.db, false, le16(0x1234)), 0x0001)
+    test.assert_eq(has_service(s.db), true)
+    test.assert_eq(add_descriptor(s.db, PERM_READ, le16(0x2901)), -1)
+
+@test
+fn test_uuids_compare_across_widths()
+    let full = uuid.uuid16_to_128(0x2800)
+    test.assert(uuid_equal(le16(0x2800), full))
+    test.assert(uuid_equal(full, le16(0x2800)))
+    test.assert_eq(uuid_equal(le16(0x2801), full), false)
+    test.assert_eq(uuid_equal([0x00], full), false)
+
+@test
+fn test_exchange_mtu()
+    var s = test_server()
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x02, 0x00, 0x01]), 0)), [0x03, 65, 0x00])
+    test.assert_eq(mtu_of(s.link, 0), 65)
+    var t = test_server()
+    let _ = receive(var t.db, var t.link, octets([0x02, 0x30, 0x00]), 0)
+    test.assert_eq(mtu_of(t.link, 0), 0x30)
+    var u = test_server()
+    let _ = receive(var u.db, var u.link, octets([0x02, 0x10, 0x00]), 0)
+    test.assert_eq(mtu_of(u.link, 0), 23)
+    assert_error(receive(var u.db, var u.link, octets([0x02, 0x10]), 0), 0x02, 0, att.ATT_ERR_INVALID_PDU)
+
+@test
+fn test_discover_all_primary_services()
+    var s = test_server()
+    // Read By Group Type for «Primary Service»: GAP and GATT, then the
+    // added service from 0x0008.
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x10, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28]), 0)),
+        [0x11, 6, 0x01, 0x00, 0x03, 0x00, 0x00, 0x18, 0x04, 0x00, 0x07, 0x00, 0x01, 0x18, 0x08, 0x00, 0x15, 0x00, 0x00, 0xAA])
+    assert_error(receive(var s.db, var s.link, octets([0x10, 0x16, 0x00, 0xFF, 0xFF, 0x00, 0x28]), 0), 0x10, 0x0016, att.ATT_ERR_ATTRIBUTE_NOT_FOUND)
+    assert_error(receive(var s.db, var s.link, octets([0x10, 0x01, 0x00, 0xFF, 0xFF, 0x03, 0x28]), 0), 0x10, 0x0001, att.ATT_ERR_UNSUPPORTED_GROUP_TYPE)
+    assert_error(receive(var s.db, var s.link, octets([0x10, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x28]), 0), 0x10, 0x0000, att.ATT_ERR_INVALID_HANDLE)
+    assert_error(receive(var s.db, var s.link, octets([0x10, 0x05, 0x00, 0x04, 0x00, 0x00, 0x28]), 0), 0x10, 0x0005, att.ATT_ERR_INVALID_HANDLE)
+    assert_error(receive(var s.db, var s.link, octets([0x10, 0x01, 0x00]), 0), 0x10, 0, att.ATT_ERR_INVALID_PDU)
+    // The 128-bit form of «Primary Service» asks the same.
+    var req = octets([0x10, 0x08, 0x00, 0xFF, 0xFF])
+    list.append(req, uuid.uuid16_to_128(UUID_PRIMARY_SERVICE))
+    assert_bytes(one(receive(var s.db, var s.link, req, 0)), [0x11, 6, 0x08, 0x00, 0x15, 0x00, 0x00, 0xAA])
+
+@test
+fn test_services_of_both_widths_are_listed_apart()
+    var s = new_server(records(), 65)
+    let _ = add_service(var s.db, false, uuid128(0x07))
+    let first = one(receive(var s.db, var s.link, octets([0x10, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28]), 0))
+    test.assert_eq(first[1] as Int, 6)
+    test.assert_eq(list.len(first), 2 + 2 * 6)
+    let second = one(receive(var s.db, var s.link, octets([0x10, 0x08, 0x00, 0xFF, 0xFF, 0x00, 0x28]), 0))
+    test.assert_eq(second[1] as Int, 20)
+    test.assert_eq(list.len(second), 2 + 20)
+
+@test
+fn test_find_by_type_value()
+    var s = test_server()
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x06, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28, 0x00, 0xAA]), 0)), [0x07, 0x08, 0x00, 0x15, 0x00])
+    // A non-grouping attribute ends at its own handle.
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x06, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x2A, 'N' as Int, 'o' as Int, 'v' as Int, 'o' as Int]), 0)), [0x07, 0x03, 0x00, 0x03, 0x00])
+    assert_error(receive(var s.db, var s.link, octets([0x06, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28, 0x99, 0x99]), 0), 0x06, 0x0001, att.ATT_ERR_ATTRIBUTE_NOT_FOUND)
+    assert_error(receive(var s.db, var s.link, octets([0x06, 0x02, 0x00, 0x01, 0x00, 0x00, 0x28]), 0), 0x06, 0x0002, att.ATT_ERR_INVALID_HANDLE)
+    assert_error(receive(var s.db, var s.link, octets([0x06, 0x01, 0x00, 0xFF, 0xFF, 0x00]), 0), 0x06, 0, att.ATT_ERR_INVALID_PDU)
+
+@test
+fn test_find_information()
+    var s = test_server()
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x04, 0x12, 0x00, 0x13, 0x00]), 0)), [0x05, 0x01, 0x12, 0x00, 0x05, 0xAA, 0x13, 0x00, 0x02, 0x29])
+    // A 128-bit type after 16-bit ones ends the list; alone it uses format 2.
+    let mixed = one(receive(var s.db, var s.link, octets([0x04, 0x13, 0x00, 0x15, 0x00]), 0))
+    test.assert_eq(list.len(mixed), 2 + 4 + 4)
+    let wide = one(receive(var s.db, var s.link, octets([0x04, 0x15, 0x00, 0x15, 0x00]), 0))
+    test.assert_eq(wide[1] as Int, 0x02)
+    test.assert_eq(list.len(wide), 2 + 2 + 16)
+    // ATT_MTU 23 holds five 16-bit pairs.
+    test.assert_eq(list.len(one(receive(var s.db, var s.link, octets([0x04, 0x01, 0x00, 0xFF, 0xFF]), 0))), 2 + 5 * 4)
+    assert_error(receive(var s.db, var s.link, octets([0x04, 0x16, 0x00, 0xFF, 0xFF]), 0), 0x04, 0x0016, att.ATT_ERR_ATTRIBUTE_NOT_FOUND)
+    assert_error(receive(var s.db, var s.link, octets([0x04, 0x00, 0x00, 0xFF, 0xFF]), 0), 0x04, 0x0000, att.ATT_ERR_INVALID_HANDLE)
+    assert_error(receive(var s.db, var s.link, octets([0x04, 0x01]), 0), 0x04, 0, att.ATT_ERR_INVALID_PDU)
+
+@test
+fn test_read_by_type_discovers_characteristics()
+    var s = test_server()
+    // Characteristic declarations of 5 octets; the 128-bit one at 0x0014
+    // is of another length and would not fit anyway.
+    let rsp = one(receive(var s.db, var s.link, octets([0x08, 0x08, 0x00, 0x15, 0x00, 0x03, 0x28]), 0))
+    test.assert_eq(rsp[1] as Int, 7)
+    test.assert_eq(list.len(rsp), 2 + 3 * 7)
+    let wide = one(receive(var s.db, var s.link, octets([0x08, 0x14, 0x00, 0x15, 0x00, 0x03, 0x28]), 0))
+    test.assert_eq(wide[1] as Int, 21)
+    assert_error(receive(var s.db, var s.link, octets([0x08, 0x16, 0x00, 0xFF, 0xFF, 0x03, 0x28]), 0), 0x08, 0x0016, att.ATT_ERR_ATTRIBUTE_NOT_FOUND)
+    assert_error(receive(var s.db, var s.link, octets([0x08, 0x02, 0x00, 0x01, 0x00, 0x03, 0x28]), 0), 0x08, 0x0002, att.ATT_ERR_INVALID_HANDLE)
+    assert_error(receive(var s.db, var s.link, octets([0x08, 0x01, 0x00, 0xFF, 0xFF, 0x03]), 0), 0x08, 0, att.ATT_ERR_INVALID_PDU)
+
+@test
+fn test_read_by_type_checks_access()
+    var s = test_server()
+    // The first match refused: the error names it.
+    assert_error(receive(var s.db, var s.link, octets([0x08, 0x01, 0x00, 0xFF, 0xFF, 0x02, 0xAA]), 0), 0x08, 0x000C, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    // A refused match after a readable one ends the list.
+    let _ = add_characteristic(var s.db, 0x02, PERM_READ, le16(0xAA01))
+    let _ = set_value(var s.db, 0, [0x09, 0x09, 0x09, 0x09])
+    let _ = add_characteristic(var s.db, 0x02, PERM_READ_AUTHOR, le16(0xAA01))
+    let _ = set_value(var s.db, 0, [0x08, 0x08, 0x08, 0x08])
+    let rsp = one(receive(var s.db, var s.link, octets([0x08, 0x01, 0x00, 0xFF, 0xFF, 0x01, 0xAA]), 0))
+    test.assert_eq(list.len(rsp), 2 + 2 * 6)
+    // A value of another length ends it too.
+    let _ = add_characteristic(var s.db, 0x02, PERM_READ, le16(0xAA06))
+    let _ = set_value(var s.db, 0, [0x01])
+    let _ = add_characteristic(var s.db, 0x02, PERM_READ, le16(0xAA06))
+    let _ = set_value(var s.db, 0, [0x01, 0x02])
+    test.assert_eq(list.len(one(receive(var s.db, var s.link, octets([0x08, 0x01, 0x00, 0xFF, 0xFF, 0x06, 0xAA]), 0))), 2 + 3)
+
+@test
+fn test_read_by_type_cuts_a_long_value()
+    var s = test_server()
+    let _ = add_characteristic(var s.db, 0x02, PERM_READ, le16(0xAA07))
+    var long: [u8] = []
+    for k in 0..40
+        list.push(long, k as u8)
+    let _ = set_value(var s.db, 0, long)
+    let rsp = one(receive(var s.db, var s.link, octets([0x08, 0x01, 0x00, 0xFF, 0xFF, 0x07, 0xAA]), 0))
+    test.assert_eq(rsp[1] as Int, 2 + 19)
+    test.assert_eq(list.len(rsp), 23)
+
+@test
+fn test_read_and_security()
+    var s = test_server()
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x0A, 0x0A, 0x00]), 0)), [0x0B, 0x01, 0x02, 0x03, 0x04])
+    assert_error(receive(var s.db, var s.link, octets([0x0A, 0x99, 0x00]), 0), 0x0A, 0x0099, att.ATT_ERR_INVALID_HANDLE)
+    assert_error(receive(var s.db, var s.link, octets([0x0A, 0x99]), 0), 0x0A, 0, att.ATT_ERR_INVALID_PDU)
+    // Unencrypted with no key: Insufficient Authentication, for
+    // encryption and authentication alike.
+    assert_error(receive(var s.db, var s.link, octets([0x0A, 0x0C, 0x00]), 0), 0x0A, 0x000C, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    assert_error(receive(var s.db, var s.link, octets([0x0A, 0x0E, 0x00]), 0), 0x0A, 0x000E, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    assert_error(receive(var s.db, var s.link, octets([0x0A, 0x10, 0x00]), 0), 0x0A, 0x0010, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+    // With a key for the peer: Insufficient Encryption.
+    set_security(var s.link, LinkSecurity { encrypted: false, level: 1, key_size: 0, has_ltk: true })
+    assert_error(receive(var s.db, var s.link, octets([0x0A, 0x0C, 0x00]), 0), 0x0A, 0x000C, att.ATT_ERR_INSUFFICIENT_ENCRYPTION)
+    // Encrypted, unauthenticated: encryption is enough, authentication not.
+    set_security(var s.link, encrypted(2, 16))
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x0A, 0x0C, 0x00]), 0)), [0x0B, 0x11])
+    assert_error(receive(var s.db, var s.link, octets([0x0A, 0x0E, 0x00]), 0), 0x0A, 0x000E, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    // Authenticated: both; the 128-bit value still needs a 16-octet key.
+    set_security(var s.link, encrypted(3, 7))
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x0A, 0x0E, 0x00]), 0)), [0x0B, 0x22])
+    assert_error(receive(var s.db, var s.link, octets([0x0A, 0x15, 0x00]), 0), 0x0A, 0x0015, att.ATT_ERR_INSUFFICIENT_ENC_KEY_SIZE)
+    set_security(var s.link, encrypted(4, 16))
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x0A, 0x15, 0x00]), 0)), [0x0B, 0x55])
+    // The Service Changed value is indicated, not read.
+    assert_error(receive(var s.db, var s.link, octets([0x0A, 0x06, 0x00]), 0), 0x0A, 0x0006, att.ATT_ERR_READ_NOT_PERMITTED)
+
+@test
+fn test_read_not_permitted()
+    var s = test_server()
+    let _ = add_characteristic(var s.db, 0x08, PERM_WRITE, le16(0xAA08))
+    let _ = set_value(var s.db, 0, [0x01])
+    assert_error(receive(var s.db, var s.link, octets([0x0A, 0x17, 0x00]), 0), 0x0A, 0x0017, att.ATT_ERR_READ_NOT_PERMITTED)
+    assert_error(receive(var s.db, var s.link, octets([0x0C, 0x17, 0x00, 0x00, 0x00]), 0), 0x0C, 0x0017, att.ATT_ERR_READ_NOT_PERMITTED)
+
+@test
+fn test_read_blob()
+    var s = test_server()
+    let _ = add_characteristic(var s.db, 0x02, PERM_READ, le16(0xAA09))
+    var long: [u8] = []
+    for k in 0..30
+        list.push(long, k as u8)
+    let _ = set_value(var s.db, 0, long)
+    let first = one(receive(var s.db, var s.link, octets([0x0A, 0x17, 0x00]), 0))
+    test.assert_eq(list.len(first), 23)
+    let rest = one(receive(var s.db, var s.link, octets([0x0C, 0x17, 0x00, 22, 0x00]), 0))
+    assert_bytes(rest, [0x0D, 22, 23, 24, 25, 26, 27, 28, 29])
+    let middle = one(receive(var s.db, var s.link, octets([0x0C, 0x17, 0x00, 1, 0x00]), 0))
+    test.assert_eq(list.len(middle), 23)
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x0C, 0x17, 0x00, 30, 0x00]), 0)), [0x0D])
+    assert_error(receive(var s.db, var s.link, octets([0x0C, 0x17, 0x00, 31, 0x00]), 0), 0x0C, 0x0017, att.ATT_ERR_INVALID_OFFSET)
+    assert_error(receive(var s.db, var s.link, octets([0x0C, 0x99, 0x00, 0x00, 0x00]), 0), 0x0C, 0x0099, att.ATT_ERR_INVALID_HANDLE)
+    assert_error(receive(var s.db, var s.link, octets([0x0C, 0x0C, 0x00, 0x00, 0x00]), 0), 0x0C, 0x000C, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    assert_error(receive(var s.db, var s.link, octets([0x0C, 0x17, 0x00]), 0), 0x0C, 0, att.ATT_ERR_INVALID_PDU)
+
+@test
+@satisfies("REQ-BLE-GAF-080")
+fn test_a_read_blob_after_the_value_changed_is_value_changed_during_read_long()
+    var s = test_server()
+    let _ = add_characteristic(var s.db, 0x02, PERM_READ, le16(0xAA09))
+    test.assert(add_read_long_rule(var s.db, 0x17))
+    test.assert(add_read_long_rule(var s.db, 0x17))
+    test.assert_eq(list.len(s.db.long_reads), 1)
+    var long: [u8] = []
+    for k in 0..30
+        list.push(long, k as u8)
+    let _ = set_value(var s.db, 0, long)
+    // A part before any read from offset 0 is served: no value changed under the client.
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x0C, 0x17, 0x00, 22, 0x00]), 0)), [0x0D, 22, 23, 24, 25, 26, 27, 28, 29])
+    test.assert_eq(list.len(one(receive(var s.db, var s.link, octets([0x0A, 0x17, 0x00]), 0))), 23)
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x0C, 0x17, 0x00, 22, 0x00]), 0)), [0x0D, 22, 23, 24, 25, 26, 27, 28, 29])
+    // The value changes: the continuation is refused, and a new read from offset 0 restarts.
+    list.push(long, 30)
+    let _ = set_value(var s.db, 0, long)
+    assert_error(receive(var s.db, var s.link, octets([0x0C, 0x17, 0x00, 22, 0x00]), 0), 0x0C, 0x0017, ERR_VALUE_CHANGED_DURING_READ_LONG)
+    test.assert_eq(list.len(one(receive(var s.db, var s.link, octets([0x0C, 0x17, 0x00, 0, 0x00]), 0))), 23)
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x0C, 0x17, 0x00, 22, 0x00]), 0)), [0x0D, 22, 23, 24, 25, 26, 27, 28, 29, 30])
+    // Another client has its own stamp, and an attribute without the rule has none.
+    var other = new_att_link(s.db)
+    set_security(var other, link_security(true, 2, 16, true))
+    assert_bytes(one(receive(var s.db, var other, octets([0x0C, 0x17, 0x00, 22, 0x00]), 0)), [0x0D, 22, 23, 24, 25, 26, 27, 28, 29, 30])
+    test.assert(not add_read_long_rule(var s.db, 1))
+    test.assert(not add_read_long_rule(var s.db, 0x0999))
+    test.assert_eq(long_read_error(s.db, s.link, 0x0A, []), 0)
+    // An attribute with the rule that the client has not read from offset 0 is served although
+    // the client has read another one.
+    test.assert(add_read_long_rule(var s.db, 0x0A))
+    test.assert_eq(long_read_error(s.db, s.link, 0x0A, []), 0)
+
+@test
+fn test_read_multiple()
+    var s = test_server()
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x0E, 0x0A, 0x00, 0x03, 0x00]), 0)), [0x0F, 0x01, 0x02, 0x03, 0x04, 'N' as Int, 'o' as Int, 'v' as Int, 'o' as Int])
+    assert_error(receive(var s.db, var s.link, octets([0x0E, 0x0A, 0x00, 0x99, 0x00]), 0), 0x0E, 0x0099, att.ATT_ERR_INVALID_HANDLE)
+    assert_error(receive(var s.db, var s.link, octets([0x0E, 0x0A, 0x00, 0x10, 0x00]), 0), 0x0E, 0x0010, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+    assert_error(receive(var s.db, var s.link, octets([0x0E, 0x0A, 0x00]), 0), 0x0E, 0, att.ATT_ERR_INVALID_PDU)
+    assert_error(receive(var s.db, var s.link, octets([0x0E, 0x0A, 0x00, 0x03]), 0), 0x0E, 0, att.ATT_ERR_INVALID_PDU)
+    // Cut to ATT_MTU - 1.
+    var req = octets([0x0E])
+    for _ in 0..8
+        list.append(req, octets([0x0A, 0x00]))
+    test.assert_eq(list.len(one(receive(var s.db, var s.link, req, 0))), 23)
+
+@test
+fn test_read_multiple_variable()
+    var s = test_server()
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x20, 0x0A, 0x00, 0x12, 0x00]), 0)), [0x21, 0x04, 0x00, 0x01, 0x02, 0x03, 0x04, 0x02, 0x00, 0x44, 0x45])
+    assert_error(receive(var s.db, var s.link, octets([0x20, 0x0A, 0x00, 0x0C, 0x00]), 0), 0x20, 0x000C, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    // A tuple whose length would be cut is left out; a value is cut.
+    var req = octets([0x20])
+    for _ in 0..4
+        list.append(req, octets([0x0A, 0x00]))
+    test.assert_eq(list.len(one(receive(var s.db, var s.link, req, 0))), 1 + 3 * 6 + 2 + 2)
+    var two = octets([0x20])
+    for _ in 0..4
+        list.append(two, octets([0x03, 0x00]))
+    let rsp = one(receive(var s.db, var s.link, two, 0))
+    test.assert_eq(list.len(rsp), 1 + 3 * 6 + 2 + 2)
+
+@test
+fn test_write_request_and_command()
+    var s = test_server()
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x12, 0x0A, 0x00, 0x09, 0x08]), 0)), [0x13])
+    assert_bytes(s.db.attributes[index_of(s.db, 0x000A)].value, [0x09, 0x08])
+    // Up to the length the tester set; longer is refused.
+    assert_error(receive(var s.db, var s.link, octets([0x12, 0x0A, 0x00, 1, 2, 3, 4, 5]), 0), 0x12, 0x000A, att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    assert_error(receive(var s.db, var s.link, octets([0x12, 0x99, 0x00, 0x00]), 0), 0x12, 0x0099, att.ATT_ERR_INVALID_HANDLE)
+    assert_error(receive(var s.db, var s.link, octets([0x12, 0x0C, 0x00, 0x00]), 0), 0x12, 0x000C, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    assert_error(receive(var s.db, var s.link, octets([0x12, 0x10, 0x00, 0x00]), 0), 0x12, 0x0010, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+    assert_error(receive(var s.db, var s.link, octets([0x12, 0x0A]), 0), 0x12, 0, att.ATT_ERR_INVALID_PDU)
+    test.assert_eq(list.len(take_changed(s.link)), 1)
+    test.assert_eq(list.len(take_changed(s.link)), 0)
+    // A command answers nothing, applied or not.
+    test.assert_eq(list.len(receive(var s.db, var s.link, octets([0x52, 0x0A, 0x00, 0x07]), 0)), 0)
+    assert_bytes(s.db.attributes[index_of(s.db, 0x000A)].value, [0x07])
+    test.assert_eq(list.len(receive(var s.db, var s.link, octets([0x52, 0x0C, 0x00, 0x07]), 0)), 0)
+    test.assert_eq(list.len(receive(var s.db, var s.link, octets([0x52, 0x0C]), 0)), 0)
+    assert_bytes(s.db.attributes[index_of(s.db, 0x000C)].value, [0x11])
+    // A value that may only be read.
+    set_security(var s.link, encrypted(4, 7))
+    assert_error(receive(var s.db, var s.link, octets([0x12, 0x15, 0x00, 0x00]), 0), 0x12, 0x0015, att.ATT_ERR_WRITE_NOT_PERMITTED)
+
+@test
+fn test_configuration_descriptor()
+    var s = test_server()
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x0A, 0x13, 0x00]), 0)), [0x0B, 0x00, 0x00])
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x12, 0x13, 0x00, 0x01, 0x00]), 0)), [0x13])
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x0A, 0x13, 0x00]), 0)), [0x0B, 0x01, 0x00])
+    assert_error(receive(var s.db, var s.link, octets([0x12, 0x13, 0x00]), 0), 0x12, 0x0013, att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    assert_error(receive(var s.db, var s.link, octets([0x12, 0x13, 0x00, 0x01, 0x00, 0x00]), 0), 0x12, 0x0013, att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    // One octet is taken as the low one.
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x12, 0x13, 0x00, 0x03]), 0)), [0x13])
+    test.assert_eq(configuration(s.link, 0x0013), 3)
+    // A queued write of the whole value, then one at an offset.
+    let _ = receive(var s.db, var s.link, octets([0x16, 0x13, 0x00, 0x00, 0x00, 0x02, 0x00]), 0)
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x18, 0x01]), 0)), [0x19])
+    test.assert_eq(configuration(s.link, 0x0013), 2)
+    let _ = receive(var s.db, var s.link, octets([0x16, 0x13, 0x00, 0x01, 0x00, 0x00]), 0)
+    assert_error(receive(var s.db, var s.link, octets([0x18, 0x01]), 0), 0x18, 0x0013, att.ATT_ERR_INVALID_OFFSET)
+    // The configuration is the client's: a new connection starts at 0,
+    // a bonded one gets back what it had.
+    save_configuration(var s.db, s.link, 1, octets([1, 2, 3, 4, 5, 6]))
+    save_configuration(var s.db, s.link, 1, octets([1, 2, 3, 4, 5, 6]))
+    test.assert_eq(list.len(s.db.saved), 1)
+    reset_bearer(s.db, var s.link)
+    test.assert_eq(configuration(s.link, 0x0013), 0)
+    restore_configuration(s.db, var s.link, 0, octets([1, 2, 3, 4, 5, 6]))
+    test.assert_eq(configuration(s.link, 0x0013), 0)
+    restore_configuration(s.db, var s.link, 1, octets([1, 2, 3, 4, 5, 6]))
+    test.assert_eq(configuration(s.link, 0x0013), 2)
+    set_configuration(var s.link, 0x0013, 0)
+    test.assert_eq(list.len(s.link.cccd), 0)
+
+@test
+fn test_queued_writes()
+    var s = test_server()
+    let _ = add_characteristic(var s.db, 0x0A, PERM_READ | PERM_WRITE, le16(0xAA0A))
+    var long: [u8] = []
+    for _ in 0..40
+        list.push(long, 0x00)
+    let _ = set_value(var s.db, 0, long)
+    // Prepare, echo, execute: the value becomes the parts in order.
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x16, 0x17, 0x00, 0x00, 0x00, 1, 2, 3]), 0)), [0x17, 0x17, 0x00, 0x00, 0x00, 1, 2, 3])
+    let _ = receive(var s.db, var s.link, octets([0x16, 0x17, 0x00, 0x03, 0x00, 4, 5]), 0)
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x18, 0x01]), 0)), [0x19])
+    assert_bytes(s.db.attributes[index_of(s.db, 0x0017)].value, [1, 2, 3, 4, 5])
+    test.assert_eq(list.len(take_changed(s.link)), 1)
+    // Cancel discards the queue.
+    let _ = receive(var s.db, var s.link, octets([0x16, 0x17, 0x00, 0x00, 0x00, 9]), 0)
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x18, 0x00]), 0)), [0x19])
+    assert_bytes(s.db.attributes[index_of(s.db, 0x0017)].value, [1, 2, 3, 4, 5])
+    // An empty queue executes to a response.
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x18, 0x01]), 0)), [0x19])
+    // An offset past the value, or a value past its longest: an error
+    // naming the handle, and nothing written.
+    let _ = receive(var s.db, var s.link, octets([0x16, 0x17, 0x00, 0x09, 0x00, 1]), 0)
+    assert_error(receive(var s.db, var s.link, octets([0x18, 0x01]), 0), 0x18, 0x0017, att.ATT_ERR_INVALID_OFFSET)
+    let _ = receive(var s.db, var s.link, octets([0x16, 0x17, 0x00, 0x00, 0x00, 7]), 0)
+    let _ = receive(var s.db, var s.link, octets([0x16, 0x17, 0x00, 0x27, 0x00, 1, 2]), 0)
+    assert_error(receive(var s.db, var s.link, octets([0x18, 0x01]), 0), 0x18, 0x0017, att.ATT_ERR_INVALID_OFFSET)
+    let _ = receive(var s.db, var s.link, octets([0x16, 0x0A, 0x00, 0x00, 0x00, 1, 2, 3, 4, 5]), 0)
+    assert_error(receive(var s.db, var s.link, octets([0x18, 0x01]), 0), 0x18, 0x000A, att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    assert_bytes(s.db.attributes[index_of(s.db, 0x0017)].value, [1, 2, 3, 4, 5])
+    // Checks at prepare time.
+    assert_error(receive(var s.db, var s.link, octets([0x16, 0x99, 0x00, 0x00, 0x00]), 0), 0x16, 0x0099, att.ATT_ERR_INVALID_HANDLE)
+    assert_error(receive(var s.db, var s.link, octets([0x16, 0x0C, 0x00, 0x00, 0x00]), 0), 0x16, 0x000C, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    assert_error(receive(var s.db, var s.link, octets([0x16, 0x0C, 0x00]), 0), 0x16, 0, att.ATT_ERR_INVALID_PDU)
+    assert_error(receive(var s.db, var s.link, octets([0x18, 0x02]), 0), 0x18, 0, att.ATT_ERR_INVALID_PDU)
+    for _ in 0..PREPARE_QUEUE_CAPACITY
+        let _ = receive(var s.db, var s.link, octets([0x16, 0x17, 0x00, 0x00, 0x00, 1]), 0)
+    assert_error(receive(var s.db, var s.link, octets([0x16, 0x17, 0x00, 0x00, 0x00, 1]), 0), 0x16, 0x0017, att.ATT_ERR_PREPARE_QUEUE_FULL)
+
+@test
+fn test_unsupported_and_client_pdus()
+    var s = test_server()
+    assert_error(receive(var s.db, var s.link, octets([0x3F]), 0), 0x3F, 0, att.ATT_ERR_REQUEST_NOT_SUPPORTED)
+    test.assert_eq(list.len(receive(var s.db, var s.link, octets([0x7F]), 0)), 0)
+    test.assert_eq(list.len(receive(var s.db, var s.link, octets([0xD2, 0x0A, 0x00]), 0)), 0)
+    test.assert_eq(list.len(receive(var s.db, var s.link, [], 0)), 0)
+    test.assert_eq(list.len(receive(var s.db, var s.link, octets([0x1B, 0x03, 0x00, 0x01]), 0)), 0)
+    test.assert_eq(list.len(take_client_pdus(var s.link)), 1)
+    test.assert_eq(list.len(take_client_pdus(var s.link)), 0)
+
+@test
+fn test_notifications_and_indications()
+    var s = test_server()
+    // Nothing until the client configures it; a value with no descriptor
+    // never goes.
+    test.assert_eq(list.len(send_value(var s.db, var s.link, 0x0012, 0)), 0)
+    test.assert_eq(list.len(send_value(var s.db, var s.link, 0x000A, 0)), 0)
+    test.assert_eq(list.len(send_value(var s.db, var s.link, 0x0999, 0)), 0)
+    set_configuration(var s.link, 0x0013, CCC_NOTIFICATION)
+    assert_bytes(one(send_value(var s.db, var s.link, 0x0012, 0)), [0x1B, 0x12, 0x00, 0x44, 0x45])
+    // Indications wait for their confirmation, one at a time.
+    set_configuration(var s.link, 0x0013, CCC_INDICATION)
+    assert_bytes(one(send_value(var s.db, var s.link, 0x0012, 0)), [0x1D, 0x12, 0x00, 0x44, 0x45])
+    test.assert_eq(list.len(send_value(var s.db, var s.link, 0x0012, 0)), 0)
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x1E]), 10)), [0x1D, 0x12, 0x00, 0x44, 0x45])
+    test.assert_eq(list.len(receive(var s.db, var s.link, octets([0x1E]), 20)), 0)
+    test.assert_eq(list.len(receive(var s.db, var s.link, octets([0x1E]), 20)), 0)
+    // No confirmation within the transaction timeout: the bearer is done.
+    let _ = send_value(var s.db, var s.link, 0x0012, 100)
+    tick(s.link, 100 + ATT_TRANSACTION_TIMEOUT_MS - 1)
+    test.assert_eq(s.link.bearers[0].timed_out, false)
+    tick(s.link, 100 + ATT_TRANSACTION_TIMEOUT_MS)
+    test.assert(s.link.bearers[0].timed_out)
+    test.assert_eq(list.len(receive(var s.db, var s.link, octets([0x0A, 0x0A, 0x00]), 0)), 0)
+    test.assert_eq(list.len(send_value(var s.db, var s.link, 0x0012, 0)), 0)
+    reset_bearer(s.db, var s.link)
+    test.assert_eq(s.link.bearers[0].timed_out, false)
+
+@test
+fn test_values_that_need_encryption_are_not_sent_in_the_clear()
+    var s = test_server()
+    let _ = add_characteristic(var s.db, 0x12, PERM_READ_ENCRYPT, le16(0xAA0B))
+    let _ = set_value(var s.db, 0, [0x01])
+    let _ = add_descriptor(s.db, PERM_READ | PERM_WRITE, le16(UUID_CLIENT_CHARACTERISTIC_CONFIGURATION))
+    set_configuration(var s.link, 0x0018, CCC_NOTIFICATION)
+    test.assert_eq(list.len(send_value(var s.db, var s.link, 0x0017, 0)), 0)
+    set_security(var s.link, encrypted(2, 16))
+    test.assert_eq(list.len(send_value(var s.db, var s.link, 0x0017, 0)), 1)
+
+@test
+fn test_service_changed()
+    var s = test_server()
+    test.assert_eq(list.len(service_changed(var s.db, var s.link, 0x0008, 0x0015, 0)), 0)
+    set_configuration(var s.link, 0x0007, CCC_INDICATION)
+    assert_bytes(one(service_changed(var s.db, var s.link, 0x0016, 0x0020, 0)), [0x1D, 0x06, 0x00, 0x16, 0x00, 0x20, 0x00])
+    var bare = new_server([], 65)
+    test.assert_eq(list.len(service_changed(var bare.db, var bare.link, 1, 2, 0)), 0)
+
+@test
+fn test_tester_reads()
+    var s = test_server()
+    let r = tester_read(s.db, s.link, 0x000A, false)
+    test.assert_eq(r.0, 0)
+    test.assert_eq(tester_read(s.db, s.link, 0x0999, false).0, att.ATT_ERR_INVALID_HANDLE)
+    test.assert_eq(tester_read(s.db, s.link, 0x0010, true).0, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+    test.assert_eq(tester_read(s.db, s.link, 0x0015, false).0, att.ATT_ERR_INSUFFICIENT_ENC_KEY_SIZE)
+    test.assert_eq(tester_read(s.db, s.link, 0x0015, true).0, att.ATT_ERR_INSUFFICIENT_ENC_KEY_SIZE)
+    set_security(var s.link, encrypted(4, 16))
+    test.assert_eq(tester_read(s.db, s.link, 0x0015, true).0, 0)
+    // No security check: the value needing encryption reads as it is.
+    test.assert_eq(tester_read(s.db, s.link, 0x000C, true).0, 0)
+    let _ = add_characteristic(var s.db, 0x08, PERM_WRITE, le16(0xAA0C))
+    test.assert_eq(tester_read(s.db, s.link, 0x0017, true).0, att.ATT_ERR_READ_NOT_PERMITTED)
+    // An include declaration that lost its service reads empty.
+    let _ = add_included(var s.db, 0x0008)
+    remove_range(var s.db, 0x0008, 0x0008)
+    test.assert_eq(list.len(tester_read(s.db, s.link, 0x0018, true).1), 0)
+
+
+@test
+fn test_edges_of_the_tables()
+    var s = test_server()
+    // Two UUIDs of one width that differ, and values of two lengths.
+    test.assert_eq(uuid_equal(le16(0x2800), le16(0x2801)), false)
+    test.assert_eq(same_bytes(octets([1]), octets([1, 2])), false)
+    // The last value has no descriptor after it.
+    test.assert_eq(list.len(send_value(var s.db, var s.link, 0x0015, 0)), 0)
+    // A second configuration descriptor in one characteristic.
+    let _ = add_characteristic(var s.db, 0x12, PERM_READ, le16(0xAA0D))
+    test.assert(add_descriptor(s.db, PERM_READ | PERM_WRITE, le16(UUID_CLIENT_CHARACTERISTIC_CONFIGURATION)) > 0)
+    test.assert_eq(add_descriptor(s.db, PERM_READ | PERM_WRITE, le16(UUID_CLIENT_CHARACTERISTIC_CONFIGURATION)), -1)
+    // Configuration of two descriptors at once.
+    set_configuration(var s.link, 0x0013, CCC_NOTIFICATION)
+    set_configuration(var s.link, 0x0018, CCC_INDICATION)
+    set_configuration(var s.link, 0x0013, 0)
+    test.assert_eq(configuration(s.link, 0x0018), CCC_INDICATION)
+    // Two bonded clients are kept apart.
+    save_configuration(var s.db, s.link, 0, octets([1, 2, 3, 4, 5, 6]))
+    save_configuration(var s.db, s.link, 1, octets([1, 2, 3, 4, 5, 6]))
+    test.assert_eq(list.len(s.db.saved), 2)
+
+@test
+fn test_find_by_type_value_stops_when_full()
+    var s = new_server(records(), 65)
+    for _ in 0..7
+        let _ = add_service(var s.db, false, le16(0xCC00))
+    // ATT_MTU 23 holds five Handles Information entries.
+    let rsp = one(receive(var s.db, var s.link, octets([0x06, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28, 0x00, 0xCC]), 0))
+    test.assert_eq(list.len(rsp), 1 + 5 * 4)
+
+@test
+fn test_read_multiple_variable_leaves_out_a_tuple_with_no_room()
+    var s = new_server(records(), 65)
+    let _ = add_service(var s.db, false, le16(0xDD00))
+    let _ = add_characteristic(var s.db, 0x02, PERM_READ, le16(0xDD01))
+    let _ = set_value(var s.db, 0, [0x07])
+    // Seven 3-octet tuples fill 21 of the 22 octets: the eighth's length
+    // does not fit.
+    var req = octets([0x20])
+    for _ in 0..8
+        list.append(req, octets([0x0A, 0x00]))
+    test.assert_eq(list.len(one(receive(var s.db, var s.link, req, 0))), 1 + 21)
+
+// ── Tests: the Database Hash, Robust Caching and signed writes ──────
+//
+// The GAP and GATT services the Host itself holds, as
+// `gatt_db.build_gap_server` lays them out: the readable Device Name
+// value at 0x0003, the Service Changed characteristic at 0x000C with its
+// configuration descriptor at 0x000D, the Client Supported Features
+// value at 0x000F and the Database Hash value at 0x0011.
+
+// A GATT server for a PC Host or a test: the GAP service with the Device Name `Test`, the Appearance and the
+// Peripheral Preferred Connection Parameters, none of them writable.
+pub @tier(app)
+fn host_server() -> GattServer
+    host_server_with(false)
+
+// The same database with the Device Name and the Appearance writable or not.
+@tier(app)
+fn host_server_with(writable_identity: Bool) -> GattServer
+    let name: [u8] = ['T', 'e', 's', 't']
+    new_server(gatt_db.build_gap_server(name, gatt_db.appearance_bytes(),
+        gatt_db.ppcp_value(0x0018, 0x0028, 0, 0x01F4), writable_identity), 65)
+
+@tier(app)
+fn host_service_changed_handle(s: GattServer) -> Int
+    handle_of_type(s.db, le16(UUID_SERVICE_CHANGED))
+
+@tier(app)
+fn host_hash_handle() -> Int
+    gatt_db.GAP_SERVER_DATABASE_HASH_HANDLE
+
+@tier(app)
+fn host_csf_request(value: Int) -> [u8]
+    octets([0x12, gatt_db.GAP_SERVER_CLIENT_SUPPORTED_FEATURES_HANDLE & 0xFF,
+        gatt_db.GAP_SERVER_CLIENT_SUPPORTED_FEATURES_HANDLE >>> 8, value])
+
+// The example database of [Vol 3] Part G, Appendix B, in the record
+// format: the GAP and GATT services with both new characteristics, a
+// Client Characteristic Configuration descriptor and a Characteristic
+// Extended Properties descriptor, an include declaration and a secondary
+// service.
+@tier(app)
+fn appendix_records() -> [u8]
+    var db = att_server.build_db_record(0x0001, UUID_PRIMARY_SERVICE, 0x0003, le16(0x1800))
+    list.append(db, att_server.build_db_record(0x0002, UUID_CHARACTERISTIC, 0x0002, [0x0A, 0x03, 0x00, 0x00, 0x2A]))
+    list.append(db, att_server.build_db_record(0x0003, 0x2A00, 0x0003, ['N', 'o']))
+    list.append(db, att_server.build_db_record(0x0004, UUID_CHARACTERISTIC, 0x0004, [0x02, 0x05, 0x00, 0x01, 0x2A]))
+    list.append(db, att_server.build_db_record(0x0005, 0x2A01, 0x0005, [0x00, 0x00]))
+    list.append(db, att_server.build_db_record(0x0006, UUID_PRIMARY_SERVICE, 0x000D, le16(0x1801)))
+    list.append(db, att_server.build_db_record(0x0007, UUID_CHARACTERISTIC, 0x0007, [0x20, 0x08, 0x00, 0x05, 0x2A]))
+    list.append(db, att_server.build_db_record(0x0008, 0x2A05, 0x0008, [0x01, 0x00, 0xFF, 0xFF]))
+    list.append(db, att_server.build_db_record(0x0009, UUID_CLIENT_CHARACTERISTIC_CONFIGURATION, 0x0009, [0x02, 0x00]))
+    list.append(db, att_server.build_db_record(0x000A, UUID_CHARACTERISTIC, 0x000A, [0x0A, 0x0B, 0x00, 0x29, 0x2B]))
+    list.append(db, att_server.build_db_record(0x000B, UUID_CLIENT_SUPPORTED_FEATURES, 0x000B, [0x01]))
+    list.append(db, att_server.build_db_record(0x000C, UUID_CHARACTERISTIC, 0x000C, [0x02, 0x0D, 0x00, 0x2A, 0x2B]))
+    list.append(db, att_server.build_db_record(0x000D, UUID_DATABASE_HASH, 0x000D, [0x00]))
+    list.append(db, att_server.build_db_record(0x000E, UUID_PRIMARY_SERVICE, 0x0016, le16(0x1808)))
+    list.append(db, att_server.build_db_record(0x000F, UUID_INCLUDE, 0x0014, [0x14, 0x00, 0x16, 0x00, 0x0F, 0x18]))
+    list.append(db, att_server.build_db_record(0x0010, UUID_CHARACTERISTIC, 0x0010, [0xA2, 0x11, 0x00, 0x18, 0x2A]))
+    list.append(db, att_server.build_db_record(0x0011, 0x2A18, 0x0011, [0x00]))
+    list.append(db, att_server.build_db_record(0x0012, UUID_CLIENT_CHARACTERISTIC_CONFIGURATION, 0x0012, [0x02, 0x00]))
+    list.append(db, att_server.build_db_record(0x0013, UUID_CHARACTERISTIC_EXTENDED_PROPERTIES, 0x0013, [0x00, 0x00]))
+    list.append(db, att_server.build_db_record(0x0014, UUID_SECONDARY_SERVICE, 0x0016, le16(0x180F)))
+    list.append(db, att_server.build_db_record(0x0015, UUID_CHARACTERISTIC, 0x0015, [0x02, 0x16, 0x00, 0x19, 0x2A]))
+    list.append(db, att_server.build_db_record(0x0016, 0x2A19, 0x0016, [0x00]))
+    db
+
+// The Connection Signature Resolving Key of the worked example of
+// [Vol 3] Part F, Section 3.4.5.4: the message 'D212001337' signed with
+// SignCounter 1 gives the CMAC F20F903C931E87F159B64F012574B4D0 and the
+// Authentication Signature '01000000F1871E933C900FF2'.  The example
+// writes the key 611B64EBFBCD1FD372EC9196DF425E50, most significant
+// octet first; a Signing Information command carries it the other way
+// round, and that is the order this is.
+@tier(app)
+fn example_csrk() -> [u8]
+    [0x50, 0x5E, 0x42, 0xDF, 0x96, 0x91, 0xEC, 0x72,
+     0xD3, 0x1F, 0xCD, 0xFB, 0xEB, 0x64, 0x1B, 0x61]
+
+// A server with a characteristic that may be written only by an
+// authenticated client, and the peer's CSRK of the example.
+@tier(app)
+fn signed_server() -> GattServer
+    var s = host_server()
+    let _ = add_service(var s.db, false, le16(0xAA00))
+    let _ = add_characteristic(var s.db, 0x0A, PERM_READ_AUTHEN | PERM_WRITE_AUTHEN, le16(0xAA01))
+    let _ = set_value(var s.db, 0, [0x00, 0x00])
+    set_peer_csrk(var s.link, example_csrk())
+    s
+
+// An ATT_SIGNED_WRITE_CMD for `handle` with `value` and SignCounter
+// `counter`, signed with the example's CSRK.
+@tier(app)
+fn signed_pdu(handle: Int, value: [u8], counter: Int) -> [u8]
+    var m = octets([0xD2, handle & 0xFF, (handle >>> 8) & 0xFF])
+    list.append(m, value)
+    list.append(m, octets([counter & 0xFF, (counter >>> 8) & 0xFF, (counter >>> 16) & 0xFF, (counter >>> 24) & 0xFF]))
+    list.append(m, signature_mac(m, example_csrk()))
+    m
+
+@test
+fn test_database_hash_matches_appendix_b()
+    var s = new_server(appendix_records(), 65)
+    // An include declaration's record carries the included service in the
+    // table's end group field, which `from_records` does not read; the
+    // attribute it makes keeps the handle the record was built with.
+    let include = s.db.attributes[14]
+    s.db.attributes[14] = GattAttribute {
+        handle: include.handle, type_uuid: include.type_uuid, value: include.value[:],
+        max_len: include.max_len, permissions: include.permissions, key_size: include.key_size,
+        tester: include.tester, included: 0x0014, per_link: false }
+    refresh_hash(var s.db)
+    // The example of Appendix B: m from 0x0001 to 0x0016 hashes to
+    // F1CA2D48ECF58BAC8A8830BBB9FBA990 (most significant octet first),
+    // so the characteristic value, a 128-bit little-endian integer, is
+    // the same octets reversed.
+    assert_bytes(database_hash(s.db),
+        [0x90, 0xA9, 0xFB, 0xB9, 0xBB, 0x30, 0x88, 0x8A, 0xAC, 0x8B, 0xF5, 0xEC, 0x48, 0x2D, 0xCA, 0xF1])
+
+@test
+fn test_database_hash_follows_the_definitions()
+    var s = host_server()
+    let before = database_hash(s.db)
+    test.assert_eq(list.len(before), HASH_OCTETS)
+    test.assert(same_bytes(value_at(s.db, s.link, index_of(s.db, host_hash_handle())), before))
+    // A service the tester adds enters the hash.
+    let added = add_service(var s.db, false, le16(0xAA00))
+    test.assert_eq(same_bytes(before, database_hash(s.db)), false)
+    test.assert(same_bytes(value_at(s.db, s.link, index_of(s.db, host_hash_handle())), database_hash(s.db)))
+    // So does a removal, and back again the hash is what it was.  The
+    // range starts where the tester's service did: the host's own tables
+    // end at the handle the GAP service's layout names.
+    let after_add = database_hash(s.db)
+    test.assert_eq(added, gatt_db.GAP_SERVER_GATT_END + 1)
+    remove_range(var s.db, added, 0xFFFF)
+    test.assert_eq(same_bytes(after_add, database_hash(s.db)), false)
+    test.assert_eq(same_bytes(before, database_hash(s.db)), true)
+
+// The Device Name and the Appearance of the GAP service take a write,
+// with or without a response, and the value read back is the new one
+// (GAP/GAT/BV-05-C and BV-06-C, [Vol 3] Part C, Section 12.1), when the
+// program asked for them writable.
+@test
+fn test_the_device_name_and_appearance_are_writable()
+    var s = host_server_with(true)
+    let name = gatt_db.GAP_SERVER_DEVICE_NAME_HANDLE
+    let appearance = gatt_db.GAP_SERVER_APPEARANCE_HANDLE
+    // A Write Command, then a Write Request: both land.
+    let _ = receive(var s.db, var s.link, octets([0x52, name & 0xFF, (name >>> 8) & 0xFF, 'A', 'B']), 0)
+    assert_bytes(value_at(s.db, s.link, index_of(s.db, name)), ['A', 'B'])
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x12, name & 0xFF, (name >>> 8) & 0xFF, 'C']), 0)), [0x13])
+    assert_bytes(value_at(s.db, s.link, index_of(s.db, name)), ['C'])
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x0A, name & 0xFF, (name >>> 8) & 0xFF]), 0)), [0x0B, 'C'])
+    // The Appearance is two octets, and the declaration says so.
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x12, appearance & 0xFF, (appearance >>> 8) & 0xFF, 0x40, 0x00]), 0)), [0x13])
+    assert_bytes(value_at(s.db, s.link, index_of(s.db, appearance)), [0x40, 0x00])
+
+// The database a program gets by default refuses a client's write to the
+// Device Name and the Appearance with Write Not Permitted, and keeps them.
+@test
+fn test_the_device_name_and_appearance_are_read_only_by_default()
+    var s = host_server()
+    let name = gatt_db.GAP_SERVER_DEVICE_NAME_HANDLE
+    let appearance = gatt_db.GAP_SERVER_APPEARANCE_HANDLE
+    assert_error(receive(var s.db, var s.link, octets([0x12, name & 0xFF, (name >>> 8) & 0xFF, 'C']), 0), 0x12, name, 0x03)
+    assert_error(receive(var s.db, var s.link, octets([0x12, appearance & 0xFF, (appearance >>> 8) & 0xFF, 0x40, 0x00]), 0), 0x12, appearance, 0x03)
+    assert_bytes(value_at(s.db, s.link, index_of(s.db, name)), ['T', 'e', 's', 't'])
+
+@test
+fn test_client_supported_features_values()
+    var s = host_server()
+    // The default is all bits zero, one octet of value.
+    let csf = gatt_db.GAP_SERVER_CLIENT_SUPPORTED_FEATURES_HANDLE
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x0A, csf & 0xFF, (csf >>> 8) & 0xFF]), 0)), [0x0B, 0x00])
+    // The client sets the Robust Caching bit and all RFU bits; the RFU
+    // bits are not features the server offers and stay zero.
+    assert_bytes(one(receive(var s.db, var s.link, host_csf_request(0xF9), 0)), [0x13])
+    test.assert_eq(s.link.csf, CSF_ROBUST_CACHING)
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x0A, csf & 0xFF, (csf >>> 8) & 0xFF]), 0)), [0x0B, 0x01])
+    // A client shall not clear a bit it has set.
+    assert_error(receive(var s.db, var s.link, host_csf_request(0x00), 0), 0x12, csf, att.ATT_ERR_VALUE_NOT_ALLOWED)
+    test.assert_eq(s.link.csf, CSF_ROBUST_CACHING)
+    // Setting the bit again is no change, and a value that is not the
+    // one octet of the bit field has no length.
+    assert_bytes(one(receive(var s.db, var s.link, host_csf_request(0x01), 0)), [0x13])
+    assert_error(receive(var s.db, var s.link, octets([0x12, csf & 0xFF, (csf >>> 8) & 0xFF]), 0), 0x12, csf, att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    assert_error(receive(var s.db, var s.link, octets([0x12, csf & 0xFF, (csf >>> 8) & 0xFF, 0x32, 0x32]), 0), 0x12, csf, att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    test.assert_eq(s.link.csf, CSF_ROBUST_CACHING)
+    // The value a tester reads over BTP is the client's.
+    test.assert_eq(tester_read(s.db, s.link, csf, true).1[0] as Int, CSF_ROBUST_CACHING)
+
+@test
+fn test_robust_caching_refuses_a_request_once_per_change()
+    var s = host_server()
+    let _ = add_service(var s.db, false, le16(0xAA00))
+    let _ = add_characteristic(var s.db, 0x0A, PERM_READ | PERM_WRITE, le16(0xAA01))
+    let _ = set_value(var s.db, 0, [0x11, 0x22])
+    let value_handle = last_handle(s.db)
+    // Robust caching off: a change leaves the client alone.
+    let read = octets([0x0A, 0x03, 0x00])
+    let _ = add_service(var s.db, false, le16(0xBB00))
+    assert_bytes(one(receive(var s.db, var s.link, read, 0)), [0x0B, 'T' as Int, 'e' as Int, 's' as Int, 't' as Int])
+    // Robust caching on: the change makes the client change-unaware and
+    // the first request hears Database Out Of Sync.
+    let _ = receive(var s.db, var s.link, host_csf_request(0x01), 0)
+    let _ = add_service(var s.db, false, le16(0xCC00))
+    assert_error(receive(var s.db, var s.link, read, 0), 0x0A, 0x0003, att.ATT_ERR_DATABASE_OUT_OF_SYNC)
+    // The response goes out once; the next request is answered and makes
+    // the client change-aware.
+    assert_bytes(one(receive(var s.db, var s.link, read, 0)), [0x0B, 'T' as Int, 'e' as Int, 's' as Int, 't' as Int])
+    // A change-unaware client's ATT command is ignored.
+    let _ = add_service(var s.db, false, le16(0xDD00))
+    assert_error(receive(var s.db, var s.link, read, 0), 0x0A, 0x0003, att.ATT_ERR_DATABASE_OUT_OF_SYNC)
+    let _ = receive(var s.db, var s.link, octets([0x52, value_handle & 0xFF, (value_handle >>> 8) & 0xFF, 0x99, 0x99]), 0)
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x0A, value_handle & 0xFF, (value_handle >>> 8) & 0xFF]), 0)), [0x0B, 0x11, 0x22])
+
+@test
+fn test_robust_caching_hash_read_clears_the_refusal()
+    var s = host_server()
+    let _ = receive(var s.db, var s.link, host_csf_request(0x01), 0)
+    let _ = add_service(var s.db, false, le16(0xAA00))
+    // The hash is read with Read Using Characteristic UUID, which a
+    // change-unaware client hears whatever its range.
+    let rsp = one(receive(var s.db, var s.link, octets([0x08, 0x01, 0x00, 0xFF, 0xFF, 0x2A, 0x2B]), 0))
+    test.assert_eq(rsp[1] as Int, 2 + HASH_OCTETS)
+    test.assert_eq(rsp[2] as Int, host_hash_handle() & 0xFF)
+    assert_bytes(rsp[4:4 + HASH_OCTETS], database_hash(s.db))
+    // The request after the hash read makes the client change-aware.
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x0A, 0x03, 0x00]), 0)), [0x0B, 'T' as Int, 'e' as Int, 's' as Int, 't' as Int])
+
+@test
+fn test_robust_caching_refuses_a_narrow_read_by_type()
+    var s = host_server()
+    let _ = receive(var s.db, var s.link, host_csf_request(0x01), 0)
+    let _ = add_service(var s.db, false, le16(0xAA00))
+    // Read By Type of a type that is neither «Include» nor
+    // «Characteristic», over a range other than the whole database.
+    assert_error(receive(var s.db, var s.link, octets([0x08, 0x01, 0x00, 0x10, 0x00, 0x00, 0xAA]), 0), 0x08, 0x0001, att.ATT_ERR_DATABASE_OUT_OF_SYNC)
+    // Service discovery is answered even then: the whole range, and the
+    // «Characteristic» type.
+    let _ = add_service(var s.db, false, le16(0xBB00))
+    test.assert_eq(list.len(one(receive(var s.db, var s.link, octets([0x08, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28]), 0))) > 2, true)
+    let _ = add_service(var s.db, false, le16(0xCC00))
+    test.assert_eq(list.len(one(receive(var s.db, var s.link, octets([0x08, 0x01, 0x00, 0x10, 0x00, 0x03, 0x28]), 0))) > 2, true)
+    // So are the other procedures that discover a service, and an MTU
+    // exchange, which names no attribute.
+    let _ = add_service(var s.db, false, le16(0xDD00))
+    test.assert_eq(list.len(one(receive(var s.db, var s.link, octets([0x10, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28]), 0))) > 2, true)
+    let _ = add_service(var s.db, false, le16(0xEE00))
+    test.assert_eq(list.len(one(receive(var s.db, var s.link, octets([0x04, 0x01, 0x00, 0xFF, 0xFF]), 0))) > 2, true)
+    let _ = add_service(var s.db, false, le16(0xEF00))
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x02, 0x00, 0x01]), 0)), [0x03, 65, 0x00])
+
+@test
+fn test_robust_caching_holds_notifications_but_not_service_changed()
+    var s = host_server()
+    let _ = add_service(var s.db, false, le16(0xAA00))
+    let _ = add_characteristic(var s.db, 0x12, PERM_READ | PERM_WRITE, le16(0xAA01))
+    let _ = set_value(var s.db, 0, [0x07])
+    let value_handle = last_handle(s.db)
+    let cccd = add_descriptor(s.db, PERM_READ | PERM_WRITE, le16(UUID_CLIENT_CHARACTERISTIC_CONFIGURATION))
+    let _ = receive(var s.db, var s.link, octets([0x12, cccd & 0xFF, (cccd >>> 8) & 0xFF, 0x01, 0x00]), 0)
+    let sc_cccd = gatt_db.GAP_SERVER_SERVICE_CHANGED_CCCD_HANDLE
+    let _ = receive(var s.db, var s.link, octets([0x12, sc_cccd & 0xFF, (sc_cccd >>> 8) & 0xFF, 0x02, 0x00]), 0)
+    let _ = receive(var s.db, var s.link, host_csf_request(0x01), 0)
+    // The change makes the client change-unaware: a notification waits,
+    // the Service Changed indication does not.
+    let _ = add_service(var s.db, false, le16(0xBB00))
+    test.assert_eq(list.len(send_value(var s.db, var s.link, value_handle, 0)), 0)
+    test.assert_eq(list.len(service_changed(var s.db, var s.link, 0x0012, 0x0012, 0)), 1)
+    assert_bytes(value_at(s.db, s.link, index_of(s.db, host_service_changed_handle(s))), [0x12, 0x00, 0x12, 0x00])
+    // Confirming that indication makes the client change-aware.
+    test.assert_eq(list.len(receive(var s.db, var s.link, octets([0x1E]), 0)), 0)
+    test.assert_eq(s.link.change_unaware, false)
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x0A, 0x03, 0x00]), 0)), [0x0B, 'T' as Int, 'e' as Int, 's' as Int, 't' as Int])
+
+@test
+fn test_signature_matches_the_spec_example()
+    // m = D2 12 00 13 37 with SignCounter 1, key 611B64EBFBCD1FD372EC9196DF425E50.
+    let message = octets([0xD2, 0x12, 0x00, 0x13, 0x37, 0x01, 0x00, 0x00, 0x00])
+    assert_bytes(signature_mac(message, example_csrk()), [0xF1, 0x87, 0x1E, 0x93, 0x3C, 0x90, 0x0F, 0xF2])
+
+@test
+fn test_signed_write_applies_a_verified_value()
+    var s = signed_server()
+    let handle = last_handle(s.db)
+    // The link is not encrypted and the value needs authentication: a
+    // Write Request is refused, the signature authenticates the client.
+    assert_error(receive(var s.db, var s.link, octets([0x12, handle & 0xFF, (handle >>> 8) & 0xFF, 0x01]), 0), 0x12, handle, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    let _ = receive(var s.db, var s.link, signed_pdu(handle, [0x13, 0x37], 1), 0)
+    assert_bytes(value_at(s.db, s.link, index_of(s.db, handle)), [0x13, 0x37])
+    test.assert_eq(s.link.sign_counter, 1)
+
+// A signed write of the rig: GATT/SR/GAW/BV-02-C on 2026-10-11, where PTS
+// signed the command D2 2F 00 02 23 45 67 89 AB CD EF with SignCounter 0
+// and its CSRK E9E8E52FFF3782FAF49013B9ABD73797, carried least
+// significant octet first, and the Authentication Signature came out
+// 00000000 9BC0E7D6A285D709.  The example of Part F writes its key the
+// way AES-CMAC takes it; a CSRK off the wire is the other way round, and
+// reading one as the other is what this pins.
+@test
+fn test_signature_mac_of_a_pts_signed_write()
+    let csrk: [u8] = [0xE9, 0xE8, 0xE5, 0x2F, 0xFF, 0x37, 0x82, 0xFA,
+                      0xF4, 0x90, 0x13, 0xB9, 0xAB, 0xD7, 0x37, 0x97]
+    let message: [u8] = [0xD2, 0x2F, 0x00, 0x02, 0x23, 0x45, 0x67,
+                         0x89, 0xAB, 0xCD, 0xEF, 0x00, 0x00, 0x00, 0x00]
+    assert_bytes(signature_mac(message, csrk), octets([0x9B, 0xC0, 0xE7, 0xD6, 0xA2, 0x85, 0xD7, 0x09]))
+    // The server applies the write the signature authenticates.
+    var s = signed_server()
+    set_peer_csrk(var s.link, csrk)
+    let handle = last_handle(s.db)
+    var pdu = octets([0xD2, handle & 0xFF, (handle >>> 8) & 0xFF, 0x02])
+    list.append(pdu, octets([0x00, 0x00, 0x00, 0x00]))
+    list.append(pdu, signature_mac(pdu, csrk))
+    let _ = receive(var s.db, var s.link, pdu, 0)
+    assert_bytes(value_at(s.db, s.link, index_of(s.db, handle)), [0x02])
+
+// The first signed command a client sends carries SignCounter 0 ([Vol 3]
+// Part H, Section 2.4.5), so a server whose stored counter started at 0
+// refused the first thing an authenticated client ever wrote --
+// GATT/SR/GAW/BV-02-C, where PTS signed its first write with counter 0
+// and read back the value it did not find.  The stored counter starts at
+// -1: with nothing verified yet, any counter passes, 0 included, and a
+// second command with a counter that is not greater is still refused.
+@test
+fn test_the_first_signed_write_uses_counter_zero()
+    var s = signed_server()
+    let handle = last_handle(s.db)
+    test.assert_eq(s.link.sign_counter, -1)
+    let _ = receive(var s.db, var s.link, signed_pdu(handle, [0x02], 0), 0)
+    assert_bytes(value_at(s.db, s.link, index_of(s.db, handle)), [0x02])
+    test.assert_eq(s.link.sign_counter, 0)
+    let _ = receive(var s.db, var s.link, signed_pdu(handle, [0x03], 0), 0)
+    assert_bytes(value_at(s.db, s.link, index_of(s.db, handle)), [0x02])
+    let _ = receive(var s.db, var s.link, signed_pdu(handle, [0x04], 1), 0)
+    assert_bytes(value_at(s.db, s.link, index_of(s.db, handle)), [0x04])
+    test.assert_eq(s.link.sign_counter, 1)
+    // A bearer that starts afresh has verified nothing again.
+    reset_bearer(s.db, var s.link)
+    set_peer_csrk(var s.link, example_csrk())
+    test.assert_eq(s.link.sign_counter, -1)
+    let _ = receive(var s.db, var s.link, signed_pdu(handle, [0x05], 0), 0)
+    assert_bytes(value_at(s.db, s.link, index_of(s.db, handle)), [0x05])
+
+@test
+fn test_signed_write_refuses_what_it_cannot_verify()
+    var s = signed_server()
+    let handle = last_handle(s.db)
+    let _ = receive(var s.db, var s.link, signed_pdu(handle, [0x13, 0x37], 7), 0)
+    assert_bytes(value_at(s.db, s.link, index_of(s.db, handle)), [0x13, 0x37])
+    // The same SignCounter again is a replay: the signature verifies but
+    // the message has been seen.
+    let _ = receive(var s.db, var s.link, signed_pdu(handle, [0x99, 0x99], 7), 0)
+    assert_bytes(value_at(s.db, s.link, index_of(s.db, handle)), [0x13, 0x37])
+    // A signature that does not verify.
+    var bad = signed_pdu(handle, [0x77, 0x77], 8)
+    bad[list.len(bad) - 1] = ((bad[list.len(bad) - 1] as Int) ^ 0xFF) as u8
+    let _ = receive(var s.db, var s.link, bad, 0)
+    assert_bytes(value_at(s.db, s.link, index_of(s.db, handle)), [0x13, 0x37])
+    // A value longer than the characteristic.
+    let _ = receive(var s.db, var s.link, signed_pdu(handle, [0x01, 0x02, 0x03], 9), 0)
+    assert_bytes(value_at(s.db, s.link, index_of(s.db, handle)), [0x13, 0x37])
+    // A handle that is no attribute.
+    let _ = receive(var s.db, var s.link, signed_pdu(0x0999, [0x01], 10), 0)
+    assert_bytes(value_at(s.db, s.link, index_of(s.db, handle)), [0x13, 0x37])
+    // None of them is answered.
+    test.assert_eq(list.len(receive(var s.db, var s.link, signed_pdu(handle, [0x01, 0x02], 11), 0)), 0)
+    assert_bytes(value_at(s.db, s.link, index_of(s.db, handle)), [0x01, 0x02])
+    test.assert_eq(s.link.sign_counter, 11)
+
+@test
+fn test_signed_write_without_a_csrk_is_ignored()
+    var s = signed_server()
+    let handle = last_handle(s.db)
+    set_peer_csrk(var s.link, [])
+    let _ = receive(var s.db, var s.link, signed_pdu(handle, [0x13, 0x37], 1), 0)
+    assert_bytes(value_at(s.db, s.link, index_of(s.db, handle)), [0x00, 0x00])
+
+@test
+fn test_the_clients_state_survives_a_bond()
+    var s = host_server()
+    let _ = receive(var s.db, var s.link, host_csf_request(0x01), 0)
+    let address = octets([1, 2, 3, 4, 5, 6])
+    // A change during the connection, which the client catches up with by
+    // reading the hash.
+    let _ = add_service(var s.db, false, le16(0xAA00))
+    let _ = receive(var s.db, var s.link, octets([0x08, 0x01, 0x00, 0xFF, 0xFF, 0x2A, 0x2B]), 0)
+    let _ = receive(var s.db, var s.link, octets([0x0A, 0x03, 0x00]), 0)
+    test.assert_eq(s.link.change_unaware, false)
+    save_configuration(var s.db, s.link, 1, address)
+    reset_bearer(s.db, var s.link)
+    restore_configuration(s.db, var s.link, 1, address)
+    test.assert_eq(s.link.csf, CSF_ROBUST_CACHING)
+    test.assert_eq(s.link.change_unaware, false)
+    // The database changes while the client is away: it comes back
+    // change-unaware.
+    let _ = add_service(var s.db, false, le16(0xBB00))
+    reset_bearer(s.db, var s.link)
+    restore_configuration(s.db, var s.link, 1, address)
+    test.assert_eq(s.link.change_unaware, true)
+    // A client without a trusted relationship starts change-aware, with
+    // the default value.
+    reset_bearer(s.db, var s.link)
+    test.assert_eq(s.link.change_unaware, false)
+    test.assert_eq(s.link.csf, 0)
+
+// ── The ATT bearers of one connection ───────────────────────────────
+//
+// The unenhanced bearer is the table's first entry, and every channel of
+// the Enhanced ATT PSM is another one ([Vol 3] Part G, Section 5.3).  The
+// cases these tests follow are GATT/SR/GAC/BI-01-C (an MTU exchange is
+// not one of an enhanced bearer's procedures), GATT/SR/GAW/BI-38-C (a
+// signed write is not to be used on one) and GATT/SR/GAW/BV-12-C (queued
+// writes of several bearers are written by one Execute Write Request).
+
+// A server with an enhanced bearer at index 1, its channel number 0 and
+// its ATT_MTU 100, and a characteristic that may be read and written.
+@tier(app)
+fn enhanced_server() -> GattServer
+    var s = test_server()
+    let _ = open_bearer(s.link, 0, true, 100)
+    s
+
+// The value of the characteristic the test service's first characteristic
+// holds, as the bearer `index` reads it.
+@tier(app)
+fn read_on(var s: GattServer, index: Int, handle: Int) -> [u8]
+    let out = receive_on(var s.db, var s.link, index, octets([0x0A, handle & 0xFF, handle >>> 8]), 0)
+    if list.len(out) == 0
+        []
+    else
+        out[0]
+
+// A server with a 200-octet readable value (its handle), an enhanced
+// bearer at index 1 with the ATT_MTU `mtu`, and the unenhanced bearer.
+@tier(app)
+fn long_value_server(mtu: Int) -> (GattServer, Int)
+    var s = new_server(records(), 65)
+    let _ = add_service(var s.db, false, le16(0xAA00))
+    let _ = add_characteristic(var s.db, 0x02, PERM_READ, le16(0xAA01))
+    var long: [u8] = []
+    for i in 0..200
+        list.push(long, (i & 0xFF) as u8)
+    let _ = set_value(var s.db, 0, long)
+    let _ = open_bearer(s.link, 0, true, mtu)
+    (s, last_handle(s.db))
+
+@test
+fn test_an_enhanced_bearer_has_an_att_mtu_of_its_own()
+    var setup = long_value_server(100)
+    var s = setup.0
+    let handle = setup.1
+    test.assert_eq(bearer_count(s.link), 2)
+    test.assert_eq(bearer_of_channel(s.link, 0, true), 1)
+    test.assert_eq(channel_of_bearer(s.link, 1), 0)
+    test.assert_eq(mtu_of(s.link, 1), 100)
+    test.assert_eq(mtu_of(s.link, 0), ATT_DEFAULT_MTU)
+    // The MTU exchange of the unenhanced bearer leaves the enhanced one
+    // alone.
+    let _ = receive(var s.db, var s.link, octets([0x02, 0x41, 0x00]), 0)
+    test.assert_eq(mtu_of(s.link, 0), 65)
+    test.assert_eq(mtu_of(s.link, 1), 100)
+    // The same value read over the two bearers: each bearer's answer is
+    // cut to its own ATT_MTU - 1 octets ([Vol 3] Part F, Section 3.4.4.4).
+    let by_enhanced = read_on(var s, 1, handle)
+    test.assert_eq(list.len(by_enhanced), 1 + 99)
+    test.assert_eq(by_enhanced[1] as Int, 0x00)
+    test.assert_eq(by_enhanced[99] as Int, 98)
+    let by_unenhanced = read_on(var s, 0, handle)
+    test.assert_eq(list.len(by_unenhanced), 1 + 64)
+    test.assert_eq(by_unenhanced[64] as Int, 63)
+
+@test
+fn test_the_mtu_exchange_is_not_an_enhanced_bearers_procedure()
+    var s = enhanced_server()
+    // GATT/SR/GAC/BI-01-C: the request is answered Request Not Supported,
+    // naming the request opcode and handle 0x0000.
+    assert_error(receive_on(var s.db, var s.link, 1, octets([0x02, 0x00, 0x02]), 0), 0x02, 0, att.ATT_ERR_REQUEST_NOT_SUPPORTED)
+    test.assert_eq(mtu_of(s.link, 1), 100)
+    // A malformed one is answered the same way, not Invalid PDU.
+    assert_error(receive_on(var s.db, var s.link, 1, octets([0x02, 0x41]), 0), 0x02, 0, att.ATT_ERR_REQUEST_NOT_SUPPORTED)
+    // The unenhanced bearer's own exchange still answers with the Server
+    // Rx MTU.
+    assert_bytes(one(receive_on(var s.db, var s.link, 0, octets([0x02, 0x00, 0x02]), 0)), [0x03, 65, 0x00])
+
+@test
+fn test_a_signed_write_is_ignored_on_an_enhanced_bearer()
+    var s = signed_server()
+    let handle = last_handle(s.db)
+    // GATT/SR/GAW/BI-38-C: the command is a valid one, signed with the
+    // bond's CSRK and a counter this server has not seen, and it is
+    // ignored all the same ([Vol 3] Part F, Section 3.4.5.4: "This
+    // command shall not be used on an Enhanced ATT bearer").
+    let _ = open_bearer(s.link, 0, true, 100)
+    let _ = receive_on(var s.db, var s.link, 1, signed_pdu(handle, [0x11, 0x22], 1), 0)
+    assert_bytes(value_at(s.db, s.link, index_of(s.db, handle)), [0x00, 0x00])
+    test.assert_eq(s.link.sign_counter, -1)
+    // The same command on the unenhanced bearer is verified and written.
+    let _ = receive_on(var s.db, var s.link, 0, signed_pdu(handle, [0x11, 0x22], 1), 0)
+    assert_bytes(value_at(s.db, s.link, index_of(s.db, handle)), [0x11, 0x22])
+    test.assert_eq(s.link.sign_counter, 1)
+
+@test
+fn test_each_bearer_keeps_its_own_outstanding_indication()
+    var s = test_server()
+    let _ = open_bearer(s.link, 0, true, 100)
+    set_configuration(var s.link, 0x0013, CCC_INDICATION)
+    // One indication waits on each bearer, and each is confirmed on its
+    // own ([Vol 3] Part F, Section 3.2.11: an ATT bearer has its own
+    // transaction state, and one outstanding request per bearer is what
+    // that means).
+    assert_bytes(one(send_value_on(s.db, var s.link, 1, 0x0012, 0)), [0x1D, 0x12, 0x00, 0x44, 0x45])
+    assert_bytes(one(send_value_on(s.db, var s.link, 0, 0x0012, 0)), [0x1D, 0x12, 0x00, 0x44, 0x45])
+    // A second indication on one bearer waits behind the one that is
+    // outstanding there, and the other bearer is none of its business.
+    test.assert_eq(list.len(send_value_on(s.db, var s.link, 1, 0x0012, 0)), 0)
+    test.assert_eq(list.len(send_value_on(s.db, var s.link, 0, 0x0012, 0)), 0)
+    // Each confirmation releases what waited on its own bearer, and the
+    // next confirmation of an idle bearer is answered with nothing.
+    assert_bytes(one(receive_on(var s.db, var s.link, 1, octets([0x1E]), 0)), [0x1D, 0x12, 0x00, 0x44, 0x45])
+    assert_bytes(one(receive_on(var s.db, var s.link, 0, octets([0x1E]), 0)), [0x1D, 0x12, 0x00, 0x44, 0x45])
+    test.assert_eq(list.len(receive_on(var s.db, var s.link, 0, octets([0x1E]), 0)), 0)
+    // A transaction that times out ends that bearer alone: the ATT_MTU of
+    // an enhanced bearer comes from its channel, but its transaction state
+    // is its own ([Vol 3] Part F, Section 3.2.11).
+    test.assert_eq(s.link.bearers[1].indicating, 0x0012)
+    tick(s.link, ATT_TRANSACTION_TIMEOUT_MS)
+    test.assert_eq(s.link.bearers[1].timed_out, true)
+    test.assert_eq(s.link.bearers[0].timed_out, false)
+    test.assert_eq(list.len(receive_on(var s.db, var s.link, 1, octets([0x0A, 0x0A, 0x00]), 0)), 0)
+    test.assert(list.len(receive_on(var s.db, var s.link, 0, octets([0x0A, 0x0A, 0x00]), 0)) > 0)
+
+@test
+fn test_the_prepare_queue_belongs_to_the_client_not_to_a_bearer()
+    var s = test_server()
+    let _ = open_bearer(s.link, 0, true, 100)
+    // GATT/SR/GAW/BV-12-C: the parts are prepared with roll-over over the
+    // bearers, and the Execute Write Request on any of them writes all of
+    // them ([Vol 3] Part F, Section 3.4.6.4).
+    let part_one = octets([0x16, 0x0A, 0x00, 0x00, 0x00, 0x01, 0x02])
+    let part_two = octets([0x16, 0x0A, 0x00, 0x02, 0x00, 0x03, 0x04])
+    let first = receive_on(var s.db, var s.link, 1, part_one, 0)
+    test.assert_eq(list.len(first), 1)
+    test.assert_eq(list.len(s.link.prepare_queue), 1)
+    let second = receive_on(var s.db, var s.link, 0, part_two, 0)
+    test.assert_eq(list.len(second), 1)
+    test.assert_eq(list.len(s.link.prepare_queue), 2)
+    let done = receive_on(var s.db, var s.link, 0, octets([0x18, 0x01]), 0)
+    assert_bytes(one(done), [0x19])
+    test.assert_eq(list.len(s.link.prepare_queue), 0)
+    assert_bytes(value_at(s.db, s.link, index_of(s.db, 0x000A)), [0x01, 0x02, 0x03, 0x04])
+
+@test
+fn test_an_execute_write_after_a_database_change_is_database_out_of_sync()
+    // GATT/SR/GAW/BI-41-C: the Lower Tester prepares a write, the IUT's
+    // database changes -- the attribute the part names is removed -- and
+    // the Execute Write Request that follows is answered Database Out Of
+    // Sync (0x12) with the handle of the part, and nothing is written
+    // ([Vol 3] Part F, Section 3.4.6.3 as the ATT v6.1 text has it).
+    var s = test_server()
+    let prepared = receive(var s.db, var s.link, octets([0x16, 0x0A, 0x00, 0x00, 0x00, 0x09]), 0)
+    assert_bytes(one(prepared), [0x17, 0x0A, 0x00, 0x00, 0x00, 0x09])
+    test.assert_eq(list.len(s.link.prepare_queue), 1)
+    remove_range(var s.db, 0x000A, 0x000A)
+    assert_error(receive(var s.db, var s.link, octets([0x18, 0x01]), 0), 0x18, 0x000A, att.ATT_ERR_DATABASE_OUT_OF_SYNC)
+    test.assert_eq(list.len(s.link.prepare_queue), 0)
+    // A queue the definitions did not move under is written as always:
+    // the check above is the change alone.
+    let again = receive(var s.db, var s.link, octets([0x16, 0x12, 0x00, 0x00, 0x00, 0x09]), 0)
+    assert_bytes(one(again), [0x17, 0x12, 0x00, 0x00, 0x00, 0x09])
+    let written = receive(var s.db, var s.link, octets([0x18, 0x01]), 0)
+    assert_bytes(one(written), [0x19])
+    assert_bytes(value_at(s.db, s.link, index_of(s.db, 0x0012)), [0x09])
+
+@test
+fn test_the_bearer_table_follows_the_channels_the_link_holds()
+    var s = test_server()
+    test.assert_eq(bearer_count(s.link), 1)
+    test.assert_eq(bearer_of_channel(s.link, 0, true), -1)
+    test.assert_eq(open_bearer(s.link, 2, true, 64), 1)
+    test.assert_eq(open_bearer(s.link, 3, true, 64), 2)
+    test.assert_eq(bearer_count(s.link), 3)
+    // Opening a bearer that is there only moves its ATT_MTU: a channel
+    // whose L2CAP MTU was reconfigured moves the bearer's with it.
+    test.assert_eq(open_bearer(s.link, 2, true, 128), 1)
+    test.assert_eq(bearer_count(s.link), 3)
+    test.assert_eq(mtu_of(s.link, 1), 128)
+    // The bearer of a channel the link no longer holds is gone; the
+    // unenhanced bearer stays whatever the list says.
+    retain_bearers(var s.link, [3])
+    test.assert_eq(bearer_count(s.link), 2)
+    test.assert_eq(bearer_of_channel(s.link, 2, true), -1)
+    test.assert_eq(bearer_of_channel(s.link, 3, true), 1)
+    retain_bearers(var s.link, [])
+    test.assert_eq(bearer_count(s.link), 1)
+    test.assert_eq(mtu_of(s.link, 0), ATT_DEFAULT_MTU)
+    // A bearer index outside the table reads as the default and no
+    // channel.
+    test.assert_eq(bearer_of_channel(s.link, 9, true), -1)
+    test.assert_eq(mtu_of(s.link, 7), ATT_DEFAULT_MTU)
+    test.assert_eq(channel_of_bearer(s.link, 7), 0)
+
+@test
+fn test_the_enhanced_att_bit_is_what_the_client_sets()
+    var s = host_server()
+    // GATT/SR/GAC/BI-01-C's preamble: the client writes 0x0002, "The
+    // client supports Enhanced ATT bearer" ([Vol 3] Part G, Table 7.6,
+    // bit 1 of octet 0).
+    let _ = receive(var s.db, var s.link, host_csf_request(CSF_ENHANCED_ATT), 0)
+    test.assert_eq(s.link.csf, CSF_ENHANCED_ATT)
+    // Robust Caching and it together, and a bit this device does not
+    // support is dropped from the value it keeps.
+    let _ = receive(var s.db, var s.link, host_csf_request(CSF_ROBUST_CACHING | CSF_ENHANCED_ATT | 0x04), 0)
+    test.assert_eq(s.link.csf, CSF_ROBUST_CACHING | CSF_ENHANCED_ATT)
+
+// ── Access levels and the configuration descriptor's own access ─────
+
+@test
+fn test_access_levels_map_to_permission_bits()
+    test.assert_eq(permission_bits(Permissions { read: Access.Denied, write: Access.Denied }), 0)
+    test.assert_eq(permission_bits(open_permissions()), PERM_READ | PERM_WRITE)
+    test.assert_eq(permission_bits(Permissions { read: Access.Encrypted, write: Access.Open }), PERM_READ_ENCRYPT | PERM_WRITE)
+    test.assert_eq(permission_bits(Permissions { read: Access.Open, write: Access.Authenticated }), PERM_READ | PERM_WRITE_AUTHEN)
+    test.assert_eq(permission_bits(both_ways(Access.Authorized)), PERM_READ_AUTHOR | PERM_WRITE_AUTHOR)
+    test.assert_eq(permission_bits(both_ways(Access.SecureConnections)),
+        PERM_READ_AUTHEN | PERM_READ_SC | PERM_WRITE_AUTHEN | PERM_WRITE_SC)
+
+@tier(app)
+fn level_server(read: Access, write: Access) -> GattServer
+    var s = new_server([], 65)
+    test.assert_eq(add_service(var s.db, false, le16(0xAA00)), 1)
+    test.assert_eq(add_characteristic(var s.db, 0x0A, permission_bits(Permissions { read: read, write: write }), le16(0xAA01)), 2)
+    test.assert(set_value(var s.db, 0, [0x07]))
+    s
+
+@tier(app)
+fn read_of(var s: GattServer) -> [[u8]]
+    receive(var s.db, var s.link, octets([0x0A, 0x03, 0x00]), 0)
+
+@tier(app)
+fn write_of(var s: GattServer) -> [[u8]]
+    receive(var s.db, var s.link, octets([0x12, 0x03, 0x00, 0x09]), 0)
+
+@test
+fn test_every_access_level_is_enforced_for_reads()
+    // Denied.
+    var denied = level_server(Access.Denied, Access.Denied)
+    assert_error(read_of(var denied), 0x0A, 3, att.ATT_ERR_READ_NOT_PERMITTED)
+    // Open.
+    var open = level_server(Access.Open, Access.Open)
+    assert_bytes(one(read_of(var open)), [0x0B, 0x07])
+    // Authorized: no client is.
+    var authorized = level_server(Access.Authorized, Access.Open)
+    assert_error(read_of(var authorized), 0x0A, 3, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+    // Encrypted: no key, a key but no encryption, encryption.
+    var enc = level_server(Access.Encrypted, Access.Open)
+    assert_error(read_of(var enc), 0x0A, 3, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    set_security(var enc.link, link_security(false, 1, 0, true))
+    assert_error(read_of(var enc), 0x0A, 3, att.ATT_ERR_INSUFFICIENT_ENCRYPTION)
+    set_security(var enc.link, encrypted(2, 16))
+    assert_bytes(one(read_of(var enc)), [0x0B, 0x07])
+    // Authenticated: level 2 is not enough, level 3 is.
+    var auth = level_server(Access.Authenticated, Access.Open)
+    set_security(var auth.link, encrypted(2, 16))
+    assert_error(read_of(var auth), 0x0A, 3, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    set_security(var auth.link, encrypted(3, 16))
+    assert_bytes(one(read_of(var auth)), [0x0B, 0x07])
+    // Secure Connections: level 3 is not enough, level 4 is.
+    var sc = level_server(Access.SecureConnections, Access.Open)
+    assert_error(read_of(var sc), 0x0A, 3, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    set_security(var sc.link, encrypted(3, 16))
+    assert_error(read_of(var sc), 0x0A, 3, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    set_security(var sc.link, encrypted(4, 16))
+    assert_bytes(one(read_of(var sc)), [0x0B, 0x07])
+
+@test
+fn test_every_access_level_is_enforced_for_writes()
+    var denied = level_server(Access.Open, Access.Denied)
+    assert_error(write_of(var denied), 0x12, 3, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    var open = level_server(Access.Open, Access.Open)
+    assert_bytes(one(write_of(var open)), [0x13])
+    var authorized = level_server(Access.Open, Access.Authorized)
+    assert_error(write_of(var authorized), 0x12, 3, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+    var enc = level_server(Access.Open, Access.Encrypted)
+    assert_error(write_of(var enc), 0x12, 3, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    set_security(var enc.link, link_security(false, 1, 0, true))
+    assert_error(write_of(var enc), 0x12, 3, att.ATT_ERR_INSUFFICIENT_ENCRYPTION)
+    set_security(var enc.link, encrypted(2, 16))
+    assert_bytes(one(write_of(var enc)), [0x13])
+    var auth = level_server(Access.Open, Access.Authenticated)
+    set_security(var auth.link, encrypted(2, 16))
+    assert_error(write_of(var auth), 0x12, 3, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    set_security(var auth.link, encrypted(3, 16))
+    assert_bytes(one(write_of(var auth)), [0x13])
+    var sc = level_server(Access.Open, Access.SecureConnections)
+    set_security(var sc.link, encrypted(3, 16))
+    assert_error(write_of(var sc), 0x12, 3, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    set_security(var sc.link, encrypted(4, 16))
+    assert_bytes(one(write_of(var sc)), [0x13])
+
+@tier(app)
+fn notify_server(cccd: Permissions) -> GattServer
+    var s = new_server([], 65)
+    test.assert_eq(add_service(var s.db, false, le16(0xAA00)), 1)
+    test.assert_eq(add_characteristic(var s.db, PROP_NOTIFY, 0, le16(0xAA01)), 2)
+    test.assert(set_value(var s.db, 0, [0x05]))
+    test.assert_eq(add_configuration(var s.db, cccd), 4)
+    s
+
+@tier(app)
+fn subscribe(var s: GattServer) -> [[u8]]
+    receive(var s.db, var s.link, octets([0x12, 0x04, 0x00, 0x01, 0x00]), 0)
+
+@test
+fn test_a_configuration_descriptor_takes_its_own_access()
+    // Write needs encryption, read is open: a client in the clear can read
+    // the descriptor but not subscribe.
+    var s = notify_server(Permissions { read: Access.Open, write: Access.Encrypted })
+    test.assert_eq(permission_bits_of(s, 4), PERM_READ | PERM_WRITE_ENCRYPT)
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x0A, 0x04, 0x00]), 0)), [0x0B, 0x00, 0x00])
+    assert_error(subscribe(s), 0x12, 4, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    set_security(var s.link, link_security(false, 1, 0, true))
+    assert_error(subscribe(s), 0x12, 4, att.ATT_ERR_INSUFFICIENT_ENCRYPTION)
+    test.assert_eq(configuration(s.link, 4), 0)
+    set_security(var s.link, encrypted(2, 16))
+    assert_bytes(one(subscribe(s)), [0x13])
+    test.assert_eq(configuration(s.link, 4), CCC_NOTIFICATION)
+    // The value is notify-only, yet it goes out once subscribed.
+    assert_bytes(one(send_value(var s.db, var s.link, 3, 0)), [0x1B, 0x03, 0x00, 0x05])
+    assert_error(receive(var s.db, var s.link, octets([0x0A, 0x03, 0x00]), 0), 0x0A, 3, att.ATT_ERR_READ_NOT_PERMITTED)
+
+@tier(app)
+fn permission_bits_of(s: GattServer, handle: Int) -> Int
+    s.db.attributes[index_of(s.db, handle)].permissions
+
+@test
+fn test_a_configuration_descriptor_refuses_each_level()
+    var enc = notify_server(Permissions { read: Access.Encrypted, write: Access.Encrypted })
+    assert_error(receive(var enc.db, var enc.link, octets([0x0A, 0x04, 0x00]), 0), 0x0A, 4, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    var auth = notify_server(Permissions { read: Access.Open, write: Access.Authenticated })
+    set_security(var auth.link, encrypted(2, 16))
+    assert_error(subscribe(auth), 0x12, 4, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    set_security(var auth.link, encrypted(3, 16))
+    assert_bytes(one(subscribe(auth)), [0x13])
+    var sc = notify_server(Permissions { read: Access.Open, write: Access.SecureConnections })
+    set_security(var sc.link, encrypted(3, 16))
+    assert_error(subscribe(sc), 0x12, 4, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    set_security(var sc.link, encrypted(4, 16))
+    assert_bytes(one(subscribe(sc)), [0x13])
+    var authorized = notify_server(Permissions { read: Access.Open, write: Access.Authorized })
+    assert_error(subscribe(authorized), 0x12, 4, att.ATT_ERR_INSUFFICIENT_AUTHORIZATION)
+    var denied = notify_server(Permissions { read: Access.Open, write: Access.Denied })
+    assert_error(subscribe(denied), 0x12, 4, att.ATT_ERR_WRITE_NOT_PERMITTED)
+
+@test
+fn test_a_subscription_is_not_served_on_a_weaker_link()
+    var s = notify_server(Permissions { read: Access.Open, write: Access.Encrypted })
+    // A subscription kept from an earlier encrypted link does not make the
+    // value go out on a link that is not encrypted.
+    set_configuration(var s.link, 4, CCC_NOTIFICATION)
+    test.assert_eq(list.len(send_value(var s.db, var s.link, 3, 0)), 0)
+    set_security(var s.link, encrypted(2, 16))
+    test.assert_eq(list.len(send_value(var s.db, var s.link, 3, 0)), 1)
+
+@test
+fn test_add_configuration_checks_the_characteristic()
+    var s = new_server([], 65)
+    test.assert_eq(add_configuration(var s.db, open_permissions()), -1)
+    test.assert_eq(add_service(var s.db, false, le16(0xAA00)), 1)
+    test.assert_eq(add_configuration(var s.db, open_permissions()), -1)
+    // A characteristic that neither notifies nor indicates takes none.
+    test.assert_eq(add_characteristic(var s.db, PROP_READ, PERM_READ, le16(0xAA01)), 2)
+    test.assert_eq(add_configuration(var s.db, open_permissions()), -1)
+    test.assert_eq(add_characteristic(var s.db, PROP_INDICATE, 0, le16(0xAA02)), 4)
+    test.assert_eq(add_configuration(var s.db, open_permissions()), 6)
+    // Only one per characteristic.
+    test.assert_eq(add_configuration(var s.db, open_permissions()), -1)
+
+@tier(app)
+fn control_point_server() -> GattServer
+    var s = new_server([], 65)
+    test.assert_eq(add_service(var s.db, false, le16(0xAA00)), 1)
+    test.assert_eq(add_characteristic(var s.db, PROP_WRITE | PROP_INDICATE, PERM_WRITE, le16(0xAA01)), 2)
+    test.assert_eq(add_configuration(var s.db, open_permissions()), 4)
+    test.assert(require_indication(var s.db, 3, 0x81, 0x80))
+    s
+
+@test
+fn test_a_control_point_write_needs_an_indication_subscription()
+    var s = control_point_server()
+    assert_error(receive(var s.db, var s.link, octets([0x12, 0x03, 0x00, 0x01]), 0), 0x12, 3, 0x81)
+    test.assert_eq(list.len(take_changed(s.link)), 0)
+    // A subscription to notifications is not one to indications.
+    set_configuration(var s.link, 4, CCC_NOTIFICATION)
+    assert_error(receive(var s.db, var s.link, octets([0x12, 0x03, 0x00, 0x01]), 0), 0x12, 3, 0x81)
+    // A command is dropped without a response.
+    set_configuration(var s.link, 4, 0)
+    test.assert_eq(list.len(receive(var s.db, var s.link, octets([0x52, 0x03, 0x00, 0x01]), 0)), 0)
+    set_configuration(var s.link, 4, CCC_INDICATION)
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x12, 0x03, 0x00, 0x01]), 0)), [0x13])
+    test.assert_eq(take_changed(s.link)[0], 3)
+
+@test
+fn test_a_control_point_write_waits_for_the_unconfirmed_indication()
+    var s = control_point_server()
+    set_configuration(var s.link, 4, CCC_INDICATION)
+    let _ = receive(var s.db, var s.link, octets([0x12, 0x03, 0x00, 0x01]), 0)
+    assert_bytes(one(send_value(var s.db, var s.link, 3, 0)), [0x1D, 0x03, 0x00, 0x01])
+    assert_error(receive(var s.db, var s.link, octets([0x12, 0x03, 0x00, 0x02]), 0), 0x12, 3, 0x80)
+    // The confirmation ends the wait.
+    test.assert_eq(list.len(receive(var s.db, var s.link, octets([0x1E]), 0)), 0)
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x12, 0x03, 0x00, 0x02]), 0)), [0x13])
+    // A prepared write is held to the same rule.
+    set_configuration(var s.link, 4, 0)
+    assert_error(receive(var s.db, var s.link, octets([0x16, 0x03, 0x00, 0x00, 0x00, 0x01]), 0), 0x16, 3, 0x81)
+
+@test
+fn test_a_write_is_restricted_to_the_first_octets_allowed()
+    var s = new_server([], 65)
+    test.assert_eq(add_service(var s.db, false, le16(0xAA00)), 1)
+    test.assert_eq(add_characteristic(var s.db, PROP_WRITE, PERM_WRITE, le16(0xAA01)), 2)
+    test.assert(restrict_first_octet(var s.db, 3, [1, 2], 0x80))
+    test.assert_eq(restrict_first_octet(var s.db, 0x99, [1], 0x80), false)
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x12, 0x03, 0x00, 0x02]), 0)), [0x13])
+    assert_error(receive(var s.db, var s.link, octets([0x12, 0x03, 0x00, 0x03]), 0), 0x12, 3, 0x80)
+    assert_error(receive(var s.db, var s.link, octets([0x12, 0x03, 0x00]), 0), 0x12, 3, 0x80)
+    test.assert_eq(require_indication(var s.db, 3, 0x81, 0x80), false)
+
+@test
+@satisfies("REQ-BLE-GAF-008")
+fn test_a_write_is_held_to_the_format_rule_of_its_attribute()
+    var s = new_server([], 65)
+    test.assert_eq(add_service(var s.db, false, le16(0xAA00)), 1)
+    test.assert_eq(add_characteristic(var s.db, PROP_READ | PROP_WRITE, PERM_READ | PERM_WRITE, le16(0xAA01)), 2)
+    test.assert(set_value(var s.db, 3, octets([1, 0, 0, 0])))
+    // Four octets, the top four bits clear, Write Request Rejected otherwise.
+    test.assert(require_value_format(var s.db, 3, 4, 0xF0000000, 0xFC))
+    test.assert_eq(require_value_format(var s.db, 0x99, 4, 0, 0xFC), false)
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x12, 0x03, 0x00, 0x00, 0x00, 0x00, 0x08]), 0)), [0x13])
+    assert_bytes(s.db.attributes[2].value, [0x00, 0x00, 0x00, 0x08])
+    assert_error(receive(var s.db, var s.link, octets([0x12, 0x03, 0x00, 0x00, 0x00, 0x00, 0x10]), 0), 0x12, 3, 0xFC)
+    assert_error(receive(var s.db, var s.link, octets([0x12, 0x03, 0x00, 0x01, 0x00, 0x00]), 0), 0x12, 3, 0xFC)
+    assert_error(receive(var s.db, var s.link, octets([0x12, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]), 0), 0x12, 3, 0xFC)
+    assert_error(receive(var s.db, var s.link, octets([0x12, 0x03, 0x00]), 0), 0x12, 3, 0xFC)
+    // A command is held to it too, and so is a prepared write, when the
+    // queue is executed.
+    test.assert_eq(list.len(receive(var s.db, var s.link, octets([0x52, 0x03, 0x00, 0x01]), 0)), 0)
+    assert_bytes(s.db.attributes[2].value, [0x00, 0x00, 0x00, 0x08])
+    assert_bytes(one(receive(var s.db, var s.link, octets([0x16, 0x03, 0x00, 0x01, 0x00, 0x05]), 0)), [0x17, 0x03, 0x00, 0x01, 0x00, 0x05])
+    assert_error(receive(var s.db, var s.link, octets([0x18, 0x01]), 0), 0x18, 3, 0xFC)
+    // A rule of length -1 checks only the reserved bits.
+    test.assert(require_value_format(var s.db, 3, -1, 0x80, 0xFC))
+    assert_bytes(value_format_octets(s.db), [0xFC])
+
+// The Error Code a write of one octet with the reserved bit set is answered
+// with under the rules of attribute 3, for a test to read.
+@tier(app)
+fn value_format_octets(db: GattDb) -> [u8]
+    [value_format_error(db, 3, 0, octets([0x80])) as u8]

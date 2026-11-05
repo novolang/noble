@@ -1,0 +1,184 @@
+// smp_handler.nv — SMP L2CAP handler glue.
+//
+// Composes smp_fsm (state machine + reply-builder) and smp (PDU
+// shapes) into the dispatcher main.nv (or the L2CAP-channel
+// router) calls when an L2CAP B-frame on CID 0x0006 lands.  Pure
+// software — no timing-sensitive code, no hardware dependency.
+//
+// Architecture:
+//
+//   main.nv                                     ← receives L2CAP frame
+//     │  classify_cid(b_frame_cid(frame)) == 3  ← from l2cap.nv
+//     ▼
+//   smp_handler.smp_inbound_event_for_opcode(op) ← here
+//     │  parses opcode, picks the right SmpPairingEvent
+//     ▼
+//   smp_fsm.smppairing_step(state, event)       ← FSM transition
+//     │  produces SmpPairingState (the new state)
+//     ▼
+//   smp_fsm.smp_reply_for_state(new_state)      ← in smp_fsm.nv
+//     │  builds the reply PDU bytes (or [] if no reply)
+//     ▼
+//   l2cap.build_b_frame(CID_SMP, reply)         ← back through l2cap
+//     │
+//     ▼
+//   conn_event_dispatch.stage_tx(b_frame)       ← out on the wire
+//
+// `smp_reply_for_state` lives in smp_fsm.nv (not here) because
+// Novo's OCaml backend rejects cross-module pattern matches on
+// state-machine variants.  This module owns just the opcode →
+// event mapping (function-call composition, no patterns) plus
+// the integration tests that walk the full handler.
+//
+// Satisfies REQ-BLE-SMP-011 (SMP PDU dispatch).
+
+use std.bits
+use std.test
+use smp
+use smp_fsm
+
+// ── Opcode → SmpPairingEvent mapping ────────────────────────────────
+//
+// Returns the FSM event that should fire when the dispatcher
+// observes the given inbound SMP opcode.  Returns
+// `smp_event_host_abort()` for unknown opcodes (we don't model
+// "received unsupported PDU" as its own event; treat-as-abort is
+// the closest approximation for the FSM's purposes — a real
+// dispatcher would also emit a Pairing_Failed("CMD_NOT_SUPPORTED")
+// to the peer; that's the caller's job, not the FSM's).
+
+// The event of the pairing state machine that a received SMP command with `opcode` stands for.
+pub @tier(embedded)
+fn smp_inbound_event_for_opcode(opcode: Int) -> SmpPairingEvent
+    match smp.command_of(opcode)
+        Some(PairingRequest) => smp_fsm.smp_event_rx_pairing_request()
+        Some(PairingConfirm) => smp_fsm.smp_event_rx_pairing_confirm()
+        Some(PairingRandom) => smp_fsm.smp_event_rx_pairing_random()
+        Some(PairingFailed) => smp_fsm.smp_event_rx_pairing_failed()
+        _ => smp_fsm.smp_event_host_abort()
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+// Test-only helper: 16-byte zero block.  Tests that drive
+// smp_fsm.smp_reply_for_state_pure with deterministic
+// inputs use this for the synthetic Sconfirm/Srand parameters.
+@tier(embedded)
+fn test_zero16() -> [u8]
+    [
+        0, 0, 0, 0,
+        0, 0, 0, 0,
+        0, 0, 0, 0,
+        0, 0, 0, 0]
+
+@test
+fn test_inbound_event_mapping_drives_each_supported_opcode()
+    let req_evt = smp_inbound_event_for_opcode(smp.SMP_OP_PAIRING_REQUEST)
+    let s = smp_fsm.smppairing_step(smp_fsm.smp_initial_state(), req_evt)
+    test.assert_eq(smp_fsm.smp_state_name(s), "ResponseSent")
+
+    let conf_evt = smp_inbound_event_for_opcode(smp.SMP_OP_PAIRING_CONFIRM)
+    let s2 = smp_fsm.smppairing_step(s, conf_evt)
+    test.assert_eq(smp_fsm.smp_state_name(s2), "SconfirmSent")
+
+    let rand_evt = smp_inbound_event_for_opcode(smp.SMP_OP_PAIRING_RANDOM)
+    let s3 = smp_fsm.smppairing_step(s2, rand_evt)
+    test.assert_eq(smp_fsm.smp_state_name(s3), "MrandReceived")
+
+    let fail_evt = smp_inbound_event_for_opcode(smp.SMP_OP_PAIRING_FAILED)
+    let s4 = smp_fsm.smppairing_step(s, fail_evt)
+    test.assert(smp_fsm.smp_is_failed(s4))
+
+@test
+fn test_unknown_opcode_maps_to_host_abort_event()
+    // 0x99 is not an SMP opcode we accept.  Should map to
+    // HostAbort, which from any in-progress state lands SmpFailed.
+    let evt = smp_inbound_event_for_opcode(0x99)
+    let post_request = smp_fsm.smppairing_step(smp_fsm.smp_initial_state(),
+                                                smp_fsm.smp_event_rx_pairing_request())
+    let s = smp_fsm.smppairing_step(post_request, evt)
+    test.assert(smp_fsm.smp_is_failed(s))
+
+@test
+fn test_full_handler_walk_idle_to_stk_ready()
+    // End-to-end: simulate a Just Works handler walk from Idle
+    // through StkReady, observing the PDUs we'd emit at each step.
+    var state = smp_fsm.smp_initial_state()
+
+    // 1. Pairing_Request from peer → ResponseSent + Pairing_Response.
+    let req = smp.build_pairing_request(
+        smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT,
+        smp.SMP_OOB_NOT_PRESENT,
+        smp.SMP_AUTHREQ_BONDING,
+        smp.SMP_MAX_ENC_KEY_SIZE,
+        smp.SMP_KEY_DIST_NONE,
+        smp.SMP_KEY_DIST_NONE)
+    let evt1 = smp_inbound_event_for_opcode(smp.smp_opcode(req))
+    state = smp_fsm.smppairing_step(state, evt1)
+    let resp = smp_fsm.smp_reply_for_state_pure(state, test_zero16(), test_zero16())
+    test.assert(smp.is_pairing_response(resp))
+    test.assert_eq(smp.pairing_io_cap(resp), smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT)
+
+    // 2. Pairing_Confirm from peer → SconfirmSent + Pairing_Confirm.
+    let mconfirm_bytes: [u8] = [
+        0xCC, 0xCC, 0xCC, 0xCC,
+        0xCC, 0xCC, 0xCC, 0xCC,
+        0xCC, 0xCC, 0xCC, 0xCC,
+        0xCC, 0xCC, 0xCC, 0xCC]
+    let mconfirm = smp.build_pairing_confirm(mconfirm_bytes)
+    let evt2 = smp_inbound_event_for_opcode(smp.smp_opcode(mconfirm))
+    state = smp_fsm.smppairing_step(state, evt2)
+    let sconfirm_pdu = smp_fsm.smp_reply_for_state_pure(state, test_zero16(), test_zero16())
+    test.assert(smp.is_pairing_confirm(sconfirm_pdu))
+    // Stub: all 16 bytes are zero.
+    test.assert_eq(smp.pairing_confirm_byte(sconfirm_pdu, 0), 0)
+    test.assert_eq(smp.pairing_confirm_byte(sconfirm_pdu, 15), 0)
+
+    // 3. Pairing_Random (Mrand) from peer → MrandReceived (no reply yet).
+    let mrand_bytes: [u8] = [
+        0x33, 0x33, 0x33, 0x33,
+        0x33, 0x33, 0x33, 0x33,
+        0x33, 0x33, 0x33, 0x33,
+        0x33, 0x33, 0x33, 0x33]
+    let mrand = smp.build_pairing_random(mrand_bytes)
+    let evt3 = smp_inbound_event_for_opcode(smp.smp_opcode(mrand))
+    state = smp_fsm.smppairing_step(state, evt3)
+    let no_reply = smp_fsm.smp_reply_for_state_pure(state, test_zero16(), test_zero16())
+    test.assert_eq(list.len(no_reply), 0)
+    test.assert_eq(smp_fsm.smp_state_name(state), "MrandReceived")
+
+    // 4. Caller computes c1(TK, Mrand, …) and verifies → StkReady.
+    state = smp_fsm.smppairing_step(state, smp_fsm.smp_event_confirm_verify_ok())
+    let srand_pdu = smp_fsm.smp_reply_for_state_pure(state, test_zero16(), test_zero16())
+    test.assert(smp.is_pairing_random(srand_pdu))
+    test.assert_eq(smp_fsm.smp_state_name(state), "StkReady")
+
+@test
+fn test_handler_walk_verify_failed_emits_pairing_failed()
+    // Arrange: walk to MrandReceived.
+    var state = smp_fsm.smp_initial_state()
+    state = smp_fsm.smppairing_step(state, smp_fsm.smp_event_rx_pairing_request())
+    state = smp_fsm.smppairing_step(state, smp_fsm.smp_event_rx_pairing_confirm())
+    state = smp_fsm.smppairing_step(state, smp_fsm.smp_event_rx_pairing_random())
+
+    // Act: caller's c1 verify fails.
+    state = smp_fsm.smppairing_step(state, smp_fsm.smp_event_confirm_verify_failed())
+    let pdu = smp_fsm.smp_reply_for_state_pure(state, test_zero16(), test_zero16())
+
+    // Assert: SmpFailed → Pairing_Failed(UNSPECIFIED).
+    test.assert(smp_fsm.smp_is_failed(state))
+    test.assert(smp.is_pairing_failed(pdu))
+    test.assert_eq(smp.pairing_failed_reason(pdu), smp.SMP_FAIL_UNSPECIFIED_REASON)
+
+@test
+fn test_handler_walk_peer_aborts_emits_no_reply_then_failed()
+    // Pairing_Failed from peer → SmpFailed.  Per spec the peer
+    // already aborted, so we DON'T echo Pairing_Failed back.
+    // But our state lands in SmpFailed for caller's bookkeeping,
+    // and smp_reply_for_state for SmpFailed produces a
+    // Pairing_Failed PDU — that's caller's job to suppress
+    // when the cause was already a peer abort.  Test documents
+    // current behaviour.
+    var state = smp_fsm.smp_initial_state()
+    state = smp_fsm.smppairing_step(state, smp_fsm.smp_event_rx_pairing_request())
+    state = smp_fsm.smppairing_step(state, smp_fsm.smp_event_rx_pairing_failed())
+    test.assert(smp_fsm.smp_is_failed(state))

@@ -1,0 +1,1447 @@
+// iso_big.nv -- the Host's side of Broadcast Isochronous Groups.
+//
+// A BIG is a set of BISes that an Isochronous Broadcaster transmits and any
+// number of Synchronized Receivers follow ([Vol 6] Part B, Section 4.4.6).
+// The Broadcaster's Host creates a BIG on a periodic advertising train with
+// LE Create BIG (or LE Create BIG Test) and receives an LE Create BIG
+// Complete event with one Connection_Handle for each BIS; it ends the BIG
+// with LE Terminate BIG and receives an LE Terminate BIG Complete event.  The
+// Receiver's Host reads the BIGInfo of a train it is synchronized to (the LE
+// BIGInfo Advertising Report event), follows the BIG with LE BIG Create
+// Sync, and receives an LE BIG Sync Established event with the handles of
+// the BISes it asked for; it stops with LE BIG Terminate Sync, and learns of
+// a BIG that ended or was lost from an LE BIG Sync Lost event ([Vol 4] Part
+// E, Sections 7.8.103 to 7.8.107 and 7.7.65.27 to 7.7.65.30).  An ISO data
+// path is set up for each BIS handle with LE Setup ISO Data Path (Section
+// 7.8.109): input for a Broadcaster, output for a Receiver.
+//
+// The module follows `iso_cis.nv`: a `BigTable` of fixed-size `Vec`s, and for
+// each procedure a function that checks a command, moves the row towards the
+// state the command heads for and answers 0 or the Controller error code
+// the Controller would answer, and a function that takes the answer or the
+// event and answers an `IsoEvent`.  One command is in flight at a time.  The
+// table holds `noble_config.MAX_BIG` groups and `noble_config.MAX_BIS` streams over all
+// of them; a command that needs more is refused with Rejected Due To
+// Limited Resources.
+//
+// A group is in one of these states.
+//
+//   Vacant           the row holds nothing
+//   Building         Broadcaster: LE Create BIG was sent; the LE Create BIG
+//                    Complete event is awaited
+//   Cancelling       Broadcaster: LE Terminate BIG was sent while the BIG
+//                    was being created; the Controller stops and answers
+//                    the LE Create BIG Complete event with Operation
+//                    Cancelled by Host ([Vol 4] Part E, Section 7.8.105)
+//   Broadcasting     Broadcaster: the BIG is up and its BISes exist
+//   Terminating      Broadcaster: LE Terminate BIG was sent for a BIG that
+//                    is up; the LE Terminate BIG Complete event is awaited
+//   Syncing          Receiver: LE BIG Create Sync was sent; the LE BIG Sync
+//                    Established event is awaited
+//   SyncCancelling   Receiver: LE BIG Terminate Sync was sent while the
+//                    synchronization was being established; the Controller
+//                    answers the LE BIG Sync Established event with
+//                    Operation Cancelled by Host ([Vol 4] Part E, Section
+//                    7.8.107)
+//   Synchronized     Receiver: the BIG is followed and its BISes exist
+//
+// Satisfies: REQ-BLE-ISO-004.
+
+use std.test
+use hci_commands
+use budget
+use hci_codec
+use iso_event
+use noble_config
+
+// A table of an absent feature keeps one record: a `Vec` holds at least one element.
+const fn max1(n: Int) -> Int
+    if n > 1 then n else 1
+// The state of one row of the BIG table: vacant, building, cancelling, broadcasting, terminating, syncing, sync
+// cancelling or synchronized.
+pub @value
+enum BigState
+    Vacant
+    Building
+    Cancelling
+    Broadcasting
+    Terminating
+    Syncing
+    SyncCancelling
+    Synchronized
+
+// The command the table waits an answer for.
+pub @value
+enum BigPending
+    NoCommand
+    CreateBig
+    TerminateBig
+    CreateSync
+    TerminateSync
+    SetBisPath
+    RemoveBisPath
+
+// A BIG_Handle and an Advertising_Handle are 0x00 to 0xEF.
+const ID_MAX = 0xEF
+
+// A Connection_Handle, the Sync_Handle of a periodic advertising train
+// included, is 0x0000 to 0x0EFF.
+const HANDLE_MAX = 0x0EFF
+
+// Num_BIS and a BIS_Number are 0x01 to 0x1F.
+const BIS_MAX = 0x1F
+
+const PHY_MASK = 0x07
+
+const NO_BIG = 255
+
+// Data_Path_Direction of LE Setup ISO Data Path, and the bits of LE Remove
+// ISO Data Path ([Vol 4] Part E, Sections 7.8.109 and 7.8.110).
+pub const PATH_INPUT = 0
+
+// The Data_Path_Direction of a path from the Controller to the Host.
+pub const PATH_OUTPUT = 1
+
+const PATH_BIT_INPUT = 0x01
+
+const PATH_BIT_OUTPUT = 0x02
+
+// The ranges of the parameters of LE Create BIG and LE Create BIG Test
+// ([Vol 4] Part E, Sections 7.8.103 and 7.8.104).
+const TRANSPORT_LATENCY_MIN = 0x0005
+
+const TRANSPORT_LATENCY_MAX = 0x0FA0
+
+const SDU_MAX = 0x0FFF
+
+const RTN_MAX = 0x1E
+
+const ISO_INTERVAL_MIN = 0x0004
+
+const ISO_INTERVAL_MAX = 0x0C80
+
+const PDU_MAX = 0x00FB
+
+// The ranges of LE BIG Create Sync ([Vol 4] Part E, Section 7.8.106).
+const MSE_MAX = 0x1F
+
+const SYNC_TIMEOUT_MIN = 0x000A
+
+const SYNC_TIMEOUT_MAX = 0x4000
+
+// The Host's broadcast isochronous groups: one row for each group, in the capacity of `noble_config.MAX_BIG`, and the
+// command each one has in flight.
+pub @value
+struct BigTable
+    pending: BigPending
+    pending_big: u8
+    pending_count: u8
+    pending_handle: u16
+    pending_arg: u8
+    // LE BIG Create Sync: the BIS_Number of each BIS asked for, in order.
+    pending_numbers: Vec[u8; max1(noble_config.MAX_BIS)]
+    state: Vec[BigState; max1(noble_config.MAX_BIG)]
+    broadcaster: Vec[Bool; max1(noble_config.MAX_BIG)]
+    big_handle: Vec[u8; max1(noble_config.MAX_BIG)]
+    // The Advertising_Handle of a Broadcaster's group, the Sync_Handle of a
+    // Receiver's.
+    link_handle: Vec[u16; max1(noble_config.MAX_BIG)]
+    stream_count: Vec[u8; max1(noble_config.MAX_BIG)]
+    encrypted: Vec[Bool; max1(noble_config.MAX_BIG)]
+    bis_used: Vec[Bool; max1(noble_config.MAX_BIS)]
+    bis_big: Vec[u8; max1(noble_config.MAX_BIS)]
+    bis_handle: Vec[u16; max1(noble_config.MAX_BIS)]
+    bis_number: Vec[u8; max1(noble_config.MAX_BIS)]
+    bis_paths: Vec[u8; max1(noble_config.MAX_BIS)]
+
+// The bytes of a group row and of a stream row.  `budget.BIG_RECORD` and
+// `budget.BIS_RECORD` have to cover them.
+const BIG_ROW_BYTES = 21
+
+const BIS_ROW_BYTES = 8
+
+@tier(embedded)
+fn big_table_new() -> BigTable
+    var t = BigTable {
+        pending: BigPending.NoCommand, pending_big: 0, pending_count: 0, pending_handle: 0,
+        pending_arg: 0, pending_numbers: Vec.new(), state: Vec.new(),
+        broadcaster: Vec.new(), big_handle: Vec.new(), link_handle: Vec.new(),
+        stream_count: Vec.new(), encrypted: Vec.new(), bis_used: Vec.new(), bis_big: Vec.new(),
+        bis_handle: Vec.new(), bis_number: Vec.new(), bis_paths: Vec.new() }
+    for _ in 0..noble_config.MAX_BIG
+        let _a = t.state.push(BigState.Vacant)
+        let _b = t.broadcaster.push(false)
+        let _c = t.big_handle.push(0)
+        let _d = t.link_handle.push(0)
+        let _e = t.stream_count.push(0)
+        let _f = t.encrypted.push(false)
+    for _ in 0..noble_config.MAX_BIS
+        let _g = t.pending_numbers.push(0)
+        let _h = t.bis_used.push(false)
+        let _i = t.bis_big.push(NO_BIG)
+        let _j = t.bis_handle.push(0)
+        let _k = t.bis_number.push(0)
+        let _l = t.bis_paths.push(0)
+    t
+
+// ── Lookups ─────────────────────────────────────────────────────────
+
+// The row of the group `big_handle`, or -1.
+@tier(embedded)
+@no_alloc
+fn big_row(var t: BigTable, big_handle: Int) -> Int
+    for i in 0..t.state.len()
+        if t.state[i] != BigState.Vacant and (t.big_handle[i] as Int) == big_handle
+            return i
+    -1
+
+@tier(embedded)
+@no_alloc
+fn big_free_row(var t: BigTable) -> Int
+    for i in 0..t.state.len()
+        if t.state[i] == BigState.Vacant
+            return i
+    -1
+
+// The row of the stream with Connection_Handle `handle`, or -1.
+@tier(embedded)
+@no_alloc
+fn bis_row(var t: BigTable, handle: Int) -> Int
+    for i in 0..t.bis_used.len()
+        if t.bis_used[i] and (t.bis_handle[i] as Int) == handle
+            return i
+    -1
+
+@tier(embedded)
+@no_alloc
+fn bis_unused_rows(var t: BigTable) -> Int
+    var n = 0
+    for i in 0..t.bis_used.len()
+        if not t.bis_used[i]
+            n = n + 1
+    n
+
+// The stream rows that groups still to be established have claimed: a
+// group being created or synchronized to takes its streams when the event
+// of the command arrives, and until then the rows are not free.
+@tier(embedded)
+@no_alloc
+fn bis_claimed_rows(var t: BigTable) -> Int
+    var n = 0
+    for i in 0..t.state.len()
+        let st = t.state[i]
+        if st == BigState.Building or st == BigState.Cancelling or st == BigState.Syncing or st == BigState.SyncCancelling
+            n = n + (t.stream_count[i] as Int)
+    n
+
+@tier(embedded)
+@no_alloc
+fn bis_free_rows(var t: BigTable) -> Int
+    bis_unused_rows(var t) - bis_claimed_rows(var t)
+
+// The number of groups in `state`.
+@tier(embedded)
+@no_alloc
+fn big_count_in(var t: BigTable, state: BigState) -> Int
+    var n = 0
+    for i in 0..t.state.len()
+        if t.state[i] == state
+            n = n + 1
+    n
+
+// The number of stream rows of the group in row `slot`.
+@tier(embedded)
+@no_alloc
+fn big_bis_rows(var t: BigTable, slot: Int) -> Int
+    var n = 0
+    for i in 0..t.bis_used.len()
+        if t.bis_used[i] and (t.bis_big[i] as Int) == (t.big_handle[slot] as Int)
+            n = n + 1
+    n
+
+@tier(embedded)
+@no_alloc
+fn big_release(var t: BigTable, slot: Int)
+    for i in 0..t.bis_used.len()
+        if t.bis_used[i] and (t.bis_big[i] as Int) == (t.big_handle[slot] as Int)
+            t.bis_used[i] = false
+            t.bis_big[i] = NO_BIG
+            t.bis_handle[i] = 0
+            t.bis_number[i] = 0
+            t.bis_paths[i] = 0
+    t.state[slot] = BigState.Vacant
+    t.broadcaster[slot] = false
+    t.big_handle[slot] = 0
+    t.link_handle[slot] = 0
+    t.stream_count[slot] = 0
+    t.encrypted[slot] = false
+
+@tier(embedded)
+@no_alloc
+fn big_pending_clear(var t: BigTable)
+    t.pending = BigPending.NoCommand
+    t.pending_big = 0
+    t.pending_count = 0
+    t.pending_handle = 0
+    t.pending_arg = 0
+
+// Whether `code` is a Broadcast_Code the command can carry for `encrypted`:
+// 16 octets, and all zero when the BIG is not encrypted, as the Host sets
+// it ([Vol 4] Part E, Section 7.8.103).
+@tier(embedded)
+@no_alloc
+fn broadcast_code_ok(encrypted: Bool, code: [u8]) -> Bool
+    if list.len(code) != hci_commands.ISO_BROADCAST_CODE_LENGTH
+        return false
+    if encrypted
+        return true
+    for i in 0..list.len(code)
+        if (code[i] as Int) != 0
+            return false
+    true
+
+// ── Broadcaster: LE Create BIG ──────────────────────────────────────
+
+// The error code of the parameters LE Create BIG and LE Create BIG Test
+// have in common, or 0: BIG_Handle and Advertising_Handle 0x00 to 0xEF,
+// Num_BIS 0x01 to 0x1F, SDU_Interval 0x0000FF to 0x0FFFFF, Max_SDU 0x0001 to
+// 0x0FFF, Packing 0 to 1, Framing 0 to 2, Encryption 0 to 1 and a
+// Broadcast_Code that is 16 octets and zero for an unencrypted BIG; PHY has
+// at least one bit (Invalid HCI Command Parameters) and no bit outside the
+// three PHYs (Unsupported Feature or Parameter Value).
+@tier(embedded)
+@no_alloc
+fn create_big_common_status(big_handle: Int, advertising_handle: Int, num_bis: Int, sdu_interval: Int, max_sdu: Int, phy: Int, packing: Int, framing: Int, encrypted: Bool, code: [u8]) -> Int
+    if big_handle < 0 or big_handle > ID_MAX or advertising_handle < 0 or advertising_handle > ID_MAX
+        return iso_event.STATUS_INVALID_COMMAND_PARAMETERS
+    if num_bis < 1 or num_bis > BIS_MAX or not hci_commands.iso_sdu_interval_ok(sdu_interval)
+        return iso_event.STATUS_INVALID_COMMAND_PARAMETERS
+    if max_sdu < 1 or max_sdu > SDU_MAX or packing < 0 or packing > 1 or framing < 0 or framing > 2
+        return iso_event.STATUS_INVALID_COMMAND_PARAMETERS
+    if not broadcast_code_ok(encrypted, code) or phy == 0
+        return iso_event.STATUS_INVALID_COMMAND_PARAMETERS
+    if (phy & PHY_MASK) != phy
+        return iso_event.STATUS_UNSUPPORTED_FEATURE_OR_PARAMETER
+    iso_event.STATUS_SUCCESS
+
+// The error code of the table's own limits for a BIG of `num_bis` streams on
+// the advertising train `advertising_handle`, or 0.
+@tier(embedded)
+@no_alloc
+fn create_big_resources_status(var t: BigTable, big_handle: Int, advertising_handle: Int, num_bis: Int) -> Int
+    if t.pending != BigPending.NoCommand or big_row(var t, big_handle) >= 0
+        return iso_event.STATUS_COMMAND_DISALLOWED
+    for i in 0..t.state.len()
+        if t.state[i] != BigState.Vacant and t.broadcaster[i] and (t.link_handle[i] as Int) == advertising_handle
+            return iso_event.STATUS_UNKNOWN_ADVERTISING_IDENTIFIER
+    if big_free_row(var t) < 0 or num_bis > bis_free_rows(var t)
+        return iso_event.STATUS_REJECTED_LIMITED_RESOURCES
+    iso_event.STATUS_SUCCESS
+
+// Take the row of a new Broadcaster's group.
+@tier(embedded)
+@no_alloc
+fn big_open_broadcast(var t: BigTable, big_handle: Int, advertising_handle: Int, num_bis: Int, encrypted: Bool)
+    let at = big_free_row(var t)
+    t.state[at] = BigState.Building
+    t.broadcaster[at] = true
+    t.big_handle[at] = big_handle as u8
+    t.link_handle[at] = advertising_handle as u16
+    t.stream_count[at] = num_bis as u8
+    t.encrypted[at] = encrypted
+    t.pending = BigPending.CreateBig
+    t.pending_big = big_handle as u8
+    t.pending_count = num_bis as u8
+
+// Check LE Create BIG ([Vol 4] Part E, Section 7.8.103) and, when it can be
+// sent, take a row for the group and wait for its Command Status.  A BIG
+// handle the table holds, or a command in flight, is Command Disallowed; an
+// Advertising_Handle that another group of this Host uses is Unknown
+// Advertising Identifier; no free group row or too few free stream rows is
+// Rejected Due To Limited Resources.  Parameters out of range are Invalid
+// HCI Command Parameters.
+pub @satisfies("REQ-BLE-ISO-004")
+@tier(embedded)
+@no_alloc
+fn big_create(var t: BigTable, big_handle: Int, advertising_handle: Int, num_bis: Int, sdu_interval: Int, max_sdu: Int, max_transport_latency: Int, rtn: Int, phy: Int, packing: Int, framing: Int, encrypted: Bool, code: [u8]) -> Int
+    let bad = create_big_common_status(big_handle, advertising_handle, num_bis, sdu_interval, max_sdu, phy, packing, framing, encrypted, code)
+    if bad != iso_event.STATUS_SUCCESS
+        return bad
+    if max_transport_latency < TRANSPORT_LATENCY_MIN or max_transport_latency > TRANSPORT_LATENCY_MAX or rtn < 0 or rtn > RTN_MAX
+        return iso_event.STATUS_INVALID_COMMAND_PARAMETERS
+    let limit = create_big_resources_status(var t, big_handle, advertising_handle, num_bis)
+    if limit != iso_event.STATUS_SUCCESS
+        return limit
+    big_open_broadcast(var t, big_handle, advertising_handle, num_bis, encrypted)
+    iso_event.STATUS_SUCCESS
+
+// Check LE Create BIG Test ([Vol 4] Part E, Section 7.8.104): the checks of
+// `big_create`, with the ISO_Interval 0x0004 to 0x0C80, NSE 0x01 to 0x1F,
+// Max_PDU 0x0001 to 0x00FB, BN 0x01 to 0x07, IRC 0x01 to 0x0F and PTO 0x00 to
+// 0x0F of the Test form.  A parameter out of range, an NSE that is not a
+// multiple of BN, and an NSE below IRC times BN are Unsupported Feature or
+// Parameter Value in this command.
+@satisfies("REQ-BLE-ISO-004")
+@tier(embedded)
+@no_alloc
+fn big_create_test(var t: BigTable, big_handle: Int, advertising_handle: Int, num_bis: Int, sdu_interval: Int, iso_interval: Int, nse: Int, max_sdu: Int, max_pdu: Int, phy: Int, packing: Int, framing: Int, bn: Int, irc: Int, pto: Int, encrypted: Bool, code: [u8]) -> Int
+    let unsupported = iso_event.STATUS_UNSUPPORTED_FEATURE_OR_PARAMETER
+    let bad = create_big_common_status(big_handle, advertising_handle, num_bis, sdu_interval, max_sdu, phy, packing, framing, encrypted, code)
+    if bad == iso_event.STATUS_INVALID_COMMAND_PARAMETERS
+        return unsupported
+    if bad != iso_event.STATUS_SUCCESS
+        return bad
+    if iso_interval < ISO_INTERVAL_MIN or iso_interval > ISO_INTERVAL_MAX or nse < 1 or nse > 0x1F
+        return unsupported
+    if max_pdu < 1 or max_pdu > PDU_MAX or bn < 1 or bn > 7 or irc < 1 or irc > 0x0F or pto < 0 or pto > 0x0F
+        return unsupported
+    if nse % bn != 0 or nse < irc * bn
+        return unsupported
+    let limit = create_big_resources_status(var t, big_handle, advertising_handle, num_bis)
+    if limit != iso_event.STATUS_SUCCESS
+        return limit
+    big_open_broadcast(var t, big_handle, advertising_handle, num_bis, encrypted)
+    iso_event.STATUS_SUCCESS
+
+// The Command Status of LE Create BIG or LE Create BIG Test.  A failure
+// ends the attempt and frees the row; a success leaves the group Building
+// until the LE Create BIG Complete event.
+@satisfies("REQ-BLE-ISO-004")
+@tier(embedded)
+fn big_create_status(var t: BigTable, status: Int) -> iso_event.IsoEvent
+    if t.pending != BigPending.CreateBig
+        return iso_event.unrelated(0)
+    let handle = t.pending_big as Int
+    let at = big_row(var t, handle)
+    if status == iso_event.STATUS_SUCCESS
+        big_pending_clear(var t)
+        return iso_event.iso_event(iso_event.IsoEventKind.CommandDone, at, handle, status)
+    if at >= 0
+        big_release(var t, at)
+    big_pending_clear(var t)
+    iso_event.command_failed(handle, status)
+
+// The LE Create BIG Complete event ([Vol 4] Part E, Section 7.7.65.27).  A
+// failure frees the group.  A success makes the group Broadcasting and a
+// stream row of every Connection_Handle, numbered from 1 in order.  An event
+// for a group the table does not hold as Building, one whose Num_BIS is not
+// the command's and one that names a handle outside 0x0000 to 0x0EFF, a
+// handle twice or a handle another stream holds, changes nothing.  An event
+// for a group the Host is cancelling frees it; if the Controller created
+// the BIG before it saw the cancellation, the group is Terminating, and the
+// LE Terminate BIG Complete event follows.
+@satisfies("REQ-BLE-ISO-004")
+@tier(embedded)
+fn big_create_complete(var t: BigTable, evt: hci_codec.CreateBigComplete) -> iso_event.IsoEvent
+    let at = big_row(var t, evt.big_handle)
+    if at < 0 or not t.broadcaster[at] or (t.state[at] != BigState.Building and t.state[at] != BigState.Cancelling)
+        return iso_event.unrelated(evt.big_handle)
+    let cancelling = t.state[at] == BigState.Cancelling
+    if evt.status != iso_event.STATUS_SUCCESS
+        big_release(var t, at)
+        return iso_event.iso_event(iso_event.IsoEventKind.BigCreateFailed, at, evt.big_handle, evt.status)
+    let n = list.len(evt.connection_handles)
+    if n != (t.stream_count[at] as Int) or n > bis_unused_rows(var t)
+        return iso_event.unrelated(evt.big_handle)
+    for k in 0..n
+        let h = evt.connection_handles[k]
+        if h < 0 or h > HANDLE_MAX or bis_row(var t, h) >= 0
+            return iso_event.unrelated(evt.big_handle)
+        for j in 0..k
+            if evt.connection_handles[j] == h
+                return iso_event.unrelated(evt.big_handle)
+    for k in 0..n
+        take_bis(var t, evt.big_handle, evt.connection_handles[k], k + 1)
+    t.state[at] = if cancelling then BigState.Terminating else BigState.Broadcasting
+    iso_event.iso_event(iso_event.IsoEventKind.BigCreated, at, evt.big_handle, iso_event.STATUS_SUCCESS)
+
+@tier(embedded)
+@no_alloc
+fn take_bis(var t: BigTable, big_handle: Int, handle: Int, number: Int)
+    for i in 0..t.bis_used.len()
+        if not t.bis_used[i]
+            t.bis_used[i] = true
+            t.bis_big[i] = big_handle as u8
+            t.bis_handle[i] = handle as u16
+            t.bis_number[i] = number as u8
+            t.bis_paths[i] = 0
+            return
+
+// ── Broadcaster: LE Terminate BIG ───────────────────────────────────
+
+// Check LE Terminate BIG ([Vol 4] Part E, Section 7.8.105): Unknown
+// Advertising Identifier for a group the table does not hold, Command
+// Disallowed for a group this Host follows as a Receiver, for one that is
+// being terminated already, and while another command is in flight.  A BIG
+// that is still being created is cancelled: the group goes to Cancelling.
+pub @satisfies("REQ-BLE-ISO-004")
+@tier(embedded)
+@no_alloc
+fn big_terminate(var t: BigTable, big_handle: Int, reason: Int) -> Int
+    let at = big_row(var t, big_handle)
+    if at < 0
+        return iso_event.STATUS_UNKNOWN_ADVERTISING_IDENTIFIER
+    if not t.broadcaster[at] or t.pending != BigPending.NoCommand
+        return iso_event.STATUS_COMMAND_DISALLOWED
+    if reason < 0 or reason > 0xFF
+        return iso_event.STATUS_INVALID_COMMAND_PARAMETERS
+    if t.state[at] == BigState.Broadcasting
+        t.state[at] = BigState.Terminating
+    else if t.state[at] == BigState.Building
+        t.state[at] = BigState.Cancelling
+    else
+        return iso_event.STATUS_COMMAND_DISALLOWED
+    t.pending = BigPending.TerminateBig
+    t.pending_big = big_handle as u8
+    iso_event.STATUS_SUCCESS
+
+// The Command Status of LE Terminate BIG.  A failure puts the group back
+// where it was.
+@satisfies("REQ-BLE-ISO-004")
+@tier(embedded)
+fn big_terminate_status(var t: BigTable, status: Int) -> iso_event.IsoEvent
+    if t.pending != BigPending.TerminateBig
+        return iso_event.unrelated(0)
+    let handle = t.pending_big as Int
+    let at = big_row(var t, handle)
+    big_pending_clear(var t)
+    if status == iso_event.STATUS_SUCCESS
+        return iso_event.iso_event(iso_event.IsoEventKind.CommandDone, at, handle, status)
+    if at >= 0
+        if t.state[at] == BigState.Terminating
+            t.state[at] = BigState.Broadcasting
+        else if t.state[at] == BigState.Cancelling
+            t.state[at] = BigState.Building
+    iso_event.command_failed(handle, status)
+
+// The LE Terminate BIG Complete event ([Vol 4] Part E, Section 7.7.65.28):
+// the group and its streams, with their data paths, are gone.  Local
+// termination has the reason Connection Terminated By Local Host.  The
+// event is for a group the Host is terminating; one for any other state
+// changes nothing.
+pub @satisfies("REQ-BLE-ISO-004")
+@tier(embedded)
+fn big_terminate_complete(var t: BigTable, evt: hci_codec.TerminateBigComplete) -> iso_event.IsoEvent
+    let at = big_row(var t, evt.big_handle)
+    if at < 0 or not t.broadcaster[at] or t.state[at] != BigState.Terminating
+        return iso_event.unrelated(evt.big_handle)
+    big_release(var t, at)
+    iso_event.iso_event(iso_event.IsoEventKind.BigTerminated, at, evt.big_handle, evt.reason)
+
+// ── Receiver: LE BIG Create Sync ────────────────────────────────────
+
+// Check LE BIG Create Sync ([Vol 4] Part E, Section 7.8.106) and, when it
+// can be sent, take a row for the group.  The BIS numbers `bis` are in
+// ascending order with no duplicates, each 0x01 to 0x1F; MSE is 0x00 to
+// 0x1F, BIG_Sync_Timeout 0x000A to 0x4000 and the Broadcast_Code 16 octets
+// (ignored while `encrypted` is false), and every fault of these is Invalid
+// HCI Command Parameters.  A BIG handle the table holds, a train this Host
+// is synchronized to a BIG of already, a synchronization still being
+// established, and a command in flight are Command Disallowed; no free
+// group row or too few free stream rows is Rejected Due To Limited
+// Resources.
+pub @satisfies("REQ-BLE-ISO-004")
+@tier(embedded)
+@no_alloc
+fn big_sync_create(var t: BigTable, big_handle: Int, sync_handle: Int, encrypted: Bool, code: [u8], mse: Int, sync_timeout: Int, bis: [Int]) -> Int
+    let n = list.len(bis)
+    if big_handle < 0 or big_handle > ID_MAX or sync_handle < 0 or sync_handle > HANDLE_MAX
+        return iso_event.STATUS_INVALID_COMMAND_PARAMETERS
+    if mse < 0 or mse > MSE_MAX or sync_timeout < SYNC_TIMEOUT_MIN or sync_timeout > SYNC_TIMEOUT_MAX
+        return iso_event.STATUS_INVALID_COMMAND_PARAMETERS
+    if n < 1 or n > BIS_MAX or list.len(code) != hci_commands.ISO_BROADCAST_CODE_LENGTH
+        return iso_event.STATUS_INVALID_COMMAND_PARAMETERS
+    for k in 0..n
+        if bis[k] < 1 or bis[k] > BIS_MAX
+            return iso_event.STATUS_INVALID_COMMAND_PARAMETERS
+        if k > 0 and bis[k] <= bis[k - 1]
+            return iso_event.STATUS_INVALID_COMMAND_PARAMETERS
+    if t.pending != BigPending.NoCommand or big_row(var t, big_handle) >= 0
+        return iso_event.STATUS_COMMAND_DISALLOWED
+    for i in 0..t.state.len()
+        if t.state[i] == BigState.Syncing or t.state[i] == BigState.SyncCancelling
+            return iso_event.STATUS_COMMAND_DISALLOWED
+        if t.state[i] != BigState.Vacant and not t.broadcaster[i] and (t.link_handle[i] as Int) == sync_handle
+            return iso_event.STATUS_COMMAND_DISALLOWED
+    if big_free_row(var t) < 0 or n > bis_free_rows(var t) or n > t.pending_numbers.len()
+        return iso_event.STATUS_REJECTED_LIMITED_RESOURCES
+    let at = big_free_row(var t)
+    t.state[at] = BigState.Syncing
+    t.broadcaster[at] = false
+    t.big_handle[at] = big_handle as u8
+    t.link_handle[at] = sync_handle as u16
+    t.stream_count[at] = n as u8
+    t.encrypted[at] = encrypted
+    for k in 0..n
+        t.pending_numbers[k] = bis[k] as u8
+    t.pending = BigPending.CreateSync
+    t.pending_big = big_handle as u8
+    t.pending_count = n as u8
+    iso_event.STATUS_SUCCESS
+
+// The Command Status of LE BIG Create Sync: a failure frees the row.
+@satisfies("REQ-BLE-ISO-004")
+@tier(embedded)
+fn big_sync_status(var t: BigTable, status: Int) -> iso_event.IsoEvent
+    if t.pending != BigPending.CreateSync
+        return iso_event.unrelated(0)
+    let handle = t.pending_big as Int
+    let at = big_row(var t, handle)
+    if status == iso_event.STATUS_SUCCESS
+        big_pending_clear(var t)
+        return iso_event.iso_event(iso_event.IsoEventKind.CommandDone, at, handle, status)
+    if at >= 0
+        big_release(var t, at)
+    big_pending_clear(var t)
+    iso_event.command_failed(handle, status)
+
+// The LE BIG Sync Established event ([Vol 4] Part E, Section 7.7.65.29).
+// A failure frees the group.  A success makes it Synchronized and a stream
+// row of every Connection_Handle, numbered as the BIS arrayed parameter of
+// the command was, in its order.  The event must carry as many handles as
+// the command asked BISes; an event that does not, or names a handle
+// outside 0x0000 to 0x0EFF, twice or one another stream holds, changes
+// nothing.  An event for a synchronization the Host is cancelling frees the
+// group and reports the cancellation, whatever its status.
+@satisfies("REQ-BLE-ISO-004")
+@tier(embedded)
+fn big_sync_established(var t: BigTable, evt: hci_codec.BigSyncEstablished) -> iso_event.IsoEvent
+    let at = big_row(var t, evt.big_handle)
+    if at < 0 or t.broadcaster[at] or (t.state[at] != BigState.Syncing and t.state[at] != BigState.SyncCancelling)
+        return iso_event.unrelated(evt.big_handle)
+    if t.state[at] == BigState.SyncCancelling or evt.status != iso_event.STATUS_SUCCESS
+        big_release(var t, at)
+        return iso_event.iso_event(iso_event.IsoEventKind.BigSyncFailed, at, evt.big_handle, evt.status)
+    let n = list.len(evt.connection_handles)
+    if n != (t.stream_count[at] as Int) or n > bis_unused_rows(var t)
+        return iso_event.unrelated(evt.big_handle)
+    for k in 0..n
+        let h = evt.connection_handles[k]
+        if h < 0 or h > HANDLE_MAX or bis_row(var t, h) >= 0
+            return iso_event.unrelated(evt.big_handle)
+        for j in 0..k
+            if evt.connection_handles[j] == h
+                return iso_event.unrelated(evt.big_handle)
+    for k in 0..n
+        take_bis(var t, evt.big_handle, evt.connection_handles[k], t.pending_numbers[k] as Int)
+    t.state[at] = BigState.Synchronized
+    iso_event.iso_event(iso_event.IsoEventKind.BigSynced, at, evt.big_handle, iso_event.STATUS_SUCCESS)
+
+// ── Receiver: LE BIG Terminate Sync and LE BIG Sync Lost ────────────
+
+// Check LE BIG Terminate Sync ([Vol 4] Part E, Section 7.8.107): Unknown
+// Advertising Identifier for a group the table does not hold, Command
+// Disallowed for a group this Host broadcasts, for one it is neither
+// synchronized to nor synchronizing to, and while another command is in
+// flight.
+pub @satisfies("REQ-BLE-ISO-004")
+@tier(embedded)
+@no_alloc
+fn big_sync_terminate(var t: BigTable, big_handle: Int) -> Int
+    let at = big_row(var t, big_handle)
+    if at < 0
+        return iso_event.STATUS_UNKNOWN_ADVERTISING_IDENTIFIER
+    if t.broadcaster[at] or t.pending != BigPending.NoCommand
+        return iso_event.STATUS_COMMAND_DISALLOWED
+    if t.state[at] != BigState.Syncing and t.state[at] != BigState.Synchronized
+        return iso_event.STATUS_COMMAND_DISALLOWED
+    t.pending = BigPending.TerminateSync
+    t.pending_big = big_handle as u8
+    iso_event.STATUS_SUCCESS
+
+// The Command Complete of LE BIG Terminate Sync.  For a BIG that is followed
+// it frees the group, its streams and their data paths.  For a
+// synchronization still being established it stops the attempt: the group
+// goes to SyncCancelling and the LE BIG Sync Established event follows with
+// Operation Cancelled by Host.  A failure changes nothing.
+@satisfies("REQ-BLE-ISO-004")
+@tier(embedded)
+fn big_sync_terminate_complete(var t: BigTable, status: Int, big_handle: Int) -> iso_event.IsoEvent
+    if t.pending != BigPending.TerminateSync or (t.pending_big as Int) != big_handle
+        return iso_event.unrelated(big_handle)
+    let at = big_row(var t, big_handle)
+    big_pending_clear(var t)
+    if status != iso_event.STATUS_SUCCESS
+        return iso_event.command_failed(big_handle, status)
+    if at < 0
+        return iso_event.unrelated(big_handle)
+    if t.state[at] == BigState.Syncing
+        t.state[at] = BigState.SyncCancelling
+        return iso_event.iso_event(iso_event.IsoEventKind.CommandDone, at, big_handle, status)
+    big_release(var t, at)
+    iso_event.iso_event(iso_event.IsoEventKind.BigSyncTerminated, at, big_handle, status)
+
+// The LE BIG Sync Lost event ([Vol 4] Part E, Section 7.7.65.30): the
+// Broadcaster ended the BIG (Remote User Terminated Connection), the
+// timeout ran out (Connection Timeout) or a payload failed its integrity
+// check (Connection Terminated due to MIC Failure).  The Controller removes
+// the streams and their data paths, and so does the table.
+@satisfies("REQ-BLE-ISO-004")
+@tier(embedded)
+fn big_sync_lost(var t: BigTable, evt: hci_codec.BigSyncLost) -> iso_event.IsoEvent
+    let at = big_row(var t, evt.big_handle)
+    if at < 0 or t.broadcaster[at] or t.state[at] != BigState.Synchronized
+        return iso_event.unrelated(evt.big_handle)
+    big_release(var t, at)
+    iso_event.iso_event(iso_event.IsoEventKind.BigSyncLost, at, evt.big_handle, evt.reason)
+
+// ── ISO data paths of BISes ─────────────────────────────────────────
+
+// Check LE Setup ISO Data Path for the BIS `handle` ([Vol 4] Part E,
+// Section 7.8.109).  Unknown Connection Identifier for a handle that is
+// no BIS; Command Disallowed for the output direction of a Broadcaster's
+// BIS, the input direction of a Receiver's BIS, a path that exists, and a
+// command in flight; Invalid HCI Command Parameters for a direction that is
+// neither, and for a codec configuration with the transparent coding
+// format.  A BIS handle exists only while its group does.
+pub @satisfies("REQ-BLE-ISO-004")
+@tier(embedded)
+@no_alloc
+fn bis_data_path_setup(var t: BigTable, handle: Int, direction: Int, coding_format: Int, configuration_length: Int) -> Int
+    let at = bis_row(var t, handle)
+    if at < 0
+        return iso_event.STATUS_UNKNOWN_CONNECTION_IDENTIFIER
+    if direction != PATH_INPUT and direction != PATH_OUTPUT
+        return iso_event.STATUS_INVALID_COMMAND_PARAMETERS
+    if configuration_length < 0 or configuration_length > 255
+        return iso_event.STATUS_INVALID_COMMAND_PARAMETERS
+    if coding_format == hci_commands.ISO_CODING_FORMAT_TRANSPARENT and configuration_length != 0
+        return iso_event.STATUS_INVALID_COMMAND_PARAMETERS
+    let owner = big_row(var t, t.bis_big[at] as Int)
+    let broadcasting = owner >= 0 and t.broadcaster[owner]
+    if (broadcasting and direction == PATH_OUTPUT) or (not broadcasting and direction == PATH_INPUT)
+        return iso_event.STATUS_COMMAND_DISALLOWED
+    let bit = if direction == PATH_INPUT then PATH_BIT_INPUT else PATH_BIT_OUTPUT
+    if t.pending != BigPending.NoCommand or ((t.bis_paths[at] as Int) & bit) != 0
+        return iso_event.STATUS_COMMAND_DISALLOWED
+    t.pending = BigPending.SetBisPath
+    t.pending_handle = handle as u16
+    t.pending_arg = direction as u8
+    iso_event.STATUS_SUCCESS
+
+// The Command Complete of LE Setup ISO Data Path for a BIS.
+@satisfies("REQ-BLE-ISO-004")
+@tier(embedded)
+fn bis_data_path_setup_complete(var t: BigTable, status: Int, handle: Int) -> iso_event.IsoEvent
+    if t.pending != BigPending.SetBisPath or (t.pending_handle as Int) != handle
+        return iso_event.unrelated(handle)
+    let at = bis_row(var t, handle)
+    let direction = t.pending_arg as Int
+    big_pending_clear(var t)
+    if status != iso_event.STATUS_SUCCESS
+        return iso_event.command_failed(handle, status)
+    if at < 0
+        return iso_event.unrelated(handle)
+    let bit = if direction == PATH_INPUT then PATH_BIT_INPUT else PATH_BIT_OUTPUT
+    t.bis_paths[at] = ((t.bis_paths[at] as Int) | bit) as u8
+    iso_event.iso_event(iso_event.IsoEventKind.DataPathSet, at, handle, status)
+
+// Check LE Remove ISO Data Path for the BIS `handle` and the directions
+// `directions`, a bit field of 1 (input) to 3 (both).
+pub @satisfies("REQ-BLE-ISO-004")
+@tier(embedded)
+@no_alloc
+fn bis_data_path_remove(var t: BigTable, handle: Int, directions: Int) -> Int
+    let at = bis_row(var t, handle)
+    if at < 0
+        return iso_event.STATUS_UNKNOWN_CONNECTION_IDENTIFIER
+    if directions < 1 or directions > 3
+        return iso_event.STATUS_INVALID_COMMAND_PARAMETERS
+    if t.pending != BigPending.NoCommand or ((t.bis_paths[at] as Int) & directions) != directions
+        return iso_event.STATUS_COMMAND_DISALLOWED
+    t.pending = BigPending.RemoveBisPath
+    t.pending_handle = handle as u16
+    t.pending_arg = directions as u8
+    iso_event.STATUS_SUCCESS
+
+// The Command Complete of LE Remove ISO Data Path for a BIS.
+@satisfies("REQ-BLE-ISO-004")
+@tier(embedded)
+fn bis_data_path_remove_complete(var t: BigTable, status: Int, handle: Int) -> iso_event.IsoEvent
+    if t.pending != BigPending.RemoveBisPath or (t.pending_handle as Int) != handle
+        return iso_event.unrelated(handle)
+    let at = bis_row(var t, handle)
+    let directions = t.pending_arg as Int
+    big_pending_clear(var t)
+    if status != iso_event.STATUS_SUCCESS
+        return iso_event.command_failed(handle, status)
+    if at < 0
+        return iso_event.unrelated(handle)
+    t.bis_paths[at] = ((t.bis_paths[at] as Int) & (0x03 - directions)) as u8
+    iso_event.iso_event(iso_event.IsoEventKind.DataPathRemoved, at, handle, status)
+
+// Whether ISO data may be sent in the BIS `handle`: its Broadcaster's group
+// is up and the input path is set up.
+pub @tier(embedded)
+@no_alloc
+fn bis_may_send(var t: BigTable, handle: Int) -> Bool
+    let at = bis_row(var t, handle)
+    if at < 0
+        return false
+    let owner = big_row(var t, t.bis_big[at] as Int)
+    owner >= 0 and t.broadcaster[owner] and t.state[owner] == BigState.Broadcasting and ((t.bis_paths[at] as Int) & PATH_BIT_INPUT) != 0
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+@tier(app)
+fn zero_code() -> [u8]
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+@tier(app)
+fn some_code() -> [u8]
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+
+// LE Create BIG with sound parameters but the ones named.
+@tier(app)
+fn create(var t: BigTable, big_handle: Int, advertising_handle: Int, num_bis: Int) -> Int
+    big_create(var t, big_handle, advertising_handle, num_bis, 10000, 100, 20, 2, 0x02, 0, 0, false, zero_code())
+
+@tier(app)
+fn create_complete_event(big_handle: Int, status: Int, handles: [Int]) -> hci_codec.CreateBigComplete
+    hci_codec.CreateBigComplete {
+        status: status, big_handle: big_handle, big_sync_delay: 1000, transport_latency_big: 2000,
+        phy: 2, nse: 2, bn: 1, pto: 0, irc: 1, max_pdu: 100, iso_interval: 8, connection_handles: handles }
+
+@tier(app)
+fn sync_established_event(big_handle: Int, status: Int, handles: [Int]) -> hci_codec.BigSyncEstablished
+    hci_codec.BigSyncEstablished {
+        status: status, big_handle: big_handle, transport_latency_big: 2000, nse: 2, bn: 1,
+        pto: 0, irc: 1, max_pdu: 100, iso_interval: 8, connection_handles: handles }
+
+// A Broadcaster's group `big_handle` of the streams `handles`, up.
+@tier(app)
+fn broadcasting(var t: BigTable, big_handle: Int, advertising_handle: Int, handles: [Int])
+    test.assert_eq(create(var t, big_handle, advertising_handle, list.len(handles)), 0)
+    test.assert(big_create_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
+    let e = big_create_complete(var t, create_complete_event(big_handle, 0, handles))
+    test.assert(e.kind == iso_event.IsoEventKind.BigCreated)
+
+// A Receiver's group `big_handle` on the train `sync_handle`, following the
+// BISes `numbers`, which the Controller gave `handles`.
+@tier(app)
+fn synchronized(var t: BigTable, big_handle: Int, sync_handle: Int, numbers: [Int], handles: [Int])
+    test.assert_eq(big_sync_create(var t, big_handle, sync_handle, false, zero_code(), 0, 100, numbers), 0)
+    test.assert(big_sync_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
+    let e = big_sync_established(var t, sync_established_event(big_handle, 0, handles))
+    test.assert(e.kind == iso_event.IsoEventKind.BigSynced)
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_a_new_big_table_is_empty_and_its_capacities_are_the_limits()
+    var t = big_table_new()
+    test.assert_eq(t.state.capacity(), max1(noble_config.MAX_BIG))
+    test.assert_eq(t.state.len(), noble_config.MAX_BIG)
+    test.assert_eq(t.stream_count.capacity(), max1(noble_config.MAX_BIG))
+    test.assert_eq(t.bis_used.capacity(), max1(noble_config.MAX_BIS))
+    test.assert_eq(t.bis_used.len(), noble_config.MAX_BIS)
+    test.assert_eq(t.pending_numbers.capacity(), max1(noble_config.MAX_BIS))
+    test.assert_eq(t.bis_handle.capacity(), max1(noble_config.MAX_BIS))
+    test.assert(t.pending == BigPending.NoCommand)
+    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS)
+    test.assert_eq(big_row(var t, 0), -1)
+
+@test
+fn test_the_rows_fit_the_budget_records()
+    test.assert(BIG_ROW_BYTES <= budget.BIG_RECORD)
+    test.assert(BIS_ROW_BYTES <= budget.BIS_RECORD)
+
+// ── LE Create BIG ───────────────────────────────────────────────────
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_create_big_takes_a_row_and_claims_its_streams()
+    var t = big_table_new()
+    test.assert_eq(big_create(var t, 3, 7, 2, 10000, 100, 20, 2, 0x02, 1, 1, true, some_code()), 0)
+    let at = big_row(var t, 3)
+    test.assert(at >= 0)
+    test.assert(t.state[at] == BigState.Building)
+    test.assert(t.broadcaster[at])
+    test.assert_eq(t.link_handle[at] as Int, 7)
+    test.assert_eq(t.stream_count[at] as Int, 2)
+    test.assert(t.encrypted[at])
+    test.assert(t.pending == BigPending.CreateBig)
+    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS - 2)
+    // The stream rows are not used yet.
+    test.assert_eq(bis_unused_rows(var t), noble_config.MAX_BIS)
+    let s = big_create_status(var t, 0)
+    test.assert(s.kind == iso_event.IsoEventKind.CommandDone)
+    test.assert(t.pending == BigPending.NoCommand)
+    test.assert(t.state[at] == BigState.Building)
+    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS - 2)
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_create_big_complete_makes_the_streams()
+    var t = big_table_new()
+    test.assert_eq(create(var t, 3, 7, 2), 0)
+    test.assert(big_create_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
+    let e = big_create_complete(var t, create_complete_event(3, 0, [0x0100, 0x0101]))
+    test.assert(e.kind == iso_event.IsoEventKind.BigCreated)
+    test.assert_eq(e.handle, 3)
+    test.assert(t.state[e.slot] == BigState.Broadcasting)
+    test.assert_eq(big_bis_rows(var t, e.slot), 2)
+    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS - 2)
+    let a = bis_row(var t, 0x0100)
+    let b = bis_row(var t, 0x0101)
+    test.assert(a >= 0 and b >= 0 and a != b)
+    test.assert_eq(t.bis_number[a] as Int, 1)
+    test.assert_eq(t.bis_number[b] as Int, 2)
+    test.assert_eq(t.bis_big[a] as Int, 3)
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_create_big_refuses_a_parameter_out_of_range()
+    var t = big_table_new()
+    let invalid = iso_event.STATUS_INVALID_COMMAND_PARAMETERS
+    let z = zero_code()
+    test.assert_eq(big_create(var t, 0xF0, 0, 1, 10000, 100, 20, 2, 2, 0, 0, false, z), invalid)
+    test.assert_eq(big_create(var t, -1, 0, 1, 10000, 100, 20, 2, 2, 0, 0, false, z), invalid)
+    test.assert_eq(big_create(var t, 0, 0xF0, 1, 10000, 100, 20, 2, 2, 0, 0, false, z), invalid)
+    // Num_BIS is 0x01 to 0x1F.
+    test.assert_eq(big_create(var t, 0, 0, 0, 10000, 100, 20, 2, 2, 0, 0, false, z), invalid)
+    test.assert_eq(big_create(var t, 0, 0, 0x20, 10000, 100, 20, 2, 2, 0, 0, false, z), invalid)
+    // SDU_Interval 0x0000FF to 0x0FFFFF; Max_SDU 0x0001 to 0x0FFF.
+    test.assert_eq(big_create(var t, 0, 0, 1, 0xFE, 100, 20, 2, 2, 0, 0, false, z), invalid)
+    test.assert_eq(big_create(var t, 0, 0, 1, 0x100000, 100, 20, 2, 2, 0, 0, false, z), invalid)
+    test.assert_eq(big_create(var t, 0, 0, 1, 10000, 0, 20, 2, 2, 0, 0, false, z), invalid)
+    test.assert_eq(big_create(var t, 0, 0, 1, 10000, 0x1000, 20, 2, 2, 0, 0, false, z), invalid)
+    // Max_Transport_Latency 0x0005 to 0x0FA0; RTN 0x00 to 0x1E.
+    test.assert_eq(big_create(var t, 0, 0, 1, 10000, 100, 4, 2, 2, 0, 0, false, z), invalid)
+    test.assert_eq(big_create(var t, 0, 0, 1, 10000, 100, 0x0FA1, 2, 2, 0, 0, false, z), invalid)
+    test.assert_eq(big_create(var t, 0, 0, 1, 10000, 100, 20, 0x1F, 2, 0, 0, false, z), invalid)
+    test.assert_eq(big_create(var t, 0, 0, 1, 10000, 100, 20, -1, 2, 0, 0, false, z), invalid)
+    // Packing 0 to 1, Framing 0 to 2.
+    test.assert_eq(big_create(var t, 0, 0, 1, 10000, 100, 20, 2, 2, 2, 0, false, z), invalid)
+    test.assert_eq(big_create(var t, 0, 0, 1, 10000, 100, 20, 2, 2, 0, 3, false, z), invalid)
+    // The Broadcast_Code is 16 octets, and zero when the BIG is not encrypted.
+    test.assert_eq(big_create(var t, 0, 0, 1, 10000, 100, 20, 2, 2, 0, 0, true, z[0:15]), invalid)
+    test.assert_eq(big_create(var t, 0, 0, 1, 10000, 100, 20, 2, 2, 0, 0, false, some_code()), invalid)
+    // PHY has a bit; a bit outside the three PHYs is unsupported.
+    test.assert_eq(big_create(var t, 0, 0, 1, 10000, 100, 20, 2, 0, 0, 0, false, z), invalid)
+    test.assert_eq(big_create(var t, 0, 0, 1, 10000, 100, 20, 2, 0x08, 0, 0, false, z), iso_event.STATUS_UNSUPPORTED_FEATURE_OR_PARAMETER)
+    test.assert(t.pending == BigPending.NoCommand)
+    test.assert_eq(big_count_in(var t, BigState.Vacant), noble_config.MAX_BIG)
+    // The bounds are accepted.
+    test.assert_eq(big_create(var t, 0xEF, 0xEF, 1, 0xFF, 1, 5, 0, 0x07, 1, 2, true, some_code()), 0)
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_create_big_refuses_what_the_table_cannot_hold()
+    var t = big_table_new()
+    // More streams than the table has rows: Rejected Due To Limited Resources.
+    test.assert_eq(create(var t, 1, 1, noble_config.MAX_BIS + 1), iso_event.STATUS_REJECTED_LIMITED_RESOURCES)
+    test.assert_eq(create(var t, 1, 1, 1), 0)
+    // A command in flight, and the same BIG handle: Command Disallowed.
+    test.assert_eq(create(var t, 2, 2, 1), iso_event.STATUS_COMMAND_DISALLOWED)
+    test.assert(big_create_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
+    test.assert_eq(create(var t, 1, 2, 1), iso_event.STATUS_COMMAND_DISALLOWED)
+    // The train of another group: Unknown Advertising Identifier.
+    test.assert_eq(create(var t, 2, 1, 1), iso_event.STATUS_UNKNOWN_ADVERTISING_IDENTIFIER)
+    // No free group row.
+    test.assert_eq(create(var t, 2, 2, 1), iso_event.STATUS_REJECTED_LIMITED_RESOURCES)
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_create_big_command_status_failure_frees_the_row()
+    var t = big_table_new()
+    test.assert_eq(create(var t, 1, 1, 2), 0)
+    let e = big_create_status(var t, iso_event.STATUS_REJECTED_LIMITED_RESOURCES)
+    test.assert(e.kind == iso_event.IsoEventKind.CommandFailed)
+    test.assert_eq(e.status, 0x0D)
+    test.assert_eq(big_row(var t, 1), -1)
+    test.assert(t.pending == BigPending.NoCommand)
+    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS)
+    test.assert(big_create_status(var t, 0).kind == iso_event.IsoEventKind.Unrelated)
+    // The same handle can be used again.
+    test.assert_eq(create(var t, 1, 1, 2), 0)
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_create_big_complete_with_a_failure_frees_the_group()
+    var t = big_table_new()
+    test.assert_eq(create(var t, 1, 1, 2), 0)
+    test.assert(big_create_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
+    // 0x45: packet too long.
+    let e = big_create_complete(var t, create_complete_event(1, 0x45, []))
+    test.assert(e.kind == iso_event.IsoEventKind.BigCreateFailed)
+    test.assert_eq(e.status, 0x45)
+    test.assert_eq(big_row(var t, 1), -1)
+    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS)
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_create_big_complete_that_does_not_fit_the_command_changes_nothing()
+    var t = big_table_new()
+    // For a group the table does not hold.
+    test.assert(big_create_complete(var t, create_complete_event(1, 0, [0x0100])).kind == iso_event.IsoEventKind.Unrelated)
+    test.assert_eq(create(var t, 1, 1, 2), 0)
+    test.assert(big_create_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
+    // Another Num_BIS, a handle above 0x0EFF, a handle twice.
+    test.assert(big_create_complete(var t, create_complete_event(1, 0, [0x0100])).kind == iso_event.IsoEventKind.Unrelated)
+    test.assert(big_create_complete(var t, create_complete_event(1, 0, [0x0100, 0x0F00])).kind == iso_event.IsoEventKind.Unrelated)
+    test.assert(big_create_complete(var t, create_complete_event(1, 0, [-1, 0x0100])).kind == iso_event.IsoEventKind.Unrelated)
+    test.assert(big_create_complete(var t, create_complete_event(1, 0, [0x0100, 0x0100])).kind == iso_event.IsoEventKind.Unrelated)
+    test.assert(t.state[big_row(var t, 1)] == BigState.Building)
+    test.assert_eq(bis_unused_rows(var t), noble_config.MAX_BIS)
+    // For a group of the other role.
+    var r = big_table_new()
+    synchronized(r, 1, 0x20, [1], [0x0100])
+    test.assert(big_create_complete(var r, create_complete_event(1, 0, [0x0100])).kind == iso_event.IsoEventKind.Unrelated)
+    // An event for a group that is up already.
+    var u = big_table_new()
+    broadcasting(var u, 1, 1, [0x0100])
+    test.assert(big_create_complete(var u, create_complete_event(1, 0, [0x0100])).kind == iso_event.IsoEventKind.Unrelated)
+
+// ── LE Create BIG Test ──────────────────────────────────────────────
+
+@tier(app)
+fn create_test(var t: BigTable, iso_interval: Int, nse: Int, max_pdu: Int, bn: Int, irc: Int, pto: Int) -> Int
+    big_create_test(var t, 1, 1, 1, 10000, iso_interval, nse, 100, max_pdu, 0x02, 0, 0, bn, irc, pto, false, zero_code())
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_create_big_test_takes_a_row_like_create_big()
+    var t = big_table_new()
+    test.assert_eq(create_test(var t, 8, 4, 100, 2, 1, 0), 0)
+    let at = big_row(var t, 1)
+    test.assert(t.state[at] == BigState.Building)
+    test.assert(t.pending == BigPending.CreateBig)
+    test.assert(big_create_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
+    test.assert(big_create_complete(var t, create_complete_event(1, 0, [0x0100])).kind == iso_event.IsoEventKind.BigCreated)
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_create_big_test_refuses_a_parameter_out_of_range_as_unsupported()
+    var t = big_table_new()
+    let unsupported = iso_event.STATUS_UNSUPPORTED_FEATURE_OR_PARAMETER
+    // ISO_Interval 0x0004 to 0x0C80.
+    test.assert_eq(create_test(var t, 3, 2, 100, 1, 1, 0), unsupported)
+    test.assert_eq(create_test(var t, 0x0C81, 2, 100, 1, 1, 0), unsupported)
+    // NSE 0x01 to 0x1F.
+    test.assert_eq(create_test(var t, 8, 0, 100, 1, 1, 0), unsupported)
+    test.assert_eq(create_test(var t, 8, 0x20, 100, 1, 1, 0), unsupported)
+    // Max_PDU 0x0001 to 0x00FB.
+    test.assert_eq(create_test(var t, 8, 2, 0, 1, 1, 0), unsupported)
+    test.assert_eq(create_test(var t, 8, 2, 0xFC, 1, 1, 0), unsupported)
+    // BN 1 to 7, IRC 1 to 15, PTO 0 to 15.
+    test.assert_eq(create_test(var t, 8, 2, 100, 0, 1, 0), unsupported)
+    test.assert_eq(create_test(var t, 8, 2, 100, 8, 1, 0), unsupported)
+    test.assert_eq(create_test(var t, 8, 2, 100, 1, 0, 0), unsupported)
+    test.assert_eq(create_test(var t, 8, 2, 100, 1, 16, 0), unsupported)
+    test.assert_eq(create_test(var t, 8, 2, 100, 1, 1, 16), unsupported)
+    test.assert_eq(create_test(var t, 8, 2, 100, 1, 1, -1), unsupported)
+    // A parameter the two commands share is out of range here too.
+    test.assert_eq(big_create_test(var t, 0xF0, 1, 1, 10000, 8, 2, 100, 100, 0x02, 0, 0, 1, 1, 0, false, zero_code()), unsupported)
+    test.assert_eq(big_create_test(var t, 1, 1, 1, 0xFE, 8, 2, 100, 100, 0x02, 0, 0, 1, 1, 0, false, zero_code()), unsupported)
+    test.assert_eq(big_create_test(var t, 1, 1, 1, 10000, 8, 2, 100, 100, 0x08, 0, 0, 1, 1, 0, false, zero_code()), unsupported)
+    test.assert(t.pending == BigPending.NoCommand)
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_create_big_test_refuses_an_nse_that_does_not_fit_bn_and_irc()
+    var t = big_table_new()
+    let unsupported = iso_event.STATUS_UNSUPPORTED_FEATURE_OR_PARAMETER
+    // NSE is not a multiple of BN.
+    test.assert_eq(create_test(var t, 8, 5, 100, 2, 1, 0), unsupported)
+    // NSE is below IRC times BN.
+    test.assert_eq(create_test(var t, 8, 4, 100, 2, 3, 0), unsupported)
+    // NSE equal to IRC times BN is allowed.
+    test.assert_eq(create_test(var t, 8, 6, 100, 2, 3, 0), 0)
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_create_big_test_refuses_what_the_table_cannot_hold()
+    var t = big_table_new()
+    test.assert_eq(big_create_test(var t, 1, 1, noble_config.MAX_BIS + 1, 10000, 8, 2, 100, 100, 0x02, 0, 0, 1, 1, 0, false, zero_code()), iso_event.STATUS_REJECTED_LIMITED_RESOURCES)
+    test.assert_eq(create_test(var t, 8, 2, 100, 1, 1, 0), 0)
+    test.assert_eq(create_test(var t, 8, 2, 100, 1, 1, 0), iso_event.STATUS_COMMAND_DISALLOWED)
+
+// ── LE Terminate BIG ────────────────────────────────────────────────
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_terminate_big_runs_broadcasting_terminating_free()
+    var t = big_table_new()
+    broadcasting(var t, 1, 1, [0x0100, 0x0101])
+    let at = big_row(var t, 1)
+    test.assert_eq(bis_data_path_setup(var t, 0x0100, PATH_INPUT, 0x06, 0), 0)
+    test.assert(bis_data_path_setup_complete(var t, 0, 0x0100).kind == iso_event.IsoEventKind.DataPathSet)
+    test.assert_eq(big_terminate(var t, 1, iso_event.STATUS_CONNECTION_TERMINATED_BY_LOCAL_HOST), 0)
+    test.assert(t.state[at] == BigState.Terminating)
+    test.assert(t.pending == BigPending.TerminateBig)
+    test.assert(big_terminate_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
+    test.assert(t.state[at] == BigState.Terminating)
+    let e = big_terminate_complete(var t, hci_codec.TerminateBigComplete { big_handle: 1, reason: 0x16 })
+    test.assert(e.kind == iso_event.IsoEventKind.BigTerminated)
+    test.assert_eq(e.status, 0x16)
+    test.assert_eq(big_row(var t, 1), -1)
+    // The streams and their paths are gone.
+    test.assert_eq(bis_row(var t, 0x0100), -1)
+    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS)
+    test.assert_eq(t.bis_paths[0] as Int, 0)
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_terminate_big_refusals_and_failure()
+    var t = big_table_new()
+    test.assert_eq(big_terminate(var t, 1, 0x16), iso_event.STATUS_UNKNOWN_ADVERTISING_IDENTIFIER)
+    broadcasting(var t, 1, 1, [0x0100])
+    test.assert_eq(big_terminate(var t, 1, 0x100), iso_event.STATUS_INVALID_COMMAND_PARAMETERS)
+    test.assert_eq(big_terminate(var t, 1, 0x16), 0)
+    // One command at a time, and not twice.
+    test.assert_eq(big_terminate(var t, 1, 0x16), iso_event.STATUS_COMMAND_DISALLOWED)
+    // A failed command puts the BIG back.
+    let f = big_terminate_status(var t, iso_event.STATUS_COMMAND_DISALLOWED)
+    test.assert(f.kind == iso_event.IsoEventKind.CommandFailed)
+    test.assert(t.state[big_row(var t, 1)] == BigState.Broadcasting)
+    test.assert(big_terminate_status(var t, 0).kind == iso_event.IsoEventKind.Unrelated)
+    test.assert_eq(big_terminate(var t, 1, 0x16), 0)
+    test.assert(big_terminate_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
+    // Terminating already.
+    test.assert_eq(big_terminate(var t, 1, 0x16), iso_event.STATUS_COMMAND_DISALLOWED)
+    // A group this Host follows is not the Broadcaster's to terminate.
+    var r = big_table_new()
+    synchronized(r, 1, 0x20, [1], [0x0100])
+    test.assert_eq(big_terminate(var r, 1, 0x16), iso_event.STATUS_COMMAND_DISALLOWED)
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_terminate_big_while_creating_cancels_the_creation()
+    var t = big_table_new()
+    test.assert_eq(create(var t, 1, 1, 2), 0)
+    test.assert(big_create_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
+    test.assert_eq(big_terminate(var t, 1, 0x16), 0)
+    let at = big_row(var t, 1)
+    test.assert(t.state[at] == BigState.Cancelling)
+    // A failed command puts the creation back.
+    test.assert(big_terminate_status(var t, iso_event.STATUS_COMMAND_DISALLOWED).kind == iso_event.IsoEventKind.CommandFailed)
+    test.assert(t.state[at] == BigState.Building)
+    test.assert_eq(big_terminate(var t, 1, 0x16), 0)
+    test.assert(big_terminate_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
+    // 0x44: Operation Cancelled by Host.
+    let e = big_create_complete(var t, create_complete_event(1, iso_event.STATUS_OPERATION_CANCELLED_BY_HOST, []))
+    test.assert(e.kind == iso_event.IsoEventKind.BigCreateFailed)
+    test.assert_eq(e.status, 0x44)
+    test.assert_eq(big_row(var t, 1), -1)
+    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS)
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_a_big_created_before_the_cancellation_is_then_terminated()
+    var t = big_table_new()
+    test.assert_eq(create(var t, 1, 1, 1), 0)
+    test.assert(big_create_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
+    test.assert_eq(big_terminate(var t, 1, 0x16), 0)
+    test.assert(big_terminate_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
+    // The Controller finished creating the BIG before it saw the command.
+    let e = big_create_complete(var t, create_complete_event(1, 0, [0x0100]))
+    test.assert(e.kind == iso_event.IsoEventKind.BigCreated)
+    test.assert(t.state[e.slot] == BigState.Terminating)
+    let g = big_terminate_complete(var t, hci_codec.TerminateBigComplete { big_handle: 1, reason: 0x16 })
+    test.assert(g.kind == iso_event.IsoEventKind.BigTerminated)
+    test.assert_eq(big_row(var t, 1), -1)
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_terminate_big_complete_for_nothing_the_table_terminates_is_ignored()
+    var t = big_table_new()
+    let done = hci_codec.TerminateBigComplete { big_handle: 1, reason: 0x16 }
+    test.assert(big_terminate_complete(var t, done).kind == iso_event.IsoEventKind.Unrelated)
+    broadcasting(var t, 1, 1, [0x0100])
+    // The BIG is up and the Host did not terminate it.
+    test.assert(big_terminate_complete(var t, done).kind == iso_event.IsoEventKind.Unrelated)
+    test.assert(t.state[big_row(var t, 1)] == BigState.Broadcasting)
+    var r = big_table_new()
+    synchronized(r, 1, 0x20, [1], [0x0100])
+    test.assert(big_terminate_complete(var r, done).kind == iso_event.IsoEventKind.Unrelated)
+
+// ── LE BIG Create Sync ──────────────────────────────────────────────
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_big_create_sync_takes_a_row_and_claims_its_streams()
+    var t = big_table_new()
+    test.assert_eq(big_sync_create(var t, 2, 0x0020, true, some_code(), 3, 0x0C80, [1, 2]), 0)
+    let at = big_row(var t, 2)
+    test.assert(t.state[at] == BigState.Syncing)
+    test.assert(not t.broadcaster[at])
+    test.assert_eq(t.link_handle[at] as Int, 0x0020)
+    test.assert_eq(t.stream_count[at] as Int, 2)
+    test.assert(t.encrypted[at])
+    test.assert_eq(t.pending_numbers[1] as Int, 2)
+    test.assert(t.pending == BigPending.CreateSync)
+    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS - 2)
+    test.assert(big_sync_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
+    test.assert(t.pending == BigPending.NoCommand)
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_big_create_sync_refuses_a_parameter_out_of_range()
+    var t = big_table_new()
+    let invalid = iso_event.STATUS_INVALID_COMMAND_PARAMETERS
+    let z = zero_code()
+    test.assert_eq(big_sync_create(var t, 0xF0, 0x20, false, z, 0, 100, [1]), invalid)
+    test.assert_eq(big_sync_create(var t, -1, 0x20, false, z, 0, 100, [1]), invalid)
+    test.assert_eq(big_sync_create(var t, 1, 0x0F00, false, z, 0, 100, [1]), invalid)
+    test.assert_eq(big_sync_create(var t, 1, -1, false, z, 0, 100, [1]), invalid)
+    // MSE 0x00 to 0x1F; BIG_Sync_Timeout 0x000A to 0x4000.
+    test.assert_eq(big_sync_create(var t, 1, 0x20, false, z, 0x20, 100, [1]), invalid)
+    test.assert_eq(big_sync_create(var t, 1, 0x20, false, z, -1, 100, [1]), invalid)
+    test.assert_eq(big_sync_create(var t, 1, 0x20, false, z, 0, 9, [1]), invalid)
+    test.assert_eq(big_sync_create(var t, 1, 0x20, false, z, 0, 0x4001, [1]), invalid)
+    // Num_BIS 0x01 to 0x1F; the code is 16 octets.
+    test.assert_eq(big_sync_create(var t, 1, 0x20, false, z, 0, 100, []), invalid)
+    test.assert_eq(big_sync_create(var t, 1, 0x20, false, z[0:15], 0, 100, [1]), invalid)
+    // BIS_Number 0x01 to 0x1F, ascending, no duplicates.
+    test.assert_eq(big_sync_create(var t, 1, 0x20, false, z, 0, 100, [0]), invalid)
+    test.assert_eq(big_sync_create(var t, 1, 0x20, false, z, 0, 100, [0x20]), invalid)
+    test.assert_eq(big_sync_create(var t, 1, 0x20, false, z, 0, 100, [2, 1]), invalid)
+    test.assert_eq(big_sync_create(var t, 1, 0x20, false, z, 0, 100, [1, 1]), invalid)
+    test.assert(t.pending == BigPending.NoCommand)
+    // The bounds are accepted.
+    test.assert_eq(big_sync_create(var t, 0xEF, 0x0EFF, true, some_code(), 0x1F, 0x4000, [0x1F]), 0)
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_big_create_sync_refusals_from_the_state_of_the_table()
+    var t = big_table_new()
+    let z = zero_code()
+    test.assert_eq(big_sync_create(var t, 1, 0x20, false, z, 0, 100, [1]), 0)
+    // A command in flight.
+    test.assert_eq(big_sync_create(var t, 2, 0x21, false, z, 0, 100, [1]), iso_event.STATUS_COMMAND_DISALLOWED)
+    test.assert(big_sync_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
+    // Synchronizing to a BIG whose LE BIG Sync Established event is awaited.
+    test.assert_eq(big_sync_create(var t, 2, 0x21, false, z, 0, 100, [1]), iso_event.STATUS_COMMAND_DISALLOWED)
+    // The same BIG_Handle.
+    test.assert_eq(big_sync_create(var t, 1, 0x21, false, z, 0, 100, [1]), iso_event.STATUS_COMMAND_DISALLOWED)
+    test.assert(big_sync_established(var t, sync_established_event(1, 0, [0x0100])).kind == iso_event.IsoEventKind.BigSynced)
+    // Already synchronized to the BIG of that train.
+    test.assert_eq(big_sync_create(var t, 2, 0x20, false, z, 0, 100, [1]), iso_event.STATUS_COMMAND_DISALLOWED)
+    // No free group row, and too many streams.
+    test.assert_eq(big_sync_create(var t, 2, 0x21, false, z, 0, 100, [1]), iso_event.STATUS_REJECTED_LIMITED_RESOURCES)
+    var u = big_table_new()
+    var many: [Int] = []
+    for i in 0..(noble_config.MAX_BIS + 1)
+        list.push(many, i + 1)
+    test.assert_eq(big_sync_create(var u, 1, 0x20, false, z, 0, 100, many), iso_event.STATUS_REJECTED_LIMITED_RESOURCES)
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_big_create_sync_command_status_failure_frees_the_row()
+    var t = big_table_new()
+    test.assert_eq(big_sync_create(var t, 1, 0x20, false, zero_code(), 0, 100, [1, 2]), 0)
+    let e = big_sync_status(var t, iso_event.STATUS_COMMAND_DISALLOWED)
+    test.assert(e.kind == iso_event.IsoEventKind.CommandFailed)
+    test.assert_eq(big_row(var t, 1), -1)
+    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS)
+    test.assert(big_sync_status(var t, 0).kind == iso_event.IsoEventKind.Unrelated)
+
+// ── LE BIG Sync Established, Terminate Sync, Sync Lost ──────────────
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_big_sync_established_numbers_the_streams_as_asked_for()
+    var t = big_table_new()
+    test.assert_eq(big_sync_create(var t, 1, 0x20, false, zero_code(), 0, 100, [2, 5]), 0)
+    test.assert(big_sync_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
+    let e = big_sync_established(var t, sync_established_event(1, 0, [0x0100, 0x0101]))
+    test.assert(e.kind == iso_event.IsoEventKind.BigSynced)
+    test.assert(t.state[e.slot] == BigState.Synchronized)
+    test.assert_eq(t.bis_number[bis_row(var t, 0x0100)] as Int, 2)
+    test.assert_eq(t.bis_number[bis_row(var t, 0x0101)] as Int, 5)
+    test.assert_eq(big_bis_rows(var t, e.slot), 2)
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_big_sync_established_with_a_failure_frees_the_group()
+    var t = big_table_new()
+    test.assert_eq(big_sync_create(var t, 1, 0x20, false, zero_code(), 0, 100, [1]), 0)
+    test.assert(big_sync_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
+    // 0x3E: connection failed to be established, the synchronization timeout.
+    let e = big_sync_established(var t, sync_established_event(1, 0x3E, []))
+    test.assert(e.kind == iso_event.IsoEventKind.BigSyncFailed)
+    test.assert_eq(e.status, 0x3E)
+    test.assert_eq(big_row(var t, 1), -1)
+    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS)
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_big_sync_established_that_does_not_fit_the_command_changes_nothing()
+    var t = big_table_new()
+    test.assert(big_sync_established(var t, sync_established_event(1, 0, [0x0100])).kind == iso_event.IsoEventKind.Unrelated)
+    test.assert_eq(big_sync_create(var t, 1, 0x20, false, zero_code(), 0, 100, [1, 2]), 0)
+    test.assert(big_sync_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
+    test.assert(big_sync_established(var t, sync_established_event(1, 0, [0x0100])).kind == iso_event.IsoEventKind.Unrelated)
+    test.assert(big_sync_established(var t, sync_established_event(1, 0, [0x0100, 0x0F00])).kind == iso_event.IsoEventKind.Unrelated)
+    test.assert(big_sync_established(var t, sync_established_event(1, 0, [0x0100, 0x0100])).kind == iso_event.IsoEventKind.Unrelated)
+    test.assert(t.state[big_row(var t, 1)] == BigState.Syncing)
+    // For a group of the other role.
+    var b = big_table_new()
+    broadcasting(var b, 1, 1, [0x0100])
+    test.assert(big_sync_established(var b, sync_established_event(1, 0, [0x0100])).kind == iso_event.IsoEventKind.Unrelated)
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_big_terminate_sync_of_a_followed_big_frees_it()
+    var t = big_table_new()
+    synchronized(t, 1, 0x20, [1, 2], [0x0100, 0x0101])
+    test.assert_eq(bis_data_path_setup(var t, 0x0100, PATH_OUTPUT, 0x06, 0), 0)
+    test.assert(bis_data_path_setup_complete(var t, 0, 0x0100).kind == iso_event.IsoEventKind.DataPathSet)
+    test.assert_eq(big_sync_terminate(var t, 1), 0)
+    test.assert(t.pending == BigPending.TerminateSync)
+    let e = big_sync_terminate_complete(var t, 0, 1)
+    test.assert(e.kind == iso_event.IsoEventKind.BigSyncTerminated)
+    test.assert_eq(big_row(var t, 1), -1)
+    test.assert_eq(bis_row(var t, 0x0100), -1)
+    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS)
+    test.assert(t.pending == BigPending.NoCommand)
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_big_terminate_sync_while_syncing_cancels_the_attempt()
+    var t = big_table_new()
+    test.assert_eq(big_sync_create(var t, 1, 0x20, false, zero_code(), 0, 100, [1]), 0)
+    test.assert(big_sync_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
+    test.assert_eq(big_sync_terminate(var t, 1), 0)
+    // An answer for another BIG is not this command's.
+    test.assert(big_sync_terminate_complete(var t, 0, 2).kind == iso_event.IsoEventKind.Unrelated)
+    let c = big_sync_terminate_complete(var t, 0, 1)
+    test.assert(c.kind == iso_event.IsoEventKind.CommandDone)
+    test.assert(t.state[c.slot] == BigState.SyncCancelling)
+    // Another synchronization waits until the cancelled one has reported.
+    test.assert_eq(big_sync_create(var t, 2, 0x21, false, zero_code(), 0, 100, [1]), iso_event.STATUS_COMMAND_DISALLOWED)
+    let e = big_sync_established(var t, sync_established_event(1, iso_event.STATUS_OPERATION_CANCELLED_BY_HOST, []))
+    test.assert(e.kind == iso_event.IsoEventKind.BigSyncFailed)
+    test.assert_eq(e.status, 0x44)
+    test.assert_eq(big_row(var t, 1), -1)
+    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS)
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_big_terminate_sync_refusals_and_failure()
+    var t = big_table_new()
+    test.assert_eq(big_sync_terminate(var t, 1), iso_event.STATUS_UNKNOWN_ADVERTISING_IDENTIFIER)
+    // A group this Host broadcasts is not one it synchronizes to.
+    broadcasting(var t, 1, 1, [0x0100])
+    test.assert_eq(big_sync_terminate(var t, 1), iso_event.STATUS_COMMAND_DISALLOWED)
+    var r = big_table_new()
+    synchronized(r, 1, 0x20, [1], [0x0100])
+    test.assert_eq(big_sync_terminate(var r, 1), 0)
+    // One command at a time; a failure changes nothing.
+    test.assert_eq(big_sync_terminate(var r, 1), iso_event.STATUS_COMMAND_DISALLOWED)
+    let f = big_sync_terminate_complete(var r, iso_event.STATUS_COMMAND_DISALLOWED, 1)
+    test.assert(f.kind == iso_event.IsoEventKind.CommandFailed)
+    test.assert(r.state[big_row(var r, 1)] == BigState.Synchronized)
+    test.assert(big_sync_terminate_complete(var r, 0, 1).kind == iso_event.IsoEventKind.Unrelated)
+    // A group whose synchronization was cancelled is neither.
+    var c = big_table_new()
+    test.assert_eq(big_sync_create(var c, 1, 0x20, false, zero_code(), 0, 100, [1]), 0)
+    test.assert(big_sync_status(var c, 0).kind == iso_event.IsoEventKind.CommandDone)
+    test.assert_eq(big_sync_terminate(var c, 1), 0)
+    test.assert(big_sync_terminate_complete(var c, 0, 1).kind == iso_event.IsoEventKind.CommandDone)
+    test.assert_eq(big_sync_terminate(var c, 1), iso_event.STATUS_COMMAND_DISALLOWED)
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_big_sync_lost_frees_the_group_with_the_reason()
+    var t = big_table_new()
+    synchronized(t, 1, 0x20, [1], [0x0100])
+    // 0x08: connection timeout.
+    let e = big_sync_lost(var t, hci_codec.BigSyncLost { big_handle: 1, reason: 0x08 })
+    test.assert(e.kind == iso_event.IsoEventKind.BigSyncLost)
+    test.assert_eq(e.status, 0x08)
+    test.assert_eq(big_row(var t, 1), -1)
+    test.assert_eq(bis_row(var t, 0x0100), -1)
+    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS)
+    // The same BIG handle may be used again.
+    synchronized(t, 1, 0x20, [1], [0x0100])
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_big_sync_lost_for_nothing_the_table_follows_is_ignored()
+    var t = big_table_new()
+    let lost = hci_codec.BigSyncLost { big_handle: 1, reason: 0x13 }
+    test.assert(big_sync_lost(var t, lost).kind == iso_event.IsoEventKind.Unrelated)
+    broadcasting(var t, 1, 1, [0x0100])
+    test.assert(big_sync_lost(var t, lost).kind == iso_event.IsoEventKind.Unrelated)
+    test.assert(t.state[big_row(var t, 1)] == BigState.Broadcasting)
+    var s = big_table_new()
+    test.assert_eq(big_sync_create(var s, 1, 0x20, false, zero_code(), 0, 100, [1]), 0)
+    test.assert(big_sync_status(var s, 0).kind == iso_event.IsoEventKind.CommandDone)
+    // Not yet synchronized: a loss is not possible.
+    test.assert(big_sync_lost(var s, lost).kind == iso_event.IsoEventKind.Unrelated)
+
+// ── ISO data paths of BISes ─────────────────────────────────────────
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_a_broadcasters_bis_takes_an_input_path_only()
+    var t = big_table_new()
+    broadcasting(var t, 1, 1, [0x0100, 0x0101])
+    test.assert(not bis_may_send(var t, 0x0100))
+    test.assert_eq(bis_data_path_setup(var t, 0x0100, PATH_OUTPUT, 0x06, 0), iso_event.STATUS_COMMAND_DISALLOWED)
+    test.assert_eq(bis_data_path_setup(var t, 0x0100, PATH_INPUT, 0x06, 40), 0)
+    test.assert(t.pending == BigPending.SetBisPath)
+    // A command in flight, and an answer for another handle.
+    test.assert_eq(bis_data_path_setup(var t, 0x0101, PATH_INPUT, 0x06, 0), iso_event.STATUS_COMMAND_DISALLOWED)
+    test.assert(bis_data_path_setup_complete(var t, 0, 0x0101).kind == iso_event.IsoEventKind.Unrelated)
+    let e = bis_data_path_setup_complete(var t, 0, 0x0100)
+    test.assert(e.kind == iso_event.IsoEventKind.DataPathSet)
+    test.assert(bis_may_send(var t, 0x0100))
+    test.assert(not bis_may_send(var t, 0x0101))
+    // The same direction twice.
+    test.assert_eq(bis_data_path_setup(var t, 0x0100, PATH_INPUT, 0x06, 0), iso_event.STATUS_COMMAND_DISALLOWED)
+    // Data does not flow while the group is being terminated.
+    test.assert_eq(big_terminate(var t, 1, 0x16), 0)
+    test.assert(not bis_may_send(var t, 0x0100))
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_a_receivers_bis_takes_an_output_path_only()
+    var t = big_table_new()
+    synchronized(t, 1, 0x20, [1], [0x0100])
+    test.assert_eq(bis_data_path_setup(var t, 0x0100, PATH_INPUT, 0x06, 0), iso_event.STATUS_COMMAND_DISALLOWED)
+    test.assert_eq(bis_data_path_setup(var t, 0x0100, PATH_OUTPUT, 0x06, 0), 0)
+    test.assert(bis_data_path_setup_complete(var t, 0, 0x0100).kind == iso_event.IsoEventKind.DataPathSet)
+    // A Receiver never sends.
+    test.assert(not bis_may_send(var t, 0x0100))
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_setup_iso_data_path_for_a_bis_refusals()
+    var t = big_table_new()
+    test.assert_eq(bis_data_path_setup(var t, 0x0100, PATH_INPUT, 0x06, 0), iso_event.STATUS_UNKNOWN_CONNECTION_IDENTIFIER)
+    broadcasting(var t, 1, 1, [0x0100])
+    test.assert_eq(bis_data_path_setup(var t, 0x0100, 2, 0x06, 0), iso_event.STATUS_INVALID_COMMAND_PARAMETERS)
+    test.assert_eq(bis_data_path_setup(var t, 0x0100, -1, 0x06, 0), iso_event.STATUS_INVALID_COMMAND_PARAMETERS)
+    test.assert_eq(bis_data_path_setup(var t, 0x0100, PATH_INPUT, 0x06, 256), iso_event.STATUS_INVALID_COMMAND_PARAMETERS)
+    test.assert_eq(bis_data_path_setup(var t, 0x0100, PATH_INPUT, hci_commands.ISO_CODING_FORMAT_TRANSPARENT, 1), iso_event.STATUS_INVALID_COMMAND_PARAMETERS)
+    test.assert_eq(bis_data_path_setup(var t, 0x0100, PATH_INPUT, hci_commands.ISO_CODING_FORMAT_TRANSPARENT, 0), 0)
+    // A failure leaves no path.
+    let f = bis_data_path_setup_complete(var t, iso_event.STATUS_INVALID_COMMAND_PARAMETERS, 0x0100)
+    test.assert(f.kind == iso_event.IsoEventKind.CommandFailed)
+    test.assert_eq(t.bis_paths[bis_row(var t, 0x0100)] as Int, 0)
+    test.assert(bis_data_path_setup_complete(var t, 0, 0x0100).kind == iso_event.IsoEventKind.Unrelated)
+
+@test
+@satisfies("REQ-BLE-ISO-004")
+fn test_remove_iso_data_path_for_a_bis()
+    var t = big_table_new()
+    broadcasting(var t, 1, 1, [0x0100])
+    test.assert_eq(bis_data_path_remove(var t, 0x0200, 1), iso_event.STATUS_UNKNOWN_CONNECTION_IDENTIFIER)
+    test.assert_eq(bis_data_path_remove(var t, 0x0100, 1), iso_event.STATUS_COMMAND_DISALLOWED)
+    test.assert_eq(bis_data_path_setup(var t, 0x0100, PATH_INPUT, 0x06, 0), 0)
+    test.assert(bis_data_path_setup_complete(var t, 0, 0x0100).kind == iso_event.IsoEventKind.DataPathSet)
+    test.assert_eq(bis_data_path_remove(var t, 0x0100, 0), iso_event.STATUS_INVALID_COMMAND_PARAMETERS)
+    test.assert_eq(bis_data_path_remove(var t, 0x0100, 4), iso_event.STATUS_INVALID_COMMAND_PARAMETERS)
+    test.assert_eq(bis_data_path_remove(var t, 0x0100, 3), iso_event.STATUS_COMMAND_DISALLOWED)
+    test.assert_eq(bis_data_path_remove(var t, 0x0100, PATH_BIT_INPUT), 0)
+    test.assert(bis_data_path_remove_complete(var t, 0, 0x0101).kind == iso_event.IsoEventKind.Unrelated)
+    let f = bis_data_path_remove_complete(var t, iso_event.STATUS_COMMAND_DISALLOWED, 0x0100)
+    test.assert(f.kind == iso_event.IsoEventKind.CommandFailed)
+    test.assert(bis_may_send(var t, 0x0100))
+    test.assert_eq(bis_data_path_remove(var t, 0x0100, PATH_BIT_INPUT), 0)
+    let e = bis_data_path_remove_complete(var t, 0, 0x0100)
+    test.assert(e.kind == iso_event.IsoEventKind.DataPathRemoved)
+    test.assert(not bis_may_send(var t, 0x0100))
+    test.assert(bis_data_path_remove_complete(var t, 0, 0x0100).kind == iso_event.IsoEventKind.Unrelated)

@@ -576,7 +576,7 @@ fn cig_set_complete(var t: CisTable, status: Int, cig_id: Int, handles: [Int]) -
     for k in 0..count
         var at = cis_row_of(var t, want, t.pending_ids[k] as Int)
         if at < 0
-            at = free_row(t)
+            at = free_row(var t)
             t.state[at] = CisState.Configured
             t.central[at] = true
             t.cig[at] = want as u8
@@ -719,7 +719,7 @@ fn cis_request(var t: CisTable, req: hci_codec.CisRequest, acl: AclRef) -> iso_e
             -1,
             req.cis_connection_handle,
             iso_event.STATUS_COMMAND_DISALLOWED)
-    let at = free_row(t)
+    let at = free_row(var t)
     if at < 0 or cis_free_rows(var t) < 1
         return iso_event.iso_event(iso_event.IsoEventKind.CisRequestRefused,
             -1,

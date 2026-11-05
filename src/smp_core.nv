@@ -465,7 +465,7 @@ fn draw(var s: PairingState) -> [u8]
 
 // A passkey from 000000 to 999999.
 fn draw_passkey(var s: PairingState) -> Int
-    let r = draw(s)
+    let r = draw(var s)
     let v = r[0] as Int | (r[1] as Int << 8) | (r[2] as Int << 16) | (r[3] as Int << 24)
     v % 1000000
 
@@ -476,7 +476,7 @@ fn draw_passkey(var s: PairingState) -> Int
 @satisfies("REQ-BLE-SMP-008")
 @satisfies("REQ-BLE-SMP-024")
 fn abort(var s: PairingState, reason: Reason, attempt: Bool)
-    send(s, smp.build_pairing_failed(smp.reason_code(reason)))
+    send(var s, smp.build_pairing_failed(smp.reason_code(reason)))
     if s.phase != Phase.Idle
         s.failures = s.failures + 1
     if attempt
@@ -485,7 +485,7 @@ fn abort(var s: PairingState, reason: Reason, attempt: Bool)
 
 // Queue Pairing Failed with `reason` for a command outside a pairing.
 fn decline(var s: PairingState, reason: Reason)
-    send(s, smp.build_pairing_failed(smp.reason_code(reason)))
+    send(var s, smp.build_pairing_failed(smp.reason_code(reason)))
 
 // The Security Manager Timer ran out: no SMP command is sent on this
 // connection again (Section 3.4).
@@ -535,7 +535,7 @@ fn reseed(var s: PairingState, seed: [u8])
 
 // Make the local r and answer its C, f4(PKx, PKx, r, 0).
 fn create_oob_confirm(var s: PairingState) -> [u8]
-    s.local_oob_r = draw(s)
+    s.local_oob_r = draw(var s)
     smp_keys.sc_confirm(local_x(s), local_x(s), s.local_oob_r, 0)
 
 // ── Repeated attempts ([Vol 3] Part H, Section 2.3.6) ───────────────
@@ -750,7 +750,7 @@ fn oob_confirm_matches(s: PairingState, peer_x: [u8]) -> Bool
 // (Section 2.3.5.6.3): draws the round's nonce and returns the confirm
 // value to send.
 fn passkey_round_confirm(var s: PairingState) -> [u8]
-    s.local_rand = draw(s)
+    s.local_rand = draw(var s)
     let z = smp_keys.passkey_z(s.passkey, s.round)
     smp_keys.sc_confirm(local_x(s), s.peer_key.x, s.local_rand, z)
 
@@ -888,7 +888,7 @@ fn take_dhkey(var s: PairingState, dhkey: [u8]) -> Taken
 @satisfies("REQ-BLE-SMP-017")
 fn send_keypress(var s: PairingState, notification_type: Int)
     if s.keypress and local_user_types(s) and s.phase != Phase.Idle and notification_type >= 0 and notification_type <= smp.SMP_KEYPRESS_ENTRY_COMPLETED
-        send(s, smp.build_keypress_notification(notification_type))
+        send(var s, smp.build_keypress_notification(notification_type))
 
 // ── Transport Specific Key Distribution ([Vol 3] Part H, Section 3.6)
 
@@ -917,19 +917,19 @@ fn peer_distribution(s: PairingState) -> Int
 fn send_local_keys(var s: PairingState)
     let dist = local_distribution(s)
     if has(dist, smp.SMP_KEY_DIST_ENC) and not s.sc
-        s.dist_ltk = smp_keys.mask_key(draw(s), s.key_size)
-        let r = draw(s)
+        s.dist_ltk = smp_keys.mask_key(draw(var s), s.key_size)
+        let r = draw(var s)
         s.dist_ediv = r[0] as Int | (r[1] as Int << 8)
         s.dist_rand = r[2:10]
-        send(s, smp.build_encryption_information(s.dist_ltk))
-        send(s, smp.build_central_identification(s.dist_ediv, s.dist_rand))
+        send(var s, smp.build_encryption_information(s.dist_ltk))
+        send(var s, smp.build_central_identification(s.dist_ediv, s.dist_rand))
     if has(dist, smp.SMP_KEY_DIST_ID)
-        send(s, smp.build_identity_information(s.config.identity_irk))
-        send(s,
+        send(var s, smp.build_identity_information(s.config.identity_irk))
+        send(var s,
             smp.build_identity_address_information(s.config.identity_address_type, s.config.identity_address))
     if has(dist, smp.SMP_KEY_DIST_SIGN)
-        s.dist_csrk = draw(s)
-        send(s, smp.build_signing_information(s.dist_csrk))
+        s.dist_csrk = draw(var s)
+        send(var s, smp.build_signing_information(s.dist_csrk))
 
 // The command the peer's next key arrives in, if one is owed.  The state
 // keeps it as a command and a flag, because an optional value-type enum

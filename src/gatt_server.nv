@@ -1635,7 +1635,7 @@ fn receive_on(var db: GattDb, var link: AttLink, index: Int, pdu: [u8], now_ms: 
     if admitted != 0
         return error(op, refused_handle(pdu), admitted)
     if op == att.ATT_OP_WRITE_CMD
-        let _ = write(db, link, pdu, false)
+        let _ = write(var db, var link, pdu, false)
         return []
     if op == att.ATT_OP_SIGNED_WRITE_CMD
         // The command shall not be used on an Enhanced ATT bearer, and a
@@ -1651,11 +1651,11 @@ fn receive_on(var db: GattDb, var link: AttLink, index: Int, pdu: [u8], now_ms: 
         0x4  => find_information(db, link, index, pdu)
         0x6  => find_by_type_value(db, link, index, pdu)
         0x8  => read_by_type(db, link, index, pdu)
-        0xa  => read(db, link, index, pdu)
+        0xa  => read(db, var link, index, pdu)
         0xc  => read_blob(db, var link, index, pdu)
         0xe  => read_multiple(db, link, index, pdu, false)
         0x10 => read_by_group_type(db, link, index, pdu)
-        0x12 => write(db, link, pdu, true)
+        0x12 => write(var db, var link, pdu, true)
         0x16 => prepare_write(var db, var link, pdu)
         0x18 => execute_write(var db, var link, pdu)
         0x20 => read_multiple(db, link, index, pdu, true)

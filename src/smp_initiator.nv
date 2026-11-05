@@ -619,7 +619,7 @@ fn on_command(var s: SmpInitState, command: Command, pdu: [u8]) -> SmpInitStep
         return start_pairing(var s, level)
     if command == Command.PairingRequest
         // Only the initiating device sends one (Section 3.5.1).
-        return reject(s, Reason.CommandNotSupported)
+        return reject(var s, Reason.CommandNotSupported)
     let p = s.phase
     if p == Phase.PairingResponse and command == Command.PairingResponse
         return on_pairing_response(var s, pdu)
@@ -640,7 +640,7 @@ fn on_command(var s: SmpInitState, command: Command, pdu: [u8]) -> SmpInitStep
         return on_dhkey_check(var s, pdu)
     if p == Phase.KeyDistribution or p == Phase.Encryption and s.expecting
         return on_distributed_key(var s, pdu)
-    reject(s, Reason.UnspecifiedReason)
+    reject(var s, Reason.UnspecifiedReason)
 
 // ── Encryption ([Vol 3] Part H, Sections 2.4.4, 2.4.4.1, 2.4.4.2) ───
 

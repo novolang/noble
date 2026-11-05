@@ -505,7 +505,7 @@ fn on_command(var s: SmpState, command: Command, pdu: [u8]) -> SmpStep
         return on_pairing_request(var s, pdu)
     if command == Command.SecurityRequest
         // Sent by a Peripheral only (Section 3.6.7).
-        return reject(s, Reason.CommandNotSupported)
+        return reject(var s, Reason.CommandNotSupported)
     let p = s.phase
     if p == Phase.LegacyConfirm and command == Command.PairingConfirm and list.len(s.peer_confirm) == 0
         return on_legacy_confirm(var s, pdu)
@@ -523,7 +523,7 @@ fn on_command(var s: SmpState, command: Command, pdu: [u8]) -> SmpStep
         return on_distributed_key(var s, pdu)
     if p == Phase.Encryption and s.expecting
         return hold_key(var s, pdu)
-    reject(s, Reason.UnspecifiedReason)
+    reject(var s, Reason.UnspecifiedReason)
 
 // ── Encryption ([Vol 3] Part H, Sections 2.4.4, 2.4.4.1, 2.4.4.2) ───
 

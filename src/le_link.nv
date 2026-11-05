@@ -527,7 +527,7 @@ fn signaling_pdu(var link: LeLink, payload: [u8], now_ms: Int) -> [[u8]]
             if l2cap_coc.is_coc_code(p.code)
                 send_coc(var link, l2cap_coc.receive_signaling(var link.coc, p.code, p.identifier, p.data))
             else if l2cap.is_response_code(p.code)
-                answered(link, p, now_ms)
+                answered(var link, p, now_ms)
                 []
             else if link.central and p.code == l2cap.CODE_CONNECTION_PARAMETER_UPDATE_REQ
                 answered_parameter_update(var link, p)

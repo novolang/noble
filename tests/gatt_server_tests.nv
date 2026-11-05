@@ -1707,3 +1707,80 @@ fn test_an_indication_is_pending_from_its_send_until_its_confirmation()
     let _ = receive(var s.db, var s.link, octets([0x1E]), 0)
     let _ = receive(var s.db, var s.link, octets([0x1E]), 0)
     test.assert(not gatt_server.indication_pending(s.link, 3))
+
+// A rule that tells what it was given in the Error Code it answers: 0x80 plus 1 for a state value, 2 for a properties value, 4 for a
+// subscription and 8 for a recorded owner, 0 for a write of the value 0, and 0x82 for any read of a rule of the kind 9.
+fn tagging_rule(kind: Int, read: Bool, value: [u8], offset: Int, state: [u8], props: [u8],
+                data: [u8], ccc: Int, owner: Int, writer: Int) -> Int
+    if read
+        if kind == 9
+            return 0x82
+        return 0
+    if list.len(value) > 0 and (value[0] as Int) == 0
+        return 0
+    var code = 0x80
+    if list.len(state) > 0
+        code = code + 1
+    if list.len(props) > 0
+        code = code + 2
+    if ccc != 0
+        code = code + 4
+    if owner != 0
+        code = code + 8
+    code
+
+@test
+fn test_a_write_guard_is_given_the_state_the_properties_the_subscription_and_the_owner_of_its_attribute()
+    // No state or properties attribute: the rule sees neither; the client is subscribed to the attribute's indications.
+    var s = control_point_server()
+    set_configuration(var s.link, 4, CCC_INDICATION)
+    test.assert(gatt_server.add_write_guard(var s.db, 3, tagging_rule, 1, 0, 0, []))
+    test.assert_eq(answer(var s, [0x12, 0x03, 0x00, 0x01]), "01 12 03 00 84")
+    test.assert_eq(answer(var s, [0x12, 0x03, 0x00, 0x00]), "13")
+    // State and properties attributes that hold values, and a recorded owner.
+    var t = control_point_server()
+    set_configuration(var t.link, 4, CCC_INDICATION)
+    test.assert(set_value(var t.db, 3, [7]))
+    test.assert(gatt_server.add_write_guard(var t.db, 3, tagging_rule, 1, 3, 3, []))
+    test.assert(gatt_server.set_guard_owner(var t.db, 3, 5))
+    test.assert_eq(answer(var t, [0x12, 0x03, 0x00, 0x01]), "01 12 03 00 8F")
+    // A characteristic with no Client Characteristic Configuration: the rule sees no subscription.
+    var u = control_point_server()
+    let plain = add_characteristic(var u.db, PROP_WRITE, PERM_WRITE, le16(0xAA02)) + 1
+    test.assert_eq(plain, 6)
+    test.assert(gatt_server.add_write_guard(var u.db, plain, tagging_rule, 1, 0, 0, []))
+    test.assert_eq(answer(var u, [0x12, 0x06, 0x00, 0x01]), "01 12 06 00 80")
+    // The rule also decides the writes a Prepare Write and an Execute Write bring: a value of 0 goes ahead, any other is refused.
+    test.assert_eq(answer(var u, [0x16, 0x06, 0x00, 0x00, 0x00, 0x00]), "17 06 00 00 00 00")
+    test.assert_eq(answer(var u, [0x18, 0x01]), "19")
+    test.assert_eq(answer(var u, [0x16, 0x06, 0x00, 0x00, 0x00, 0x05]), "17 06 00 00 00 05")
+    test.assert_eq(answer(var u, [0x18, 0x01]), "01 18 06 00 80")
+
+// The octets of the one response the server gives a request, as hexadecimal numbers.
+fn answer(var s: GattServer, pdu: [Int]) -> Str
+    hex_of(one(receive(var s.db, var s.link, octets(pdu), 0)))
+
+@test
+fn test_a_write_guard_of_a_read_rule_refuses_the_read_it_names()
+    var s = control_point_server()
+    let plain = add_characteristic(var s.db, PROP_READ | PROP_WRITE, PERM_READ | PERM_WRITE, le16(0xAA03)) + 1
+    test.assert_eq(plain, 6)
+    let at = index_of(s.db, plain)
+    test.assert_eq(gatt_server.access_error(s.db, s.link, at, false), 0)
+    test.assert(gatt_server.add_write_guard(var s.db, plain, tagging_rule, 9, 0, 0, []))
+    test.assert_eq(gatt_server.access_error(s.db, s.link, at, false), 0x82)
+    // A rule of another kind lets the read go ahead.
+    var t = control_point_server()
+    let other = add_characteristic(var t.db, PROP_READ | PROP_WRITE, PERM_READ | PERM_WRITE, le16(0xAA03)) + 1
+    test.assert(gatt_server.add_write_guard(var t.db, other, tagging_rule, 1, 0, 0, []))
+    test.assert_eq(gatt_server.access_error(t.db, t.link, index_of(t.db, other), false), 0)
+
+fn hex_of(b: [u8]) -> Str
+    var out = ""
+    for i in 0..list.len(b)
+        let v = b[i] as Int
+        let digits = "0123456789ABCDEF"
+        if i > 0
+            out = out + " "
+        out = out + str.slice(digits, v / 16, v / 16 + 1) + str.slice(digits, v % 16, v % 16 + 1)
+    out

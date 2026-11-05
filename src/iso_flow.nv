@@ -31,18 +31,26 @@ use noble_config
 // The sequence numbers are 16 bits.
 const SEQUENCE_MODULUS = 0x10000
 
+// A table of an absent feature keeps one record: a `Vec` holds at least one element.
+const fn max1(n: Int) -> Int
+    if n > 1
+        n
+    else
+        1
+
 // The pool, the packets in flight of each stream and the next sequence
-// number of each.  The capacity of the stream tables is a literal and is
-// `noble_config.MAX_CIS + noble_config.MAX_BIS`.
+// number of each.  The capacity of the stream tables is
+// `max1(noble_config.MAX_CIS + noble_config.MAX_BIS)`; the pool holds
+// `noble_config.MAX_CIS + noble_config.MAX_BIS` streams, none when both keys are 0.
 @value
 struct IsoCredits
     packet_length: u16
     total: u8
     free: u8
-    used: Vec[Bool; 4]
-    handles: Vec[u16; 4]
-    in_flight: Vec[u8; 4]
-    sequence: Vec[u16; 4]
+    used: Vec[Bool; max1(noble_config.MAX_CIS + noble_config.MAX_BIS)]
+    handles: Vec[u16; max1(noble_config.MAX_CIS + noble_config.MAX_BIS)]
+    in_flight: Vec[u8; max1(noble_config.MAX_CIS + noble_config.MAX_BIS)]
+    sequence: Vec[u16; max1(noble_config.MAX_CIS + noble_config.MAX_BIS)]
 
 @tier(embedded)
 fn iso_credits_new() -> IsoCredits

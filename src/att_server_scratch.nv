@@ -18,11 +18,9 @@
 // attributes" path that emits an ERROR_RSP at the same scratch
 // position.
 
-use std.bits
 use att
 use att_scratch
 use att_server
-
 
 // ── No-allocation db value access ─────────────────────────────────
 //
@@ -49,9 +47,10 @@ fn db_value_byte_at(blob: [u8], idx: Int, k: Int) -> Int
 fn db_write_value_to_scratch(blob: [u8], idx: Int) -> Bool [hw]
     let value_len = att_server.db_value_len_at(blob, idx)
     if value_len <= 0
-        true                      // empty value, nothing to write
+        true   // empty value, nothing to write
     else
         let off = att_server.db_record_offset(blob, idx)
+        // cov: skip — a value length above 0 was read from the record at `idx`, so the record has an offset
         if off < 0
             true
         else
@@ -64,7 +63,6 @@ fn db_write_value_to_scratch(blob: [u8], idx: Int) -> Bool [hw]
                     blob[off + att_server.DB_REC_HEADER_LEN + i] as Int)
                 i = i + 1
             ok
-
 
 // ── Fixed-RAM db accessors ────────────────────────────────────────
 //
@@ -163,7 +161,6 @@ fn db_index_for_handle_ram(handle: Int) -> Int [hw]
         i = i + 1
     found
 
-
 @tier(embedded)
 fn db_write_value_to_scratch_ram(idx: Int) -> Bool [hw]
     let value_len = db_value_len_at_ram(idx)
@@ -171,6 +168,7 @@ fn db_write_value_to_scratch_ram(idx: Int) -> Bool [hw]
         true
     else
         let off = db_record_offset_ram(idx)
+        // cov: skip — a value length above 0 was read from the record at `idx`, so the record has an offset
         if off < 0
             true
         else
@@ -183,7 +181,6 @@ fn db_write_value_to_scratch_ram(idx: Int) -> Bool [hw]
                     att_scratch.gatt_db_ram_byte_at(off + att_server.DB_REC_HEADER_LEN + i))
                 i = i + 1
             ok
-
 
 // ── Write apply (in-place, fixed RAM) ─────────────────────────────
 //
@@ -213,7 +210,6 @@ fn db_apply_write_ram(handle: Int, offset: Int, value_addr: Int, value_len: Int)
                 i = i + 1
             true
 
-
 // CCCD UUID (Vol 3 Part G §3.3.3.3) — replicated here so the
 // scratch handlers can do the writability check without pulling
 // in att_server's CCCD_UUID16 (which has the same value).  Kept in
@@ -236,7 +232,7 @@ fn db_writable_at_ram(value_handle: Int) -> Bool [hw]
         loop
             if i >= count
                 break
-            if db_type16_at_ram(i) == 0x2803      // CHARACTERISTIC
+            if db_type16_at_ram(i) == 0x2803   // CHARACTERISTIC
                 let decl_off = db_record_offset_ram(i)
                 let v_off = decl_off + att_server.DB_REC_HEADER_LEN
                 if att_scratch.gatt_db_ram_byte_at(v_off + 0) >= 0
@@ -252,7 +248,6 @@ fn db_writable_at_ram(value_handle: Int) -> Bool [hw]
         else
             // 0x08 = Write, 0x04 = Write Without Response.
             (props & 0x0C) != 0
-
 
 // ── Helper: write an ERROR_RSP into scratch at the current cursor ─
 //
@@ -271,7 +266,6 @@ fn write_error_rsp(req_opcode: Int, handle: Int, err_code: Int) -> Bool [hw]
     else
         false
 
-
 // ── EXCHANGE_MTU into scratch ──────────────────────────────────────
 @tier(embedded)
 fn handle_exchange_mtu_to_scratch(my_mtu: Int) -> Bool [hw]
@@ -279,7 +273,6 @@ fn handle_exchange_mtu_to_scratch(my_mtu: Int) -> Bool [hw]
         att_scratch.scratch_write_u16_le(my_mtu)
     else
         false
-
 
 // ── READ — return attribute value at handle ────────────────────────
 @tier(embedded)
@@ -296,7 +289,6 @@ fn handle_read_to_scratch(blob: [u8], req: [u8]) -> Bool [hw]
                 false
             else
                 db_write_value_to_scratch(blob, idx)
-
 
 // ── READ_BLOB — value bytes from offset, capped at MTU ────────────
 @tier(embedded)
@@ -334,7 +326,6 @@ fn handle_read_blob_to_scratch(blob: [u8], my_mtu: Int, req: [u8]) -> Bool [hw]
                         i = i + 1
                     ok
 
-
 // ── READ_BY_TYPE — handle/value pairs matching a 16-bit type ──────
 //
 // Per spec, all pairs in one RSP must have the same value length.
@@ -364,7 +355,7 @@ fn handle_read_by_type_to_scratch(blob: [u8], my_mtu: Int, req: [u8]) -> Bool [h
             false
         else
             let pair_len_off = att_scratch.scratch_len()
-            if not att_scratch.scratch_write_u8(0)        // patched on first match
+            if not att_scratch.scratch_write_u8(0)   // patched on first match
                 false
             else
                 var pair_value_len = -1
@@ -398,7 +389,6 @@ fn handle_read_by_type_to_scratch(blob: [u8], my_mtu: Int, req: [u8]) -> Bool [h
                     write_error_rsp(att.ATT_OP_READ_BY_TYPE_REQ, start, att.ATT_ERR_ATTRIBUTE_NOT_FOUND)
                 else
                     true
-
 
 // ── READ_BY_GROUP_TYPE — handle/end_group/value triplets ──────────
 @tier(embedded)
@@ -459,7 +449,6 @@ fn handle_read_by_group_type_to_scratch(blob: [u8], my_mtu: Int, req: [u8]) -> B
                     else
                         true
 
-
 // ── FIND_INFORMATION — handle/UUID pairs (16-bit format only) ─────
 @tier(embedded)
 fn handle_find_information_to_scratch(blob: [u8], my_mtu: Int, req: [u8]) -> Bool [hw]
@@ -500,7 +489,6 @@ fn handle_find_information_to_scratch(blob: [u8], my_mtu: Int, req: [u8]) -> Boo
                     write_error_rsp(att.ATT_OP_FIND_INFORMATION_REQ, start, att.ATT_ERR_ATTRIBUTE_NOT_FOUND)
                 else
                     true
-
 
 // ── FIND_BY_TYPE_VALUE — handle group ids matching (type, value) ──
 @tier(embedded)
@@ -556,7 +544,6 @@ fn handle_find_by_type_value_to_scratch(blob: [u8], my_mtu: Int, req: [u8]) -> B
             else
                 true
 
-
 // ── Top-level dispatcher to scratch ────────────────────────────────
 //
 // Caller has already written 4 bytes of L2CAP B-frame header
@@ -576,19 +563,18 @@ fn handle_request_to_scratch(blob: [u8], my_mtu: Int, req: [u8]) -> Int [hw]
     else
         let op = req[0] as Int
         match att.opcode_method(op)
-            0x02 => handle_exchange_mtu_to_scratch(my_mtu)
-            0x0A => handle_read_to_scratch(blob, req)
-            0x0C => handle_read_blob_to_scratch(blob, my_mtu, req)
-            0x08 => handle_read_by_type_to_scratch(blob, my_mtu, req)
+            0x2  => handle_exchange_mtu_to_scratch(my_mtu)
+            0xa  => handle_read_to_scratch(blob, req)
+            0xc  => handle_read_blob_to_scratch(blob, my_mtu, req)
+            0x8  => handle_read_by_type_to_scratch(blob, my_mtu, req)
             0x10 => handle_read_by_group_type_to_scratch(blob, my_mtu, req)
-            0x04 => handle_find_information_to_scratch(blob, my_mtu, req)
-            0x06 => handle_find_by_type_value_to_scratch(blob, my_mtu, req)
+            0x4  => handle_find_information_to_scratch(blob, my_mtu, req)
+            0x6  => handle_find_by_type_value_to_scratch(blob, my_mtu, req)
             _    => write_error_rsp(op, 0, att.ATT_ERR_REQUEST_NOT_SUPPORTED)
     if ok
         att_scratch.scratch_len() - start_len
     else
         0
-
 
 // ── Write — fixed-RAM blob path ────────────────────────────────────
 //
@@ -623,7 +609,6 @@ fn handle_write_req_to_scratch_ram(req_addr: Int, req_len: Int) -> Bool [hw]
                 let _ = db_apply_write_ram(handle, 0, req_addr + 3, value_len)
                 att_scratch.scratch_write_u8(att.ATT_OP_WRITE_RSP)
 
-
 // WRITE_CMD — silent overwrite (no response, even on error).
 // Returns true iff the blob was actually mutated; caller (main.nv)
 // uses this to gate CCCD-write detection for subscription tracking.
@@ -643,7 +628,6 @@ fn handle_write_cmd_to_scratch_ram(req_addr: Int, req_len: Int) -> Bool [hw]
                 false
             else
                 db_apply_write_ram(handle, 0, req_addr + 3, value_len)
-
 
 // ── Fully-ram-backed read handlers (no heap [u8] blob) ────────────
 //
@@ -679,7 +663,6 @@ fn read_req_u16_at_ram(req_addr: Int, req_len: Int, off: Int) -> Int [hw]
     else
         hw.mem_read8(req_addr + off) | (hw.mem_read8(req_addr + off + 1) << 8)
 
-
 @tier(embedded)
 fn handle_read_ram(req_addr: Int, req_len: Int) -> Bool [hw]
     let handle = read_req_handle_ram(req_addr, req_len)
@@ -694,7 +677,6 @@ fn handle_read_ram(req_addr: Int, req_len: Int) -> Bool [hw]
                 false
             else
                 db_write_value_to_scratch_ram(idx)
-
 
 @tier(embedded)
 fn handle_read_blob_ram(my_mtu: Int, req_addr: Int, req_len: Int) -> Bool [hw]
@@ -728,7 +710,6 @@ fn handle_read_blob_ram(my_mtu: Int, req_addr: Int, req_len: Int) -> Bool [hw]
                         ok = att_scratch.scratch_write_u8(db_value_byte_at_ram(idx, i))
                         i = i + 1
                     ok
-
 
 @tier(embedded)
 fn handle_read_by_type_ram(my_mtu: Int, req_addr: Int, req_len: Int) -> Bool [hw]
@@ -788,7 +769,6 @@ fn handle_read_by_type_ram(my_mtu: Int, req_addr: Int, req_len: Int) -> Bool [hw
                     write_error_rsp(att.ATT_OP_READ_BY_TYPE_REQ, start, att.ATT_ERR_ATTRIBUTE_NOT_FOUND)
                 else
                     true
-
 
 @tier(embedded)
 fn handle_read_by_group_type_ram(my_mtu: Int, req_addr: Int, req_len: Int) -> Bool [hw]
@@ -853,7 +833,6 @@ fn handle_read_by_group_type_ram(my_mtu: Int, req_addr: Int, req_len: Int) -> Bo
                     else
                         true
 
-
 @tier(embedded)
 fn handle_find_information_ram(my_mtu: Int, req_addr: Int, req_len: Int) -> Bool [hw]
     let start = read_req_u16_at_ram(req_addr, req_len, 1)
@@ -893,7 +872,6 @@ fn handle_find_information_ram(my_mtu: Int, req_addr: Int, req_len: Int) -> Bool
                     write_error_rsp(att.ATT_OP_FIND_INFORMATION_REQ, start, att.ATT_ERR_ATTRIBUTE_NOT_FOUND)
                 else
                     true
-
 
 @tier(embedded)
 fn handle_find_by_type_value_ram(my_mtu: Int, req_addr: Int, req_len: Int) -> Bool [hw]
@@ -947,7 +925,6 @@ fn handle_find_by_type_value_ram(my_mtu: Int, req_addr: Int, req_len: Int) -> Bo
             else
                 true
 
-
 // Read-side dispatch (fully ram).  Returns Bool indicating whether
 // the handler successfully wrote response bytes into scratch.
 // Extracted into its own function so the top-level dispatcher
@@ -958,15 +935,14 @@ fn dispatch_read_ram(my_mtu: Int, req_addr: Int, req_len: Int) -> Bool [hw]
     let op = hw.mem_read8(req_addr)
     let m = att.opcode_method(op)
     match m
-        0x02 => handle_exchange_mtu_to_scratch(my_mtu)
-        0x0A => handle_read_ram(req_addr, req_len)
-        0x0C => handle_read_blob_ram(my_mtu, req_addr, req_len)
-        0x08 => handle_read_by_type_ram(my_mtu, req_addr, req_len)
+        0x2  => handle_exchange_mtu_to_scratch(my_mtu)
+        0xa  => handle_read_ram(req_addr, req_len)
+        0xc  => handle_read_blob_ram(my_mtu, req_addr, req_len)
+        0x8  => handle_read_by_type_ram(my_mtu, req_addr, req_len)
         0x10 => handle_read_by_group_type_ram(my_mtu, req_addr, req_len)
-        0x04 => handle_find_information_ram(my_mtu, req_addr, req_len)
-        0x06 => handle_find_by_type_value_ram(my_mtu, req_addr, req_len)
+        0x4  => handle_find_information_ram(my_mtu, req_addr, req_len)
+        0x6  => handle_find_by_type_value_ram(my_mtu, req_addr, req_len)
         _    => write_error_rsp(op, 0, att.ATT_ERR_REQUEST_NOT_SUPPORTED)
-
 
 // Top-level fully-ram dispatcher.  Zero heap traffic; reads request
 // bytes from RX RAM directly, walks the ram-backed gatt_db, writes
@@ -1006,7 +982,6 @@ fn handle_request_to_scratch_ram_full(my_mtu: Int, req_addr: Int, req_len: Int) 
         att_scratch.scratch_len() - start_len
     else
         0
-
 
 // (Old hybrid `handle_request_to_scratch_ram` removed —
 // superseded by `handle_request_to_scratch_ram_full` above which

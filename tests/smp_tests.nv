@@ -1,0 +1,218 @@
+// tests/smp_tests.nv — the unit tests of src/smp.nv.
+//
+//   novo test tests/smp_tests.nv
+
+use std.test
+use smp.{ Command, Reason, SMP_ADDR_TYPE_STATIC_RANDOM, SMP_AUTHREQ_BONDING, SMP_AUTHREQ_MITM, SMP_AUTHREQ_NO_BONDING, SMP_AUTHREQ_SC, SMP_FAIL_AUTH_REQUIREMENTS, SMP_IO_CAP_DISPLAY_ONLY, SMP_IO_CAP_DISPLAY_YES_NO, SMP_IO_CAP_KEYBOARD_DISPLAY, SMP_IO_CAP_KEYBOARD_ONLY, SMP_IO_CAP_NO_INPUT_NO_OUTPUT, SMP_KEYPRESS_ENTRY_COMPLETED, SMP_KEY_DIST_ENC, SMP_KEY_DIST_ID, SMP_KEY_DIST_NONE, SMP_MAX_ENC_KEY_SIZE, SMP_OOB_NOT_PRESENT, SMP_OP_CENTRAL_IDENTIFICATION, SMP_OP_ENCRYPTION_INFORMATION, SMP_OP_IDENTITY_ADDRESS_INFORMATION, SMP_OP_PAIRING_CONFIRM, SMP_OP_PAIRING_DHKEY_CHECK, SMP_OP_PAIRING_FAILED, SMP_OP_PAIRING_KEYPRESS_NOTIFICATION, SMP_OP_PAIRING_PUBLIC_KEY, SMP_OP_PAIRING_RANDOM, SMP_OP_PAIRING_REQUEST, SMP_OP_PAIRING_RESPONSE, SMP_OP_SECURITY_REQUEST, SMP_OP_SIGNING_INFORMATION, SMP_PAIRING_CONFIRM_SIZE, SMP_PAIRING_FAILED_SIZE, SMP_PAIRING_RANDOM_SIZE, SMP_PAIRING_REQUEST_SIZE, SMP_PAIRING_RESPONSE_SIZE, auth_req_bonding, auth_req_mitm, auth_req_sc, build_central_identification, build_encryption_information, build_identity_address_information, build_identity_information, build_keypress_notification, build_pairing_confirm, build_pairing_dhkey_check, build_pairing_failed, build_pairing_public_key, build_pairing_random, build_pairing_request, build_pairing_response_just_works, build_security_request, build_signing_information, command_code, command_length, command_of, field_bytes, is_pairing_confirm, is_pairing_failed, is_pairing_random, is_pairing_request, is_pairing_response, pairing_auth_req, pairing_confirm_byte, pairing_failed_reason, pairing_init_key_dist, pairing_io_cap, pairing_max_key_size, pairing_oob, pairing_random_byte, pairing_resp_key_dist, reason_code, smp_opcode }
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+@test
+fn test_opcodes_match_spec_table()
+    test.assert_eq(SMP_OP_PAIRING_REQUEST, 0x01)
+    test.assert_eq(SMP_OP_PAIRING_RESPONSE, 0x02)
+    test.assert_eq(SMP_OP_PAIRING_CONFIRM, 0x03)
+    test.assert_eq(SMP_OP_PAIRING_RANDOM, 0x04)
+    test.assert_eq(SMP_OP_PAIRING_FAILED, 0x05)
+
+@test
+fn test_command_variants_map_to_their_codes_and_back()
+    for code in 0..0x10
+        match command_of(code)
+            Some(c) => test.assert_eq(command_code(c), code)
+            None    => test.assert(code == 0 or code > SMP_OP_PAIRING_KEYPRESS_NOTIFICATION)
+    test.assert_eq(command_code(Command.PairingFailed), SMP_OP_PAIRING_FAILED)
+    test.assert(command_of(0x0F) == None)
+    test.assert(command_of(0xFF) == None)
+
+@test
+fn test_reason_variants_map_to_table_3_7()
+    test.assert_eq(reason_code(Reason.PasskeyEntryFailed), 0x01)
+    test.assert_eq(reason_code(Reason.ConfirmValueFailed), 0x04)
+    test.assert_eq(reason_code(Reason.UnspecifiedReason), 0x08)
+    test.assert_eq(reason_code(Reason.DhKeyCheckFailed), 0x0B)
+    test.assert_eq(reason_code(Reason.Busy), 0x10)
+
+@test
+fn test_io_cap_constants_match_spec()
+    test.assert_eq(SMP_IO_CAP_DISPLAY_ONLY, 0x00)
+    test.assert_eq(SMP_IO_CAP_DISPLAY_YES_NO, 0x01)
+    test.assert_eq(SMP_IO_CAP_KEYBOARD_ONLY, 0x02)
+    test.assert_eq(SMP_IO_CAP_NO_INPUT_NO_OUTPUT, 0x03)
+    test.assert_eq(SMP_IO_CAP_KEYBOARD_DISPLAY, 0x04)
+
+@test
+fn test_authreq_bit_flags_match_spec()
+    test.assert_eq(SMP_AUTHREQ_NO_BONDING, 0x00)
+    test.assert_eq(SMP_AUTHREQ_BONDING, 0x01)
+    test.assert_eq(SMP_AUTHREQ_MITM, 0x04)
+    test.assert_eq(SMP_AUTHREQ_SC, 0x08)
+
+@test
+fn test_pdu_sizes_match_spec()
+    test.assert_eq(SMP_PAIRING_REQUEST_SIZE, 7)
+    test.assert_eq(SMP_PAIRING_RESPONSE_SIZE, 7)
+    test.assert_eq(SMP_PAIRING_CONFIRM_SIZE, 17)
+    test.assert_eq(SMP_PAIRING_RANDOM_SIZE, 17)
+    test.assert_eq(SMP_PAIRING_FAILED_SIZE, 2)
+
+@test
+fn test_build_pairing_request_round_trips_via_accessors()
+    let pdu = build_pairing_request(
+        SMP_IO_CAP_DISPLAY_YES_NO,
+        SMP_OOB_NOT_PRESENT,
+        SMP_AUTHREQ_BONDING | SMP_AUTHREQ_MITM,
+        SMP_MAX_ENC_KEY_SIZE,
+        SMP_KEY_DIST_ENC,
+        SMP_KEY_DIST_ID)
+    test.assert_eq(list.len(pdu), 7)
+    test.assert(is_pairing_request(pdu))
+    test.assert_eq(pairing_io_cap(pdu), SMP_IO_CAP_DISPLAY_YES_NO)
+    test.assert_eq(pairing_oob(pdu), SMP_OOB_NOT_PRESENT)
+    test.assert_eq(pairing_auth_req(pdu), SMP_AUTHREQ_BONDING | SMP_AUTHREQ_MITM)
+    test.assert_eq(pairing_max_key_size(pdu), 16)
+    test.assert_eq(pairing_init_key_dist(pdu), SMP_KEY_DIST_ENC)
+    test.assert_eq(pairing_resp_key_dist(pdu), SMP_KEY_DIST_ID)
+
+@test
+fn test_build_pairing_response_just_works_shape()
+    let pdu = build_pairing_response_just_works()
+    test.assert_eq(list.len(pdu), 7)
+    test.assert(is_pairing_response(pdu))
+    test.assert_eq(pairing_io_cap(pdu), SMP_IO_CAP_NO_INPUT_NO_OUTPUT)
+    test.assert_eq(pairing_oob(pdu), SMP_OOB_NOT_PRESENT)
+    test.assert_eq(pairing_auth_req(pdu), SMP_AUTHREQ_BONDING)
+    test.assert_eq(pairing_max_key_size(pdu), 16)
+    test.assert_eq(pairing_init_key_dist(pdu), SMP_KEY_DIST_NONE)
+    test.assert_eq(pairing_resp_key_dist(pdu), SMP_KEY_DIST_NONE)
+
+@test
+fn test_auth_req_bit_decoders()
+    let bonding_only = SMP_AUTHREQ_BONDING
+    test.assert(auth_req_bonding(bonding_only))
+    test.assert(not auth_req_mitm(bonding_only))
+    test.assert(not auth_req_sc(bonding_only))
+
+    let bond_mitm_sc = SMP_AUTHREQ_BONDING | SMP_AUTHREQ_MITM | SMP_AUTHREQ_SC
+    test.assert(auth_req_bonding(bond_mitm_sc))
+    test.assert(auth_req_mitm(bond_mitm_sc))
+    test.assert(auth_req_sc(bond_mitm_sc))
+
+@test
+fn test_build_pairing_confirm_carries_16_bytes()
+    let cv: [u8] = [
+        0xC0, 0xC1, 0xC2, 0xC3,
+        0xC4, 0xC5, 0xC6, 0xC7,
+        0xC8, 0xC9, 0xCA, 0xCB,
+        0xCC, 0xCD, 0xCE, 0xCF]
+    let pdu = build_pairing_confirm(cv)
+    test.assert_eq(list.len(pdu), 17)
+    test.assert(is_pairing_confirm(pdu))
+    test.assert_eq(pairing_confirm_byte(pdu, 0), 0xC0)
+    test.assert_eq(pairing_confirm_byte(pdu, 7), 0xC7)
+    test.assert_eq(pairing_confirm_byte(pdu, 15), 0xCF)
+
+@test
+fn test_build_pairing_random_carries_16_bytes()
+    let rv: [u8] = [
+        0xA0, 0xA1, 0xA2, 0xA3,
+        0xA4, 0xA5, 0xA6, 0xA7,
+        0xA8, 0xA9, 0xAA, 0xAB,
+        0xAC, 0xAD, 0xAE, 0xAF]
+    let pdu = build_pairing_random(rv)
+    test.assert_eq(list.len(pdu), 17)
+    test.assert(is_pairing_random(pdu))
+    test.assert_eq(pairing_random_byte(pdu, 0), 0xA0)
+    test.assert_eq(pairing_random_byte(pdu, 7), 0xA7)
+    test.assert_eq(pairing_random_byte(pdu, 15), 0xAF)
+
+@test
+fn test_build_pairing_failed_reason_round_trips()
+    let pdu = build_pairing_failed(SMP_FAIL_AUTH_REQUIREMENTS)
+    test.assert_eq(list.len(pdu), 2)
+    test.assert(is_pairing_failed(pdu))
+    test.assert_eq(pairing_failed_reason(pdu), SMP_FAIL_AUTH_REQUIREMENTS)
+
+@test
+fn test_short_pdu_returns_negative_one_from_accessors()
+    let stub: [u8] = [SMP_OP_PAIRING_REQUEST]
+    test.assert_eq(pairing_io_cap(stub), -1)
+    test.assert_eq(pairing_auth_req(stub), -1)
+    test.assert_eq(pairing_failed_reason(stub), -1)
+    test.assert_eq(pairing_confirm_byte(stub, 0), -1)
+
+@test
+fn test_empty_pdu_smp_opcode_returns_negative_one()
+    let empty: [u8] = []
+    test.assert_eq(smp_opcode(empty), -1)
+    test.assert(not is_pairing_request(empty))
+    test.assert(not is_pairing_failed(empty))
+
+@test
+fn test_command_lengths_match_the_section_3_formats()
+    test.assert_eq(command_length(SMP_OP_PAIRING_REQUEST), 7)
+    test.assert_eq(command_length(SMP_OP_PAIRING_RANDOM), 17)
+    test.assert_eq(command_length(SMP_OP_CENTRAL_IDENTIFICATION), 11)
+    test.assert_eq(command_length(SMP_OP_IDENTITY_ADDRESS_INFORMATION), 8)
+    test.assert_eq(command_length(SMP_OP_SECURITY_REQUEST), 2)
+    test.assert_eq(command_length(SMP_OP_PAIRING_PUBLIC_KEY), 65)
+    test.assert_eq(command_length(SMP_OP_PAIRING_DHKEY_CHECK), 17)
+    test.assert_eq(command_length(SMP_OP_PAIRING_KEYPRESS_NOTIFICATION), 2)
+    test.assert_eq(command_length(0x0F), -1)
+    test.assert_eq(command_length(0x00), -1)
+
+@test
+fn test_key_distribution_builders_lay_out_their_fields()
+    var key: [u8] = []
+    for i in 0..16
+        list.push(key, i as u8)
+    let enc = build_encryption_information(key)
+    test.assert_eq(list.len(enc), 17)
+    test.assert_eq(enc[0] as Int, 0x06)
+    test.assert_eq(enc[16] as Int, 15)
+    let rand8: [u8] = [1, 2, 3, 4, 5, 6, 7, 8]
+    let cid = build_central_identification(0xBEEF, rand8)
+    test.assert_eq(list.len(cid), 11)
+    test.assert_eq(cid[1] as Int, 0xEF)
+    test.assert_eq(cid[2] as Int, 0xBE)
+    test.assert_eq(cid[10] as Int, 8)
+    let addr: [u8] = [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xC5]
+    let ia = build_identity_address_information(SMP_ADDR_TYPE_STATIC_RANDOM, addr)
+    test.assert_eq(list.len(ia), 8)
+    test.assert_eq(ia[1] as Int, 1)
+    test.assert_eq(ia[7] as Int, 0xC5)
+    test.assert_eq(build_identity_information(key)[0] as Int, 0x08)
+    test.assert_eq(build_signing_information(key)[0] as Int, 0x0A)
+    test.assert_eq(build_pairing_dhkey_check(key)[0] as Int, 0x0D)
+    let sr = build_security_request(SMP_AUTHREQ_BONDING | SMP_AUTHREQ_MITM)
+    test.assert_eq(sr[0] as Int, 0x0B)
+    test.assert_eq(sr[1] as Int, 0x05)
+    let kp = build_keypress_notification(SMP_KEYPRESS_ENTRY_COMPLETED)
+    test.assert_eq(kp[1] as Int, 4)
+    test.assert_eq(field_bytes(cid, 3, 8)[7] as Int, 8)
+
+@test
+fn test_public_key_builder_carries_x_then_y()
+    var x: [u8] = []
+    var y: [u8] = []
+    for i in 0..32
+        list.push(x, i as u8)
+        list.push(y, (0x80 + i) as u8)
+    let pk = build_pairing_public_key(x, y)
+    test.assert_eq(list.len(pk), 65)
+    test.assert_eq(pk[0] as Int, 0x0C)
+    test.assert_eq(pk[1] as Int, 0)
+    test.assert_eq(pk[32] as Int, 31)
+    test.assert_eq(pk[33] as Int, 0x80)
+    test.assert_eq(pk[64] as Int, 0x9F)
+
+@test
+fn test_short_commands_answer_negative_one_from_every_reader()
+    let stub: [u8] = [SMP_OP_PAIRING_REQUEST]
+    test.assert_eq(pairing_oob(stub), -1)
+    test.assert_eq(pairing_max_key_size(stub), -1)
+    test.assert_eq(pairing_init_key_dist(stub), -1)
+    test.assert_eq(pairing_resp_key_dist(stub), -1)
+    test.assert_eq(pairing_random_byte(stub, 0), -1)
+    test.assert_eq(command_length(SMP_OP_SIGNING_INFORMATION), 17)
+    test.assert_eq(command_length(SMP_OP_ENCRYPTION_INFORMATION), 17)

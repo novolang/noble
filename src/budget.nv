@@ -23,7 +23,6 @@
 //
 // The record sizes below are those of the schema's `bytes_expr` fields.
 
-use std.test
 use limits
 use noble_config
 use links
@@ -115,7 +114,10 @@ const HAP_BTP_STATE = 640
 // The larger of `n` and 1: a table of an absent feature keeps one record.
 @tier(embedded)
 const fn max1(n: Int) -> Int
-    if n > 1 then n else 1
+    if n > 1
+        n
+    else
+        1
 
 // One L2CAP B-frame buffer: the largest ATT PDU and the L2CAP header.
 @tier(embedded)
@@ -158,7 +160,10 @@ const fn receive_frame_bytes() -> Int
 
 @tier(embedded)
 const fn att_state_bytes() -> Int
-    let prepared = if noble_config.MAX_PREPARED_BYTES > 0 then slot(noble_config.MAX_PREPARED_BYTES) else 0
+    let prepared = if noble_config.MAX_PREPARED_BYTES > 0
+        slot(noble_config.MAX_PREPARED_BYTES)
+    else
+        0
     noble_config.MAX_CONNECTIONS * (ATT_LINK_FIXED + noble_config.MAX_BEARERS * BEARER_RECORD
         + vec_bytes(noble_config.MAX_CCCD, 2) + prepared)
 
@@ -169,7 +174,10 @@ const fn transmit_pool_bytes() -> Int
 
 @tier(embedded)
 const fn sequenced_bytes() -> Int
-    if noble_config.SEQUENCED_SLOTS > 0 then noble_config.SEQUENCED_SLOTS * slot(frame_octets()) + SEQUENCED_HEADER else 0
+    if noble_config.SEQUENCED_SLOTS > 0
+        noble_config.SEQUENCED_SLOTS * slot(frame_octets()) + SEQUENCED_HEADER
+    else
+        0
 
 @tier(embedded)
 const fn pending_bit_bytes() -> Int
@@ -254,7 +262,7 @@ const fn broadcast_bytes() -> Int
 const fn bap_bytes() -> Int
     let sources = noble_config.MAX_BCAST_SOURCES
     let ltv = slot(BAP_LTV_OCTETS)
-    let draft = noble_config.MAX_BIS * ((8 + ltv) + (8 + slot(5) + 2 * ltv))
+    let draft = noble_config.MAX_BIS * (8 + ltv + (8 + slot(5) + 2 * ltv))
     if sources == 0
         0
     else
@@ -328,85 +336,17 @@ const fn total_bytes() -> Int
 // tests, and the messages name the key to change.
 
 // The storage is the total the schema's `bytes_expr` fields give, so the schema and this module agree on the size rule.
-assert_const(total_bytes() == noble_config.budget_bytes(), "noble: budget.nv and the bytes_expr fields of novo.toml disagree on the storage total: correct the size rule in one of them (`novo config explain` prints the schema's rows)")
+assert_const(total_bytes() == noble_config.budget_bytes(),
+    "noble: budget.nv and the bytes_expr fields of novo.toml disagree on the storage total: correct the size rule in one of them (`novo config explain` prints the schema's rows)")
 // Every pool holds a slot for every connection, and the registry is declared for them.
 assert_const(noble_config.MAX_CONNECTIONS >= 1, "noble: MAX_CONNECTIONS must be at least 1")
-assert_const(noble_config.MAX_CONNECTIONS <= limits.LINK_SLOTS, "noble: max_connections exceeds LINK_SLOTS (limits.nv), the connection slots the registry and the ACL credit pool are declared for: lower MAX_CONNECTIONS or declare more slots")
+assert_const(noble_config.MAX_CONNECTIONS <= limits.LINK_SLOTS,
+    "noble: max_connections exceeds LINK_SLOTS (limits.nv), the connection slots the registry and the ACL credit pool are declared for: lower MAX_CONNECTIONS or declare more slots")
 assert_const(noble_config.ACL_BUFFERS >= 1, "noble: ACL_BUFFERS must be at least 1")
 assert_const(noble_config.MAX_BEARERS >= 1, "noble: MAX_BEARERS must be at least 1")
 assert_const(noble_config.MAX_PAIRING >= 1, "noble: MAX_PAIRING must be at least 1")
 assert_const(noble_config.MAX_ATT_MTU >= 23, "noble: MAX_ATT_MTU must be at least 23, the ATT default MTU")
 // The profiles keep their minimum.
 assert_const(noble_config.MAX_BAS >= 1, "noble: MAX_BAS must be at least 1")
-assert_const(noble_config.MAX_GAF_CLIENTS == 0 or noble_config.MAX_CTL_INSTANCES >= 3, "noble: MAX_CTL_INSTANCES must be at least 3 where MAX_GAF_CLIENTS asks for the control clients")
-
-// The sizes the toolchain reports for these types.
-@test
-fn test_a_vec_takes_its_elements_and_an_eight_octet_length()
-    test.assert_eq(slot(27), 40)
-    test.assert_eq(slot(16), 24)
-    test.assert_eq(vec_bytes(3, 2), 16)
-    test.assert_eq(vec_bytes(3, slot(16)), 80)
-    test.assert_eq(slot(512), 520)
-    test.assert_eq(slot(792), 800)
-
-@test
-fn test_the_btp_face_of_the_source_holds_a_draft_a_row_for_each_source_and_the_announcement()
-    if noble_config.MAX_BCAST_SOURCES == 0
-        test.assert_eq(bap_bytes(), 0)
-    else
-        let ltv = slot(255)
-        test.assert_eq(bap_bytes(), noble_config.MAX_BIS * ((8 + ltv) + (8 + slot(5) + 2 * ltv)) + vec_bytes(noble_config.MAX_BCAST_SOURCES, 8) + slot(250) + ltv + BAP_SCALARS)
-
-@test
-fn test_the_broadcast_source_holds_a_row_for_each_stream_a_candidate_and_a_procedure()
-    let row = BCAST_ROW_FIXED + BCAST_ROW_LISTS + vec_bytes(noble_config.MAX_BIS, 8)
-    if noble_config.MAX_BCAST_SOURCES == 0
-        test.assert_eq(broadcast_bytes(), 0)
-    else
-        test.assert_eq(broadcast_bytes(), noble_config.MAX_BCAST_SOURCES * row + row + BCAST_PROC)
-    // The lists at their largest: the address, the Broadcast_Code, a name of 32
-    // octets, Metadata of 250, advertising data of 310 and 256, and the BASE
-    // twice (the layout and its encoding) at 252.
-    test.assert(BCAST_ROW_LISTS >= slot(6) + slot(16) + slot(32) + slot(250) + slot(310) + slot(256) + 2 * slot(252))
-
-@test
-fn test_the_unicast_server_holds_a_row_and_an_sdu_buffer_for_each_stream_and_a_queue()
-    if noble_config.MAX_UNICAST_STREAMS == 0
-        test.assert_eq(unicast_bytes(), 0)
-    else
-        test.assert_eq(unicast_bytes(), noble_config.MAX_UNICAST_STREAMS * (UNI_STREAM_FIXED + slot(noble_config.ISO_SDU_OCTETS)) + UNI_PROC)
-
-@test
-fn test_the_sink_holds_a_row_for_each_receive_state_and_a_table()
-    if noble_config.MAX_BCAST_SINKS == 0
-        test.assert_eq(sink_bytes(), 0)
-    else
-        test.assert_eq(sink_bytes(), noble_config.MAX_BCAST_SINKS * (SINK_ROW_FIXED + SINK_ROW_LISTS + 3 * vec_bytes(noble_config.MAX_BIS, 8)) + SINK_TABLE)
-    // The lists at their largest: the address, the Bad_Code and the Broadcast_Code, four
-    // subgroups with 255 octets of Metadata between them, the requests, 256 octets of
-    // periodic data and the BASE of 252.
-    test.assert(SINK_ROW_LISTS >= slot(6) + slot(16) + slot(16) + 4 * 16 + slot(255) + vec_bytes(4, 8) + slot(256) + slot(252))
-
-@test
-fn test_the_control_clients_are_there_where_the_profile_asks_for_them()
-    if noble_config.MAX_GAF_CLIENTS == 0
-        test.assert_eq(control_client_bytes(), 0)
-    else
-        // A row for each link, and the set, the Commander and the BTP face once.
-        test.assert(control_client_bytes() > noble_config.MAX_GAF_CLIENTS * vec_bytes(CTL_JOB_INTS, 8))
-
-
-@test
-@satisfies("REQ-BLE-PRF-005")
-fn test_the_battery_and_hid_link_state_is_a_level_for_each_instance_and_two_registers_for_each_link()
-    test.assert_eq(profile_link_bytes(), vec_bytes(noble_config.MAX_CONNECTIONS * noble_config.MAX_BAS, 8) + 2 * vec_bytes(noble_config.MAX_CONNECTIONS, 8))
-
-@test
-fn test_the_hap_controllers_are_there_where_the_profile_asks_for_them()
-    if noble_config.MAX_GAF_CLIENTS == 0 or noble_config.MAX_HAS_CACHE == 0
-        test.assert_eq(hap_bytes(), 0)
-    else
-        // A row for each link, and the BTP face once.
-        test.assert(hap_bytes() > noble_config.MAX_GAF_CLIENTS * vec_bytes(noble_config.MAX_HAS_CACHE * HAP_NAME_OCTETS, 1))
-        test.assert(hap_bytes() > HAP_BTP_STATE)
+assert_const(noble_config.MAX_GAF_CLIENTS == 0 or noble_config.MAX_CTL_INSTANCES >= 3,
+    "noble: MAX_CTL_INSTANCES must be at least 3 where MAX_GAF_CLIENTS asks for the control clients")

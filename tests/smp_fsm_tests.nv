@@ -1,0 +1,97 @@
+// tests/smp_fsm_tests.nv — the unit tests of src/smp_fsm.nv.
+//
+//   novo test tests/smp_fsm_tests.nv
+
+use std.test
+use smp_fsm.{ smp_in_progress, smp_initial_state, smp_is_encrypted, smp_is_failed, smp_state_name }
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+@test
+fn test_initial_state_is_idle()
+    let s = smp_initial_state()
+    test.assert_eq(smp_state_name(s), "Idle")
+    test.assert(not smp_is_encrypted(s))
+    test.assert(not smp_is_failed(s))
+    test.assert(not smp_in_progress(s))
+
+@test
+fn test_rx_pairing_request_advances_to_response_sent()
+    let s = smppairing_step(SmpIdle, RxPairingRequest)
+    test.assert_eq(smp_state_name(s), "ResponseSent")
+    test.assert(smp_in_progress(s))
+
+@test
+fn test_rx_pairing_confirm_advances_to_sconfirm_sent()
+    let s = smppairing_step(ResponseSent, RxPairingConfirm)
+    test.assert_eq(smp_state_name(s), "SconfirmSent")
+
+@test
+fn test_rx_pairing_random_advances_to_mrand_received()
+    let s = smppairing_step(SconfirmSent, RxPairingRandom)
+    test.assert_eq(smp_state_name(s), "MrandReceived")
+
+@test
+fn test_confirm_verify_ok_advances_to_stk_ready()
+    let s = smppairing_step(MrandReceived, ConfirmVerifyOk)
+    test.assert_eq(smp_state_name(s), "StkReady")
+
+@test
+fn test_ll_encryption_done_lands_in_encrypted()
+    let s = smppairing_step(StkReady, LlEncryptionDone)
+    test.assert_eq(smp_state_name(s), "Encrypted")
+    test.assert(smp_is_encrypted(s))
+    test.assert(not smp_in_progress(s))
+
+@test
+fn test_full_just_works_happy_path()
+    let s0 = smp_initial_state()
+    let s1 = smppairing_step(s0, RxPairingRequest)
+    let s2 = smppairing_step(s1, RxPairingConfirm)
+    let s3 = smppairing_step(s2, RxPairingRandom)
+    let s4 = smppairing_step(s3, ConfirmVerifyOk)
+    let s5 = smppairing_step(s4, LlEncryptionDone)
+    test.assert(smp_is_encrypted(s5))
+
+@test
+fn test_confirm_verify_failed_lands_in_failed()
+    let s = smppairing_step(MrandReceived, ConfirmVerifyFailed)
+    test.assert(smp_is_failed(s))
+    test.assert(not smp_is_encrypted(s))
+
+@test
+fn test_rx_pairing_failed_aborts_from_every_in_progress_state()
+    test.assert(smp_is_failed(smppairing_step(ResponseSent, RxPairingFailed)))
+    test.assert(smp_is_failed(smppairing_step(SconfirmSent, RxPairingFailed)))
+    test.assert(smp_is_failed(smppairing_step(MrandReceived, RxPairingFailed)))
+    test.assert(smp_is_failed(smppairing_step(StkReady, RxPairingFailed)))
+
+@test
+fn test_rx_pairing_failed_from_idle_is_recorded()
+    // Idle + RxPairingFailed → SmpFailed.  The peer pushed a
+    // protocol error before we ever started; we still record
+    // it as a failure for the caller's logging.
+    let s = smppairing_step(SmpIdle, RxPairingFailed)
+    test.assert(smp_is_failed(s))
+
+@test
+fn test_host_abort_from_idle_stays_idle()
+    let s = smppairing_step(SmpIdle, HostAbort)
+    test.assert_eq(smp_state_name(s), "Idle")
+
+@test
+fn test_host_abort_from_in_progress_states_lands_in_failed()
+    test.assert(smp_is_failed(smppairing_step(ResponseSent, HostAbort)))
+    test.assert(smp_is_failed(smppairing_step(SconfirmSent, HostAbort)))
+    test.assert(smp_is_failed(smppairing_step(MrandReceived, HostAbort)))
+    test.assert(smp_is_failed(smppairing_step(StkReady, HostAbort)))
+
+@test
+fn test_smp_in_progress_classification()
+    test.assert(not smp_in_progress(SmpIdle))
+    test.assert(not smp_in_progress(Encrypted))
+    test.assert(not smp_in_progress(SmpFailed))
+    test.assert(smp_in_progress(ResponseSent))
+    test.assert(smp_in_progress(SconfirmSent))
+    test.assert(smp_in_progress(MrandReceived))
+    test.assert(smp_in_progress(StkReady))

@@ -12,10 +12,9 @@
 //   Sconfirm / Mconfirm — 16-byte c1(TK, r, p1, p2) values
 //
 // All slots in one 128-byte `static`.  Same hw.mem_* pattern as
-// enc_ctx.nv / att_scratch.nv: byte-level @tests can't run on
-// the OCaml backend (hw.mem_write8 panics), so unit testing
-// here is limited to the offset-sanity table.  Behavioural
-// verification needs a sniffer rig; nothing here does that.
+// enc_ctx.nv / att_scratch.nv: tests/smp_ctx_tests.nv checks the
+// offset table and drives each accessor through hw.mem_*.  What a
+// pairing puts on the air needs a sniffer rig; nothing here does that.
 //
 // Single-connection only.  More than one would replace these flat
 // slots with per-conn fields owned by host_conn_task[i]; the
@@ -23,9 +22,6 @@
 // target.
 //
 // Satisfies REQ-BLE-SMP-031 (per-conn SMP state).
-
-use std.test
-use std.bits
 
 // ── Base + offsets ──────────────────────────────────────────────────
 
@@ -273,33 +269,6 @@ pub @tier(embedded)
 fn clear_all() [hw]
     for i in 0..128
         hw.mem_write8(smp_ctx_base() + i, 0)
-
-// ── Tests ────────────────────────────────────────────────────────────
-//
-// hw.mem_* panics on the OCaml backend so we can't @test the
-// byte accessors directly.  What we CAN test is the offset
-// table — a transcription error in any constant silently
-// corrupts every pairing exchange and is impossible to debug
-// without a sniffer.
-
-@test
-fn test_offset_table_matches_documented_layout()
-    test.assert_eq(SMP_CTX_PRES_OFFSET, 0x00)
-    test.assert_eq(SMP_CTX_PREQ_OFFSET, 0x07)
-    test.assert_eq(SMP_CTX_RAT_OFFSET, 0x0E)
-    test.assert_eq(SMP_CTX_IAT_OFFSET, 0x0F)
-    test.assert_eq(SMP_CTX_RA_OFFSET, 0x10)
-    test.assert_eq(SMP_CTX_IA_OFFSET, 0x16)
-    test.assert_eq(SMP_CTX_TK_OFFSET, 0x20)
-    test.assert_eq(SMP_CTX_SRAND_OFFSET, 0x30)
-    test.assert_eq(SMP_CTX_MRAND_OFFSET, 0x40)
-    test.assert_eq(SMP_CTX_SCONFIRM_OFFSET, 0x50)
-    test.assert_eq(SMP_CTX_MCONFIRM_OFFSET, 0x60)
-    test.assert_eq(SMP_CTX_TOTAL_BYTES, 128)
-    // Total used: pres(7) + preq(7) + rat(1) + iat(1) + ra(6) +
-    // ia(6) + 4-byte gap + 5×16(TK+Srand+Mrand+Sconfirm+Mconfirm)
-    //   = 28 + 80 = 108 bytes named, < 128 sweep.
-    test.assert(SMP_CTX_MCONFIRM_OFFSET + 16 <= SMP_CTX_TOTAL_BYTES)
 
 // Disjointness from the other fixed buffers is the linker's: every
 // buffer is its own `static`.  tests/integration_ram_window.nv checks

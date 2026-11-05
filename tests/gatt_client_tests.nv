@@ -1,0 +1,246 @@
+// tests/gatt_client_tests.nv — the unit tests of src/gatt_client.nv.
+//
+//   novo test tests/gatt_client_tests.nv
+
+use gatt_client
+use std.test
+use att
+use noble_config
+use links
+use gatt_client.{ ClientTable, DEFAULT_MTU, ERR_ARGUMENT, ERR_NO_BEARER, ERR_NO_LINK, HASH_OCTETS, QUEUE_FIELDS, REGS, STATUS_MISMATCH, STATUS_OK, STATUS_TIMEOUT, base_lo, bearers, begin_discover_characteristics, begin_discover_services, begin_exchange_mtu, begin_read, begin_read_long, begin_subscribe, cache, close, close_bearer, init_table, is_busy, is_local, is_out_of_sync, is_peer_error, max1, mtu, needs_security, new_table, open, open_bearer, pdu_octets, queue, short_of, slot_of, uuid128, uuid16, uuid_same, value_octets }
+
+// ── Tests ───────────────────────────────────────────────────────────
+//
+// The tests of the engine against a GATT server are in
+// tests/gatt_client_engine_tests.nv; these cover what needs no peer.
+
+@test
+fn test_the_capacities_are_the_limits()
+    var t = new_table()
+    test.assert_eq(gatt_client.links(), max1(noble_config.MAX_CLIENT_LINKS))
+    test.assert_eq(bearers(), max1(noble_config.CLIENT_BEARERS))
+    test.assert_eq(cache(), max1(noble_config.CLIENT_CACHE_RECORDS))
+    test.assert_eq(queue(), max1(noble_config.CLIENT_QUEUE))
+    test.assert_eq(value_octets(), max1(noble_config.CLIENT_VALUE_BYTES))
+    test.assert_eq(pdu_octets(), noble_config.MAX_ATT_MTU)
+    test.assert_eq(t.generation.capacity(), gatt_client.links())
+    test.assert_eq(t.opened.capacity(), gatt_client.links())
+    test.assert_eq(t.flags.capacity(), gatt_client.links())
+    test.assert_eq(t.sc_handle.capacity(), gatt_client.links())
+    test.assert_eq(t.cache_n.capacity(), gatt_client.links())
+    test.assert_eq(t.hash.capacity(), gatt_client.links() * HASH_OCTETS)
+    test.assert_eq(t.c_kind.capacity(), gatt_client.links() * cache())
+    test.assert_eq(t.c_flags.capacity(), gatt_client.links() * cache())
+    test.assert_eq(t.c_handle.capacity(), gatt_client.links() * cache())
+    test.assert_eq(t.c_a.capacity(), gatt_client.links() * cache())
+    test.assert_eq(t.c_b.capacity(), gatt_client.links() * cache())
+    test.assert_eq(t.c_lo.capacity(), gatt_client.links() * cache())
+    test.assert_eq(t.c_hi.capacity(), gatt_client.links() * cache())
+    test.assert_eq(t.regs.capacity(), gatt_client.links() * bearers() * REGS)
+    test.assert_eq(t.queue.capacity(), gatt_client.links() * bearers() * queue() * QUEUE_FIELDS)
+    test.assert_eq(t.value.capacity(), gatt_client.links() * bearers() * value_octets())
+    test.assert_eq(t.payload.capacity(), gatt_client.links() * bearers() * value_octets())
+    test.assert_eq(t.tx.capacity(), gatt_client.links() * bearers() * pdu_octets())
+
+@test
+fn test_every_column_is_filled_to_its_capacity()
+    var t = new_table()
+    test.assert(t.regs.is_full())
+    test.assert(t.queue.is_full())
+    test.assert(t.value.is_full())
+    test.assert(t.tx.is_full())
+    test.assert(t.c_lo.is_full())
+    test.assert(t.hash.is_full())
+
+@test
+fn test_init_table_fills_a_table_of_empty_columns_and_returns_one_in_use_to_its_first_state()
+    var t = ClientTable {
+        generation: Vec.new(), opened: Vec.new(), flags: Vec.new(), sc_handle: Vec.new(), cache_n: Vec.new(),
+        hash: Vec.new(), c_kind: Vec.new(), c_flags: Vec.new(), c_handle: Vec.new(), c_a: Vec.new(),
+        c_b: Vec.new(), c_lo: Vec.new(), c_hi: Vec.new(), regs: Vec.new(), queue: Vec.new(),
+        value: Vec.new(), payload: Vec.new(), tx: Vec.new() }
+    test.assert_eq(t.regs.len(), 0)
+    init_table(var t)
+    test.assert(t.regs.is_full())
+    test.assert(t.tx.is_full())
+    let id = links.link_id(0, 1)
+    test.assert(open(t, id))
+    test.assert_eq(slot_of(var t, id), 0)
+    t.regs[3] = 77
+    init_table(var t)
+    test.assert_eq(slot_of(var t, id), -1)
+    test.assert_eq(t.regs[3], 0)
+    test.assert(t.regs.is_full())
+
+@test
+fn test_a_uuid_on_the_base_is_its_short_form()
+    let lo = base_lo()
+    let hi = 0x1000 | (0x180F << 32)
+    let u = uuid128(lo, hi)
+    test.assert(not u.wide)
+    test.assert(uuid_same(u, uuid16(0x180F)))
+    test.assert_eq(short_of(lo, hi), 0x180F)
+    test.assert_eq(short_of(lo + 1, hi), -1)
+    test.assert_eq(short_of(lo, hi | 0x10000), -1)
+
+@test
+fn test_other_uuids_stay_wide_and_compare_by_value()
+    let a = uuid128(0x1122334455667788, 0x0102030405060708)
+    let b = uuid128(0x1122334455667788, 0x0102030405060708)
+    let c = uuid128(0x1122334455667788, 0x0102030405060709)
+    test.assert(a.wide)
+    test.assert(uuid_same(a, b))
+    test.assert(not uuid_same(a, c))
+    test.assert(not uuid_same(a, uuid16(0x1122)))
+
+@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2)
+@test
+fn test_a_link_is_named_by_its_slot_and_generation()
+    var t = new_table()
+    let first = links.link_id(1, 4)
+    test.assert(open(t, first))
+    test.assert_eq(slot_of(var t, first), 1)
+    test.assert_eq(slot_of(var t, links.link_id(1, 5)), -1)
+    test.assert_eq(slot_of(var t, links.link_id(0, 4)), -1)
+    test.assert(open(t, links.link_id(1, 5)))
+    test.assert_eq(slot_of(var t, first), -1)
+    test.assert_eq(slot_of(var t, links.link_id(1, 5)), 1)
+
+@test
+fn test_a_slot_the_table_does_not_have_does_not_open()
+    var t = new_table()
+    test.assert(not open(t, links.link_id(gatt_client.links(), 0)))
+    test.assert(not open(t, links.link_id(-1, 0)))
+    test.assert_eq(slot_of(var t, links.no_link()), -1)
+
+@test
+fn test_a_closed_link_names_nothing()
+    var t = new_table()
+    let id = links.link_id(0, 1)
+    test.assert(open(t, id))
+    close(var t, id)
+    test.assert_eq(slot_of(var t, id), -1)
+    test.assert_eq(begin_read(t, id, 0, 3), ERR_NO_LINK)
+
+@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2)
+@test
+fn test_a_request_on_a_bearer_that_is_not_open_is_refused()
+    var t = new_table()
+    let id = links.link_id(0, 1)
+    test.assert(open(t, id))
+    test.assert_eq(begin_read(t, id, 1, 3), ERR_NO_BEARER)
+    test.assert_eq(begin_read(t, id, bearers(), 3), ERR_NO_BEARER)
+    test.assert_eq(begin_read(t, id, -1, 3), ERR_NO_BEARER)
+    test.assert(open_bearer(t, id, 1, 100))
+    test.assert_eq(mtu(var t, id, 1), 100)
+    test.assert(begin_read(t, id, 1, 3) > 0)
+
+@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2)
+@test
+fn test_an_enhanced_bearer_takes_the_mtu_of_its_channel_and_no_exchange()
+    var t = new_table()
+    let id = links.link_id(0, 1)
+    test.assert(open(t, id))
+    test.assert(not open_bearer(t, id, 0, 100))
+    test.assert(not open_bearer(t, id, bearers(), 100))
+    test.assert(not open_bearer(t, id, 1, DEFAULT_MTU - 1))
+    test.assert(not open_bearer(t, id, 1, pdu_octets() + 1))
+    test.assert(open_bearer(t, id, 1, 64))
+    test.assert_eq(begin_exchange_mtu(var t, id, 1), ERR_ARGUMENT)
+    close_bearer(var t, id, 1)
+    test.assert_eq(mtu(var t, id, 1), 0)
+
+@test
+fn test_a_range_is_checked_before_a_request_is_queued()
+    var t = new_table()
+    let id = links.link_id(0, 1)
+    test.assert(open(t, id))
+    test.assert_eq(begin_discover_services(var t, id, 0, 0, 5, false), ERR_ARGUMENT)
+    test.assert_eq(begin_discover_services(var t, id, 0, 6, 5, false), ERR_ARGUMENT)
+    test.assert_eq(begin_discover_characteristics(var t, id, 0, 1, 0x10000), ERR_ARGUMENT)
+    test.assert_eq(begin_read(t, id, 0, 0), ERR_ARGUMENT)
+    test.assert_eq(begin_read_long(var t, id, 0, 0x10000), ERR_ARGUMENT)
+    test.assert_eq(begin_subscribe(var t, id, 0, 9, 4), ERR_ARGUMENT)
+    test.assert(not is_busy(var t, id, 0))
+
+@test
+fn test_status_codes_map_to_what_a_caller_does_about_them()
+    test.assert(is_peer_error(att.ATT_ERR_READ_NOT_PERMITTED))
+    test.assert(not is_peer_error(STATUS_OK))
+    test.assert(not is_peer_error(STATUS_TIMEOUT))
+    test.assert(needs_security(att.ATT_ERR_INSUFFICIENT_AUTHENTICATION))
+    test.assert(needs_security(att.ATT_ERR_INSUFFICIENT_AUTHORIZATION))
+    test.assert(needs_security(att.ATT_ERR_INSUFFICIENT_ENC_KEY_SIZE))
+    test.assert(needs_security(att.ATT_ERR_INSUFFICIENT_ENCRYPTION))
+    test.assert(not needs_security(att.ATT_ERR_WRITE_NOT_PERMITTED))
+    test.assert(is_out_of_sync(att.ATT_ERR_DATABASE_OUT_OF_SYNC))
+    test.assert(is_local(STATUS_TIMEOUT))
+    test.assert(is_local(STATUS_MISMATCH))
+    test.assert(not is_local(att.ATT_ERR_INVALID_HANDLE))
+
+@when(noble_config.MAX_CLIENT_LINKS >= 1 and noble_config.CLIENT_CACHE_RECORDS >= 3)
+@test
+fn test_the_cache_stores_a_record_once_per_kind_and_handle_and_finds_the_next_boundary()
+    var t = gatt_client.new_table()
+    test.assert(gatt_client.open(var t, links.link_id(0, 1)))
+    let uuid = gatt_client.uuid16(0x2A00)
+    test.assert(gatt_client.cache_put(var t, 0, gatt_client.KIND_SERVICE, 0x0010, 0x0010, 0x0020, uuid, 0))
+    test.assert(gatt_client.cache_put(var t, 0, gatt_client.KIND_CHAR, 0x0021, 0x0022, 0, uuid, 0))
+    // A record of the same kind and handle replaces itself.
+    test.assert(gatt_client.cache_put(var t, 0, gatt_client.KIND_CHAR, 0x0021, 0x0023, 0, uuid, 0))
+    test.assert_eq(t.cache_n[0], 2)
+    // The boundary after a value handle is the next declaration; none gives 0x10000.
+    test.assert_eq(gatt_client.boundary_after(var t, 0, 0x0010), 0x0021)
+    test.assert_eq(gatt_client.boundary_after(var t, 0, 0x0021), 0x10000)
+    test.assert_eq(gatt_client.boundary_after(var t, 0, 0x0005), 0x0010)
+    // A full cache refuses a new record and still takes a replacement.
+    var i = 0
+    var refused = false
+    while i < gatt_client.cache() + 1 and not refused
+        refused = not gatt_client.cache_put(var t, 0, gatt_client.KIND_CHAR, 0x0100 + i, 0x0101 + i, 0, uuid, 0)
+        i = i + 1
+    test.assert(refused)
+    test.assert(gatt_client.cache_put(var t, 0, gatt_client.KIND_SERVICE, 0x0010, 0x0010, 0x0020, uuid, 0))
+
+@when(noble_config.MAX_CLIENT_LINKS >= 1 and noble_config.CLIENT_BEARERS >= 1 and noble_config.CLIENT_CACHE_RECORDS >= 1)
+@test
+fn test_a_request_with_a_bad_range_or_for_no_link_or_no_open_bearer_is_refused_before_it_is_queued()
+    var t = gatt_client.new_table()
+    let link = links.link_id(0, 1)
+    let uuid = gatt_client.uuid16(0x2A00)
+    // No link is open yet.
+    test.assert_eq(gatt_client.begin_exchange_mtu(var t, link, 0), gatt_client.ERR_NO_LINK)
+    test.assert(gatt_client.open(var t, link))
+    // The range: start from 1, end at least start, end at most 0xFFFF.
+    test.assert_eq(gatt_client.begin_discover_services_by_uuid(var t, link, 0, 0, 5, uuid),
+        gatt_client.ERR_ARGUMENT)
+    test.assert_eq(gatt_client.begin_find_included(var t, link, 0, 5, 4), gatt_client.ERR_ARGUMENT)
+    test.assert_eq(gatt_client.begin_discover_characteristics_by_uuid(var t, link, 0, 1, 0x10000, uuid),
+        gatt_client.ERR_ARGUMENT)
+    test.assert_eq(gatt_client.begin_discover_descriptors(var t, link, 0, 0, 0), gatt_client.ERR_ARGUMENT)
+    test.assert_eq(gatt_client.begin_read_by_type(var t, link, 0, 3, 2, uuid), gatt_client.ERR_ARGUMENT)
+    // A bearer the table does not have.
+    test.assert_eq(gatt_client.begin_exchange_mtu(var t, link, gatt_client.bearers()), gatt_client.ERR_NO_BEARER)
+
+@when(noble_config.MAX_CLIENT_LINKS >= 1 and noble_config.CLIENT_BEARERS >= 1 and noble_config.CLIENT_CACHE_RECORDS >= 1)
+@test
+fn test_what_a_link_the_table_does_not_hold_has_to_report_is_zero()
+    var t = gatt_client.new_table()
+    let link = links.link_id(0, 1)
+    test.assert_eq(gatt_client.result_ticket(var t, link, 0), 0)
+    test.assert_eq(gatt_client.result_handle(var t, link, 0), 0)
+    test.assert_eq(gatt_client.result_found(var t, link, 0), 0)
+    test.assert_eq(gatt_client.result_item_len(var t, link, 0), 0)
+    test.assert_eq(gatt_client.service_changed_first(var t, link, 0), 0)
+    test.assert_eq(gatt_client.service_changed_last(var t, link, 0), 0)
+    test.assert(gatt_client.open(var t, link))
+    // A record that is not there reads as 0 and an empty 16-bit UUID.
+    test.assert_eq(gatt_client.cache_a_at(var t, link, 0), 0)
+    test.assert_eq(gatt_client.cache_b_at(var t, link, 0), 0)
+    test.assert(gatt_client.uuid_same(gatt_client.cache_uuid_at(var t, link, 0), gatt_client.uuid16(0)))
+
+@test
+fn test_max1_keeps_one_record_of_a_table_that_the_configuration_leaves_out()
+    test.assert_eq(gatt_client.max1(0), 1)
+    test.assert_eq(gatt_client.max1(1), 1)
+    test.assert_eq(gatt_client.max1(9), 9)

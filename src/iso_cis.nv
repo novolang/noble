@@ -54,9 +54,7 @@
 //
 // Satisfies: REQ-BLE-ISO-003.
 
-use std.test
 use hci_commands
-use budget
 use hci_codec
 use iso_event
 use noble_config
@@ -230,7 +228,7 @@ fn cis_free_rows(var t: CisTable) -> Int
     for i in 0..t.state.len()
         if t.state[i] == CisState.Unused
             n = n + 1
-    n - (t.reserved as Int)
+    n - t.reserved as Int
 
 // The row of the first free CIG slot, or -1.
 @tier(embedded)
@@ -377,7 +375,7 @@ fn cig_parameters_status(cig: hci_commands.CigParameters, cis: [hci_commands.Cis
 fn cig_admit_status(var t: CisTable, cig_id: Int, added: Int) -> Int
     if t.pending != CisPending.NoCommand or cig_active(var t, cig_id)
         return iso_event.STATUS_COMMAND_DISALLOWED
-    if added > cis_free_rows(var t) or (cig_slot_of(var t, cig_id) < 0 and cig_slot_free(var t) < 0)
+    if added > cis_free_rows(var t) or cig_slot_of(var t, cig_id) < 0 and cig_slot_free(var t) < 0
         return iso_event.STATUS_MEMORY_CAPACITY_EXCEEDED
     iso_event.STATUS_SUCCESS
 
@@ -407,7 +405,8 @@ fn cig_note_stream(var t: CisTable, k: Int, cis_id: Int, sends: Bool, receives: 
 pub @satisfies("REQ-BLE-ISO-003")
 @tier(embedded)
 @no_alloc
-fn cig_set_parameters(var t: CisTable, cig: hci_commands.CigParameters, cis: [hci_commands.CisParameters]) -> Int
+fn cig_set_parameters(var t: CisTable, cig: hci_commands.CigParameters,
+                      cis: [hci_commands.CisParameters]) -> Int
     if t.pending != CisPending.NoCommand
         return iso_event.STATUS_COMMAND_DISALLOWED
     let bad = cig_parameters_status(cig, cis)
@@ -455,7 +454,8 @@ fn single_phy_ok(phy: Int) -> Bool
 // than one bit are invalid combinations.
 @tier(embedded)
 @no_alloc
-fn cig_test_parameters_status(cig: hci_commands.CigTestParameters, cis: [hci_commands.CisTestParameters]) -> Int
+fn cig_test_parameters_status(cig: hci_commands.CigTestParameters,
+                              cis: [hci_commands.CisTestParameters]) -> Int
     let invalid = iso_event.STATUS_INVALID_COMMAND_PARAMETERS
     if cig.cig_id < 0 or cig.cig_id > ID_MAX
         return invalid
@@ -497,7 +497,8 @@ fn cig_test_parameters_status(cig: hci_commands.CigTestParameters, cis: [hci_com
 @satisfies("REQ-BLE-ISO-003")
 @tier(embedded)
 @no_alloc
-fn cig_set_parameters_test(var t: CisTable, cig: hci_commands.CigTestParameters, cis: [hci_commands.CisTestParameters]) -> Int
+fn cig_set_parameters_test(var t: CisTable, cig: hci_commands.CigTestParameters,
+                           cis: [hci_commands.CisTestParameters]) -> Int
     if t.pending != CisPending.NoCommand
         return iso_event.STATUS_COMMAND_DISALLOWED
     let bad = cig_test_parameters_status(cig, cis)
@@ -694,7 +695,7 @@ fn cis_create_status(var t: CisTable, status: Int) -> iso_event.IsoEvent
     if status == iso_event.STATUS_SUCCESS
         pending_clear(var t)
         return iso_event.iso_event(iso_event.IsoEventKind.CommandDone, -1, 0, status)
-    for k in 0..(t.pending_count as Int)
+    for k in 0..t.pending_count as Int
         cis_unstream(var t, t.pending_ids[k] as Int)
     pending_clear(var t)
     iso_event.command_failed(0, status)
@@ -714,10 +715,16 @@ fn cis_request(var t: CisTable, req: hci_codec.CisRequest, acl: AclRef) -> iso_e
     if cis_row(var t, req.cis_connection_handle) >= 0
         return iso_event.unrelated(req.cis_connection_handle)
     if acl.central or not links.is_link(acl.link)
-        return iso_event.iso_event(iso_event.IsoEventKind.CisRequestRefused, -1, req.cis_connection_handle, iso_event.STATUS_COMMAND_DISALLOWED)
+        return iso_event.iso_event(iso_event.IsoEventKind.CisRequestRefused,
+            -1,
+            req.cis_connection_handle,
+            iso_event.STATUS_COMMAND_DISALLOWED)
     let at = free_row(t)
     if at < 0 or cis_free_rows(var t) < 1
-        return iso_event.iso_event(iso_event.IsoEventKind.CisRequestRefused, -1, req.cis_connection_handle, iso_event.STATUS_REJECTED_LIMITED_RESOURCES)
+        return iso_event.iso_event(iso_event.IsoEventKind.CisRequestRefused,
+            -1,
+            req.cis_connection_handle,
+            iso_event.STATUS_REJECTED_LIMITED_RESOURCES)
     t.state[at] = CisState.Requested
     t.central[at] = false
     t.cig[at] = req.cig_id as u8
@@ -936,7 +943,8 @@ fn cis_acl_closed(var t: CisTable, acl: links.LinkId) -> Int
 pub @satisfies("REQ-BLE-ISO-003")
 @tier(embedded)
 @no_alloc
-fn data_path_setup(var t: CisTable, handle: Int, direction: Int, coding_format: Int, configuration_length: Int) -> Int
+fn data_path_setup(var t: CisTable, handle: Int, direction: Int, coding_format: Int,
+                   configuration_length: Int) -> Int
     let at = cis_row(var t, handle)
     if at < 0
         return iso_event.STATUS_UNKNOWN_CONNECTION_IDENTIFIER
@@ -951,8 +959,11 @@ fn data_path_setup(var t: CisTable, handle: Int, direction: Int, coding_format: 
         return iso_event.STATUS_COMMAND_DISALLOWED
     if not t.central[at] and st != CisState.Accepting and st != CisState.Established
         return iso_event.STATUS_COMMAND_DISALLOWED
-    let bit = if direction == PATH_INPUT then PATH_BIT_INPUT else PATH_BIT_OUTPUT
-    if ((t.paths[at] as Int) & bit) != 0
+    let bit = if direction == PATH_INPUT
+        PATH_BIT_INPUT
+    else
+        PATH_BIT_OUTPUT
+    if (t.paths[at] as Int & bit) != 0
         return iso_event.STATUS_COMMAND_DISALLOWED
     if direction == PATH_INPUT and not t.can_send[at]
         return iso_event.STATUS_COMMAND_DISALLOWED
@@ -977,8 +988,11 @@ fn data_path_setup_complete(var t: CisTable, status: Int, handle: Int) -> iso_ev
         return iso_event.command_failed(handle, status)
     if at < 0
         return iso_event.unrelated(handle)
-    let bit = if direction == PATH_INPUT then PATH_BIT_INPUT else PATH_BIT_OUTPUT
-    t.paths[at] = ((t.paths[at] as Int) | bit) as u8
+    let bit = if direction == PATH_INPUT
+        PATH_BIT_INPUT
+    else
+        PATH_BIT_OUTPUT
+    t.paths[at] = (t.paths[at] as Int | bit) as u8
     iso_event.iso_event(iso_event.IsoEventKind.DataPathSet, at, handle, status)
 
 // Check LE Remove ISO Data Path ([Vol 4] Part E, Section 7.8.110) for the
@@ -995,7 +1009,7 @@ fn data_path_remove(var t: CisTable, handle: Int, directions: Int) -> Int
         return iso_event.STATUS_UNKNOWN_CONNECTION_IDENTIFIER
     if directions < 1 or directions > 3
         return iso_event.STATUS_INVALID_COMMAND_PARAMETERS
-    if t.pending != CisPending.NoCommand or ((t.paths[at] as Int) & directions) != directions
+    if t.pending != CisPending.NoCommand or (t.paths[at] as Int & directions) != directions
         return iso_event.STATUS_COMMAND_DISALLOWED
     t.pending = CisPending.RemoveCisPath
     t.pending_handle = handle as u16
@@ -1015,7 +1029,7 @@ fn data_path_remove_complete(var t: CisTable, status: Int, handle: Int) -> iso_e
         return iso_event.command_failed(handle, status)
     if at < 0
         return iso_event.unrelated(handle)
-    t.paths[at] = ((t.paths[at] as Int) & (0x03 - directions)) as u8
+    t.paths[at] = (t.paths[at] as Int & (0x03 - directions)) as u8
     iso_event.iso_event(iso_event.IsoEventKind.DataPathRemoved, at, handle, status)
 
 // Whether ISO data may be sent in the stream `handle`: it is established
@@ -1024,7 +1038,7 @@ pub @tier(embedded)
 @no_alloc
 fn cis_may_send(var t: CisTable, handle: Int) -> Bool
     let at = cis_row(var t, handle)
-    at >= 0 and t.state[at] == CisState.Established and ((t.paths[at] as Int) & PATH_BIT_INPUT) != 0
+    at >= 0 and t.state[at] == CisState.Established and (t.paths[at] as Int & PATH_BIT_INPUT) != 0
 
 // The bytes one row of the table takes: the columns of a stream (state,
 // CIG_ID, CIS_ID, role, handle, ACL slot, generation, ACL handle, paths and
@@ -1032,7 +1046,7 @@ fn cis_may_send(var t: CisTable, handle: Int) -> Bool
 // flight.  `budget.CIS_RECORD` has to cover it.
 const CIS_ROW_BYTES = 21
 
-// ── Tests ────────────────────────────────────────────────────────────
+// ── Fixtures that the suites of other modules share ─────────────────────
 
 @tier(app)
 fn cig_fixture(cig_id: Int) -> hci_commands.CigParameters
@@ -1042,1082 +1056,7 @@ fn cig_fixture(cig_id: Int) -> hci_commands.CigParameters
         max_transport_latency_c_to_p: 20, max_transport_latency_p_to_c: 20 }
 
 @tier(app)
-fn cig_with(cig_id: Int, sca: Int, packing: Int, framing: Int, interval_c: Int, interval_p: Int, latency_c: Int, latency_p: Int) -> hci_commands.CigParameters
-    hci_commands.CigParameters {
-        cig_id: cig_id, sdu_interval_c_to_p: interval_c, sdu_interval_p_to_c: interval_p,
-        worst_case_sca: sca, packing: packing, framing: framing,
-        max_transport_latency_c_to_p: latency_c, max_transport_latency_p_to_c: latency_p }
-
-@tier(app)
 fn cis_cfg(cis_id: Int, sdu_c: Int, sdu_p: Int) -> hci_commands.CisParameters
     hci_commands.CisParameters {
         cis_id: cis_id, max_sdu_c_to_p: sdu_c, max_sdu_p_to_c: sdu_p,
         phy_c_to_p: 0x02, phy_p_to_c: 0x02, rtn_c_to_p: 2, rtn_p_to_c: 2 }
-
-@tier(app)
-fn cis_cfg_phy(cis_id: Int, phy_c: Int, phy_p: Int) -> hci_commands.CisParameters
-    hci_commands.CisParameters {
-        cis_id: cis_id, max_sdu_c_to_p: 100, max_sdu_p_to_c: 100,
-        phy_c_to_p: phy_c, phy_p_to_c: phy_p, rtn_c_to_p: 2, rtn_p_to_c: 2 }
-
-@tier(app)
-fn acl_ref(handle: Int, slot: Int, generation: Int, central: Bool) -> AclRef
-    AclRef { handle: handle, link: links.link_id(slot, generation), central: central }
-
-@tier(app)
-fn established_event(handle: Int, status: Int, bn_c: Int, bn_p: Int) -> hci_codec.CisEstablished
-    hci_codec.CisEstablished {
-        v2: true, status: status, connection_handle: handle, cig_sync_delay: 0, cis_sync_delay: 0,
-        transport_latency_c_to_p: 0, transport_latency_p_to_c: 0, phy_c_to_p: 2, phy_p_to_c: 2,
-        nse: 2, bn_c_to_p: bn_c, bn_p_to_c: bn_p, ft_c_to_p: 1, ft_p_to_c: 1,
-        max_pdu_c_to_p: 100, max_pdu_p_to_c: 100, iso_interval: 8, sub_interval: 0,
-        max_sdu_c_to_p: 100, max_sdu_p_to_c: 100, sdu_interval_c_to_p: 10000,
-        sdu_interval_p_to_c: 10000, framing: 0 }
-
-@tier(app)
-fn request_event(acl_handle: Int, cis_handle: Int, cig_id: Int, cis_id: Int) -> hci_codec.CisRequest
-    hci_codec.CisRequest { acl_connection_handle: acl_handle, cis_connection_handle: cis_handle, cig_id: cig_id, cis_id: cis_id }
-
-// Configure CIG `cig_id` with the CIS_IDs `ids` (both directions) and give
-// them `handles`, asserting that every step succeeds.
-@tier(app)
-fn configure(var t: CisTable, cig_id: Int, ids: [Int], handles: [Int])
-    var cfg: [hci_commands.CisParameters] = []
-    for id in ids
-        list.push(cfg, cis_cfg(id, 100, 100))
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(cig_id), cfg), 0)
-    let e = cig_set_complete(var t, 0, cig_id, handles)
-    test.assert(e.kind == iso_event.IsoEventKind.CigConfigured)
-
-// Take the stream `handle` of a configured table through Create CIS to
-// Established, with data in both directions.
-@tier(app)
-fn bring_up(var t: CisTable, handle: Int)
-    cis_host_support(var t, true)
-    test.assert_eq(cis_create(var t, [handle], [acl_ref(0x0001, 0, 1, true)]), 0)
-    let a = cis_create_status(var t, 0)
-    test.assert(a.kind == iso_event.IsoEventKind.CommandDone)
-    let e = cis_established(t, established_event(handle, 0, 1, 1))
-    test.assert(e.kind == iso_event.IsoEventKind.CisEstablished)
-
-// A Peripheral's table with the stream `handle` requested, accepted and
-// established.
-@tier(app)
-fn peripheral_up(var t: CisTable, handle: Int)
-    let r = cis_request(t, request_event(0x0001, handle, 3, 4), acl_ref(0x0001, 0, 1, false))
-    test.assert(r.kind == iso_event.IsoEventKind.CisRequested)
-    test.assert_eq(cis_accept(var t, handle), 0)
-    let s = cis_accept_status(var t, 0)
-    test.assert(s.kind == iso_event.IsoEventKind.CommandDone)
-    let e = cis_established(t, established_event(handle, 0, 1, 1))
-    test.assert(e.kind == iso_event.IsoEventKind.CisEstablished)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_a_new_table_is_empty_and_its_capacity_is_the_limit()
-    var t = cis_table_new()
-    test.assert_eq(t.state.capacity(), noble_config.MAX_CIS)
-    test.assert_eq(t.state.len(), noble_config.MAX_CIS)
-    test.assert_eq(t.cig_used.capacity(), noble_config.MAX_CIS)
-    test.assert_eq(t.pending_ids.capacity(), noble_config.MAX_CIS)
-    test.assert_eq(t.handle.capacity(), noble_config.MAX_CIS)
-    test.assert_eq(t.acl_generation.capacity(), noble_config.MAX_CIS)
-    test.assert_eq(cis_free_rows(var t), noble_config.MAX_CIS)
-    test.assert(t.pending == CisPending.NoCommand)
-    test.assert(not t.host_support)
-    test.assert_eq(cis_row(var t, 0), -1)
-
-@test
-fn test_a_row_fits_the_budget_record()
-    test.assert(CIS_ROW_BYTES <= budget.CIS_RECORD)
-
-// ── LE Set CIG Parameters ───────────────────────────────────────────
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_set_cig_parameters_reserves_and_waits()
-    var t = cis_table_new()
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(1), [cis_cfg(0, 100, 0), cis_cfg(1, 0, 100)]), 0)
-    test.assert(t.pending == CisPending.SetCig)
-    test.assert_eq(t.pending_cig as Int, 1)
-    test.assert_eq(t.pending_count as Int, 2)
-    test.assert_eq(t.reserved as Int, 2)
-    test.assert_eq(t.pending_ids[1] as Int, 1)
-    test.assert(t.pending_tx[0] and not t.pending_rx[0])
-    test.assert(not t.pending_tx[1] and t.pending_rx[1])
-    // The reserved rows are no longer free.
-    test.assert_eq(cis_free_rows(var t), 0)
-    // A second command is refused while this one is in flight.
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(2), []), iso_event.STATUS_COMMAND_DISALLOWED)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_set_cig_parameters_refuses_a_parameter_out_of_range()
-    var t = cis_table_new()
-    let one = [cis_cfg(0, 100, 100)]
-    let invalid = iso_event.STATUS_INVALID_COMMAND_PARAMETERS
-    // CIG_ID is 0x00 to 0xEF.
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(0xF0), one), invalid)
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(-1), one), invalid)
-    // SDU_Interval is 0x0000FF to 0x0FFFFF, in either direction.
-    test.assert_eq(cig_set_parameters(var t, cig_with(1, 0, 0, 0, 0xFE, 10000, 20, 20), one), invalid)
-    test.assert_eq(cig_set_parameters(var t, cig_with(1, 0, 0, 0, 10000, 0x100000, 20, 20), one), invalid)
-    // Worst_Case_SCA 0 to 7, Packing 0 to 1, Framing 0 to 2.
-    test.assert_eq(cig_set_parameters(var t, cig_with(1, 8, 0, 0, 10000, 10000, 20, 20), one), invalid)
-    test.assert_eq(cig_set_parameters(var t, cig_with(1, 0, 2, 0, 10000, 10000, 20, 20), one), invalid)
-    test.assert_eq(cig_set_parameters(var t, cig_with(1, 0, 0, 3, 10000, 10000, 20, 20), one), invalid)
-    // Max_Transport_Latency is 0x0005 to 0x0FA0, in either direction.
-    test.assert_eq(cig_set_parameters(var t, cig_with(1, 0, 0, 0, 10000, 10000, 4, 20), one), invalid)
-    test.assert_eq(cig_set_parameters(var t, cig_with(1, 0, 0, 0, 10000, 10000, 0x0FA1, 20), one), invalid)
-    test.assert_eq(cig_set_parameters(var t, cig_with(1, 0, 0, 0, 10000, 10000, 20, 4), one), invalid)
-    test.assert_eq(cig_set_parameters(var t, cig_with(1, 0, 0, 0, 10000, 10000, 20, 0x0FA1), one), invalid)
-    // Nothing was reserved by a refusal.
-    test.assert(t.pending == CisPending.NoCommand)
-    // The bounds themselves are accepted.
-    test.assert_eq(cig_set_parameters(var t, cig_with(0xEF, 7, 1, 2, 0xFF, 0xFFFFF, 5, 0x0FA0), [cis_cfg(0xEF, 0xFFF, 0)]), 0)
-    test.assert(t.pending == CisPending.SetCig)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_set_cig_parameters_refuses_a_stream_configuration_out_of_range()
-    var t = cis_table_new()
-    let invalid = iso_event.STATUS_INVALID_COMMAND_PARAMETERS
-    let unsupported = iso_event.STATUS_UNSUPPORTED_FEATURE_OR_PARAMETER
-    // CIS_ID above 0xEF, Max_SDU above 0x0FFF.
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(1), [cis_cfg(0xF0, 100, 100)]), invalid)
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(1), [cis_cfg(0, 0x1000, 100)]), invalid)
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(1), [cis_cfg(0, 100, 0x1000)]), invalid)
-    // A stream with no data in either direction is an invalid combination.
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(1), [cis_cfg(0, 0, 0)]), invalid)
-    // At least one PHY bit; a bit outside the three PHYs is unsupported.
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(1), [cis_cfg_phy(0, 0, 2)]), invalid)
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(1), [cis_cfg_phy(0, 2, 0)]), invalid)
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(1), [cis_cfg_phy(0, 0x08, 2)]), unsupported)
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(1), [cis_cfg_phy(0, 2, 0x10)]), unsupported)
-    test.assert(t.pending == CisPending.NoCommand)
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(1), [cis_cfg_phy(0, 0x07, 0x05)]), 0)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_set_cig_parameters_refuses_a_cis_id_twice_and_a_retransmission_above_a_byte()
-    var t = cis_table_new()
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(1), [cis_cfg(3, 100, 100), cis_cfg(3, 100, 100)]), iso_event.STATUS_INVALID_COMMAND_PARAMETERS)
-    let rtn = hci_commands.CisParameters {
-        cis_id: 0, max_sdu_c_to_p: 100, max_sdu_p_to_c: 100, phy_c_to_p: 2, phy_p_to_c: 2,
-        rtn_c_to_p: 0x100, rtn_p_to_c: 0 }
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(1), [rtn]), iso_event.STATUS_INVALID_COMMAND_PARAMETERS)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_set_cig_parameters_refuses_more_than_the_table_holds()
-    var t = cis_table_new()
-    // One stream more than the table has rows.
-    var cfg: [hci_commands.CisParameters] = []
-    for i in 0..(noble_config.MAX_CIS + 1)
-        list.push(cfg, cis_cfg(i, 100, 100))
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(1), cfg), iso_event.STATUS_MEMORY_CAPACITY_EXCEEDED)
-    test.assert(t.pending == CisPending.NoCommand)
-    // Every CIG slot taken: another CIG is refused although a row is free.
-    configure(t, 1, [0], [0x0010])
-    configure(t, 2, [], [])
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(3), [cis_cfg(0, 100, 100)]), iso_event.STATUS_MEMORY_CAPACITY_EXCEEDED)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_set_cig_parameters_complete_stores_the_configurations()
-    var t = cis_table_new()
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(5), [cis_cfg(7, 100, 0), cis_cfg(8, 0, 120)]), 0)
-    let e = cig_set_complete(var t, 0, 5, [0x0010, 0x0011])
-    test.assert(e.kind == iso_event.IsoEventKind.CigConfigured)
-    test.assert_eq(e.handle, 5)
-    test.assert(t.pending == CisPending.NoCommand)
-    test.assert_eq(t.reserved as Int, 0)
-    let a = cis_row_of(var t, 5, 7)
-    let b = cis_row_of(var t, 5, 8)
-    test.assert(a >= 0 and b >= 0 and a != b)
-    test.assert(t.state[a] == CisState.Configured)
-    test.assert_eq(t.handle[a] as Int, 0x0010)
-    test.assert_eq(t.handle[b] as Int, 0x0011)
-    test.assert(t.central[a])
-    test.assert(t.can_send[a] and not t.can_receive[a])
-    test.assert(not t.can_send[b] and t.can_receive[b])
-    test.assert_eq(cis_row(var t, 0x0011), b)
-    test.assert(cig_slot_of(var t, 5) >= 0)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_set_cig_parameters_complete_with_a_failure_changes_nothing()
-    var t = cis_table_new()
-    configure(t, 1, [0], [0x0010])
-    // The CIG exists; a failed reconfiguration leaves it as it was.
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(1), [cis_cfg(0, 0, 50)]), 0)
-    let e = cig_set_complete(var t, iso_event.STATUS_COMMAND_DISALLOWED, 1, [])
-    test.assert(e.kind == iso_event.IsoEventKind.CommandFailed)
-    test.assert_eq(e.status, 0x0C)
-    test.assert(t.pending == CisPending.NoCommand)
-    test.assert_eq(t.reserved as Int, 0)
-    let a = cis_row_of(var t, 1, 0)
-    test.assert(t.can_send[a] and t.can_receive[a])
-    // A CIG that did not exist is not created by a failure.
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(2), [cis_cfg(0, 100, 100)]), 0)
-    let f = cig_set_complete(var t, iso_event.STATUS_MEMORY_CAPACITY_EXCEEDED, 2, [])
-    test.assert_eq(f.status, 0x07)
-    test.assert_eq(cig_slot_of(var t, 2), -1)
-    test.assert_eq(cis_row_of(var t, 2, 0), -1)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_set_cig_parameters_complete_refuses_an_answer_the_table_cannot_follow()
-    var t = cis_table_new()
-    let invalid = iso_event.STATUS_INVALID_COMMAND_PARAMETERS
-    // Another CIG_ID, the wrong count, a handle above 0x0EFF, a handle twice.
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(1), [cis_cfg(0, 100, 100), cis_cfg(1, 100, 100)]), 0)
-    test.assert_eq(cig_set_complete(var t, 0, 2, [0x10, 0x11]).status, invalid)
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(1), [cis_cfg(0, 100, 100), cis_cfg(1, 100, 100)]), 0)
-    test.assert_eq(cig_set_complete(var t, 0, 1, [0x10]).status, invalid)
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(1), [cis_cfg(0, 100, 100), cis_cfg(1, 100, 100)]), 0)
-    test.assert_eq(cig_set_complete(var t, 0, 1, [0x10, 0x0F00]).status, invalid)
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(1), [cis_cfg(0, 100, 100), cis_cfg(1, 100, 100)]), 0)
-    test.assert_eq(cig_set_complete(var t, 0, 1, [0x10, 0x10]).status, invalid)
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(1), [cis_cfg(0, 100, 100), cis_cfg(1, 100, 100)]), 0)
-    test.assert_eq(cig_set_complete(var t, 0, 1, [-1, 0x10]).status, invalid)
-    // Nothing was stored.
-    test.assert_eq(cis_free_rows(var t), noble_config.MAX_CIS)
-    test.assert_eq(cig_slot_of(var t, 1), -1)
-    // A handle that another CIG's stream holds.
-    configure(t, 1, [0], [0x0020])
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(2), [cis_cfg(0, 100, 100)]), 0)
-    test.assert_eq(cig_set_complete(var t, 0, 2, [0x0020]).status, invalid)
-    test.assert_eq(cig_slot_of(var t, 2), -1)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_set_cig_parameters_complete_without_a_command_is_ignored()
-    var t = cis_table_new()
-    let e = cig_set_complete(var t, 0, 1, [0x10])
-    test.assert(e.kind == iso_event.IsoEventKind.Unrelated)
-    test.assert_eq(cis_free_rows(var t), noble_config.MAX_CIS)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_reconfiguring_a_cis_keeps_its_handle_and_takes_no_row()
-    var t = cis_table_new()
-    configure(t, 1, [0, 1], [0x0010, 0x0011])
-    test.assert_eq(cis_free_rows(var t), 0)
-    // The same CIS_ID again: no new row is needed, so a full table accepts it.
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(1), [cis_cfg(1, 0, 77)]), 0)
-    test.assert_eq(t.reserved as Int, 0)
-    let e = cig_set_complete(var t, 0, 1, [0x0011])
-    test.assert(e.kind == iso_event.IsoEventKind.CigConfigured)
-    let b = cis_row_of(var t, 1, 1)
-    test.assert_eq(t.handle[b] as Int, 0x0011)
-    test.assert(not t.can_send[b] and t.can_receive[b])
-    // The Controller returning another handle for the same CIS_ID is an error.
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(1), [cis_cfg(1, 0, 77)]), 0)
-    test.assert_eq(cig_set_complete(var t, 0, 1, [0x0012]).status, iso_event.STATUS_INVALID_COMMAND_PARAMETERS)
-    test.assert_eq(t.handle[b] as Int, 0x0011)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_a_cig_with_no_cis_is_a_cig()
-    var t = cis_table_new()
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(9), []), 0)
-    let e = cig_set_complete(var t, 0, 9, [])
-    test.assert(e.kind == iso_event.IsoEventKind.CigConfigured)
-    test.assert(cig_slot_of(var t, 9) >= 0)
-    test.assert_eq(cis_free_rows(var t), noble_config.MAX_CIS)
-    // Removing it works as for any CIG.
-    test.assert_eq(cig_remove(var t, 9), 0)
-    test.assert(cig_remove_complete(var t, 0, 9).kind == iso_event.IsoEventKind.CigRemoved)
-    test.assert_eq(cig_slot_of(var t, 9), -1)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_an_active_cig_cannot_be_reconfigured()
-    var t = cis_table_new()
-    configure(t, 1, [0], [0x0010])
-    bring_up(var t, 0x0010)
-    test.assert(cig_active(var t, 1))
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(1), [cis_cfg(0, 100, 100)]), iso_event.STATUS_COMMAND_DISALLOWED)
-    // Another CIG is not affected.
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(2), []), 0)
-
-// ── LE Remove CIG ───────────────────────────────────────────────────
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_remove_cig_deletes_the_configurations_and_their_paths()
-    var t = cis_table_new()
-    configure(t, 1, [0, 1], [0x0010, 0x0011])
-    test.assert_eq(data_path_setup(var t, 0x0010, PATH_INPUT, 0x06, 0), 0)
-    test.assert(data_path_setup_complete(var t, 0, 0x0010).kind == iso_event.IsoEventKind.DataPathSet)
-    test.assert_eq(cig_remove(var t, 1), 0)
-    test.assert(t.pending == CisPending.RemoveCig)
-    let e = cig_remove_complete(var t, 0, 1)
-    test.assert(e.kind == iso_event.IsoEventKind.CigRemoved)
-    test.assert_eq(e.handle, 1)
-    test.assert_eq(cis_free_rows(var t), noble_config.MAX_CIS)
-    test.assert_eq(cis_row(var t, 0x0010), -1)
-    test.assert_eq(cig_slot_of(var t, 1), -1)
-    // The handle may be handed out again, with no path.
-    configure(t, 2, [0], [0x0010])
-    test.assert_eq(t.paths[cis_row(var t, 0x0010)] as Int, 0)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_remove_cig_refusals()
-    var t = cis_table_new()
-    test.assert_eq(cig_remove(var t, 1), iso_event.STATUS_UNKNOWN_CONNECTION_IDENTIFIER)
-    test.assert_eq(cig_remove(var t, 0xF0), iso_event.STATUS_INVALID_COMMAND_PARAMETERS)
-    configure(t, 1, [0], [0x0010])
-    bring_up(var t, 0x0010)
-    // Active: Command Disallowed.
-    test.assert_eq(cig_remove(var t, 1), iso_event.STATUS_COMMAND_DISALLOWED)
-    configure(t, 2, [], [])
-    // One command at a time.
-    test.assert_eq(cig_remove(var t, 2), 0)
-    test.assert_eq(cig_remove(var t, 2), iso_event.STATUS_COMMAND_DISALLOWED)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_remove_cig_complete_failure_and_stray_answers()
-    var t = cis_table_new()
-    configure(t, 1, [0], [0x0010])
-    test.assert(cig_remove_complete(var t, 0, 1).kind == iso_event.IsoEventKind.Unrelated)
-    test.assert_eq(cig_remove(var t, 1), 0)
-    // An answer for another CIG is not this command's.
-    test.assert(cig_remove_complete(var t, 0, 2).kind == iso_event.IsoEventKind.Unrelated)
-    let f = cig_remove_complete(var t, iso_event.STATUS_COMMAND_DISALLOWED, 1)
-    test.assert(f.kind == iso_event.IsoEventKind.CommandFailed)
-    test.assert_eq(f.status, 0x0C)
-    test.assert(t.pending == CisPending.NoCommand)
-    test.assert(cis_row(var t, 0x0010) >= 0)
-    test.assert(cig_slot_of(var t, 1) >= 0)
-
-// ── LE Create CIS ───────────────────────────────────────────────────
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_create_cis_binds_the_stream_to_its_link_and_waits()
-    var t = cis_table_new()
-    configure(t, 1, [0, 1], [0x0010, 0x0011])
-    cis_host_support(var t, true)
-    test.assert_eq(cis_create(var t, [0x0011], [acl_ref(0x0002, 1, 4, true)]), 0)
-    let b = cis_row(var t, 0x0011)
-    test.assert(t.state[b] == CisState.Creating)
-    test.assert_eq(t.acl_slot[b] as Int, 1)
-    test.assert_eq(t.acl_generation[b] as Int, 4)
-    test.assert_eq(t.acl_handle[b] as Int, 2)
-    test.assert(t.pending == CisPending.CreateCis)
-    test.assert(t.state[cis_row(var t, 0x0010)] == CisState.Configured)
-    let s = cis_create_status(var t, 0)
-    test.assert(s.kind == iso_event.IsoEventKind.CommandDone)
-    test.assert(t.pending == CisPending.NoCommand)
-    // The stream stays Creating until its event arrives.
-    test.assert(t.state[b] == CisState.Creating)
-    test.assert_eq(cis_creating_count(var t), 1)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_create_cis_for_two_streams_on_two_links()
-    var t = cis_table_new()
-    configure(t, 1, [0, 1], [0x0010, 0x0011])
-    cis_host_support(var t, true)
-    test.assert_eq(cis_create(var t, [0x0010, 0x0011], [acl_ref(0x0001, 0, 1, true), acl_ref(0x0002, 1, 1, true)]), 0)
-    test.assert_eq(cis_count_in(var t, CisState.Creating), 2)
-    test.assert_eq(t.pending_count as Int, 2)
-    test.assert(cis_create_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
-    // Both events must arrive before another LE Create CIS is allowed.
-    test.assert(cis_established(t, established_event(0x0010, 0, 1, 1)).kind == iso_event.IsoEventKind.CisEstablished)
-    test.assert_eq(cis_create(var t, [0x0011], [acl_ref(0x0002, 1, 1, true)]), iso_event.STATUS_COMMAND_DISALLOWED)
-    test.assert(cis_established(t, established_event(0x0011, 0, 1, 1)).kind == iso_event.IsoEventKind.CisEstablished)
-    test.assert_eq(cis_creating_count(var t), 0)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_create_cis_refusals()
-    var t = cis_table_new()
-    let ok = acl_ref(0x0001, 0, 1, true)
-    configure(t, 1, [0, 1], [0x0010, 0x0011])
-    // The Host Support feature bit is not set.
-    test.assert_eq(cis_create(var t, [0x0010], [ok]), iso_event.STATUS_COMMAND_DISALLOWED)
-    cis_host_support(var t, true)
-    // The count: none, or the lists differ.
-    test.assert_eq(cis_create(var t, [], []), iso_event.STATUS_INVALID_COMMAND_PARAMETERS)
-    test.assert_eq(cis_create(var t, [0x0010, 0x0011], [ok]), iso_event.STATUS_INVALID_COMMAND_PARAMETERS)
-    // The same handle twice.
-    test.assert_eq(cis_create(var t, [0x0010, 0x0010], [ok, ok]), iso_event.STATUS_INVALID_COMMAND_PARAMETERS)
-    // A handle that is no stream; an ACL that is no link; an ACL handle out of range.
-    test.assert_eq(cis_create(var t, [0x0099], [ok]), iso_event.STATUS_UNKNOWN_CONNECTION_IDENTIFIER)
-    test.assert_eq(cis_create(var t, [0x0010], [AclRef { handle: 1, link: links.no_link(), central: true }]), iso_event.STATUS_UNKNOWN_CONNECTION_IDENTIFIER)
-    test.assert_eq(cis_create(var t, [0x0010], [acl_ref(0x0F00, 0, 1, true)]), iso_event.STATUS_UNKNOWN_CONNECTION_IDENTIFIER)
-    // The ACL connection is one in which this Host is the Peripheral.
-    test.assert_eq(cis_create(var t, [0x0010], [acl_ref(0x0001, 0, 1, false)]), iso_event.STATUS_COMMAND_DISALLOWED)
-    // Nothing changed.
-    test.assert_eq(cis_count_in(var t, CisState.Configured), 2)
-    test.assert(t.pending == CisPending.NoCommand)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_create_cis_refuses_a_stream_that_exists_and_a_peripheral_stream_and_a_busy_table()
-    var t = cis_table_new()
-    configure(t, 1, [0], [0x0010])
-    bring_up(var t, 0x0010)
-    // The stream exists: Connection Already Exists.
-    test.assert_eq(cis_create(var t, [0x0010], [acl_ref(0x0001, 0, 1, true)]), iso_event.STATUS_CONNECTION_ALREADY_EXISTS)
-    // A stream this Host is the Peripheral of is not the Central's to create.
-    var p = cis_table_new()
-    cis_host_support(var p, true)
-    let r = cis_request(p, request_event(1, 0x0020, 1, 0), acl_ref(0x0001, 0, 1, false))
-    test.assert(r.kind == iso_event.IsoEventKind.CisRequested)
-    test.assert_eq(cis_create(var p, [0x0020], [acl_ref(0x0001, 0, 1, true)]), iso_event.STATUS_UNKNOWN_CONNECTION_IDENTIFIER)
-    // A command in flight.
-    var b = cis_table_new()
-    configure(b, 1, [0], [0x0010])
-    cis_host_support(var b, true)
-    test.assert_eq(cig_remove(var b, 1), 0)
-    test.assert_eq(cis_create(var b, [0x0010], [acl_ref(0x0001, 0, 1, true)]), iso_event.STATUS_COMMAND_DISALLOWED)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_create_cis_command_status_failure_reverts_every_stream()
-    var t = cis_table_new()
-    configure(t, 1, [0, 1], [0x0010, 0x0011])
-    cis_host_support(var t, true)
-    test.assert_eq(cis_create(var t, [0x0010, 0x0011], [acl_ref(0x0001, 0, 1, true), acl_ref(0x0002, 1, 1, true)]), 0)
-    let e = cis_create_status(var t, iso_event.STATUS_COMMAND_DISALLOWED)
-    test.assert(e.kind == iso_event.IsoEventKind.CommandFailed)
-    test.assert_eq(e.status, 0x0C)
-    test.assert_eq(cis_count_in(var t, CisState.Configured), 2)
-    test.assert(t.pending == CisPending.NoCommand)
-    let a = cis_row(var t, 0x0010)
-    test.assert_eq(t.acl_slot[a] as Int, NO_ACL)
-    test.assert_eq(t.acl_handle[a] as Int, 0)
-    // Without a command the status is not this table's.
-    test.assert(cis_create_status(var t, 0).kind == iso_event.IsoEventKind.Unrelated)
-
-// ── LE CIS Established, as the Central ──────────────────────────────
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_cis_established_with_success_names_the_directions_by_burst_number()
-    var t = cis_table_new()
-    configure(t, 1, [0, 1], [0x0010, 0x0011])
-    cis_host_support(var t, true)
-    test.assert_eq(cis_create(var t, [0x0010, 0x0011], [acl_ref(0x0001, 0, 1, true), acl_ref(0x0001, 0, 1, true)]), 0)
-    test.assert(cis_create_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
-    // The Central sends only: BN_P_To_C is zero.
-    let e = cis_established(t, established_event(0x0010, 0, 2, 0))
-    test.assert(e.kind == iso_event.IsoEventKind.CisEstablished)
-    test.assert_eq(e.handle, 0x0010)
-    test.assert_eq(e.slot, cis_row(var t, 0x0010))
-    test.assert(t.state[e.slot] == CisState.Established)
-    test.assert(t.can_send[e.slot] and not t.can_receive[e.slot])
-    // The Central receives only.
-    let f = cis_established(t, established_event(0x0011, 0, 0, 3))
-    test.assert(not t.can_send[f.slot] and t.can_receive[f.slot])
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_cis_established_with_a_failure_returns_the_central_to_the_configuration()
-    var t = cis_table_new()
-    configure(t, 1, [0], [0x0010])
-    cis_host_support(var t, true)
-    test.assert_eq(cis_create(var t, [0x0010], [acl_ref(0x0001, 0, 1, true)]), 0)
-    test.assert(cis_create_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
-    // 0x3E: connection failed to be established.
-    let e = cis_established(t, established_event(0x0010, 0x3E, 0, 0))
-    test.assert(e.kind == iso_event.IsoEventKind.CisFailed)
-    test.assert_eq(e.status, 0x3E)
-    let a = cis_row(var t, 0x0010)
-    test.assert(t.state[a] == CisState.Configured)
-    test.assert_eq(t.acl_slot[a] as Int, NO_ACL)
-    test.assert_eq(cis_creating_count(var t), 0)
-    // The CIG is configurable again and the stream can be created again.
-    test.assert(not cig_active(var t, 1))
-    test.assert_eq(cis_create(var t, [0x0010], [acl_ref(0x0001, 0, 1, true)]), 0)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_cis_established_for_nothing_the_table_waits_for_is_ignored()
-    var t = cis_table_new()
-    configure(t, 1, [0], [0x0010])
-    // Unknown handle.
-    test.assert(cis_established(t, established_event(0x0099, 0, 1, 1)).kind == iso_event.IsoEventKind.Unrelated)
-    // A Configured stream is not being created.
-    test.assert(cis_established(t, established_event(0x0010, 0, 1, 1)).kind == iso_event.IsoEventKind.Unrelated)
-    test.assert(cis_established(t, established_event(0x0010, 0x3E, 1, 1)).kind == iso_event.IsoEventKind.Unrelated)
-    test.assert(t.state[cis_row(var t, 0x0010)] == CisState.Configured)
-    // An established stream is not established twice.
-    bring_up(var t, 0x0010)
-    test.assert(cis_established(t, established_event(0x0010, 0, 1, 1)).kind == iso_event.IsoEventKind.Unrelated)
-
-// ── Peripheral: CIS Request, Accept, Reject ─────────────────────────
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_a_cis_request_is_held_for_the_application()
-    var t = cis_table_new()
-    let e = cis_request(t, request_event(0x0001, 0x0030, 3, 4), acl_ref(0x0001, 2, 7, false))
-    test.assert(e.kind == iso_event.IsoEventKind.CisRequested)
-    test.assert_eq(e.handle, 0x0030)
-    test.assert(e.slot >= 0)
-    test.assert(t.state[e.slot] == CisState.Requested)
-    test.assert(not t.central[e.slot])
-    test.assert_eq(t.cig[e.slot] as Int, 3)
-    test.assert_eq(t.cis[e.slot] as Int, 4)
-    test.assert_eq(t.acl_slot[e.slot] as Int, 2)
-    test.assert_eq(t.acl_generation[e.slot] as Int, 7)
-    test.assert_eq(cis_row(var t, 0x0030), e.slot)
-    // The same request again changes nothing.
-    test.assert(cis_request(t, request_event(0x0001, 0x0030, 3, 4), acl_ref(0x0001, 2, 7, false)).kind == iso_event.IsoEventKind.Unrelated)
-    test.assert_eq(cis_count_in(var t, CisState.Requested), 1)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_a_cis_request_the_table_cannot_hold_is_rejected_for_limited_resources()
-    var t = cis_table_new()
-    for i in 0..noble_config.MAX_CIS
-        test.assert(cis_request(t, request_event(1, 0x0030 + i, 3, i), acl_ref(1, 0, 1, false)).kind == iso_event.IsoEventKind.CisRequested)
-    let e = cis_request(t, request_event(1, 0x0040, 3, 9), acl_ref(1, 0, 1, false))
-    test.assert(e.kind == iso_event.IsoEventKind.CisRequestRefused)
-    test.assert_eq(e.status, iso_event.STATUS_REJECTED_LIMITED_RESOURCES)
-    test.assert_eq(e.handle, 0x0040)
-    test.assert_eq(cis_row(var t, 0x0040), -1)
-    // A row reserved by a Set CIG Parameters in flight counts as taken.
-    var r = cis_table_new()
-    test.assert_eq(cig_set_parameters(var r, cig_fixture(1), [cis_cfg(0, 1, 1), cis_cfg(1, 1, 1)]), 0)
-    let g = cis_request(r, request_event(1, 0x0040, 3, 9), acl_ref(1, 0, 1, false))
-    test.assert(g.kind == iso_event.IsoEventKind.CisRequestRefused)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_a_cis_request_on_a_central_link_or_no_link_is_refused()
-    var t = cis_table_new()
-    let a = cis_request(t, request_event(1, 0x0030, 3, 4), acl_ref(1, 0, 1, true))
-    test.assert(a.kind == iso_event.IsoEventKind.CisRequestRefused)
-    test.assert_eq(a.status, iso_event.STATUS_COMMAND_DISALLOWED)
-    let b = cis_request(t, request_event(1, 0x0030, 3, 4), AclRef { handle: 1, link: links.no_link(), central: false })
-    test.assert(b.kind == iso_event.IsoEventKind.CisRequestRefused)
-    test.assert_eq(cis_free_rows(var t), noble_config.MAX_CIS)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_accept_cis_request_runs_requested_accepting_established()
-    var t = cis_table_new()
-    let r = cis_request(t, request_event(1, 0x0030, 3, 4), acl_ref(1, 0, 1, false))
-    test.assert_eq(cis_accept(var t, 0x0030), 0)
-    test.assert(t.state[r.slot] == CisState.Accepting)
-    test.assert(t.pending == CisPending.AcceptCis)
-    let s = cis_accept_status(var t, 0)
-    test.assert(s.kind == iso_event.IsoEventKind.CommandDone)
-    test.assert(t.pending == CisPending.NoCommand)
-    test.assert(t.state[r.slot] == CisState.Accepting)
-    // The Peripheral's Controller sends BN_P_To_C zero: the Peripheral receives only.
-    let e = cis_established(t, established_event(0x0030, 0, 2, 0))
-    test.assert(e.kind == iso_event.IsoEventKind.CisEstablished)
-    test.assert(t.state[r.slot] == CisState.Established)
-    test.assert(not t.can_send[r.slot] and t.can_receive[r.slot])
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_accept_cis_request_refusals()
-    var t = cis_table_new()
-    test.assert_eq(cis_accept(var t, 0x0030), iso_event.STATUS_UNKNOWN_CONNECTION_IDENTIFIER)
-    // A Central's stream is not the Peripheral's to accept.
-    configure(t, 1, [0], [0x0010])
-    test.assert_eq(cis_accept(var t, 0x0010), iso_event.STATUS_COMMAND_DISALLOWED)
-    // Answered already.
-    var p = cis_table_new()
-    peripheral_up(var p, 0x0030)
-    test.assert_eq(cis_accept(var p, 0x0030), iso_event.STATUS_COMMAND_DISALLOWED)
-    // Two requests, one command at a time.
-    var q = cis_table_new()
-    test.assert(cis_request(q, request_event(1, 0x0030, 3, 4), acl_ref(1, 0, 1, false)).kind == iso_event.IsoEventKind.CisRequested)
-    test.assert(cis_request(q, request_event(1, 0x0031, 3, 5), acl_ref(1, 0, 1, false)).kind == iso_event.IsoEventKind.CisRequested)
-    test.assert_eq(cis_accept(var q, 0x0030), 0)
-    test.assert_eq(cis_accept(var q, 0x0031), iso_event.STATUS_COMMAND_DISALLOWED)
-    test.assert_eq(cis_reject(var q, 0x0031, 0x0D), iso_event.STATUS_COMMAND_DISALLOWED)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_accept_cis_request_command_status_failure()
-    var t = cis_table_new()
-    let r = cis_request(t, request_event(1, 0x0030, 3, 4), acl_ref(1, 0, 1, false))
-    test.assert_eq(cis_accept(var t, 0x0030), 0)
-    // Command Disallowed: the request stands and may be answered again.
-    let f = cis_accept_status(var t, iso_event.STATUS_COMMAND_DISALLOWED)
-    test.assert(f.kind == iso_event.IsoEventKind.CommandFailed)
-    test.assert(t.state[r.slot] == CisState.Requested)
-    test.assert_eq(cis_accept(var t, 0x0030), 0)
-    // Unknown Connection Identifier: the Controller dropped the request.
-    let g = cis_accept_status(var t, iso_event.STATUS_UNKNOWN_CONNECTION_IDENTIFIER)
-    test.assert(g.kind == iso_event.IsoEventKind.CommandFailed)
-    test.assert_eq(cis_row(var t, 0x0030), -1)
-    test.assert(cis_accept_status(var t, 0).kind == iso_event.IsoEventKind.Unrelated)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_reject_cis_request_deletes_the_stream()
-    var t = cis_table_new()
-    let r = cis_request(t, request_event(1, 0x0030, 3, 4), acl_ref(1, 0, 1, false))
-    test.assert_eq(cis_reject(var t, 0x0030, iso_event.STATUS_REJECTED_LIMITED_RESOURCES), 0)
-    test.assert(t.state[r.slot] == CisState.Rejecting)
-    test.assert(t.pending == CisPending.RejectCis)
-    // An answer for another handle is not this command's.
-    test.assert(cis_reject_complete(var t, 0, 0x0031).kind == iso_event.IsoEventKind.Unrelated)
-    let e = cis_reject_complete(var t, 0, 0x0030)
-    test.assert(e.kind == iso_event.IsoEventKind.CommandDone)
-    test.assert_eq(cis_row(var t, 0x0030), -1)
-    test.assert_eq(cis_free_rows(var t), noble_config.MAX_CIS)
-    test.assert(t.pending == CisPending.NoCommand)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_reject_cis_request_refusals_and_failures()
-    var t = cis_table_new()
-    test.assert_eq(cis_reject(var t, 0x0030, 0x0D), iso_event.STATUS_UNKNOWN_CONNECTION_IDENTIFIER)
-    configure(t, 1, [0], [0x0010])
-    test.assert_eq(cis_reject(var t, 0x0010, 0x0D), iso_event.STATUS_COMMAND_DISALLOWED)
-    var p = cis_table_new()
-    let r = cis_request(p, request_event(1, 0x0030, 3, 4), acl_ref(1, 0, 1, false))
-    test.assert_eq(cis_reject(var p, 0x0030, 0x100), iso_event.STATUS_INVALID_COMMAND_PARAMETERS)
-    test.assert_eq(cis_reject(var p, 0x0030, -1), iso_event.STATUS_INVALID_COMMAND_PARAMETERS)
-    // A failure puts the request back; Unknown Connection Identifier drops it.
-    test.assert_eq(cis_reject(var p, 0x0030, 0x0D), 0)
-    let f = cis_reject_complete(var p, iso_event.STATUS_COMMAND_DISALLOWED, 0x0030)
-    test.assert(f.kind == iso_event.IsoEventKind.CommandFailed)
-    test.assert(p.state[r.slot] == CisState.Requested)
-    test.assert_eq(cis_reject(var p, 0x0030, 0x0D), 0)
-    let g = cis_reject_complete(var p, iso_event.STATUS_UNKNOWN_CONNECTION_IDENTIFIER, 0x0030)
-    test.assert(g.kind == iso_event.IsoEventKind.CommandFailed)
-    test.assert_eq(cis_row(var p, 0x0030), -1)
-    // An established stream cannot be rejected.
-    var q = cis_table_new()
-    peripheral_up(var q, 0x0030)
-    test.assert_eq(cis_reject(var q, 0x0030, 0x0D), iso_event.STATUS_COMMAND_DISALLOWED)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_a_peripheral_stream_that_fails_to_establish_is_deleted()
-    var t = cis_table_new()
-    let r = cis_request(t, request_event(1, 0x0030, 3, 4), acl_ref(1, 0, 1, false))
-    test.assert_eq(cis_accept(var t, 0x0030), 0)
-    test.assert(cis_accept_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
-    test.assert_eq(data_path_setup(var t, 0x0030, PATH_OUTPUT, 0x06, 0), 0)
-    test.assert(data_path_setup_complete(var t, 0, 0x0030).kind == iso_event.IsoEventKind.DataPathSet)
-    let e = cis_established(t, established_event(0x0030, 0x3E, 0, 0))
-    test.assert(e.kind == iso_event.IsoEventKind.CisFailed)
-    test.assert_eq(e.status, 0x3E)
-    // Handle and data paths are gone.
-    test.assert_eq(cis_row(var t, 0x0030), -1)
-    test.assert_eq(t.paths[r.slot] as Int, 0)
-    test.assert_eq(cis_free_rows(var t), noble_config.MAX_CIS)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_an_unanswered_request_times_out_in_the_controller()
-    var t = cis_table_new()
-    test.assert(cis_request(t, request_event(1, 0x0030, 3, 4), acl_ref(1, 0, 1, false)).kind == iso_event.IsoEventKind.CisRequested)
-    // Connection Accept Timeout Exceeded, 0x10, ends the Requested stream.
-    let e = cis_established(t, established_event(0x0030, iso_event.STATUS_CONNECTION_ACCEPT_TIMEOUT_EXCEEDED, 0, 0))
-    test.assert(e.kind == iso_event.IsoEventKind.CisFailed)
-    test.assert_eq(e.status, 0x10)
-    test.assert_eq(cis_row(var t, 0x0030), -1)
-    // A success in that state is not possible and is ignored.
-    let s = cis_request(t, request_event(1, 0x0031, 3, 5), acl_ref(1, 0, 1, false))
-    test.assert(cis_established(t, established_event(0x0031, 0, 1, 1)).kind == iso_event.IsoEventKind.Unrelated)
-    test.assert(t.state[s.slot] == CisState.Requested)
-    // A failure while the accept command is in flight drops the pending command too.
-    test.assert_eq(cis_accept(var t, 0x0031), 0)
-    let f = cis_established(t, established_event(0x0031, 0x3E, 0, 0))
-    test.assert(f.kind == iso_event.IsoEventKind.CisFailed)
-    test.assert(t.pending == CisPending.NoCommand)
-
-// ── Ending a stream ─────────────────────────────────────────────────
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_disconnect_a_central_stream_returns_it_to_its_configuration()
-    var t = cis_table_new()
-    configure(t, 1, [0], [0x0010])
-    bring_up(var t, 0x0010)
-    let a = cis_row(var t, 0x0010)
-    test.assert_eq(cis_disconnect(var t, 0x0010), 0)
-    test.assert(t.state[a] == CisState.Closing)
-    test.assert(cig_active(var t, 1))
-    test.assert(cis_disconnect_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
-    let e = cis_disconnected(var t, 0x0010, iso_event.STATUS_CONNECTION_TERMINATED_BY_LOCAL_HOST)
-    test.assert(e.kind == iso_event.IsoEventKind.CisClosed)
-    test.assert_eq(e.status, 0x16)
-    test.assert(t.state[a] == CisState.Configured)
-    test.assert_eq(t.handle[a] as Int, 0x0010)
-    test.assert(not cig_active(var t, 1))
-    test.assert(t.pending == CisPending.NoCommand)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_disconnect_a_peripheral_stream_deletes_it()
-    var t = cis_table_new()
-    peripheral_up(var t, 0x0030)
-    test.assert_eq(cis_disconnect(var t, 0x0030), 0)
-    test.assert(cis_disconnect_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
-    let e = cis_disconnected(var t, 0x0030, 0x16)
-    test.assert(e.kind == iso_event.IsoEventKind.CisClosed)
-    test.assert_eq(cis_row(var t, 0x0030), -1)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_the_peer_ending_a_stream_is_the_same_event()
-    var c = cis_table_new()
-    configure(c, 1, [0], [0x0010])
-    bring_up(var c, 0x0010)
-    // 0x13: remote user terminated connection.
-    let e = cis_disconnected(var c, 0x0010, 0x13)
-    test.assert(e.kind == iso_event.IsoEventKind.CisClosed)
-    test.assert_eq(e.status, 0x13)
-    test.assert(c.state[cis_row(var c, 0x0010)] == CisState.Configured)
-    var p = cis_table_new()
-    peripheral_up(var p, 0x0030)
-    test.assert(cis_disconnected(var p, 0x0030, 0x13).kind == iso_event.IsoEventKind.CisClosed)
-    test.assert_eq(cis_row(var p, 0x0030), -1)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_disconnect_refusals_and_failure()
-    var t = cis_table_new()
-    test.assert_eq(cis_disconnect(var t, 0x0010), iso_event.STATUS_UNKNOWN_CONNECTION_IDENTIFIER)
-    configure(t, 1, [0], [0x0010])
-    // A stream that does not exist cannot be disconnected.
-    test.assert_eq(cis_disconnect(var t, 0x0010), iso_event.STATUS_COMMAND_DISALLOWED)
-    bring_up(var t, 0x0010)
-    test.assert_eq(cis_disconnect(var t, 0x0010), 0)
-    // A failed command puts the stream back.
-    let f = cis_disconnect_status(var t, iso_event.STATUS_COMMAND_DISALLOWED)
-    test.assert(f.kind == iso_event.IsoEventKind.CommandFailed)
-    test.assert(t.state[cis_row(var t, 0x0010)] == CisState.Established)
-    test.assert(cis_disconnect_status(var t, 0).kind == iso_event.IsoEventKind.Unrelated)
-    // Disconnection Complete for a handle the table does not hold, or for a
-    // stream that does not exist, changes nothing.
-    test.assert(cis_disconnected(var t, 0x0099, 0x13).kind == iso_event.IsoEventKind.Unrelated)
-    var u = cis_table_new()
-    configure(u, 1, [0], [0x0010])
-    test.assert(cis_disconnected(var u, 0x0010, 0x13).kind == iso_event.IsoEventKind.Unrelated)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_the_acl_connection_ending_ends_its_streams()
-    var t = cis_table_new()
-    configure(t, 1, [0, 1], [0x0010, 0x0011])
-    cis_host_support(var t, true)
-    test.assert_eq(cis_create(var t, [0x0010, 0x0011], [acl_ref(0x0001, 0, 1, true), acl_ref(0x0002, 1, 1, true)]), 0)
-    test.assert(cis_create_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
-    test.assert(cis_established(t, established_event(0x0010, 0, 1, 1)).kind == iso_event.IsoEventKind.CisEstablished)
-    test.assert(cis_established(t, established_event(0x0011, 0, 1, 1)).kind == iso_event.IsoEventKind.CisEstablished)
-    // A link of another generation in the same slot is not the one that ended.
-    test.assert_eq(cis_acl_closed(var t, links.link_id(0, 2)), 0)
-    test.assert_eq(cis_acl_closed(var t, links.link_id(0, 1)), 1)
-    test.assert(t.state[cis_row(var t, 0x0010)] == CisState.Configured)
-    test.assert(t.state[cis_row(var t, 0x0011)] == CisState.Established)
-    test.assert_eq(cis_acl_closed(var t, links.link_id(1, 1)), 1)
-    test.assert_eq(cis_acl_closed(var t, links.link_id(1, 1)), 0)
-    test.assert(not cig_active(var t, 1))
-    // A Peripheral's streams are deleted, requested ones too.
-    var p = cis_table_new()
-    test.assert(cis_request(p, request_event(1, 0x0030, 3, 4), acl_ref(1, 0, 5, false)).kind == iso_event.IsoEventKind.CisRequested)
-    test.assert(cis_request(p, request_event(1, 0x0031, 3, 5), acl_ref(1, 0, 5, false)).kind == iso_event.IsoEventKind.CisRequested)
-    test.assert_eq(cis_acl_closed(var p, links.link_id(0, 5)), 2)
-    test.assert_eq(cis_free_rows(var p), noble_config.MAX_CIS)
-    // The id of no link names no stream.
-    test.assert_eq(cis_acl_closed(var p, links.no_link()), 0)
-
-// ── ISO data paths ──────────────────────────────────────────────────
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_setup_iso_data_path_sets_one_direction_at_a_time()
-    var t = cis_table_new()
-    configure(t, 1, [0], [0x0010])
-    bring_up(var t, 0x0010)
-    let a = cis_row(var t, 0x0010)
-    test.assert(not cis_may_send(var t, 0x0010))
-    test.assert_eq(data_path_setup(var t, 0x0010, PATH_INPUT, 0x06, 40), 0)
-    test.assert(t.pending == CisPending.SetCisPath)
-    let e = data_path_setup_complete(var t, 0, 0x0010)
-    test.assert(e.kind == iso_event.IsoEventKind.DataPathSet)
-    test.assert_eq(t.paths[a] as Int, PATH_BIT_INPUT)
-    test.assert(cis_may_send(var t, 0x0010))
-    test.assert_eq(data_path_setup(var t, 0x0010, PATH_OUTPUT, 0x03, 0), 0)
-    test.assert(data_path_setup_complete(var t, 0, 0x0010).kind == iso_event.IsoEventKind.DataPathSet)
-    test.assert_eq(t.paths[a] as Int, 0x03)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_setup_iso_data_path_refusals()
-    var t = cis_table_new()
-    test.assert_eq(data_path_setup(var t, 0x0010, PATH_INPUT, 0x06, 0), iso_event.STATUS_UNKNOWN_CONNECTION_IDENTIFIER)
-    configure(t, 1, [0], [0x0010])
-    // A CIS configuration takes a path before the stream exists.
-    test.assert_eq(data_path_setup(var t, 0x0010, 2, 0x06, 0), iso_event.STATUS_INVALID_COMMAND_PARAMETERS)
-    test.assert_eq(data_path_setup(var t, 0x0010, -1, 0x06, 0), iso_event.STATUS_INVALID_COMMAND_PARAMETERS)
-    test.assert_eq(data_path_setup(var t, 0x0010, PATH_INPUT, 0x06, 256), iso_event.STATUS_INVALID_COMMAND_PARAMETERS)
-    test.assert_eq(data_path_setup(var t, 0x0010, PATH_INPUT, hci_commands.ISO_CODING_FORMAT_TRANSPARENT, 1), iso_event.STATUS_INVALID_COMMAND_PARAMETERS)
-    test.assert_eq(data_path_setup(var t, 0x0010, PATH_INPUT, hci_commands.ISO_CODING_FORMAT_TRANSPARENT, 0), 0)
-    // A command in flight.
-    test.assert_eq(data_path_setup(var t, 0x0010, PATH_OUTPUT, 0x06, 0), iso_event.STATUS_COMMAND_DISALLOWED)
-    test.assert(data_path_setup_complete(var t, 0, 0x0010).kind == iso_event.IsoEventKind.DataPathSet)
-    // The same direction twice.
-    test.assert_eq(data_path_setup(var t, 0x0010, PATH_INPUT, 0x06, 0), iso_event.STATUS_COMMAND_DISALLOWED)
-    // A stream that is closing.
-    bring_up(var t, 0x0010)
-    test.assert_eq(cis_disconnect(var t, 0x0010), 0)
-    test.assert(cis_disconnect_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
-    test.assert_eq(data_path_setup(var t, 0x0010, PATH_OUTPUT, 0x06, 0), iso_event.STATUS_COMMAND_DISALLOWED)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_setup_iso_data_path_on_a_unidirectional_stream()
-    var t = cis_table_new()
-    // Central to Peripheral only: the Central's output has no data.
-    test.assert_eq(cig_set_parameters(var t, cig_fixture(1), [cis_cfg(0, 100, 0)]), 0)
-    test.assert(cig_set_complete(var t, 0, 1, [0x0010]).kind == iso_event.IsoEventKind.CigConfigured)
-    test.assert_eq(data_path_setup(var t, 0x0010, PATH_OUTPUT, 0x06, 0), iso_event.STATUS_COMMAND_DISALLOWED)
-    test.assert_eq(data_path_setup(var t, 0x0010, PATH_INPUT, 0x06, 0), 0)
-    // After the stream is up, the burst numbers decide.
-    var v = cis_table_new()
-    test.assert(cis_request(v, request_event(1, 0x0030, 3, 4), acl_ref(1, 0, 1, false)).kind == iso_event.IsoEventKind.CisRequested)
-    test.assert_eq(cis_accept(var v, 0x0030), 0)
-    test.assert(cis_accept_status(var v, 0).kind == iso_event.IsoEventKind.CommandDone)
-    test.assert(cis_established(v, established_event(0x0030, 0, 2, 0)).kind == iso_event.IsoEventKind.CisEstablished)
-    // The Peripheral's BN_P_To_C is zero: it has no input path.
-    test.assert_eq(data_path_setup(var v, 0x0030, PATH_INPUT, 0x06, 0), iso_event.STATUS_COMMAND_DISALLOWED)
-    test.assert_eq(data_path_setup(var v, 0x0030, PATH_OUTPUT, 0x06, 0), 0)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_a_peripheral_stream_takes_a_path_only_once_accepted()
-    var t = cis_table_new()
-    test.assert(cis_request(t, request_event(1, 0x0030, 3, 4), acl_ref(1, 0, 1, false)).kind == iso_event.IsoEventKind.CisRequested)
-    // Requested: the accept command has not completed successfully.
-    test.assert_eq(data_path_setup(var t, 0x0030, PATH_OUTPUT, 0x06, 0), iso_event.STATUS_COMMAND_DISALLOWED)
-    test.assert_eq(cis_accept(var t, 0x0030), 0)
-    test.assert(cis_accept_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
-    test.assert_eq(data_path_setup(var t, 0x0030, PATH_OUTPUT, 0x06, 0), 0)
-    var r = cis_table_new()
-    test.assert(cis_request(r, request_event(1, 0x0030, 3, 4), acl_ref(1, 0, 1, false)).kind == iso_event.IsoEventKind.CisRequested)
-    test.assert_eq(cis_reject(var r, 0x0030, 0x0D), 0)
-    // Rejecting: not accepted either.
-    test.assert_eq(data_path_setup(var r, 0x0030, PATH_OUTPUT, 0x06, 0), iso_event.STATUS_COMMAND_DISALLOWED)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_setup_iso_data_path_complete_failure_and_strays()
-    var t = cis_table_new()
-    configure(t, 1, [0], [0x0010])
-    test.assert(data_path_setup_complete(var t, 0, 0x0010).kind == iso_event.IsoEventKind.Unrelated)
-    test.assert_eq(data_path_setup(var t, 0x0010, PATH_INPUT, 0x06, 0), 0)
-    test.assert(data_path_setup_complete(var t, 0, 0x0011).kind == iso_event.IsoEventKind.Unrelated)
-    let f = data_path_setup_complete(var t, iso_event.STATUS_INVALID_COMMAND_PARAMETERS, 0x0010)
-    test.assert(f.kind == iso_event.IsoEventKind.CommandFailed)
-    test.assert_eq(f.status, 0x12)
-    test.assert_eq(t.paths[cis_row(var t, 0x0010)] as Int, 0)
-    test.assert(t.pending == CisPending.NoCommand)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_remove_iso_data_path()
-    var t = cis_table_new()
-    configure(t, 1, [0], [0x0010])
-    test.assert_eq(data_path_remove(var t, 0x0099, 1), iso_event.STATUS_UNKNOWN_CONNECTION_IDENTIFIER)
-    // No path yet: Command Disallowed.
-    test.assert_eq(data_path_remove(var t, 0x0010, 1), iso_event.STATUS_COMMAND_DISALLOWED)
-    test.assert_eq(data_path_setup(var t, 0x0010, PATH_INPUT, 0x06, 0), 0)
-    test.assert(data_path_setup_complete(var t, 0, 0x0010).kind == iso_event.IsoEventKind.DataPathSet)
-    test.assert_eq(data_path_setup(var t, 0x0010, PATH_OUTPUT, 0x06, 0), 0)
-    test.assert(data_path_setup_complete(var t, 0, 0x0010).kind == iso_event.IsoEventKind.DataPathSet)
-    // The directions are a bit field of 1 to 3.
-    test.assert_eq(data_path_remove(var t, 0x0010, 0), iso_event.STATUS_INVALID_COMMAND_PARAMETERS)
-    test.assert_eq(data_path_remove(var t, 0x0010, 4), iso_event.STATUS_INVALID_COMMAND_PARAMETERS)
-    // Output only; the input path stays.
-    test.assert_eq(data_path_remove(var t, 0x0010, PATH_BIT_OUTPUT), 0)
-    test.assert_eq(data_path_remove(var t, 0x0010, PATH_BIT_INPUT), iso_event.STATUS_COMMAND_DISALLOWED)
-    test.assert(data_path_remove_complete(var t, 0, 0x0011).kind == iso_event.IsoEventKind.Unrelated)
-    let e = data_path_remove_complete(var t, 0, 0x0010)
-    test.assert(e.kind == iso_event.IsoEventKind.DataPathRemoved)
-    test.assert_eq(t.paths[cis_row(var t, 0x0010)] as Int, PATH_BIT_INPUT)
-    // Both asked for while only one is set: refused.
-    test.assert_eq(data_path_remove(var t, 0x0010, 3), iso_event.STATUS_COMMAND_DISALLOWED)
-    // A failure keeps the path.
-    test.assert_eq(data_path_remove(var t, 0x0010, PATH_BIT_INPUT), 0)
-    let f = data_path_remove_complete(var t, iso_event.STATUS_COMMAND_DISALLOWED, 0x0010)
-    test.assert(f.kind == iso_event.IsoEventKind.CommandFailed)
-    test.assert_eq(t.paths[cis_row(var t, 0x0010)] as Int, PATH_BIT_INPUT)
-    test.assert(data_path_remove_complete(var t, 0, 0x0010).kind == iso_event.IsoEventKind.Unrelated)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_a_central_keeps_its_paths_across_a_disconnection_and_a_peripheral_loses_them()
-    var t = cis_table_new()
-    configure(t, 1, [0], [0x0010])
-    bring_up(var t, 0x0010)
-    test.assert_eq(data_path_setup(var t, 0x0010, PATH_INPUT, 0x06, 0), 0)
-    test.assert(data_path_setup_complete(var t, 0, 0x0010).kind == iso_event.IsoEventKind.DataPathSet)
-    test.assert(cis_disconnected(var t, 0x0010, 0x13).kind == iso_event.IsoEventKind.CisClosed)
-    let a = cis_row(var t, 0x0010)
-    test.assert_eq(t.paths[a] as Int, PATH_BIT_INPUT)
-    test.assert(not cis_may_send(var t, 0x0010))
-    var p = cis_table_new()
-    peripheral_up(var p, 0x0030)
-    test.assert_eq(data_path_setup(var p, 0x0030, PATH_INPUT, 0x06, 0), 0)
-    test.assert(data_path_setup_complete(var p, 0, 0x0030).kind == iso_event.IsoEventKind.DataPathSet)
-    let slot = cis_row(var p, 0x0030)
-    test.assert(cis_disconnected(var p, 0x0030, 0x13).kind == iso_event.IsoEventKind.CisClosed)
-    test.assert_eq(p.paths[slot] as Int, 0)
-
-// ── LE Set CIG Parameters Test ──────────────────────────────────────
-
-@tier(app)
-fn test_cig(cig_id: Int) -> hci_commands.CigTestParameters
-    hci_commands.CigTestParameters {
-        cig_id: cig_id, sdu_interval_c_to_p: 10000, sdu_interval_p_to_c: 10000,
-        ft_c_to_p: 1, ft_p_to_c: 1, iso_interval: 8, worst_case_sca: 0, packing: 0, framing: 0 }
-
-@tier(app)
-fn test_cig_with(ft_c: Int, ft_p: Int, iso_interval: Int) -> hci_commands.CigTestParameters
-    hci_commands.CigTestParameters {
-        cig_id: 1, sdu_interval_c_to_p: 10000, sdu_interval_p_to_c: 10000,
-        ft_c_to_p: ft_c, ft_p_to_c: ft_p, iso_interval: iso_interval, worst_case_sca: 0, packing: 0, framing: 0 }
-
-// A bidirectional stream of 100-octet SDUs with sound parameters.
-@tier(app)
-fn test_cis(cis_id: Int) -> hci_commands.CisTestParameters
-    hci_commands.CisTestParameters {
-        cis_id: cis_id, nse: 3, max_sdu_c_to_p: 100, max_sdu_p_to_c: 100, max_pdu_c_to_p: 100,
-        max_pdu_p_to_c: 100, phy_c_to_p: 0x02, phy_p_to_c: 0x02, bn_c_to_p: 1, bn_p_to_c: 1 }
-
-@tier(app)
-fn test_cis_with(nse: Int, sdu_c: Int, sdu_p: Int, pdu_c: Int, pdu_p: Int, phy_c: Int, phy_p: Int, bn_c: Int, bn_p: Int) -> hci_commands.CisTestParameters
-    hci_commands.CisTestParameters {
-        cis_id: 0, nse: nse, max_sdu_c_to_p: sdu_c, max_sdu_p_to_c: sdu_p, max_pdu_c_to_p: pdu_c,
-        max_pdu_p_to_c: pdu_p, phy_c_to_p: phy_c, phy_p_to_c: phy_p, bn_c_to_p: bn_c, bn_p_to_c: bn_p }
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_set_cig_parameters_test_runs_like_set_cig_parameters()
-    var t = cis_table_new()
-    let uni = hci_commands.CisTestParameters {
-        cis_id: 1, nse: 2, max_sdu_c_to_p: 100, max_sdu_p_to_c: 0, max_pdu_c_to_p: 100,
-        max_pdu_p_to_c: 0, phy_c_to_p: 1, phy_p_to_c: 1, bn_c_to_p: 1, bn_p_to_c: 0 }
-    test.assert_eq(cig_set_parameters_test(var t, test_cig(5), [test_cis(0), uni]), 0)
-    test.assert(t.pending == CisPending.SetCig)
-    test.assert_eq(t.pending_count as Int, 2)
-    test.assert_eq(t.reserved as Int, 2)
-    test.assert(t.pending_tx[1] and not t.pending_rx[1])
-    let e = cig_set_complete(var t, 0, 5, [0x0010, 0x0011])
-    test.assert(e.kind == iso_event.IsoEventKind.CigConfigured)
-    test.assert_eq(cis_row(var t, 0x0011) >= 0, true)
-    test.assert(t.can_send[cis_row(var t, 0x0011)] and not t.can_receive[cis_row(var t, 0x0011)])
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_set_cig_parameters_test_refuses_a_cig_parameter_out_of_range()
-    var t = cis_table_new()
-    let invalid = iso_event.STATUS_INVALID_COMMAND_PARAMETERS
-    let one = [test_cis(0)]
-    test.assert_eq(cig_set_parameters_test(var t, test_cig(0xF0), one), invalid)
-    // FT is 0x01 to 0xFF in each direction.
-    test.assert_eq(cig_set_parameters_test(var t, test_cig_with(0, 1, 8), one), invalid)
-    test.assert_eq(cig_set_parameters_test(var t, test_cig_with(1, 0, 8), one), invalid)
-    test.assert_eq(cig_set_parameters_test(var t, test_cig_with(0x100, 1, 8), one), invalid)
-    test.assert_eq(cig_set_parameters_test(var t, test_cig_with(1, 0x100, 8), one), invalid)
-    // ISO_Interval is 0x0004 to 0x0C80.
-    test.assert_eq(cig_set_parameters_test(var t, test_cig_with(1, 1, 3), one), invalid)
-    test.assert_eq(cig_set_parameters_test(var t, test_cig_with(1, 1, 0x0C81), one), invalid)
-    // SDU_Interval, Worst_Case_SCA, Packing, Framing.
-    let bad_interval = hci_commands.CigTestParameters {
-        cig_id: 1, sdu_interval_c_to_p: 0xFE, sdu_interval_p_to_c: 10000,
-        ft_c_to_p: 1, ft_p_to_c: 1, iso_interval: 8, worst_case_sca: 0, packing: 0, framing: 0 }
-    test.assert_eq(cig_set_parameters_test(var t, bad_interval, one), invalid)
-    let bad_other = hci_commands.CigTestParameters {
-        cig_id: 1, sdu_interval_c_to_p: 10000, sdu_interval_p_to_c: 0x100000,
-        ft_c_to_p: 1, ft_p_to_c: 1, iso_interval: 8, worst_case_sca: 0, packing: 0, framing: 0 }
-    test.assert_eq(cig_set_parameters_test(var t, bad_other, one), invalid)
-    let bad_sca = hci_commands.CigTestParameters {
-        cig_id: 1, sdu_interval_c_to_p: 10000, sdu_interval_p_to_c: 10000,
-        ft_c_to_p: 1, ft_p_to_c: 1, iso_interval: 8, worst_case_sca: 8, packing: 0, framing: 0 }
-    test.assert_eq(cig_set_parameters_test(var t, bad_sca, one), invalid)
-    let bad_packing = hci_commands.CigTestParameters {
-        cig_id: 1, sdu_interval_c_to_p: 10000, sdu_interval_p_to_c: 10000,
-        ft_c_to_p: 1, ft_p_to_c: 1, iso_interval: 8, worst_case_sca: 0, packing: 2, framing: 0 }
-    test.assert_eq(cig_set_parameters_test(var t, bad_packing, one), invalid)
-    let bad_framing = hci_commands.CigTestParameters {
-        cig_id: 1, sdu_interval_c_to_p: 10000, sdu_interval_p_to_c: 10000,
-        ft_c_to_p: 1, ft_p_to_c: 1, iso_interval: 8, worst_case_sca: 0, packing: 0, framing: 3 }
-    test.assert_eq(cig_set_parameters_test(var t, bad_framing, one), invalid)
-    test.assert(t.pending == CisPending.NoCommand)
-    // The bounds are accepted.
-    test.assert_eq(cig_set_parameters_test(var t, test_cig_with(0xFF, 0xFF, 0x0C80), one), 0)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_set_cig_parameters_test_refuses_a_stream_parameter_out_of_range()
-    var t = cis_table_new()
-    let invalid = iso_event.STATUS_INVALID_COMMAND_PARAMETERS
-    let cig = test_cig(1)
-    // NSE 0x01 to 0x1F.
-    test.assert_eq(cig_set_parameters_test(var t, cig, [test_cis_with(0, 100, 100, 100, 100, 2, 2, 1, 1)]), invalid)
-    test.assert_eq(cig_set_parameters_test(var t, cig, [test_cis_with(0x20, 100, 100, 100, 100, 2, 2, 1, 1)]), invalid)
-    // Max_SDU up to 0x0FFF, Max_PDU up to 0x00FB.
-    test.assert_eq(cig_set_parameters_test(var t, cig, [test_cis_with(2, 0x1000, 100, 100, 100, 2, 2, 1, 1)]), invalid)
-    test.assert_eq(cig_set_parameters_test(var t, cig, [test_cis_with(2, 100, 0x1000, 100, 100, 2, 2, 1, 1)]), invalid)
-    test.assert_eq(cig_set_parameters_test(var t, cig, [test_cis_with(2, 100, 100, 0xFC, 100, 2, 2, 1, 1)]), invalid)
-    test.assert_eq(cig_set_parameters_test(var t, cig, [test_cis_with(2, 100, 100, 100, 0xFC, 2, 2, 1, 1)]), invalid)
-    // BN up to 0x0F.
-    test.assert_eq(cig_set_parameters_test(var t, cig, [test_cis_with(2, 100, 100, 100, 100, 2, 2, 0x10, 1)]), invalid)
-    test.assert_eq(cig_set_parameters_test(var t, cig, [test_cis_with(2, 100, 100, 100, 100, 2, 2, 1, 0x10)]), invalid)
-    // The PHY is exactly one bit.
-    test.assert_eq(cig_set_parameters_test(var t, cig, [test_cis_with(2, 100, 100, 100, 100, 0, 2, 1, 1)]), invalid)
-    test.assert_eq(cig_set_parameters_test(var t, cig, [test_cis_with(2, 100, 100, 100, 100, 3, 2, 1, 1)]), invalid)
-    test.assert_eq(cig_set_parameters_test(var t, cig, [test_cis_with(2, 100, 100, 100, 100, 2, 0x08, 1, 1)]), invalid)
-    // CIS_ID above 0xEF.
-    let high = hci_commands.CisTestParameters {
-        cis_id: 0xF0, nse: 2, max_sdu_c_to_p: 100, max_sdu_p_to_c: 100, max_pdu_c_to_p: 100,
-        max_pdu_p_to_c: 100, phy_c_to_p: 2, phy_p_to_c: 2, bn_c_to_p: 1, bn_p_to_c: 1 }
-    test.assert_eq(cig_set_parameters_test(var t, cig, [high]), invalid)
-    test.assert(t.pending == CisPending.NoCommand)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_set_cig_parameters_test_refuses_a_direction_whose_sdu_and_burst_disagree()
-    var t = cis_table_new()
-    let invalid = iso_event.STATUS_INVALID_COMMAND_PARAMETERS
-    let cig = test_cig(1)
-    // Data with a zero burst number, and a burst with no data.
-    test.assert_eq(cig_set_parameters_test(var t, cig, [test_cis_with(2, 100, 100, 100, 100, 2, 2, 0, 1)]), invalid)
-    test.assert_eq(cig_set_parameters_test(var t, cig, [test_cis_with(2, 100, 0, 100, 100, 2, 2, 1, 1)]), invalid)
-    test.assert_eq(cig_set_parameters_test(var t, cig, [test_cis_with(2, 0, 100, 100, 100, 2, 2, 1, 1)]), invalid)
-    // No data in either direction.
-    test.assert_eq(cig_set_parameters_test(var t, cig, [test_cis_with(2, 0, 0, 0, 0, 2, 2, 0, 0)]), invalid)
-    // A unidirectional stream is a valid one.
-    test.assert_eq(cig_set_parameters_test(var t, cig, [test_cis_with(2, 100, 0, 100, 0, 2, 2, 1, 0)]), 0)
-    // A CIS_ID twice.
-    var u = cis_table_new()
-    test.assert_eq(cig_set_parameters_test(var u, cig, [test_cis(0), test_cis(0)]), invalid)
-
-@test
-@satisfies("REQ-BLE-ISO-003")
-fn test_set_cig_parameters_test_has_the_same_table_refusals()
-    var t = cis_table_new()
-    // A command in flight.
-    test.assert_eq(cig_set_parameters_test(var t, test_cig(1), [test_cis(0)]), 0)
-    test.assert_eq(cig_set_parameters_test(var t, test_cig(2), [test_cis(0)]), iso_event.STATUS_COMMAND_DISALLOWED)
-    test.assert(cig_set_complete(var t, 0, 1, [0x0010]).kind == iso_event.IsoEventKind.CigConfigured)
-    // An active CIG.
-    bring_up(var t, 0x0010)
-    test.assert_eq(cig_set_parameters_test(var t, test_cig(1), [test_cis(0)]), iso_event.STATUS_COMMAND_DISALLOWED)
-    // More streams than rows.
-    var u = cis_table_new()
-    var many: [hci_commands.CisTestParameters] = []
-    for i in 0..(noble_config.MAX_CIS + 1)
-        list.push(many, test_cis(i))
-    test.assert_eq(cig_set_parameters_test(var u, test_cig(1), many), iso_event.STATUS_MEMORY_CAPACITY_EXCEEDED)

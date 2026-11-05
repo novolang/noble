@@ -25,8 +25,6 @@
 // 256 bytes covers the largest response (READ_BY_GROUP_TYPE with
 // 23 attributes, about 140 bytes) with headroom for future services.
 
-use std.bits
-
 // ATT_SCRATCH[0..1]   = 2-byte LE u16, the current cursor
 // ATT_SCRATCH[2..257] = 256 bytes of scratch buffer
 //

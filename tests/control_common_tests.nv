@@ -1,0 +1,100 @@
+// tests/control_common_tests.nv — the unit tests of src/control_common.nv.
+//
+//   novo test tests/control_common_tests.nv
+
+use std.test
+use gatt_server
+use control_common.{ add_state, all_services, is_octet, next_counter }
+use control_common
+use profile_builder
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+@test
+fn test_the_counter_wraps_at_255()
+    test.assert_eq(next_counter(0), 1)
+    test.assert_eq(next_counter(254), 255)
+    test.assert_eq(next_counter(255), 0)
+
+@test
+fn test_a_state_characteristic_has_its_properties_and_descriptor()
+    var s = gatt_server.new_server([], 247)
+    let service = gatt_server.add_service(var s.db, false, gatt_server.le16(0x1234))
+    test.assert_eq(service, 1)
+    match add_state(var s.db, gatt_server.Access.Encrypted, 0x2A00, [1, 2], true, false, false, false)
+        Err(_) => test.fail("added")
+        Ok(h)  =>
+            test.assert_eq(h.0, 3)
+            test.assert_eq(h.1, 4)
+            test.assert_eq(s.db.attributes[1].value[0] as Int, 0x12)
+    match add_state(var s.db, gatt_server.Access.Encrypted, 0x2A01, [], false, true, true, false)
+        Err(_) => test.fail("added")
+        Ok(h)  =>
+            test.assert_eq(h.1, 0)
+            test.assert_eq(s.db.attributes[gatt_server.index_of(s.db, h.0 - 1)].value[0] as Int, 0x0A)
+    test.assert(all_services(s.db, [1]))
+    test.assert(not all_services(s.db, [1, 3]))
+    test.assert(not all_services(s.db, [99]))
+    test.assert(is_octet(255) and not is_octet(256) and not is_octet(-1))
+
+@test
+fn test_attr_reads_the_value_of_a_handle_and_an_unknown_handle_is_empty()
+    var s = gatt_server.new_server([], 65)
+    let service = profile_builder.start_service(var s.db, gatt_server.le16(0xAA00))!
+    test.assert_eq(service, 1)
+    let handle = profile_builder.add_value(var s.db, gatt_server.PROP_READ, profile_builder.read_only(gatt_server.Access.Open),
+        gatt_server.le16(0xAA01), [7, 8, 9])!
+    test.assert_eq(list.len(control_common.attr(s.db, handle)), 3)
+    test.assert_eq(control_common.attr(s.db, handle)[2] as Int, 9)
+    test.assert_eq(list.len(control_common.attr(s.db, 0x0999)), 0)
+
+@test
+fn test_the_configuration_descriptor_is_readable_by_any_link_and_written_at_the_service_access()
+    let p = control_common.cccd_permissions(gatt_server.Access.Encrypted)
+    test.assert(p.read == gatt_server.Access.Open)
+    test.assert(p.write == gatt_server.Access.Encrypted)
+
+@test
+fn test_add_state_adds_a_value_and_a_descriptor_only_when_notified()
+    var s = gatt_server.new_server([], 65)
+    let _ = profile_builder.start_service(var s.db, gatt_server.le16(0xAA00))!
+    // Read only: the declaration at 2, the value at 3, no descriptor.
+    let plain = control_common.add_state(var s.db, gatt_server.Access.Open, 0xAA01, [1], false, false, false, false)!
+    test.assert_eq(plain.0, 3)
+    test.assert_eq(plain.1, 0)
+    // Notified: the value at 5 and its descriptor at 6.
+    let notified = control_common.add_state(var s.db, gatt_server.Access.Open, 0xAA02, [2], true, false, false, false)!
+    test.assert_eq(notified.0, 5)
+    test.assert_eq(notified.1, 6)
+    // Writable with a response and without: the properties of the declaration say so.
+    let writable = control_common.add_state(var s.db, gatt_server.Access.Open, 0xAA03, [3], false, true, true, true)!
+    let declaration = control_common.attr(s.db, writable.0 - 1)
+    test.assert_eq(declaration[0] as Int,
+        gatt_server.PROP_READ | gatt_server.PROP_WRITE | gatt_server.PROP_WRITE_WO_RESP)
+    let note = control_common.attr(s.db, notified.0 - 1)
+    test.assert_eq(note[0] as Int, gatt_server.PROP_READ | gatt_server.PROP_NOTIFY)
+
+@test
+fn test_add_text_makes_a_readable_notified_text_a_client_may_replace_by_write_without_response()
+    var s = gatt_server.new_server([], 65)
+    let _ = profile_builder.start_service(var s.db, gatt_server.le16(0xAA00))!
+    let fixed = control_common.add_text(var s.db, gatt_server.Access.Open, 0xAA01, [65, 66], false)!
+    test.assert(fixed.1 > 0)
+    let editable = control_common.add_text(var s.db, gatt_server.Access.Open, 0xAA02, [67], true)!
+    let declaration = control_common.attr(s.db, editable.0 - 1)
+    test.assert_eq(declaration[0] as Int & gatt_server.PROP_WRITE_WO_RESP, gatt_server.PROP_WRITE_WO_RESP)
+    test.assert_eq(declaration[0] as Int & gatt_server.PROP_WRITE, 0)
+    let fixed_declaration = control_common.attr(s.db, fixed.0 - 1)
+    test.assert_eq(fixed_declaration[0] as Int & gatt_server.PROP_WRITE_WO_RESP, 0)
+
+@test
+fn test_all_services_names_only_service_declarations()
+    var s = gatt_server.new_server([], 65)
+    let a = profile_builder.start_service(var s.db, gatt_server.le16(0xAA00))!
+    let v = profile_builder.add_value(var s.db, gatt_server.PROP_READ, profile_builder.read_only(gatt_server.Access.Open),
+        gatt_server.le16(0xAA01), [1])!
+    let b = profile_builder.start_service(var s.db, gatt_server.le16(0xAA10))!
+    test.assert(control_common.all_services(s.db, [a, b]))
+    test.assert(control_common.all_services(s.db, []))
+    test.assert(not control_common.all_services(s.db, [a, v]))
+    test.assert(not control_common.all_services(s.db, [a, 0x0999]))

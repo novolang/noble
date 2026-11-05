@@ -1,0 +1,585 @@
+// tests/att_server_tests.nv — the unit tests of src/att_server.nv.
+//
+//   novo test tests/att_server_tests.nv
+
+use std.test
+use att
+use att_server.{ ATT_DEFAULT_MTU, GATT_UUID_CHARACTERISTIC, GATT_UUID_PRIMARY_SERVICE, build_db_record, db_count, db_handle_at, db_index_for_handle, db_properties_for_value_handle, db_value_at, db_writable_at, handle_execute_write_req, handle_prepare_write_req, handle_request, handle_request_m6, handle_write_cmd, handle_write_req }
+use att_server
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+// Small fixture DB used by the tests below.  Mirrors the minimal
+// Device Information service that `gatt_db.nv` builds for real:
+//
+//   0x0001  PrimaryService    end=0x0005   value=0x180A
+//   0x0002  Characteristic    end=0x0002   value=[02,03,00,29,2A]
+//   0x0003  Manufacturer Name end=0x0003   value="Novo"
+//   0x0004  Characteristic    end=0x0004   value=[02,05,00,24,2A]
+//   0x0005  Model Number      end=0x0005   value="M5-1.0"
+@tier(embedded)
+fn fixture_db() -> [u8]
+    var r1 = build_db_record(0x0001, GATT_UUID_PRIMARY_SERVICE, 0x0005,
+        [0x0A, 0x18])
+    let r2 = build_db_record(0x0002, GATT_UUID_CHARACTERISTIC, 0x0002,
+        [0x02, 0x03, 0x00, 0x29, 0x2A])
+    let r3 = build_db_record(0x0003, 0x2A29, 0x0003,
+        [0x4E, 0x6F, 0x76, 0x6F])
+    let r4 = build_db_record(0x0004, GATT_UUID_CHARACTERISTIC, 0x0004,
+        [0x02, 0x05, 0x00, 0x24, 0x2A])
+    let r5 = build_db_record(0x0005, 0x2A24, 0x0005,
+        [0x4D, 0x35, 0x2D, 0x31, 0x2E, 0x30])
+    list.append(r1, r2)
+    list.append(r1, r3)
+    list.append(r1, r4)
+    list.append(r1, r5)
+    r1
+
+@test
+fn test_db_count_walks_records()
+    let db = fixture_db()
+    test.assert_eq(db_count(db), 5)
+
+@test
+fn test_db_handle_lookup()
+    let db = fixture_db()
+    test.assert_eq(db_handle_at(db, 0), 0x0001)
+    test.assert_eq(db_handle_at(db, 4), 0x0005)
+    test.assert_eq(db_index_for_handle(db, 0x0003), 2)
+    test.assert_eq(db_index_for_handle(db, 0x9999), -1)
+
+@test
+fn test_db_value_lookup()
+    let db = fixture_db()
+    let v = db_value_at(db, 2)
+    test.assert_eq(list.len(v), 4)
+    test.assert_eq(v[0] as Int, 0x4E)   // 'N'
+    test.assert_eq(v[3] as Int, 0x6F)   // 'o'
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-001")
+fn test_dispatch_exchange_mtu()
+    let db = fixture_db()
+    let req: [u8] = [att.ATT_OP_EXCHANGE_MTU_REQ, 0x17, 0x00]
+    let rsp = handle_request(db, ATT_DEFAULT_MTU, req)
+    test.assert_eq(rsp[0] as Int, att.ATT_OP_EXCHANGE_MTU_RSP)
+    test.assert_eq(rsp[1] as Int, ATT_DEFAULT_MTU)
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-002")
+fn test_dispatch_read_existing_handle()
+    let db = fixture_db()
+    let req: [u8] = [att.ATT_OP_READ_REQ, 0x03, 0x00]
+    let rsp = handle_request(db, ATT_DEFAULT_MTU, req)
+    test.assert_eq(rsp[0] as Int, att.ATT_OP_READ_RSP)
+    test.assert_eq(list.len(rsp), 1 + 4)
+    test.assert_eq(rsp[1] as Int, 0x4E)   // "Novo"
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-003")
+fn test_dispatch_read_invalid_handle()
+    let db = fixture_db()
+    let req: [u8] = [att.ATT_OP_READ_REQ, 0xFF, 0x00]
+    let rsp = handle_request(db, ATT_DEFAULT_MTU, req)
+    test.assert_eq(rsp[0] as Int, att.ATT_OP_ERROR_RSP)
+    test.assert_eq(rsp[1] as Int, att.ATT_OP_READ_REQ)
+    test.assert_eq(rsp[4] as Int, att.ATT_ERR_INVALID_HANDLE)
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-003")
+fn test_dispatch_read_by_group_type_primary_service()
+    // RBGT start=1 end=0xFFFF type=0x2800.
+    let db = fixture_db()
+    let req: [u8] = [
+        att.ATT_OP_READ_BY_GROUP_TYPE_REQ,
+        0x01, 0x00,
+        0xFF, 0xFF,
+        0x00, 0x28]
+    let rsp = handle_request(db, ATT_DEFAULT_MTU, req)
+    test.assert_eq(rsp[0] as Int, att.ATT_OP_READ_BY_GROUP_TYPE_RSP)
+    test.assert_eq(rsp[1] as Int, 6)   // triplet_len = 4 + value(2)
+    test.assert_eq(rsp[2] as Int, 0x01)   // handle lo
+    test.assert_eq(rsp[3] as Int, 0x00)
+    test.assert_eq(rsp[4] as Int, 0x05)   // end_group lo
+    test.assert_eq(rsp[5] as Int, 0x00)
+    test.assert_eq(rsp[6] as Int, 0x0A)   // value lo (Device Info)
+    test.assert_eq(rsp[7] as Int, 0x18)
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-003")
+fn test_dispatch_read_by_group_type_unsupported_group_type()
+    // Group type 0x2802 (Include) is not a primary-service alias —
+    // The server rejects.
+    let db = fixture_db()
+    let req: [u8] = [
+        att.ATT_OP_READ_BY_GROUP_TYPE_REQ,
+        0x01, 0x00,
+        0xFF, 0xFF,
+        0x02, 0x28]
+    let rsp = handle_request(db, ATT_DEFAULT_MTU, req)
+    test.assert_eq(rsp[0] as Int, att.ATT_OP_ERROR_RSP)
+    test.assert_eq(rsp[4] as Int, att.ATT_ERR_UNSUPPORTED_GROUP_TYPE)
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-003")
+fn test_dispatch_read_by_type_characteristics()
+    // RBT start=1 end=0xFFFF type=0x2803 → both characteristic decls.
+    let db = fixture_db()
+    let req: [u8] = [
+        att.ATT_OP_READ_BY_TYPE_REQ,
+        0x01, 0x00,
+        0xFF, 0xFF,
+        0x03, 0x28]
+    let rsp = handle_request(db, ATT_DEFAULT_MTU, req)
+    test.assert_eq(rsp[0] as Int, att.ATT_OP_READ_BY_TYPE_RSP)
+    test.assert_eq(rsp[1] as Int, 7)   // pair_len = 2 + value(5)
+    test.assert_eq(rsp[2] as Int, 0x02)   // first handle = 0x0002
+    test.assert_eq(rsp[9] as Int, 0x04)   // second handle = 0x0004
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-004")
+fn test_dispatch_find_information()
+    // FII start=1 end=2 — should return 2 handle/UUID pairs.
+    let db = fixture_db()
+    let req: [u8] = [
+        att.ATT_OP_FIND_INFORMATION_REQ,
+        0x01, 0x00,
+        0x02, 0x00]
+    let rsp = handle_request(db, ATT_DEFAULT_MTU, req)
+    test.assert_eq(rsp[0] as Int, att.ATT_OP_FIND_INFORMATION_RSP)
+    test.assert_eq(rsp[1] as Int, att.ATT_FIND_INFO_FORMAT_UUID16)
+    test.assert_eq(list.len(rsp), 2 + 4 + 4)
+    test.assert_eq(rsp[2] as Int, 0x01)   // handle 0x0001
+    test.assert_eq(rsp[4] as Int, 0x00)   // type 0x2800 lo
+    test.assert_eq(rsp[5] as Int, 0x28)   // type 0x2800 hi
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-004")
+fn test_dispatch_find_by_type_value_primary_service_dev_info()
+    // FBTV looking for service with UUID 0x180A.  Should return
+    // (handle=0x0001, end_group=0x0005).
+    let db = fixture_db()
+    let req: [u8] = [
+        att.ATT_OP_FIND_BY_TYPE_VALUE_REQ,
+        0x01, 0x00,
+        0xFF, 0xFF,
+        0x00, 0x28,
+        0x0A, 0x18]
+    let rsp = handle_request(db, ATT_DEFAULT_MTU, req)
+    test.assert_eq(rsp[0] as Int, att.ATT_OP_FIND_BY_TYPE_VALUE_RSP)
+    test.assert_eq(list.len(rsp), 1 + 4)
+    test.assert_eq(rsp[1] as Int, 0x01)   // handle lo
+    test.assert_eq(rsp[3] as Int, 0x05)   // end_group lo
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-001")
+fn test_dispatch_unknown_opcode_returns_error()
+    let db = fixture_db()
+    // 0xFF is reserved.
+    let req: [u8] = [0xFF]
+    let rsp = handle_request(db, ATT_DEFAULT_MTU, req)
+    test.assert_eq(rsp[0] as Int, att.ATT_OP_ERROR_RSP)
+    test.assert_eq(rsp[1] as Int, 0xFF)
+    test.assert_eq(rsp[4] as Int, att.ATT_ERR_REQUEST_NOT_SUPPORTED)
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-003")
+fn test_dispatch_read_blob_offset_within_value()
+    // READ_BLOB on handle 0x0005 ("M5-1.0") with offset 3.
+    let db = fixture_db()
+    let req: [u8] = [
+        att.ATT_OP_READ_BLOB_REQ,
+        0x05, 0x00,
+        0x03, 0x00]
+    let rsp = handle_request(db, ATT_DEFAULT_MTU, req)
+    test.assert_eq(rsp[0] as Int, att.ATT_OP_READ_BLOB_RSP)
+    test.assert_eq(list.len(rsp), 1 + 3)   // "1.0"
+    test.assert_eq(rsp[1] as Int, 0x31)
+    test.assert_eq(rsp[2] as Int, 0x2E)
+    test.assert_eq(rsp[3] as Int, 0x30)
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-003")
+fn test_dispatch_read_blob_offset_past_end()
+    let db = fixture_db()
+    let req: [u8] = [
+        att.ATT_OP_READ_BLOB_REQ,
+        0x05, 0x00,
+        0xFF, 0x00]   // offset 255 — way past 6-byte value
+    let rsp = handle_request(db, ATT_DEFAULT_MTU, req)
+    test.assert_eq(rsp[0] as Int, att.ATT_OP_ERROR_RSP)
+    test.assert_eq(rsp[4] as Int, att.ATT_ERR_INVALID_OFFSET)
+
+// ── Fixture: writable Heart-Rate-style db ───────────────────────────
+//
+// Mirrors a single-characteristic writable service for tests:
+//
+//   0x0001  PrimaryService (0x180D Heart Rate)   value=[0x0D 0x18]
+//   0x0002  Characteristic decl  props=0x0A (R+W) value_handle=0x0003 uuid=0x2A37
+//                                value=[0x0A, 0x03 0x00, 0x37 0x2A]
+//   0x0003  Heart Rate Measurement (writable)    value=[0x00 0x00 0x00 0x00]   (4-byte slot)
+@tier(embedded)
+fn fixture_writable_db() -> [u8]
+    var r1 = build_db_record(0x0001, GATT_UUID_PRIMARY_SERVICE, 0x0003,
+        [0x0D, 0x18])
+    let r2 = build_db_record(0x0002, GATT_UUID_CHARACTERISTIC, 0x0002,
+        [0x0A, 0x03, 0x00, 0x37, 0x2A])
+    // 4-byte writable slot — initialised to zeros.
+    let r3 = build_db_record(0x0003, 0x2A37, 0x0003,
+        [0x00, 0x00, 0x00, 0x00])
+    list.append(r1, r2)
+    list.append(r1, r3)
+    r1
+
+@test
+fn test_db_properties_for_value_handle()
+    let db = fixture_writable_db()
+    test.assert_eq(db_properties_for_value_handle(db, 0x0003), 0x0A)   // R+W
+    test.assert_eq(db_properties_for_value_handle(db, 0x9999), -1)
+    // Read-only DB lookup — fixture_db's char at 0x0003 has props 0x02 (R only).
+    test.assert_eq(db_writable_at(fixture_db(), 0x0003), false)
+    test.assert_eq(db_writable_at(db, 0x0003), true)
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-001")
+fn test_handle_write_req_success_round_trip()
+    var db = fixture_writable_db()
+    let queue: [u8] = []
+    // WRITE_REQ handle=0x0003 value=[0xAA 0xBB 0xCC 0xDD]
+    let req: [u8] = [
+        att.ATT_OP_WRITE_REQ,
+        0x03, 0x00,
+        0xAA, 0xBB, 0xCC, 0xDD]
+    let r = handle_write_req(var db, queue, req)
+    test.assert_eq(r.rsp[0] as Int, att.ATT_OP_WRITE_RSP)
+    test.assert_eq(r.applied, true)
+    // Read back through the new blob.
+    let read_req: [u8] = [att.ATT_OP_READ_REQ, 0x03, 0x00]
+    let read_rsp = handle_request(r.new_blob, ATT_DEFAULT_MTU, read_req)
+    test.assert_eq(read_rsp[0] as Int, att.ATT_OP_READ_RSP)
+    test.assert_eq(read_rsp[1] as Int, 0xAA)
+    test.assert_eq(read_rsp[4] as Int, 0xDD)
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-001")
+fn test_handle_write_req_invalid_handle_returns_error()
+    var db = fixture_writable_db()
+    let queue: [u8] = []
+    let req: [u8] = [
+        att.ATT_OP_WRITE_REQ,
+        0xFF, 0x00,
+        0x42]
+    let r = handle_write_req(var db, queue, req)
+    test.assert_eq(r.rsp[0] as Int, att.ATT_OP_ERROR_RSP)
+    test.assert_eq(r.rsp[1] as Int, att.ATT_OP_WRITE_REQ)
+    test.assert_eq(r.rsp[4] as Int, att.ATT_ERR_INVALID_HANDLE)
+    test.assert_eq(r.applied, false)
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-001")
+fn test_handle_write_req_read_only_returns_write_not_permitted()
+    // Manufacturer Name in fixture_db is read-only (props 0x02).
+    var db = fixture_db()
+    let queue: [u8] = []
+    let req: [u8] = [
+        att.ATT_OP_WRITE_REQ,
+        0x03, 0x00,
+        0x42]
+    let r = handle_write_req(var db, queue, req)
+    test.assert_eq(r.rsp[0] as Int, att.ATT_OP_ERROR_RSP)
+    test.assert_eq(r.rsp[4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    test.assert_eq(r.applied, false)
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-001")
+fn test_handle_write_req_value_too_long_returns_invalid_value_len()
+    var db = fixture_writable_db()
+    let queue: [u8] = []
+    // 4-byte slot, 5-byte payload.
+    let req: [u8] = [
+        att.ATT_OP_WRITE_REQ,
+        0x03, 0x00,
+        0x01, 0x02, 0x03, 0x04, 0x05]
+    let r = handle_write_req(var db, queue, req)
+    test.assert_eq(r.rsp[0] as Int, att.ATT_OP_ERROR_RSP)
+    test.assert_eq(r.rsp[4] as Int, att.ATT_ERR_INVALID_ATTRIBUTE_VALUE_LEN)
+    test.assert_eq(r.applied, false)
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-001")
+fn test_handle_write_cmd_silent_and_applies()
+    var db = fixture_writable_db()
+    let queue: [u8] = []
+    // WRITE_CMD opcode=0x52, handle=0x0003, value=[0x11 0x22]
+    let req: [u8] = [
+        att.ATT_OP_WRITE_CMD,
+        0x03, 0x00,
+        0x11, 0x22]
+    let r = handle_write_cmd(var db, queue, req)
+    // No response per spec — empty rsp bytes.
+    test.assert_eq(list.len(r.rsp), 0)
+    test.assert_eq(r.applied, true)
+    // Verify partial-overwrite behaviour: bytes 0-1 changed, 2-3 still zero.
+    let read_req: [u8] = [att.ATT_OP_READ_REQ, 0x03, 0x00]
+    let read_rsp = handle_request(r.new_blob, ATT_DEFAULT_MTU, read_req)
+    test.assert_eq(read_rsp[1] as Int, 0x11)
+    test.assert_eq(read_rsp[2] as Int, 0x22)
+    test.assert_eq(read_rsp[3] as Int, 0x00)
+    test.assert_eq(read_rsp[4] as Int, 0x00)
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-001")
+fn test_handle_write_cmd_silent_on_unwritable()
+    var db = fixture_db()   // read-only fixture
+    let queue: [u8] = []
+    let req: [u8] = [
+        att.ATT_OP_WRITE_CMD,
+        0x03, 0x00,
+        0x42]
+    let r = handle_write_cmd(var db, queue, req)
+    test.assert_eq(list.len(r.rsp), 0)   // still silent
+    test.assert_eq(r.applied, false)
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-001")
+fn test_prepare_then_execute_commits_atomically()
+    let db = fixture_writable_db()
+    var queue: [u8] = []
+    // Prepare two slices: offset 0 = [0xAA 0xBB], offset 2 = [0xCC 0xDD].
+    let prep1: [u8] = [
+        att.ATT_OP_PREPARE_WRITE_REQ,
+        0x03, 0x00,
+        0x00, 0x00,
+        0xAA, 0xBB]
+    let r1 = handle_prepare_write_req(db, var queue, prep1)
+    test.assert_eq(r1.rsp[0] as Int, att.ATT_OP_PREPARE_WRITE_RSP)
+    test.assert_eq(r1.applied, false)   // not yet committed
+    let prep2: [u8] = [
+        att.ATT_OP_PREPARE_WRITE_REQ,
+        0x03, 0x00,
+        0x02, 0x00,
+        0xCC, 0xDD]
+    let r2 = handle_prepare_write_req(r1.new_blob, r1.new_queue[:], prep2)
+    test.assert_eq(r2.rsp[0] as Int, att.ATT_OP_PREPARE_WRITE_RSP)
+    test.assert_eq(r2.applied, false)
+    // Pre-execute the value should still be all zeros.
+    let read_pre: [u8] = [att.ATT_OP_READ_REQ, 0x03, 0x00]
+    let pre_rsp = handle_request(r2.new_blob, ATT_DEFAULT_MTU, read_pre)
+    test.assert_eq(pre_rsp[1] as Int, 0x00)
+
+    // EXECUTE_WRITE flag=0x01 → commit.
+    let exec: [u8] = [att.ATT_OP_EXECUTE_WRITE_REQ, 0x01]
+    let r3 = handle_execute_write_req(r2.new_blob[:], r2.new_queue, exec)
+    test.assert_eq(r3.rsp[0] as Int, att.ATT_OP_EXECUTE_WRITE_RSP)
+    test.assert_eq(r3.applied, true)
+    test.assert_eq(list.len(r3.new_queue), 0)   // queue drained
+    // Both slices applied.
+    let post_rsp = handle_request(r3.new_blob, ATT_DEFAULT_MTU, read_pre)
+    test.assert_eq(post_rsp[1] as Int, 0xAA)
+    test.assert_eq(post_rsp[2] as Int, 0xBB)
+    test.assert_eq(post_rsp[3] as Int, 0xCC)
+    test.assert_eq(post_rsp[4] as Int, 0xDD)
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-001")
+fn test_execute_write_cancel_drops_queue_without_committing()
+    let db = fixture_writable_db()
+    var queue: [u8] = []
+    let prep: [u8] = [
+        att.ATT_OP_PREPARE_WRITE_REQ,
+        0x03, 0x00,
+        0x00, 0x00,
+        0xAA, 0xBB]
+    let r1 = handle_prepare_write_req(db, var queue, prep)
+    let exec: [u8] = [att.ATT_OP_EXECUTE_WRITE_REQ, 0x00]
+    let r2 = handle_execute_write_req(r1.new_blob[:], r1.new_queue, exec)
+    test.assert_eq(r2.rsp[0] as Int, att.ATT_OP_EXECUTE_WRITE_RSP)
+    test.assert_eq(r2.applied, false)
+    test.assert_eq(list.len(r2.new_queue), 0)
+    // Value still all zeros.
+    let read: [u8] = [att.ATT_OP_READ_REQ, 0x03, 0x00]
+    let post = handle_request(r2.new_blob, ATT_DEFAULT_MTU, read)
+    test.assert_eq(post[1] as Int, 0x00)
+
+@test
+@satisfies("REQ-BLE-ATT-SRV-001")
+fn test_handle_request_m6_routes_writes_through_to_blob()
+    // Top-level dispatcher — confirm it routes write opcodes
+    // into the write path while passing reads through unchanged.
+    var db = fixture_writable_db()
+    var queue: [u8] = []
+    let req: [u8] = [
+        att.ATT_OP_WRITE_REQ,
+        0x03, 0x00,
+        0x42]
+    let r = handle_request_m6(var db, var queue, ATT_DEFAULT_MTU, req)
+    test.assert_eq(r.rsp[0] as Int, att.ATT_OP_WRITE_RSP)
+    test.assert_eq(r.applied, true)
+    // Now route a read through the same dispatcher — applied=false
+    // because reads don't mutate.
+    let read: [u8] = [att.ATT_OP_READ_REQ, 0x03, 0x00]
+    let r2 = handle_request_m6(r.new_blob[:], r.new_queue[:], ATT_DEFAULT_MTU, read)
+    test.assert_eq(r2.rsp[0] as Int, att.ATT_OP_READ_RSP)
+    test.assert_eq(r2.rsp[1] as Int, 0x42)
+    test.assert_eq(r2.applied, false)
+
+// A characteristic with Indicate only, its value at 0x0003, then a
+// readable 30-octet value at 0x0005.
+@tier(app)
+fn fixture_permissions_db() -> [u8]
+    var long_value: [u8] = []
+    for i in 0..30
+        list.push(long_value, (0x41 + i) as u8)
+    var db = build_db_record(0x0001, GATT_UUID_PRIMARY_SERVICE, 0x0005, [0x01, 0x18])
+    list.append(db, build_db_record(0x0002, GATT_UUID_CHARACTERISTIC, 0x0002, [0x20, 0x03, 0x00, 0x05, 0x2A]))
+    list.append(db, build_db_record(0x0003, 0x2A05, 0x0003, [0x01, 0x00, 0xFF, 0xFF]))
+    list.append(db, build_db_record(0x0004, GATT_UUID_CHARACTERISTIC, 0x0004, [0x02, 0x05, 0x00, 0x00, 0x2A]))
+    list.append(db, build_db_record(0x0005, 0x2A00, 0x0005, long_value))
+    db
+
+@test
+fn test_read_not_permitted_without_the_read_property()
+    let db = fixture_permissions_db()
+    let rsp = handle_request(db, ATT_DEFAULT_MTU, [0x0A, 0x03, 0x00])
+    test.assert_eq(rsp[0] as Int, att.ATT_OP_ERROR_RSP)
+    test.assert_eq(rsp[4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+    let blob_rsp = handle_request(db, ATT_DEFAULT_MTU, [0x0C, 0x03, 0x00, 0x00, 0x00])
+    test.assert_eq(blob_rsp[4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+    // Read By Type of the value's type: the first match cannot be read.
+    let by_type = handle_request(db, ATT_DEFAULT_MTU, [0x08, 0x01, 0x00, 0xFF, 0xFF, 0x05, 0x2A])
+    test.assert_eq(by_type[0] as Int, att.ATT_OP_ERROR_RSP)
+    test.assert_eq(by_type[2] as Int, 0x03)
+    test.assert_eq(by_type[4] as Int, att.ATT_ERR_READ_NOT_PERMITTED)
+
+@test
+fn test_long_values_are_cut_to_the_mtu()
+    let db = fixture_permissions_db()
+    // ATT_READ_RSP: opcode and ATT_MTU - 1 = 22 octets.
+    let rsp = handle_request(db, ATT_DEFAULT_MTU, [0x0A, 0x05, 0x00])
+    test.assert_eq(list.len(rsp), ATT_DEFAULT_MTU)
+    test.assert_eq(rsp[1] as Int, 0x41)
+    // ATT_READ_BY_TYPE_RSP: one pair of handle and ATT_MTU - 4 = 19 octets.
+    let by_type = handle_request(db, ATT_DEFAULT_MTU, [0x08, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x2A])
+    test.assert_eq(by_type[0] as Int, att.ATT_OP_READ_BY_TYPE_RSP)
+    test.assert_eq(by_type[1] as Int, 21)
+    test.assert_eq(list.len(by_type), 2 + 21)
+
+// A service with one characteristic that is read and written: the value handle is 3 and holds four octets.
+fn writable_db() -> [u8]
+    var db = build_db_record(0x0001, GATT_UUID_PRIMARY_SERVICE, 0x0003, [0x0A, 0x18])
+    list.append(db, build_db_record(0x0002, GATT_UUID_CHARACTERISTIC, 0x0002, [0x0A, 0x03, 0x00, 0x00, 0x2A]))
+    list.append(db, build_db_record(0x0003, 0x2A00, 0x0003, [0x41, 0x42, 0x43, 0x44]))
+    db
+
+@test
+fn test_a_database_walk_stops_at_a_truncated_record_and_an_index_past_the_end_is_empty()
+    let db = writable_db()
+    var cut = db[:]
+    list.push(cut, 0x01)
+    list.push(cut, 0x00)
+    test.assert_eq(att_server.db_count(cut), 3)
+    test.assert_eq(att_server.db_record_offset(cut, 3), -1)
+    test.assert_eq(att_server.db_record_offset(db, 3), -1)
+    test.assert_eq(att_server.db_handle_at(db, 3), -1)
+    test.assert_eq(att_server.db_type16_at(db, 3), -1)
+    test.assert_eq(att_server.db_end_group_at(db, 3), -1)
+    test.assert_eq(list.len(att_server.db_value_at(db, 3)), 0)
+
+@test
+fn test_a_write_to_a_handle_the_database_lacks_or_past_the_value_changes_nothing()
+    let db = writable_db()
+    test.assert(not att_server.db_writable_at(db, 0x0009))
+    var blob = db[:]
+    test.assert_eq(list.len(att_server.db_apply_write(var blob, 0x0009, 0, [1])), list.len(db))
+    var same = db[:]
+    let after = att_server.db_apply_write(var same, 0x0003, 3, [1, 2])
+    test.assert_eq(att_server.db_value_at(after, 2)[3] as Int, 0x44)
+    var negative = db[:]
+    let before = att_server.db_apply_write(var negative, 0x0003, -1, [1])
+    test.assert_eq(att_server.db_value_at(before, 2)[0] as Int, 0x41)
+    var ok = db[:]
+    let applied = att_server.db_apply_write(var ok, 0x0003, 1, [9, 8])
+    test.assert_eq(att_server.db_value_at(applied, 2)[1] as Int, 9)
+    test.assert_eq(att_server.db_value_at(applied, 2)[2] as Int, 8)
+
+@test
+fn test_a_prepare_queue_cut_short_applies_only_its_whole_entries()
+    let db = writable_db()
+    var blob = db[:]
+    // Four octets of an entry header, then none: the header of 5 octets is not whole.
+    let cut: [u8] = [0x03, 0x00, 0x00, 0x00]
+    test.assert_eq(list.len(att_server.prep_queue_apply(cut, var blob)), list.len(db))
+    // A whole header that promises more octets than the queue holds.
+    var blob2 = db[:]
+    let promising: [u8] = [0x03, 0x00, 0x00, 0x00, 0x09, 0x01]
+    test.assert_eq(att_server.db_value_at(att_server.prep_queue_apply(promising, var blob2), 2)[0] as Int, 0x41)
+
+@test
+fn test_a_write_request_or_command_too_short_for_its_handle_is_refused_or_ignored()
+    var blob = writable_db()
+    let queue: [u8] = []
+    let request = att_server.handle_write_req(var blob, queue, [0x12])
+    test.assert(not request.applied)
+    test.assert_eq(request.rsp[0] as Int, att.ATT_OP_ERROR_RSP)
+    test.assert_eq(request.rsp[4] as Int, att.ATT_ERR_INVALID_PDU)
+    let command = att_server.handle_write_cmd(var blob, queue, [0x52])
+    test.assert(not command.applied)
+    test.assert_eq(list.len(command.rsp), 0)
+
+@test
+fn test_a_prepare_write_is_refused_for_a_short_pdu_a_missing_or_read_only_handle_a_value_past_the_end_or_a_full_queue()
+    let blob = writable_db()
+    var queue: [u8] = []
+    let short = att_server.handle_prepare_write_req(blob, var queue, [0x16, 0x03, 0x00])
+    test.assert_eq(short.rsp[4] as Int, att.ATT_ERR_INVALID_PDU)
+    let missing = att_server.handle_prepare_write_req(blob, var queue, [0x16, 0x09, 0x00, 0x00, 0x00, 0x01])
+    test.assert_eq(missing.rsp[4] as Int, att.ATT_ERR_INVALID_HANDLE)
+    let read_only = att_server.handle_prepare_write_req(blob, var queue, [0x16, 0x01, 0x00, 0x00, 0x00, 0x01])
+    test.assert_eq(read_only.rsp[4] as Int, att.ATT_ERR_WRITE_NOT_PERMITTED)
+    let past = att_server.handle_prepare_write_req(blob, var queue, [0x16, 0x03, 0x00, 0x03, 0x00, 0x01, 0x02])
+    test.assert_eq(past.rsp[4] as Int, att.ATT_ERR_INVALID_OFFSET)
+    // Entries of one octet take 6 octets each of the 256 of the queue.
+    var count = 0
+    var refused = false
+    while count < 100 and not refused
+        let r = att_server.handle_prepare_write_req(blob, var queue, [0x16, 0x03, 0x00, 0x00, 0x00, 0x01])
+        if (r.rsp[0] as Int) == att.ATT_OP_ERROR_RSP
+            test.assert_eq(r.rsp[4] as Int, att.ATT_ERR_PREPARE_QUEUE_FULL)
+            refused = true
+        else
+            queue = r.new_queue[:]
+        count = count + 1
+    test.assert(refused)
+    test.assert(count > 1)
+
+@test
+fn test_an_execute_write_is_refused_for_a_short_pdu_or_an_unknown_flag_and_cancels_with_flag_0()
+    var blob = writable_db()
+    var queue: [u8] = []
+    let queued = att_server.handle_prepare_write_req(blob, var queue, [0x16, 0x03, 0x00, 0x00, 0x00, 0x7F])
+    queue = queued.new_queue[:]
+    let short = att_server.handle_execute_write_req(var blob, queue, [0x18])
+    test.assert_eq(short.rsp[4] as Int, att.ATT_ERR_INVALID_PDU)
+    let unknown = att_server.handle_execute_write_req(var blob, queue, [0x18, 0x07])
+    test.assert_eq(unknown.rsp[4] as Int, att.ATT_ERR_INVALID_PDU)
+    test.assert_eq(list.len(unknown.new_queue), list.len(queue))
+    let cancel = att_server.handle_execute_write_req(var blob, queue, [0x18, 0x00])
+    test.assert_eq(list.len(cancel.new_queue), 0)
+    test.assert(not cancel.applied)
+    test.assert_eq(att_server.db_value_at(cancel.new_blob, 2)[0] as Int, 0x41)
+    let commit = att_server.handle_execute_write_req(var blob, queue, [0x18, 0x01])
+    test.assert(commit.applied)
+    test.assert_eq(att_server.db_value_at(commit.new_blob, 2)[0] as Int, 0x7F)
+
+@test
+fn test_the_write_aware_dispatcher_routes_the_prepare_and_execute_opcodes_and_refuses_an_empty_pdu()
+    var blob = writable_db()
+    var queue: [u8] = []
+    let empty = att_server.handle_request_m6(var blob, queue, 23, [])
+    test.assert_eq(empty.rsp[4] as Int, att.ATT_ERR_INVALID_PDU)
+    let prepared = att_server.handle_request_m6(var blob, queue, 23, [0x16, 0x03, 0x00, 0x00, 0x00, 0x5A])
+    test.assert_eq(prepared.rsp[0] as Int, att.ATT_OP_PREPARE_WRITE_RSP)
+    queue = prepared.new_queue[:]
+    let executed = att_server.handle_request_m6(var blob, queue, 23, [0x18, 0x01])
+    test.assert_eq(executed.rsp[0] as Int, att.ATT_OP_EXECUTE_WRITE_RSP)
+    test.assert(executed.applied)

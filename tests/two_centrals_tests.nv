@@ -139,11 +139,17 @@ fn test_link_security_is_each_centrals_own()
     // 0x000C needs an encrypted link: the first central reads it, the second
     // is refused.
     gatt_server.assert_bytes(ask(var s.db, var s.link, read_pdu(0x000C)), [0x0B, 0x11])
-    gatt_server.assert_error(gatt_server.receive(var s.db, var b, gatt_server.octets(read_pdu(0x000C)), 0), 0x0A, 0x000C, att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
+    gatt_server.assert_error(gatt_server.receive(var s.db, var b, gatt_server.octets(read_pdu(0x000C)), 0),
+        0x0A,
+        0x000C,
+        att.ATT_ERR_INSUFFICIENT_AUTHENTICATION)
     // The second central's link key makes the refusal Insufficient
     // Encryption, and encrypting its link opens the attribute to it.
     gatt_server.set_security(var b, gatt_server.link_security(false, 1, 0, true))
-    gatt_server.assert_error(gatt_server.receive(var s.db, var b, gatt_server.octets(read_pdu(0x000C)), 0), 0x0A, 0x000C, att.ATT_ERR_INSUFFICIENT_ENCRYPTION)
+    gatt_server.assert_error(gatt_server.receive(var s.db, var b, gatt_server.octets(read_pdu(0x000C)), 0),
+        0x0A,
+        0x000C,
+        att.ATT_ERR_INSUFFICIENT_ENCRYPTION)
     gatt_server.set_security(var b, gatt_server.link_security(true, 2, 16, true))
     gatt_server.assert_bytes(ask(var s.db, var b, read_pdu(0x000C)), [0x0B, 0x11])
 
@@ -152,8 +158,15 @@ fn test_change_awareness_is_each_centrals_own()
     var s = gatt_server.host_server()
     var b = gatt_server.new_att_link(s.db)
     // Both clients ask for Robust Caching.
-    let _ = ask(var s.db, var s.link, [0x12, gatt_db.GAP_SERVER_CLIENT_SUPPORTED_FEATURES_HANDLE & 0xFF, gatt_db.GAP_SERVER_CLIENT_SUPPORTED_FEATURES_HANDLE >>> 8, 0x01])
-    let _ = gatt_server.receive(var s.db, var b, gatt_server.octets([0x12, gatt_db.GAP_SERVER_CLIENT_SUPPORTED_FEATURES_HANDLE & 0xFF, gatt_db.GAP_SERVER_CLIENT_SUPPORTED_FEATURES_HANDLE >>> 8, 0x01]), 0)
+    let _ = ask(var s.db, var s.link, [0x12,
+        gatt_db.GAP_SERVER_CLIENT_SUPPORTED_FEATURES_HANDLE & 0xFF,
+        gatt_db.GAP_SERVER_CLIENT_SUPPORTED_FEATURES_HANDLE >>> 8,
+        0x01])
+    let _ = gatt_server.receive(var s.db, var b, gatt_server.octets([0x12,
+        gatt_db.GAP_SERVER_CLIENT_SUPPORTED_FEATURES_HANDLE & 0xFF,
+        gatt_db.GAP_SERVER_CLIENT_SUPPORTED_FEATURES_HANDLE >>> 8,
+        0x01]),
+    0)
     let _ = gatt_server.add_service(var s.db, false, gatt_server.le16(0xAA00))
     // The change makes both change-unaware.
     test.assert(gatt_server.is_change_unaware(s.db, var s.link))
@@ -165,10 +178,16 @@ fn test_change_awareness_is_each_centrals_own()
     gatt_server.assert_bytes(ask(var s.db, var b, read_pdu(0x0003)), [0x0B, 'T' as Int, 'e' as Int, 's' as Int, 't' as Int])
     test.assert(not gatt_server.is_change_unaware(s.db, var b))
     test.assert(gatt_server.is_change_unaware(s.db, var s.link))
-    gatt_server.assert_error(gatt_server.receive(var s.db, var s.link, gatt_server.octets(read_pdu(0x0003)), 0), 0x0A, 0x0003, att.ATT_ERR_DATABASE_OUT_OF_SYNC)
+    gatt_server.assert_error(gatt_server.receive(var s.db, var s.link, gatt_server.octets(read_pdu(0x0003)), 0),
+        0x0A,
+        0x0003,
+        att.ATT_ERR_DATABASE_OUT_OF_SYNC)
     // A second change makes the second client change-unaware again, once.
     let _ = gatt_server.add_service(var s.db, false, gatt_server.le16(0xBB00))
-    gatt_server.assert_error(gatt_server.receive(var s.db, var b, gatt_server.octets(read_pdu(0x0003)), 0), 0x0A, 0x0003, att.ATT_ERR_DATABASE_OUT_OF_SYNC)
+    gatt_server.assert_error(gatt_server.receive(var s.db, var b, gatt_server.octets(read_pdu(0x0003)), 0),
+        0x0A,
+        0x0003,
+        att.ATT_ERR_DATABASE_OUT_OF_SYNC)
 
 @test
 fn test_a_per_connection_value_reads_differently_for_each_central()

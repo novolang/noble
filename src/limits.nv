@@ -32,7 +32,10 @@ pub const LINK_SLOTS = 4
 // The larger of `n` and 1: a table of an absent feature keeps one record.
 @tier(embedded)
 const fn max1(n: Int) -> Int
-    if n > 1 then n else 1
+    if n > 1
+        n
+    else
+        1
 
 // One L2CAP B-frame buffer: the largest ATT PDU and the L2CAP header.
 @tier(embedded)

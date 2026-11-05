@@ -44,7 +44,7 @@ fn fixture_db() -> [u8]
 // (handle, uuid16) pairs of every service found, flattened, in handle
 // order, and the number of requests it took as the last element.
 fn discover_all_primary_services(db: [u8], mtu: Int) -> [Int]
-    var found : [Int] = []
+    var found: [Int] = []
     var requests = 0
     var start = 0x0001
     loop

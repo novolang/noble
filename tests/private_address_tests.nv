@@ -1,0 +1,121 @@
+// tests/private_address_tests.nv — the unit tests of src/private_address.nv.
+//
+//   novo test tests/private_address_tests.nv
+
+use std.test
+use private_address.{ ah_plaintext, identity, le_encrypt_parameters, non_resolvable_from_random, parse_irk, prand_from_random, resolvable_from_encrypted, same_address }
+use private_address
+
+@test
+fn test_non_resolvable_has_the_0b00_subtype_and_the_random_octets()
+    let random: [u8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0xFF, 0x77, 0x88]
+    match non_resolvable_from_random(random, identity())
+        None    => test.fail("a mixed random part gives an address")
+        Some(a) =>
+            test.assert(same_address(a, [0x11, 0x22, 0x33, 0x44, 0x55, 0x3F]))
+            test.assert_eq(a[5] as Int & 0xC0, 0x00)
+
+@test
+fn test_non_resolvable_refuses_all_zeros_and_all_ones()
+    // The two most significant bits do not count: 0xC0 over zeros is
+    // still an all-zero random part.
+    let zeros: [u8] = [0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x12, 0x34]
+    let ones: [u8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00]
+    test.assert(non_resolvable_from_random(zeros, identity()) == None)
+    test.assert(non_resolvable_from_random(ones, identity()) == None)
+    // One bit either way is enough.
+    let one_bit: [u8] = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+    let one_zero: [u8] = [0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F, 0x00, 0x00]
+    test.assert(non_resolvable_from_random(one_bit, identity()) != None)
+    test.assert(non_resolvable_from_random(one_zero, identity()) != None)
+
+@test
+fn test_non_resolvable_refuses_the_identity_address()
+    let public_like: [u8] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06]
+    let random: [u8] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x00, 0x00]
+    test.assert(non_resolvable_from_random(random, public_like) == None)
+    test.assert(non_resolvable_from_random(random, identity()) != None)
+
+@test
+fn test_non_resolvable_needs_six_octets()
+    test.assert(non_resolvable_from_random([0x01, 0x02], identity()) == None)
+
+@test
+fn test_prand_has_the_0b01_subtype()
+    match prand_from_random([0x94, 0x81, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x00])
+        None    => test.fail("a mixed prand is kept")
+        Some(p) =>
+            test.assert(same_address(p, [0x94, 0x81, 0x70]))
+            test.assert_eq(p[2] as Int & 0xC0, 0x40)
+
+@test
+fn test_prand_refuses_all_zeros_and_all_ones()
+    test.assert(prand_from_random([0x00, 0x00, 0x40]) == None)
+    test.assert(prand_from_random([0xFF, 0xFF, 0xFF]) == None)
+    test.assert(prand_from_random([0xFF, 0xFF, 0x3E]) != None)
+
+// [Vol 3] Part H, Appendix D.7: IRK ec0234a3 57c8ad05 341010a6 0a397d9b,
+// prand 0x708194, M = 0x...00708194, AES_128 159d5fb7 2ebe2311 a48c1bdc
+// c40dfbaa, ah 0x0dfbaa.  Each value here is least significant octet
+// first, as HCI carries it.
+
+@tier(app)
+fn d7_irk() -> [u8]
+    [0x9b, 0x7d, 0x39, 0x0a, 0xa6, 0x10, 0x10, 0x34, 0x05, 0xad, 0xc8, 0x57, 0xa3, 0x34, 0x02, 0xec]
+
+@tier(app)
+fn d7_encrypted() -> [u8]
+    [0xaa, 0xfb, 0x0d, 0xc4, 0xdc, 0x1b, 0x8c, 0xa4, 0x11, 0x23, 0xbe, 0x2e, 0xb7, 0x5f, 0x9d, 0x15]
+
+@test
+fn test_ah_plaintext_is_the_d7_m()
+    let m = ah_plaintext([0x94, 0x81, 0x70])
+    test.assert_eq(list.len(m), 16)
+    test.assert(same_address(m[0:3], [0x94, 0x81, 0x70]))
+    for i in 3..16
+        test.assert_eq(m[i] as Int, 0)
+
+@test
+fn test_le_encrypt_parameters_are_key_then_plaintext()
+    let p = le_encrypt_parameters(d7_irk(), ah_plaintext([0x94, 0x81, 0x70]))
+    test.assert_eq(list.len(p), 32)
+    test.assert(same_address(p[0:16], d7_irk()))
+    test.assert_eq(p[16] as Int, 0x94)
+    test.assert_eq(p[18] as Int, 0x70)
+
+@test
+fn test_resolvable_address_from_the_d7_vector()
+    // RPA 0x7081940dfbaa, least significant octet first.
+    match resolvable_from_encrypted([0x94, 0x81, 0x70], d7_encrypted())
+        None    => test.fail("a full block gives an address")
+        Some(a) =>
+            test.assert(same_address(a, [0xaa, 0xfb, 0x0d, 0x94, 0x81, 0x70]))
+            test.assert_eq(a[5] as Int & 0xC0, 0x40)
+    test.assert(resolvable_from_encrypted([0x94, 0x81, 0x70], [0x00]) == None)
+
+@test
+fn test_parse_irk_reverses_the_written_order()
+    let text = "ec0234a357c8ad05341010a60a397d9b"
+    match parse_irk(bytes_of(text))
+        None    => test.fail("32 hex digits are a key")
+        Some(k) => test.assert(same_address(k, d7_irk()))
+    test.assert(parse_irk(bytes_of("ec0234")) == None)
+    test.assert(parse_irk(bytes_of("zz0234a357c8ad05341010a60a397d9b")) == None)
+
+@tier(app)
+fn bytes_of(text: Str) -> [u8]
+    var out: [u8] = []
+    for i in 0..str.len(text)
+        list.push(out, (str.byte_at(text, i) ?? 0) as u8)
+    out
+
+@test
+fn test_the_random_part_of_a_private_address_is_not_all_zeros_and_not_all_ones()
+    // Three octets: the top two bits of the last one are the subtype, so the random part is 22 bits.
+    test.assert(private_address.random_part_is_mixed([0x12, 0x34, 0x56], 3))
+    test.assert(not private_address.random_part_is_mixed([0x00, 0x00, 0x00], 3))
+    test.assert(not private_address.random_part_is_mixed([0x00, 0x00, 0xC0], 3))
+    test.assert(not private_address.random_part_is_mixed([0xFF, 0xFF, 0x3F], 3))
+    test.assert(not private_address.random_part_is_mixed([0xFF, 0xFF, 0xFF], 3))
+    test.assert(private_address.random_part_is_mixed([0x00, 0x00, 0x01], 3))
+    test.assert(private_address.random_part_is_mixed([0xFF, 0xFF, 0x3E], 3))

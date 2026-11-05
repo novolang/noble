@@ -11,8 +11,6 @@
 // ([Vol 1] Part F, and the Errors table of each command in [Vol 4] Part E,
 // Section 7.8), so a caller treats a refusal and a Controller's answer alike.
 
-use std.test
-
 // Controller error codes ([Vol 1] Part F, Section 1.3) the isochronous
 // commands and events use.
 pub const STATUS_SUCCESS = 0x00
@@ -119,38 +117,3 @@ fn unrelated(handle: Int) -> IsoEvent
 @tier(embedded)
 fn command_failed(handle: Int, status: Int) -> IsoEvent
     IsoEvent { kind: IsoEventKind.CommandFailed, slot: -1, handle: handle, status: status }
-
-@test
-fn test_an_event_carries_its_four_fields()
-    let e = iso_event(IsoEventKind.CisEstablished, 1, 0x0040, 0)
-    test.assert(e.kind == IsoEventKind.CisEstablished)
-    test.assert_eq(e.slot, 1)
-    test.assert_eq(e.handle, 0x0040)
-    test.assert_eq(e.status, 0)
-
-@test
-fn test_an_unrelated_event_and_a_failed_command_name_no_row()
-    let a = unrelated(0x0041)
-    test.assert(a.kind == IsoEventKind.Unrelated)
-    test.assert_eq(a.slot, -1)
-    test.assert_eq(a.handle, 0x0041)
-    let b = command_failed(0x0042, STATUS_COMMAND_DISALLOWED)
-    test.assert(b.kind == IsoEventKind.CommandFailed)
-    test.assert_eq(b.status, 0x0C)
-    test.assert_eq(b.slot, -1)
-
-// The codes are those of [Vol 1] Part F, Section 1.3.
-@test
-fn test_the_status_codes_are_the_specified_ones()
-    test.assert_eq(STATUS_UNKNOWN_CONNECTION_IDENTIFIER, 0x02)
-    test.assert_eq(STATUS_MEMORY_CAPACITY_EXCEEDED, 0x07)
-    test.assert_eq(STATUS_CONNECTION_ALREADY_EXISTS, 0x0B)
-    test.assert_eq(STATUS_COMMAND_DISALLOWED, 0x0C)
-    test.assert_eq(STATUS_REJECTED_LIMITED_RESOURCES, 0x0D)
-    test.assert_eq(STATUS_CONNECTION_ACCEPT_TIMEOUT_EXCEEDED, 0x10)
-    test.assert_eq(STATUS_UNSUPPORTED_FEATURE_OR_PARAMETER, 0x11)
-    test.assert_eq(STATUS_INVALID_COMMAND_PARAMETERS, 0x12)
-    test.assert_eq(STATUS_CONNECTION_TERMINATED_BY_LOCAL_HOST, 0x16)
-    test.assert_eq(STATUS_ENCRYPTION_MODE_NOT_ACCEPTABLE, 0x25)
-    test.assert_eq(STATUS_UNKNOWN_ADVERTISING_IDENTIFIER, 0x42)
-    test.assert_eq(STATUS_OPERATION_CANCELLED_BY_HOST, 0x44)

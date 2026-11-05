@@ -18,7 +18,6 @@
 // Every key and address is least significant octet first, the order
 // the Security Manager commands and HCI carry them in.
 
-use std.test
 use smp_keys
 
 // One bonded device.
@@ -173,66 +172,3 @@ pub fn resolving_list(table: SmpBondTable, local_irk: [u8]) -> [ResolvingListEnt
         if entry != None
             list.push(out, entry!)
     out
-
-// ── Tests ───────────────────────────────────────────────────────────
-
-fn hex(text: Str) -> [u8]
-    bytes.to_byte_list(bytes.from_hex(text)!)
-
-fn test_bond(address: [u8], irk: [u8]) -> SmpBond
-    SmpBond {
-        peer_address_type: 1, peer_address: address, peer_irk: irk, peer_csrk: [],
-        peer_sign_counter: -1, peer_ltk: [], peer_ediv: 0, peer_rand: [],
-        ltk: hex("00112233445566778899aabbccddeeff"), ediv: 0x1234, rand: hex("0102030405060708"),
-        local_csrk: [], key_size: 16, authenticated: true, secure_connections: true }
-
-@test
-fn test_table_finds_by_identity_and_by_resolvable_private_address()
-    let irk = smp_keys.reversed(hex("ec0234a357c8ad05341010a60a397d9b"))
-    var table = new_bond_table(2)
-    table.save(test_bond(hex("c00102030405"), irk))
-    test.assert(table.find(1, hex("c00102030405")) != None)
-    test.assert(table.find(0, hex("c00102030405")) == None)
-    let rpa = smp_keys.resolvable_private_address(irk, hex("708194"))
-    let found = table.find(1, rpa)
-    test.assert(found != None)
-    test.assert_eq(found!.ediv, 0x1234)
-    test.assert(table.find(1, hex("aabbccddee44")) == None)
-
-@test
-fn test_table_replaces_the_same_identity_and_drops_the_oldest()
-    var table = new_bond_table(2)
-    table.save(test_bond(hex("c00000000001"), []))
-    table.save(test_bond(hex("c00000000002"), []))
-    table.save(test_bond(hex("c00000000002"), []))
-    test.assert_eq(list.len(table.bonds), 2)
-    table.save(test_bond(hex("c00000000003"), []))
-    test.assert_eq(list.len(table.bonds), 2)
-    test.assert(table.find(1, hex("c00000000001")) == None)
-    table.forget(1, hex("c00000000002"))
-    test.assert_eq(list.len(table.bonds), 1)
-
-@test
-fn test_resolving_list_takes_bonds_with_an_irk()
-    var table = new_bond_table(4)
-    table.save(test_bond(hex("c00000000001"), hex("0102030405060708090a0b0c0d0e0f10")))
-    table.save(test_bond(hex("c00000000002"), []))
-    let entries = resolving_list(table, hex("ffeeddccbbaa99887766554433221100"))
-    test.assert_eq(list.len(entries), 1)
-    test.assert_eq(entries[0].peer_identity_address[5] as Int, 0x01)
-    test.assert_eq(entries[0].local_irk[0] as Int, 0xff)
-
-@test
-fn test_security_level_follows_the_properties()
-    var b = test_bond(hex("c00000000001"), [])
-    test.assert_eq(security_level(b), 4)
-    let short = SmpBond {
-        peer_address_type: 1, peer_address: b.peer_address, peer_irk: [], peer_csrk: [],
-        peer_sign_counter: -1, peer_ltk: [], peer_ediv: 0, peer_rand: [], ltk: b.ltk, ediv: 0,
-        rand: [], local_csrk: [], key_size: 7, authenticated: true, secure_connections: true }
-    test.assert_eq(security_level(short), 3)
-    let unauth = SmpBond {
-        peer_address_type: 1, peer_address: b.peer_address, peer_irk: [], peer_csrk: [],
-        peer_sign_counter: -1, peer_ltk: [], peer_ediv: 0, peer_rand: [], ltk: b.ltk, ediv: 0,
-        rand: [], local_csrk: [], key_size: 16, authenticated: false, secure_connections: true }
-    test.assert_eq(security_level(unauth), 2)

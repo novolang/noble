@@ -28,7 +28,6 @@
 // cannot be a named constant), and a test compares them with `LINK_SLOTS`.
 // A registry is made for the `slots` a Host serves, at most `LINK_SLOTS`.
 
-use std.test
 use limits
 use noble_config
 // The slot of a link that holds none.
@@ -96,7 +95,10 @@ pub @tier(embedded)
 @no_alloc
 fn acl_slot_payload() -> Int
     let n = noble_config.ACL_OCTETS - ACL_HEADER_OCTETS
-    if n < ACL_DATA_MIN then ACL_DATA_MIN else n
+    if n < ACL_DATA_MIN
+        ACL_DATA_MIN
+    else
+        n
 
 // The ACL packets the Host tells the Controller it can hold at once when it
 // turns flow control toward itself on (Host_Total_Num_ACL_Data_Packets of
@@ -139,7 +141,17 @@ struct AclCredits
 // Host assumes before the Controller says.
 @tier(embedded)
 fn acl_credits_new() -> AclCredits
-    var c = AclCredits { packet_length: ACL_DATA_MIN as u16, total: 1, free: 1, cursor: 0, flow_control: false, rx_oversize: 0, in_flight: Vec.new(), owed_handle: Vec.new(), owed_count: Vec.new(), owed_n: 0, owed_total: 0 }
+    var c = AclCredits { packet_length: ACL_DATA_MIN as u16,
+        total: 1,
+        free: 1,
+        cursor: 0,
+        flow_control: false,
+        rx_oversize: 0,
+        in_flight: Vec.new(),
+        owed_handle: Vec.new(),
+        owed_count: Vec.new(),
+        owed_n: 0,
+        owed_total: 0 }
     for _ in 0..limits.LINK_SLOTS
         let _a = c.in_flight.push(0)
     for _ in 0..ACL_OWED_HANDLES
@@ -224,17 +236,17 @@ fn acl_flow_control_set(var c: AclCredits, on: Bool)
 @tier(embedded)
 @no_alloc
 fn acl_owe(var c: AclCredits, handle: Int, n: Int) -> Bool
-    for i in 0..(c.owed_n as Int)
+    for i in 0..c.owed_n as Int
         if (c.owed_handle[i] as Int) == handle
-            c.owed_count[i] = c.owed_count[i] + (n as u16)
-            c.owed_total = c.owed_total + (n as u16)
+            c.owed_count[i] = c.owed_count[i] + n as u16
+            c.owed_total = c.owed_total + n as u16
             return true
     if (c.owed_n as Int) >= ACL_OWED_HANDLES
         return false
     c.owed_handle[c.owed_n as Int] = handle as u16
     c.owed_count[c.owed_n as Int] = n as u16
     c.owed_n = c.owed_n + 1
-    c.owed_total = c.owed_total + (n as u16)
+    c.owed_total = c.owed_total + n as u16
     true
 
 // Whether the packets owed reach half of the buffers the Host told the
@@ -305,9 +317,12 @@ fn acl_credits_completed(var c: AclCredits, slot: Int, count: Int) -> Int
     if slot < 0 or slot >= c.in_flight.len() or count < 1
         return 0
     let held = c.in_flight[slot] as Int
-    let back = if count < held then count else held
+    let back = if count < held
+        count
+    else
+        held
     c.in_flight[slot] = (held - back) as u8
-    c.free = ((c.free as Int) + back) as u8
+    c.free = (c.free as Int + back) as u8
     back
 
 // The connection of `slot` ended.  The Host assumes every packet it sent and
@@ -329,8 +344,8 @@ fn acl_credits_next(var c: AclCredits, wanting: Int) -> Int
     if c.free == 0 or wanting == 0
         return -1
     let n = c.in_flight.len()
-    for k in 1..(n + 1)
-        let slot = ((c.cursor as Int) + k) % n
+    for k in 1..n + 1
+        let slot = (c.cursor as Int + k) % n
         if (wanting & (1 << slot)) != 0
             c.cursor = slot as u8
             return slot
@@ -356,7 +371,13 @@ struct Links
 // An empty registry of `slots` slots, clamped to 1 and `LINK_SLOTS`.
 pub @tier(embedded)
 fn links_new(slots: Int) -> Links
-    let served = if slots < 1 then 1 else if slots > limits.LINK_SLOTS then limits.LINK_SLOTS else slots
+    let served = if slots < 1
+        1
+    else
+        if slots > limits.LINK_SLOTS
+            limits.LINK_SLOTS
+        else
+            slots
     var l = Links {
         slots: served as u8,
         used: Vec.new(), generation: Vec.new(), handle: Vec.new(), central: Vec.new(),
@@ -382,7 +403,7 @@ pub @tier(embedded)
 @no_alloc
 fn links_count(l: Links) -> Int
     var n = 0
-    for i in 0..(l.slots as Int)
+    for i in 0..l.slots as Int
         if l.used[i]
             n = n + 1
     n
@@ -417,7 +438,7 @@ fn links_open(var l: Links, handle: Int, central: Bool, peer_type: Int, peer: [u
         return no_link()
     if is_link(links_find_handle(l, handle))
         return no_link()
-    for slot in 0..(l.slots as Int)
+    for slot in 0..l.slots as Int
         if not l.used[slot]
             l.used[slot] = true
             l.generation[slot] = l.generation[slot] + 1
@@ -461,7 +482,7 @@ fn links_set_peer(var l: Links, id: LinkId, peer_type: Int, peer: [u8]) -> Bool
 // The connection with the Connection_Handle `handle`, `no_link()` for none.
 pub @tier(embedded)
 fn links_find_handle(l: Links, handle: Int) -> LinkId
-    for slot in 0..(l.slots as Int)
+    for slot in 0..l.slots as Int
         if l.used[slot] and (l.handle[slot] as Int) == handle
             return link_id(slot, l.generation[slot] as Int)
     no_link()
@@ -471,7 +492,7 @@ fn links_find_handle(l: Links, handle: Int) -> LinkId
 fn links_find_peer(l: Links, peer_type: Int, peer: [u8]) -> LinkId
     if list.len(peer) != ADDRESS_OCTETS
         return no_link()
-    for slot in 0..(l.slots as Int)
+    for slot in 0..l.slots as Int
         if l.used[slot] and (l.peer_type[slot] as Int) == peer_type
             var same = true
             for k in 0..ADDRESS_OCTETS
@@ -485,7 +506,10 @@ fn links_find_peer(l: Links, peer_type: Int, peer: [u8]) -> LinkId
 pub @tier(embedded)
 @no_alloc
 fn links_handle(l: Links, id: LinkId) -> Int
-    if links_live(l, id) then l.handle[id.slot] as Int else -1
+    if links_live(l, id)
+        l.handle[id.slot] as Int
+    else
+        -1
 
 // Whether the Host is the Central in `id`; false for a stale id.
 @tier(embedded)
@@ -497,7 +521,10 @@ fn links_central(l: Links, id: LinkId) -> Bool
 pub @tier(embedded)
 @no_alloc
 fn links_peer_type(l: Links, id: LinkId) -> Int
-    if links_live(l, id) then l.peer_type[id.slot] as Int else -1
+    if links_live(l, id)
+        l.peer_type[id.slot] as Int
+    else
+        -1
 
 // Whether the six octets of the peer of `id` are `peer`.
 @tier(embedded)
@@ -509,276 +536,3 @@ fn links_peer_is(l: Links, id: LinkId, peer: [u8]) -> Bool
         if l.peer[id.slot * ADDRESS_OCTETS + k] != peer[k]
             return false
     true
-
-@test
-fn test_an_id_names_its_slot_and_generation()
-    let id = link_id(2, 5)
-    test.assert_eq(id.slot, 2)
-    test.assert_eq(id.generation, 5)
-    test.assert(is_link(id))
-
-@test
-fn test_no_link_names_no_slot()
-    test.assert(not is_link(no_link()))
-    test.assert(not same_link(no_link(), link_id(0, 0)))
-
-@test
-fn test_a_reused_slot_is_another_connection()
-    let first = link_id(1, 0)
-    let second = next_generation(first)
-    test.assert_eq(second.slot, 1)
-    test.assert(same_link(first, first))
-    test.assert(not same_link(first, second))
-
-fn peer_a() -> [u8]
-    [0x11, 0x22, 0x33, 0x44, 0x55, 0x66]
-
-fn peer_b() -> [u8]
-    [0x11, 0x22, 0x33, 0x44, 0x55, 0x67]
-
-@test
-@satisfies("REQ-BLE-LINKS-001")
-fn test_the_registry_columns_have_the_declared_capacity()
-    let l = links_new(limits.LINK_SLOTS)
-    test.assert_eq(l.used.capacity(), limits.LINK_SLOTS)
-    test.assert_eq(l.generation.capacity(), limits.LINK_SLOTS)
-    test.assert_eq(l.handle.capacity(), limits.LINK_SLOTS)
-    test.assert_eq(l.central.capacity(), limits.LINK_SLOTS)
-    test.assert_eq(l.peer_type.capacity(), limits.LINK_SLOTS)
-    test.assert_eq(l.peer.capacity(), limits.LINK_SLOTS * ADDRESS_OCTETS)
-    test.assert_eq(acl_credits_new().in_flight.capacity(), limits.LINK_SLOTS)
-
-@test
-@satisfies("REQ-BLE-LINKS-001")
-fn test_a_registry_serves_the_slots_it_is_made_for()
-    test.assert_eq(links_slots(links_new(2)), 2)
-    test.assert_eq(links_slots(links_new(0)), 1)
-    test.assert_eq(links_slots(links_new(99)), limits.LINK_SLOTS)
-
-@test
-@satisfies("REQ-BLE-LINKS-001")
-fn test_open_gives_the_lowest_free_slot_and_records_the_connection()
-    var l = links_new(3)
-    let a = links_open(var l, 0x0040, false, 1, peer_a())
-    let b = links_open(var l, 0x0041, true, 0, peer_b())
-    test.assert_eq(a.slot, 0)
-    test.assert_eq(b.slot, 1)
-    test.assert_eq(a.generation, 1)
-    test.assert_eq(links_count(l), 2)
-    test.assert_eq(links_handle(l, a), 0x0040)
-    test.assert_eq(links_handle(l, b), 0x0041)
-    test.assert(not links_central(l, a))
-    test.assert(links_central(l, b))
-    test.assert_eq(links_peer_type(l, a), 1)
-    test.assert_eq(links_peer_type(l, b), 0)
-    test.assert(links_peer_is(l, a, peer_a()))
-    test.assert(not links_peer_is(l, a, peer_b()))
-
-@test
-@satisfies("REQ-BLE-LINKS-001")
-fn test_a_full_registry_refuses_the_next_connection()
-    var l = links_new(2)
-    test.assert(is_link(links_open(var l, 1, false, 0, peer_a())))
-    test.assert(is_link(links_open(var l, 2, false, 0, peer_b())))
-    test.assert(not is_link(links_open(var l, 3, false, 0, [1, 2, 3, 4, 5, 6])))
-    test.assert_eq(links_count(l), 2)
-
-@test
-@satisfies("REQ-BLE-LINKS-001")
-fn test_open_refuses_a_bad_handle_a_held_handle_and_a_short_address()
-    var l = links_new(3)
-    test.assert(not is_link(links_open(var l, -1, false, 0, peer_a())))
-    test.assert(not is_link(links_open(var l, 0x0F00, false, 0, peer_a())))
-    test.assert(not is_link(links_open(var l, 5, false, 0, [1, 2])))
-    test.assert(is_link(links_open(var l, 5, false, 0, peer_a())))
-    test.assert(not is_link(links_open(var l, 5, false, 0, peer_b())))
-    test.assert_eq(links_count(l), 1)
-
-@test
-@satisfies("REQ-BLE-LINKS-001")
-fn test_a_closed_slot_is_reused_in_a_new_generation_and_the_old_id_is_stale()
-    var l = links_new(2)
-    let first = links_open(var l, 1, false, 0, peer_a())
-    test.assert(links_close(var l, first))
-    test.assert(not links_live(l, first))
-    test.assert(not links_close(var l, first))
-    let second = links_open(var l, 2, false, 0, peer_b())
-    test.assert_eq(second.slot, first.slot)
-    test.assert_eq(second.generation, first.generation + 1)
-    test.assert(links_live(l, second))
-    test.assert(not links_live(l, first))
-    test.assert_eq(links_handle(l, first), -1)
-    test.assert(not links_central(l, first))
-    test.assert(not links_peer_is(l, first, peer_b()))
-
-@test
-@satisfies("REQ-BLE-LINKS-001")
-fn test_a_connection_is_found_by_handle_and_by_peer_address()
-    var l = links_new(3)
-    let a = links_open(var l, 0x0040, false, 1, peer_a())
-    let b = links_open(var l, 0x0041, true, 1, peer_b())
-    test.assert(same_link(links_find_handle(l, 0x0041), b))
-    test.assert(same_link(links_find_peer(l, 1, peer_a()), a))
-    test.assert(same_link(links_find_peer(l, 1, peer_b()), b))
-    test.assert(not is_link(links_find_handle(l, 0x0042)))
-    // The address type is part of the name.
-    test.assert(not is_link(links_find_peer(l, 0, peer_a())))
-    test.assert(not is_link(links_find_peer(l, 1, [1])))
-    let _ = links_close(var l, a)
-    test.assert(not is_link(links_find_peer(l, 1, peer_a())))
-    test.assert(not is_link(links_find_handle(l, 0x0040)))
-
-@test
-@satisfies("REQ-BLE-LINKS-001")
-fn test_the_id_of_a_slot_is_none_for_an_empty_or_missing_slot()
-    var l = links_new(2)
-    test.assert(not is_link(links_id(l, 0)))
-    test.assert(not is_link(links_id(l, 5)))
-    test.assert(not is_link(links_id(l, -1)))
-    let a = links_open(var l, 1, false, 0, peer_a())
-    test.assert(same_link(links_id(l, 0), a))
-
-@test
-@satisfies("REQ-BLE-LINKS-002")
-fn test_a_new_pool_holds_one_minimum_buffer_and_ignores_a_controller_without_le_buffers()
-    var c = acl_credits_new()
-    test.assert_eq(acl_free(c), 1)
-    test.assert_eq(acl_packet_length(c), 27)
-    test.assert(not acl_credits_configure(var c, 26, 3))
-    test.assert(not acl_credits_configure(var c, 251, 0))
-    test.assert_eq(acl_free(c), 1)
-    test.assert(acl_credits_configure(var c, 251, 3))
-    test.assert_eq(acl_free(c), 3)
-    test.assert_eq(acl_packet_length(c), 251)
-
-@test
-@satisfies("REQ-BLE-LINKS-002")
-fn test_two_connections_spend_the_three_controller_buffers_between_them()
-    var c = acl_credits_new()
-    test.assert(acl_credits_configure(var c, 251, 3))
-    test.assert(acl_credits_take(var c, 0))
-    test.assert(acl_credits_take(var c, 0))
-    test.assert(acl_credits_take(var c, 1))
-    // All three are in flight: neither connection may send.
-    test.assert(not acl_credits_take(var c, 0))
-    test.assert(not acl_credits_take(var c, 1))
-    test.assert_eq(acl_in_flight(c, 0), 2)
-    test.assert_eq(acl_in_flight(c, 1), 1)
-    // A completed packet of the second connection frees a buffer for either.
-    test.assert_eq(acl_credits_completed(var c, 1, 1), 1)
-    test.assert_eq(acl_free(c), 1)
-    test.assert(acl_credits_take(var c, 0))
-
-@test
-@satisfies("REQ-BLE-LINKS-002")
-fn test_completed_packets_never_return_more_than_the_slot_had_in_flight()
-    var c = acl_credits_new()
-    test.assert(acl_credits_configure(var c, 251, 3))
-    test.assert(acl_credits_take(var c, 1))
-    test.assert_eq(acl_credits_completed(var c, 0, 2), 0)
-    test.assert_eq(acl_credits_completed(var c, 1, 5), 1)
-    test.assert_eq(acl_free(c), 3)
-    test.assert_eq(acl_credits_completed(var c, 1, 1), 0)
-    test.assert_eq(acl_credits_completed(var c, 7, 1), 0)
-    test.assert_eq(acl_credits_completed(var c, -1, 1), 0)
-
-@test
-@satisfies("REQ-BLE-LINKS-002")
-fn test_a_connection_that_ends_gives_its_buffers_back()
-    var c = acl_credits_new()
-    test.assert(acl_credits_configure(var c, 251, 3))
-    test.assert(acl_credits_take(var c, 0))
-    test.assert(acl_credits_take(var c, 0))
-    test.assert(acl_credits_take(var c, 1))
-    test.assert_eq(acl_credits_release(var c, 0), 2)
-    test.assert_eq(acl_free(c), 2)
-    test.assert_eq(acl_in_flight(c, 0), 0)
-    test.assert_eq(acl_in_flight(c, 1), 1)
-    test.assert_eq(acl_credits_release(var c, 0), 0)
-
-@test
-@satisfies("REQ-BLE-LINKS-002")
-fn test_waiting_connections_get_the_free_buffers_in_turn()
-    var c = acl_credits_new()
-    test.assert(acl_credits_configure(var c, 251, 3))
-    // Slots 0, 1 and 2 all wait; each hand-out goes to the next after the
-    // last one served.
-    test.assert_eq(acl_credits_next(var c, 0b111), 1)
-    test.assert_eq(acl_credits_next(var c, 0b111), 2)
-    test.assert_eq(acl_credits_next(var c, 0b111), 0)
-    // Only slot 1 waits: it is served whatever the cursor says.
-    test.assert_eq(acl_credits_next(var c, 0b010), 1)
-    test.assert_eq(acl_credits_next(var c, 0b010), 1)
-    // Nobody waits.
-    test.assert_eq(acl_credits_next(var c, 0), -1)
-
-@test
-@satisfies("REQ-BLE-LINKS-002")
-fn test_no_slot_is_chosen_while_no_buffer_is_free()
-    var c = acl_credits_new()
-    test.assert_eq(acl_credits_next(var c, 0b11), 1)
-    test.assert(acl_credits_take(var c, 1))
-    test.assert_eq(acl_free(c), 0)
-    test.assert_eq(acl_credits_next(var c, 0b11), -1)
-
-// ── A Controller whose packet length is not the Host's ──────────────
-
-@test
-@satisfies("REQ-BLE-HCI-059")
-fn test_a_controller_with_the_minimum_length_is_served_at_27_octets()
-    var c = acl_credits_new()
-    test.assert(acl_credits_configure(var c, 27, 2))
-    test.assert_eq(acl_packet_length(c), 27)
-    test.assert_eq(acl_free(c), 2)
-
-@test
-@satisfies("REQ-BLE-HCI-059")
-fn test_a_controller_above_the_host_buffer_is_served_at_the_host_buffer()
-    var c = acl_credits_new()
-    // The Controller says 0xFFFF; the Host never sends more than its buffer holds.
-    test.assert(acl_credits_configure(var c, 0xFFFF, 4))
-    test.assert_eq(acl_packet_length(c), acl_slot_payload())
-    test.assert_eq(acl_free(c), 4)
-    test.assert(acl_credits_configure(var c, acl_slot_payload() + 1, 4))
-    test.assert_eq(acl_packet_length(c), acl_slot_payload())
-    test.assert(acl_credits_configure(var c, acl_slot_payload(), 4))
-    test.assert_eq(acl_packet_length(c), acl_slot_payload())
-
-@test
-@satisfies("REQ-BLE-HCI-059")
-fn test_a_packet_above_the_host_buffer_does_not_fit_and_is_counted()
-    var c = acl_credits_new()
-    test.assert(acl_rx_fits(acl_slot_payload()))
-    test.assert(not acl_rx_fits(acl_slot_payload() + 1))
-    test.assert(acl_rx_fits(27))
-    test.assert_eq(acl_rx_oversize(c), 0)
-    acl_rx_note_oversize(var c)
-    acl_rx_note_oversize(var c)
-    test.assert_eq(acl_rx_oversize(c), 2)
-    test.assert(not acl_flow_control(c))
-    acl_flow_control_set(var c, true)
-    test.assert(acl_flow_control(c))
-
-@test
-@satisfies("REQ-BLE-HCI-059")
-fn test_packets_owed_are_counted_for_each_handle_and_forgotten_when_flow_control_changes()
-    var c = acl_credits_new()
-    acl_flow_control_set(var c, true)
-    test.assert(acl_owe(var c, 0x0040, 1))
-    test.assert_eq(acl_owed_due(c), false)
-    test.assert(acl_owe(var c, 0x0041, 1))
-    test.assert(acl_owe(var c, 0x0040, 1))
-    test.assert_eq(acl_owed_handles(c), 2)
-    test.assert_eq(acl_owed_handle(c, 0), 0x0040)
-    test.assert_eq(acl_owed_count(c, 0), 2)
-    test.assert_eq(acl_owed_handle(c, 1), 0x0041)
-    test.assert_eq(acl_owed_count(c, 1), 1)
-    // Half of the Host's buffers, rounded up, is due.
-    test.assert_eq(acl_owed_due(c), true)
-    // A ninth handle has no entry.
-    acl_owed_clear(var c)
-    for h in 0..ACL_OWED_HANDLES
-        test.assert(acl_owe(var c, 0x0100 + h, 1))
-    test.assert(not acl_owe(var c, 0x0200, 1))
-    acl_flow_control_set(var c, false)
-    test.assert_eq(acl_owed_handles(c), 0)

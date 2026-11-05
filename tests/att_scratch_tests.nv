@@ -1,0 +1,122 @@
+// tests/att_scratch_tests.nv — the unit tests of src/att_scratch.nv.
+//
+//   novo test tests/att_scratch_tests.nv
+//
+// The module holds three fixed-RAM regions: the ATT response scratch (a two-octet cursor and 256 octets), the GATT
+// database blob (a two-octet length and 768 octets) and the two octets of the handle the last write changed.  The
+// tests read and write them through the accessors and through `hw.mem_read8`.
+
+use std.test
+use att_scratch
+
+@test
+fn test_the_regions_have_the_addresses_their_layout_names()
+    test.assert_eq(att_scratch.scratch_buf_addr(), att_scratch.scratch_cursor_addr() + 2)
+    test.assert_eq(att_scratch.gatt_db_blob_addr(), att_scratch.gatt_db_len_addr() + 2)
+    test.assert(att_scratch.scratch_cursor_addr() != att_scratch.gatt_db_len_addr())
+    test.assert(att_scratch.last_write_handle_addr() != att_scratch.scratch_cursor_addr())
+
+@test
+fn test_the_cursor_counts_the_octets_written_and_a_reset_starts_over() [hw]
+    att_scratch.scratch_reset()
+    test.assert_eq(att_scratch.scratch_len(), 0)
+    test.assert(att_scratch.scratch_write_u8(0x12))
+    test.assert(att_scratch.scratch_write_u16_le(0x3456))
+    test.assert_eq(att_scratch.scratch_len(), 3)
+    test.assert_eq(att_scratch.scratch_byte_at(0), 0x12)
+    test.assert_eq(att_scratch.scratch_byte_at(1), 0x56)
+    test.assert_eq(att_scratch.scratch_byte_at(2), 0x34)
+    test.assert_eq(hw.mem_read8(att_scratch.scratch_buf_addr() + 1), 0x56)
+    att_scratch.scratch_reset()
+    test.assert_eq(att_scratch.scratch_len(), 0)
+
+@test
+fn test_a_full_scratch_refuses_the_next_octet_and_keeps_the_cursor() [hw]
+    att_scratch.scratch_reset()
+    for i in 0..256
+        test.assert(att_scratch.scratch_write_u8(i))
+    test.assert_eq(att_scratch.scratch_len(), 256)
+    test.assert(not att_scratch.scratch_write_u8(1))
+    test.assert(not att_scratch.scratch_write_u16_le(0x0102))
+    test.assert_eq(att_scratch.scratch_len(), 256)
+    // One octet of room: the low octet of a 16-bit value is written, the high one is refused.
+    att_scratch.scratch_set_len(255)
+    test.assert(not att_scratch.scratch_write_u16_le(0x0102))
+    test.assert_eq(att_scratch.scratch_len(), 256)
+    test.assert_eq(att_scratch.scratch_byte_at(255), 0x02)
+    att_scratch.scratch_reset()
+
+@test
+fn test_scratch_write_bytes_copies_a_run_and_stops_at_a_full_buffer() [hw]
+    let src: [u8] = [9, 8, 7, 6, 5]
+    att_scratch.scratch_reset()
+    test.assert(att_scratch.scratch_write_bytes(src, 1, 3))
+    test.assert_eq(att_scratch.scratch_len(), 3)
+    test.assert_eq(att_scratch.scratch_byte_at(0), 8)
+    test.assert_eq(att_scratch.scratch_byte_at(2), 6)
+    att_scratch.scratch_set_len(254)
+    test.assert(not att_scratch.scratch_write_bytes(src, 0, 5))
+    test.assert_eq(att_scratch.scratch_len(), 256)
+    att_scratch.scratch_reset()
+
+@test
+fn test_the_patch_helpers_overwrite_in_place_and_refuse_a_position_past_the_buffer() [hw]
+    att_scratch.scratch_reset()
+    for i in 0..4
+        test.assert(att_scratch.scratch_write_u8(0))
+    att_scratch.scratch_patch_u8(1, 0x1AB)
+    test.assert_eq(att_scratch.scratch_byte_at(1), 0xAB)
+    att_scratch.scratch_patch_u16_le(2, 0xBEEF)
+    test.assert_eq(att_scratch.scratch_byte_at(2), 0xEF)
+    test.assert_eq(att_scratch.scratch_byte_at(3), 0xBE)
+    // A position past the buffer changes nothing: the last octet stays, and no octet is read after it.
+    let last = att_scratch.scratch_byte_at(255)
+    att_scratch.scratch_patch_u8(256, 0x77)
+    att_scratch.scratch_patch_u16_le(255, 0x7777)
+    att_scratch.scratch_patch_u16_le(300, 0x7777)
+    test.assert_eq(att_scratch.scratch_byte_at(255), last)
+    test.assert_eq(att_scratch.scratch_byte_at(256), 0)
+    test.assert_eq(att_scratch.scratch_byte_at(-1), 0)
+    att_scratch.scratch_reset()
+
+@test
+fn test_the_database_blob_is_copied_in_and_read_back_by_offset() [hw]
+    let blob: [u8] = [1, 2, 3, 4, 5, 6, 7, 8]
+    att_scratch.gatt_db_ram_init_from_blob(blob)
+    test.assert_eq(att_scratch.gatt_db_ram_len(), 8)
+    test.assert_eq(att_scratch.gatt_db_ram_byte_at(0), 1)
+    test.assert_eq(att_scratch.gatt_db_ram_byte_at(7), 8)
+    test.assert_eq(hw.mem_read8(att_scratch.gatt_db_blob_addr() + 3), 4)
+    let back = att_scratch.gatt_db_ram_to_blob()
+    test.assert_eq(list.len(back), 8)
+    test.assert_eq(back[7] as Int, 8)
+    // An offset outside the blob's 768 octets reads 0 and writes nothing.
+    test.assert_eq(att_scratch.gatt_db_ram_byte_at(-1), 0)
+    test.assert_eq(att_scratch.gatt_db_ram_byte_at(768), 0)
+    att_scratch.gatt_db_ram_set_byte_at(2, 0x1FF)
+    test.assert_eq(att_scratch.gatt_db_ram_byte_at(2), 0xFF)
+    att_scratch.gatt_db_ram_set_byte_at(-1, 0x55)
+    att_scratch.gatt_db_ram_set_byte_at(768, 0x55)
+    test.assert_eq(att_scratch.gatt_db_ram_len(), 8)
+
+@test
+fn test_a_blob_longer_than_the_region_is_cut_to_it() [hw]
+    var big: [u8] = []
+    for i in 0..800
+        list.push(big, (i % 251) as u8)
+    att_scratch.gatt_db_ram_init_from_blob(big)
+    test.assert_eq(att_scratch.gatt_db_ram_len(), 768)
+    test.assert_eq(att_scratch.gatt_db_ram_byte_at(767), 767 % 251)
+    att_scratch.gatt_db_ram_init_from_blob([])
+    test.assert_eq(att_scratch.gatt_db_ram_len(), 0)
+
+@test
+fn test_the_last_write_handle_is_minus_one_until_a_write_sets_it() [hw]
+    att_scratch.last_write_handle_clear()
+    test.assert_eq(att_scratch.last_write_handle(), -1)
+    att_scratch.last_write_handle_set(0x0123)
+    test.assert_eq(att_scratch.last_write_handle(), 0x0123)
+    test.assert_eq(hw.mem_read8(att_scratch.last_write_handle_addr()), 0x23)
+    test.assert_eq(hw.mem_read8(att_scratch.last_write_handle_addr() + 1), 0x01)
+    att_scratch.last_write_handle_clear()
+    test.assert_eq(att_scratch.last_write_handle(), -1)

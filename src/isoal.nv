@@ -37,7 +37,6 @@
 //
 // Satisfies: REQ-BLE-ISO-002, REQ-BLE-ISO-007.
 
-use std.test
 use hci_codec
 use noble_config
 // ── HCI level: segmentation of an SDU ───────────────────────────────
@@ -64,7 +63,8 @@ const ISOAL_SDU_MAX = 0x0FFF
 // for a `time_stamp` outside 32 bits.
 pub @satisfies("REQ-BLE-ISO-002")
 @tier(embedded)
-fn isoal_fragments(connection_handle: Int, packet_sequence_number: Int, time_stamp: ?Int, sdu: [u8], max_packet_length: Int) -> ?[hci_codec.IsoDataPacket]
+fn isoal_fragments(connection_handle: Int, packet_sequence_number: Int, time_stamp: ?Int, sdu: [u8],
+                   max_packet_length: Int) -> ?[hci_codec.IsoDataPacket]
     let n = list.len(sdu)
     let has_ts = time_stamp != None
     let head = hci_codec.ISO_SDU_HEADER_LEN + (if has_ts then hci_codec.ISO_TIME_STAMP_LEN else 0)
@@ -101,7 +101,6 @@ fn isoal_fragments(connection_handle: Int, packet_sequence_number: Int, time_sta
             packet_status: 0, data: sdu[at:end] })
         at = end
     Some(packets)
-
 
 // ── HCI level: reassembly of received packets ───────────────────────
 
@@ -148,7 +147,11 @@ fn isoal_reassembler(connection_handle: Int) -> IsoReassembler
 // The SDU of lost data for the sequence number `seq`.
 @tier(embedded)
 fn lost_sdu(seq: Int, has_ts: Bool, ts: Int) -> IsoSdu
-    IsoSdu { packet_sequence_number: seq, has_time_stamp: has_ts, time_stamp: ts, packet_status: hci_codec.ISO_PSF_LOST, data: [] }
+    IsoSdu { packet_sequence_number: seq,
+        has_time_stamp: has_ts,
+        time_stamp: ts,
+        packet_status: hci_codec.ISO_PSF_LOST,
+        data: [] }
 
 // The SDU `r` has collected, once its last octet has arrived. Its status
 // is the Packet_Status_Flag of its first packet, and a valid status
@@ -164,7 +167,11 @@ fn finish_sdu(r: IsoReassembler) -> IsoSdu
         data = []
     else if list.len(data) != r.iso_sdu_length and status == hci_codec.ISO_PSF_VALID
         status = hci_codec.ISO_PSF_POSSIBLY_INVALID
-    IsoSdu { packet_sequence_number: r.packet_sequence_number, has_time_stamp: r.has_time_stamp, time_stamp: r.time_stamp, packet_status: status, data: data }
+    IsoSdu { packet_sequence_number: r.packet_sequence_number,
+        has_time_stamp: r.has_time_stamp,
+        time_stamp: r.time_stamp,
+        packet_status: status,
+        data: data }
 
 // Take one HCI ISO Data packet received for `r`'s Connection_Handle and
 // answer the SDUs it completes: none for a fragment that leaves the SDU
@@ -223,7 +230,6 @@ fn isoal_push(var r: IsoReassembler, pkt: hci_codec.IsoDataPacket) -> [IsoSdu]
         r.data = []
     out
 
-
 // ── Link Layer level: unframed and framed PDUs ──────────────────────
 
 // LLID of a CIS Data PDU or a BIS Data PDU ([Vol 6] Part B, Sections
@@ -254,7 +260,8 @@ fn isoal_unframed_pdus(sdu: [u8], max_pdu: Int) -> ?[IsoPdu]
     let n = list.len(sdu)
     var at = 0
     while n - at > max_pdu
-        list.push(pdus, IsoPdu { llid: ISO_LLID_UNFRAMED_START_OR_CONTINUATION, payload: sdu[at:at + max_pdu] })
+        list.push(pdus,
+            IsoPdu { llid: ISO_LLID_UNFRAMED_START_OR_CONTINUATION, payload: sdu[at:at + max_pdu] })
         at = at + max_pdu
     list.push(pdus, IsoPdu { llid: ISO_LLID_UNFRAMED_END, payload: sdu[at:n] })
     Some(pdus)
@@ -339,13 +346,21 @@ fn isoal_framed_pdus(sdu: [u8], time_offset: Int, max_pdu: Int) -> ?[IsoPdu]
     var at = 0
     var first = true
     while true
-        let room = if first then first_room else later_room
-        let take = if n - at > room then room else n - at
+        let room = if first
+            first_room
+        else
+            later_room
+        let take = if n - at > room
+            room
+        else
+            n - at
         let last = at + take >= n
         var payload: [u8] = [((if first then 0 else ISO_SEGMENT_SC) | (if last then ISO_SEGMENT_CMPLT else 0)) as u8,
                              (take + (if first then ISO_TIME_OFFSET_LEN else 0)) as u8]
         if first
-            list.append(payload, [(time_offset & 0xFF) as u8, ((time_offset >>> 8) & 0xFF) as u8, ((time_offset >>> 16) & 0xFF) as u8])
+            list.append(payload, [(time_offset & 0xFF) as u8,
+                ((time_offset >>> 8) & 0xFF) as u8,
+                ((time_offset >>> 16) & 0xFF) as u8])
         list.append(payload, sdu[at:at + take])
         list.push(pdus, IsoPdu { llid: ISO_LLID_FRAMED, payload: payload })
         at = at + take
@@ -391,7 +406,7 @@ fn isoal_framed_sdus(pdus: [IsoPdu]) -> [IsoFramedSdu]
                     ok = false
                     open = false
                 else
-                    offset = (pl[body] as Int) | ((pl[body + 1] as Int) << 8) | ((pl[body + 2] as Int) << 16)
+                    offset = pl[body] as Int | (pl[body + 1] as Int << 8) | (pl[body + 2] as Int << 16)
                     data_at = body + ISO_TIME_OFFSET_LEN
                     open = true
             else if not open
@@ -404,7 +419,6 @@ fn isoal_framed_sdus(pdus: [IsoPdu]) -> [IsoFramedSdu]
                     open = false
             at = body + len
     sdus
-
 
 // ── Framed PDUs: Unsegmented mode, aggregation and padding ──────────
 //
@@ -461,10 +475,13 @@ fn isoal_framed_unsegmented_pdu(sdu: [u8], time_offset: Int, max_pdu: Int) -> ?I
 @tier(app)
 fn isoal_put_segment(var payload: [u8], start: Bool, complete: Bool, time_offset: Int, data: [u8])
     let length = list.len(data) + (if start then ISO_TIME_OFFSET_LEN else 0)
-    list.push(payload, ((if start then 0 else ISO_SEGMENT_SC) | (if complete then ISO_SEGMENT_CMPLT else 0)) as u8)
+    list.push(payload,
+        ((if start then 0 else ISO_SEGMENT_SC) | (if complete then ISO_SEGMENT_CMPLT else 0)) as u8)
     list.push(payload, length as u8)
     if start
-        list.append(payload, [(time_offset & 0xFF) as u8, ((time_offset >>> 8) & 0xFF) as u8, ((time_offset >>> 16) & 0xFF) as u8])
+        list.append(payload, [(time_offset & 0xFF) as u8,
+            ((time_offset >>> 8) & 0xFF) as u8,
+            ((time_offset >>> 16) & 0xFF) as u8])
     for b in data
         list.push(payload, b)
 
@@ -517,7 +534,10 @@ fn isoal_framed_aggregate(sdus: [IsoFramedSdu], max_pdu: Int, unsegmented: Bool)
             let cap = 0xFF - (if first then ISO_TIME_OFFSET_LEN else 0)
             if room > cap
                 room = cap
-            let take = if n - at > room then room else n - at
+            let take = if n - at > room
+                room
+            else
+                n - at
             let last = at + take >= n
             isoal_put_segment(var payload, first, last, sdu.time_offset, sdu.data[at:at + take])
             at = at + take
@@ -528,7 +548,7 @@ fn isoal_framed_aggregate(sdus: [IsoFramedSdu], max_pdu: Int, unsegmented: Bool)
         list.push(pdus, IsoPdu { llid: ISO_LLID_FRAMED, payload: payload })
     Some(pdus)
 
-// ── Tests ────────────────────────────────────────────────────────────
+// ── Fixtures that the suites of other modules share ─────────────────────
 
 // `n` octets 0, 1, 2, ... (mod 251, so that neighbouring octets differ).
 @tier(app)
@@ -537,650 +557,3 @@ fn sdu_of(n: Int) -> [u8]
     for i in 0..n
         list.push(sdu, (i % 251) as u8)
     sdu
-
-@tier(app)
-fn same_data(got: [u8], want: [u8])
-    test.assert_eq(list.len(got), list.len(want))
-    for i in 0..list.len(want)
-        test.assert_eq(got[i] as Int, want[i] as Int)
-
-// The packets of `sdu`, sent through the wire form and parsed back as a
-// Controller's would be, pushed into a fresh reassembler for handle 0x40.
-@tier(app)
-fn round_trip(sdu: [u8], max_packet_length: Int, time_stamp: ?Int) -> [IsoSdu]
-    var r = isoal_reassembler(0x0040)
-    var out: [IsoSdu] = []
-    match isoal_fragments(0x0040, 9, time_stamp, sdu, max_packet_length)
-        None        => test.fail("the SDU is cut")
-        Some(packets) =>
-            for p in packets
-                test.assert(list.len(p.data) <= max_packet_length)
-                match hci_codec.build_iso_data_packet(p)
-                    None       => test.fail("the packet builds")
-                    Some(wire) =>
-                        test.assert(list.len(wire) - hci_codec.ISO_HEADER_LEN <= max_packet_length)
-                        match hci_codec.iso_data_packet(wire)
-                            None      => test.fail("the packet parses")
-                            Some(got) => list.append(out, isoal_push(var r, got))
-    out
-
-@test
-@satisfies("REQ-BLE-ISO-002")
-fn test_fragments_of_an_sdu_that_fits_are_one_complete_packet()
-    match isoal_fragments(0x0040, 5, None, sdu_of(6), 10)
-        None          => test.fail("the SDU is cut")
-        Some(packets) =>
-            test.assert_eq(list.len(packets), 1)
-            test.assert_eq(packets[0].pb_flag, hci_codec.ISO_PB_COMPLETE_SDU)
-            test.assert_eq(packets[0].iso_sdu_length, 6)
-            test.assert_eq(packets[0].packet_sequence_number, 5)
-            test.assert(not packets[0].has_time_stamp)
-            same_data(packets[0].data, sdu_of(6))
-    // An empty SDU is one complete packet with no data.
-    match isoal_fragments(0x0040, 5, None, [], 5)
-        None          => test.fail("an empty SDU is cut")
-        Some(packets) =>
-            test.assert_eq(list.len(packets), 1)
-            test.assert_eq(list.len(packets[0].data), 0)
-            test.assert_eq(packets[0].iso_sdu_length, 0)
-
-@test
-@satisfies("REQ-BLE-ISO-002")
-fn test_fragments_split_at_the_packet_length()
-    // Max 10, SDU header 4: the first fragment holds 6 octets, the rest
-    // 10 each.  16 octets are a first and a last; 17 are a first, an
-    // intermediate and a last.
-    match isoal_fragments(0x0040, 1, None, sdu_of(10), 10)
-        None          => test.fail("the SDU is cut")
-        Some(packets) =>
-            // 4 + 10 = 14 > 10: first (6) and last (4).
-            test.assert_eq(list.len(packets), 2)
-            test.assert_eq(packets[0].pb_flag, hci_codec.ISO_PB_FIRST_FRAGMENT)
-            test.assert_eq(list.len(packets[0].data), 6)
-            test.assert_eq(packets[0].iso_sdu_length, 10)
-            test.assert_eq(packets[1].pb_flag, hci_codec.ISO_PB_LAST_FRAGMENT)
-            test.assert_eq(list.len(packets[1].data), 4)
-            test.assert(not packets[1].has_sdu_header)
-    match isoal_fragments(0x0040, 1, None, sdu_of(26), 10)
-        None          => test.fail("the SDU is cut")
-        Some(packets) =>
-            // 6 + 10 + 10 = 26: the last fragment fills its packet exactly.
-            test.assert_eq(list.len(packets), 3)
-            test.assert_eq(packets[1].pb_flag, hci_codec.ISO_PB_INTERMEDIATE_FRAGMENT)
-            test.assert_eq(list.len(packets[1].data), 10)
-            test.assert_eq(packets[2].pb_flag, hci_codec.ISO_PB_LAST_FRAGMENT)
-            test.assert_eq(list.len(packets[2].data), 10)
-    match isoal_fragments(0x0040, 1, None, sdu_of(27), 10)
-        None          => test.fail("the SDU is cut")
-        Some(packets) =>
-            test.assert_eq(list.len(packets), 4)
-            test.assert_eq(list.len(packets[3].data), 1)
-    // A Time_Stamp is in the first packet only and widens the SDU header to 8.
-    match isoal_fragments(0x0040, 1, Some(0x01020304), sdu_of(10), 10)
-        None          => test.fail("the SDU is cut")
-        Some(packets) =>
-            test.assert_eq(list.len(packets), 2)
-            test.assert(packets[0].has_time_stamp)
-            test.assert_eq(packets[0].time_stamp, 0x01020304)
-            test.assert_eq(list.len(packets[0].data), 2)
-            test.assert(not packets[1].has_time_stamp)
-
-@test
-@satisfies("REQ-BLE-ISO-002")
-fn test_fragments_refuse_what_cannot_be_cut()
-    // An SDU above 4095 octets; a packet length with no room for data beside
-    // the header (4, or 8 with a Time_Stamp); one above the 14-bit length.
-    test.assert(isoal_fragments(0x0040, 1, None, sdu_of(4096), 251) == None)
-    test.assert(isoal_fragments(0x0040, 1, None, sdu_of(1), 4) == None)
-    test.assert(isoal_fragments(0x0040, 1, Some(0), sdu_of(1), 8) == None)
-    test.assert(isoal_fragments(0x0040, 1, None, sdu_of(1), 0x4000) == None)
-    // The largest SDU, in packets of 251.
-    match isoal_fragments(0x0040, 1, None, sdu_of(4095), 251)
-        None          => test.fail("4095 octets are cut")
-        Some(packets) => test.assert_eq(list.len(packets), 1 + (4095 - 247 + 250) / 251)
-
-@test
-@satisfies("REQ-BLE-ISO-002")
-fn test_every_sdu_length_survives_every_packet_length()
-    for max in [5, 6, 9, 12, 27, 251]
-        for n in 0..60
-            let sdus = round_trip(sdu_of(n), max, None)
-            test.assert_eq(list.len(sdus), 1)
-            test.assert_eq(sdus[0].packet_status, hci_codec.ISO_PSF_VALID)
-            test.assert_eq(sdus[0].packet_sequence_number, 9)
-            same_data(sdus[0].data, sdu_of(n))
-    // A long SDU, a Time_Stamp that comes back.
-    let long = round_trip(sdu_of(noble_config.ISO_SDU_OCTETS), 251, Some(0xCAFE))
-    test.assert_eq(list.len(long), 1)
-    same_data(long[0].data, sdu_of(noble_config.ISO_SDU_OCTETS))
-    test.assert(long[0].has_time_stamp)
-    test.assert_eq(long[0].time_stamp, 0xCAFE)
-
-@test
-@satisfies("REQ-BLE-ISO-002")
-fn test_reassembly_reports_lost_data_and_cut_short_sdus()
-    var r = isoal_reassembler(0x0040)
-    // A complete SDU of Packet_Status_Flag 0b10 has no data.
-    let lost_packet = hci_codec.IsoDataPacket {
-        connection_handle: 0x0040, pb_flag: hci_codec.ISO_PB_COMPLETE_SDU, has_sdu_header: true,
-        has_time_stamp: false, time_stamp: 0, packet_sequence_number: 3, iso_sdu_length: 0,
-        packet_status: hci_codec.ISO_PSF_LOST, data: [] }
-    let a = isoal_push(var r, lost_packet)
-    test.assert_eq(list.len(a), 1)
-    test.assert_eq(a[0].packet_status, hci_codec.ISO_PSF_LOST)
-    test.assert_eq(a[0].packet_sequence_number, 3)
-    test.assert_eq(list.len(a[0].data), 0)
-    // A first fragment that says lost carries no SDU either, and opens none.
-    let lost_first = hci_codec.IsoDataPacket {
-        connection_handle: 0x0040, pb_flag: hci_codec.ISO_PB_FIRST_FRAGMENT, has_sdu_header: true,
-        has_time_stamp: false, time_stamp: 0, packet_sequence_number: 4, iso_sdu_length: 0,
-        packet_status: hci_codec.ISO_PSF_LOST, data: [0x01] }
-    let b = isoal_push(var r, lost_first)
-    test.assert_eq(list.len(b), 1)
-    test.assert_eq(list.len(b[0].data), 0)
-    test.assert(not r.collecting)
-    // A first fragment, then a complete SDU: the first is reported lost,
-    // then the second as it is.
-    match isoal_fragments(0x0040, 10, None, sdu_of(20), 10)
-        None          => test.fail("the SDU is cut")
-        Some(packets) =>
-            test.assert_eq(list.len(isoal_push(var r, packets[0])), 0)
-            test.assert(r.collecting)
-            match isoal_fragments(0x0040, 11, None, sdu_of(3), 10)
-                None       => test.fail("the SDU is cut")
-                Some(next) =>
-                    let c = isoal_push(var r, next[0])
-                    test.assert_eq(list.len(c), 2)
-                    test.assert_eq(c[0].packet_sequence_number, 10)
-                    test.assert_eq(c[0].packet_status, hci_codec.ISO_PSF_LOST)
-                    test.assert_eq(list.len(c[0].data), 0)
-                    test.assert_eq(c[1].packet_sequence_number, 11)
-                    test.assert_eq(c[1].packet_status, hci_codec.ISO_PSF_VALID)
-                    same_data(c[1].data, sdu_of(3))
-            test.assert(not r.collecting)
-    // A first fragment, an intermediate one lost on the way, then the last:
-    // the data is short of ISO_SDU_Length, and the SDU is possibly invalid.
-    match isoal_fragments(0x0040, 12, None, sdu_of(26), 10)
-        None          => test.fail("the SDU is cut")
-        Some(packets) =>
-            test.assert_eq(list.len(isoal_push(var r, packets[0])), 0)
-            let d = isoal_push(var r, packets[2])
-            test.assert_eq(list.len(d), 1)
-            test.assert_eq(d[0].packet_status, hci_codec.ISO_PSF_POSSIBLY_INVALID)
-            test.assert_eq(list.len(d[0].data), 16)
-
-@test
-@satisfies("REQ-BLE-ISO-002")
-fn test_reassembly_keeps_possibly_invalid_and_counts_orphans()
-    var r = isoal_reassembler(0x0040)
-    let flagged = hci_codec.IsoDataPacket {
-        connection_handle: 0x0040, pb_flag: hci_codec.ISO_PB_COMPLETE_SDU, has_sdu_header: true,
-        has_time_stamp: true, time_stamp: 77, packet_sequence_number: 5, iso_sdu_length: 2,
-        packet_status: hci_codec.ISO_PSF_POSSIBLY_INVALID, data: [0xAA, 0xBB] }
-    let a = isoal_push(var r, flagged)
-    test.assert_eq(list.len(a), 1)
-    test.assert_eq(a[0].packet_status, hci_codec.ISO_PSF_POSSIBLY_INVALID)
-    test.assert_eq(a[0].time_stamp, 77)
-    same_data(a[0].data, [0xAA, 0xBB])
-    // Fragments with no first fragment before them, and one for another handle.
-    let middle = hci_codec.IsoDataPacket {
-        connection_handle: 0x0040, pb_flag: hci_codec.ISO_PB_INTERMEDIATE_FRAGMENT, has_sdu_header: false,
-        has_time_stamp: false, time_stamp: 0, packet_sequence_number: 0, iso_sdu_length: 0,
-        packet_status: 0, data: [0x01] }
-    let end = hci_codec.IsoDataPacket {
-        connection_handle: 0x0040, pb_flag: hci_codec.ISO_PB_LAST_FRAGMENT, has_sdu_header: false,
-        has_time_stamp: false, time_stamp: 0, packet_sequence_number: 0, iso_sdu_length: 0,
-        packet_status: 0, data: [0x01] }
-    test.assert_eq(list.len(isoal_push(var r, middle)), 0)
-    test.assert_eq(list.len(isoal_push(var r, end)), 0)
-    test.assert_eq(r.orphan_fragments, 2)
-    let other = hci_codec.IsoDataPacket {
-        connection_handle: 0x0041, pb_flag: hci_codec.ISO_PB_COMPLETE_SDU, has_sdu_header: true,
-        has_time_stamp: false, time_stamp: 0, packet_sequence_number: 6, iso_sdu_length: 1,
-        packet_status: 0, data: [0x01] }
-    test.assert_eq(list.len(isoal_push(var r, other)), 0)
-    test.assert_eq(r.orphan_fragments, 2)
-
-@test
-@satisfies("REQ-BLE-ISO-002")
-fn test_unframed_pdus_split_and_recombine()
-    // Pinned: 5 octets in PDUs of 2 are 2, 2 and 1, LLID 0b01, 0b01, 0b00.
-    match isoal_unframed_pdus(sdu_of(5), 2)
-        None       => test.fail("the SDU is cut")
-        Some(pdus) =>
-            test.assert_eq(list.len(pdus), 3)
-            test.assert_eq(pdus[0].llid, ISO_LLID_UNFRAMED_START_OR_CONTINUATION)
-            test.assert_eq(pdus[1].llid, ISO_LLID_UNFRAMED_START_OR_CONTINUATION)
-            test.assert_eq(pdus[2].llid, ISO_LLID_UNFRAMED_END)
-            test.assert_eq(list.len(pdus[2].payload), 1)
-    // An SDU that is a multiple of the PDU length ends with a full PDU; an
-    // empty one is a single empty PDU of LLID 0b00.
-    match isoal_unframed_pdus(sdu_of(4), 2)
-        None       => test.fail("the SDU is cut")
-        Some(pdus) =>
-            test.assert_eq(list.len(pdus), 2)
-            test.assert_eq(pdus[1].llid, ISO_LLID_UNFRAMED_END)
-            test.assert_eq(list.len(pdus[1].payload), 2)
-    match isoal_unframed_pdus([], 2)
-        None       => test.fail("an empty SDU is cut")
-        Some(pdus) =>
-            test.assert_eq(list.len(pdus), 1)
-            test.assert_eq(pdus[0].llid, ISO_LLID_UNFRAMED_END)
-            test.assert_eq(list.len(pdus[0].payload), 0)
-    test.assert(isoal_unframed_pdus(sdu_of(3), 0) == None)
-    // Several SDUs back to back come back in order, every length and cut.
-    for max in [1, 2, 3, 7, 251]
-        var pdus: [IsoPdu] = []
-        for n in [0, 1, 5, 20, 300]
-            match isoal_unframed_pdus(sdu_of(n), max)
-                None    => test.fail("the SDU is cut")
-                Some(p) => list.append(pdus, p)
-        let sdus = isoal_unframed_sdus(pdus)
-        test.assert_eq(list.len(sdus), 5)
-        same_data(sdus[0], [])
-        same_data(sdus[3], sdu_of(20))
-        same_data(sdus[4], sdu_of(300))
-    // A framed PDU in the stream is skipped, and an SDU left open at the
-    // end is not answered.
-    let mixed = [IsoPdu { llid: ISO_LLID_UNFRAMED_START_OR_CONTINUATION, payload: [0x01] },
-                 IsoPdu { llid: ISO_LLID_FRAMED, payload: [0x03, 0x03, 0x00, 0x00, 0x00] },
-                 IsoPdu { llid: ISO_LLID_UNFRAMED_END, payload: [0x02] },
-                 IsoPdu { llid: ISO_LLID_UNFRAMED_START_OR_CONTINUATION, payload: [0x09] }]
-    let got = isoal_unframed_sdus(mixed)
-    test.assert_eq(list.len(got), 1)
-    same_data(got[0], [0x01, 0x02])
-
-@test
-@satisfies("REQ-BLE-ISO-002")
-fn test_framed_pdus_carry_the_segmentation_header()
-    // 5 octets with a Time_Offset of 0x010203 in PDUs of 8: the first
-    // segment holds 3 octets of data (header 2, offset 3), the second the
-    // other 2.  SC is clear on the first and set on the second; CMPLT is set
-    // on the second.
-    match isoal_framed_pdus(sdu_of(5), 0x010203, 8)
-        None       => test.fail("the SDU is cut")
-        Some(pdus) =>
-            test.assert_eq(list.len(pdus), 2)
-            test.assert_eq(pdus[0].llid, ISO_LLID_FRAMED)
-            same_data(pdus[0].payload, [0x00, 0x06, 0x03, 0x02, 0x01, 0x00, 0x01, 0x02])
-            same_data(pdus[1].payload, [0x03, 0x02, 0x03, 0x04])
-    // An SDU that fits is one segment with SC clear and CMPLT set; an empty
-    // one is the header and the Time_Offset only.
-    match isoal_framed_pdus(sdu_of(1), 0, 8)
-        None       => test.fail("the SDU is cut")
-        Some(pdus) => same_data(pdus[0].payload, [0x02, 0x04, 0x00, 0x00, 0x00, 0x00])
-    match isoal_framed_pdus([], 0x000010, 8)
-        None       => test.fail("an empty SDU is cut")
-        Some(pdus) =>
-            test.assert_eq(list.len(pdus), 1)
-            same_data(pdus[0].payload, [0x02, 0x03, 0x10, 0x00, 0x00])
-    // No room for an octet of data beside the header and the Time_Offset.
-    test.assert(isoal_framed_pdus(sdu_of(1), 0, 5) == None)
-    // The segment length is one octet: a large PDU is clamped to 255 octets
-    // a segment, 252 of data in the first.
-    match isoal_framed_pdus(sdu_of(600), 0, 1000)
-        None       => test.fail("the SDU is cut")
-        Some(pdus) =>
-            test.assert_eq(list.len(pdus), 3)
-            test.assert_eq(pdus[0].payload[1] as Int, 255)
-            test.assert_eq(pdus[1].payload[1] as Int, 255)
-            test.assert_eq(list.len(pdus[1].payload), 257)
-
-@test
-@satisfies("REQ-BLE-ISO-002")
-fn test_framed_pdus_recombine_for_every_length_and_cut()
-    for max in [6, 7, 8, 11, 27, 251, 1000]
-        var pdus: [IsoPdu] = []
-        for n in [0, 1, 2, 5, 30, 300, 600]
-            match isoal_framed_pdus(sdu_of(n), 1000 + n, max)
-                None    => test.fail("the SDU is cut")
-                Some(p) => list.append(pdus, p)
-        let sdus = isoal_framed_sdus(pdus)
-        test.assert_eq(list.len(sdus), 7)
-        same_data(sdus[0].data, [])
-        test.assert_eq(sdus[0].time_offset, 1000)
-        same_data(sdus[3].data, sdu_of(5))
-        test.assert_eq(sdus[3].time_offset, 1005)
-        same_data(sdus[6].data, sdu_of(600))
-        test.assert_eq(sdus[6].time_offset, 1600)
-
-@test
-@satisfies("REQ-BLE-ISO-002")
-fn test_framed_pdu_with_several_segments_and_damaged_streams()
-    // One PDU can hold the end of one SDU and a whole next one: a CMPLT
-    // continuation of 1 octet, then a start segment of an SDU of 2 octets.
-    let start_a = IsoPdu { llid: ISO_LLID_FRAMED, payload: [0x00, 0x04, 0x01, 0x00, 0x00, 0xA1] }
-    let packed = IsoPdu { llid: ISO_LLID_FRAMED, payload: [0x03, 0x01, 0xA2, 0x02, 0x05, 0x02, 0x00, 0x00, 0xB1, 0xB2] }
-    let sdus = isoal_framed_sdus([start_a, packed])
-    test.assert_eq(list.len(sdus), 2)
-    same_data(sdus[0].data, [0xA1, 0xA2])
-    test.assert_eq(sdus[0].time_offset, 1)
-    same_data(sdus[1].data, [0xB1, 0xB2])
-    test.assert_eq(sdus[1].time_offset, 2)
-    // A continuation with no start is dropped; a start while an SDU is open
-    // drops the open one; a segment that runs past its PDU drops the open SDU;
-    // a start segment shorter than the Time_Offset is dropped.
-    let orphan = IsoPdu { llid: ISO_LLID_FRAMED, payload: [0x03, 0x01, 0xEE] }
-    test.assert_eq(list.len(isoal_framed_sdus([orphan])), 0)
-    let open_a = IsoPdu { llid: ISO_LLID_FRAMED, payload: [0x00, 0x04, 0x01, 0x00, 0x00, 0xA1] }
-    let whole_b = IsoPdu { llid: ISO_LLID_FRAMED, payload: [0x02, 0x04, 0x02, 0x00, 0x00, 0xB1] }
-    let got = isoal_framed_sdus([open_a, whole_b])
-    test.assert_eq(list.len(got), 1)
-    same_data(got[0].data, [0xB1])
-    let overrun = IsoPdu { llid: ISO_LLID_FRAMED, payload: [0x03, 0x09, 0xEE] }
-    test.assert_eq(list.len(isoal_framed_sdus([open_a, overrun])), 0)
-    let too_short = IsoPdu { llid: ISO_LLID_FRAMED, payload: [0x02, 0x02, 0x01, 0x00] }
-    test.assert_eq(list.len(isoal_framed_sdus([too_short])), 0)
-    // Unframed PDUs in the stream, and the octets after the last segment,
-    // are skipped.
-    let unframed = IsoPdu { llid: ISO_LLID_UNFRAMED_END, payload: [0x01] }
-    let stray = IsoPdu { llid: ISO_LLID_FRAMED, payload: [0x02, 0x04, 0x07, 0x00, 0x00, 0xC1, 0x03] }
-    let tail = isoal_framed_sdus([unframed, stray])
-    test.assert_eq(list.len(tail), 1)
-    same_data(tail[0].data, [0xC1])
-
-@test
-@satisfies("REQ-BLE-ISO-002")
-fn test_unframed_padding_makes_up_the_fragments_of_an_sdu()
-    // [Vol 6] Part G, Section 2.1: "when UPPS=4 and only 3 PDUs are generated
-    // from the SDU, an additional padding PDU needs to be added", an empty
-    // payload with LLID 0b01.
-    match isoal_unframed_pdus(sdu_of(5), 2)
-        None       => test.fail("the SDU is cut")
-        Some(pdus) =>
-            let padded = isoal_unframed_pad(pdus, 4)
-            test.assert_eq(list.len(padded), 4)
-            test.assert_eq(padded[2].llid, ISO_LLID_UNFRAMED_END)
-            test.assert_eq(padded[3].llid, ISO_LLID_UNFRAMED_START_OR_CONTINUATION)
-            test.assert_eq(list.len(padded[3].payload), 0)
-            // Padding follows the end fragment and is not part of any SDU.
-            let sdus = isoal_unframed_sdus(list.concat(padded, padded))
-            test.assert_eq(list.len(sdus), 2)
-            same_data(sdus[0], sdu_of(5))
-            same_data(sdus[1], sdu_of(5))
-            // A PDU list that is long enough is returned as it is.
-            test.assert_eq(list.len(isoal_unframed_pad(pdus, 2)), 3)
-    // Section 2.1: "An SDU with a length less than or equal to the Max_PDU
-    // shall be sent in a single unframed PDU", and "the minimum number of
-    // unframed PDUs" otherwise.
-    match isoal_unframed_pdus(sdu_of(2), 2)
-        None       => test.fail("the SDU is cut")
-        Some(pdus) =>
-            test.assert_eq(list.len(pdus), 1)
-            test.assert_eq(pdus[0].llid, ISO_LLID_UNFRAMED_END)
-    match isoal_unframed_pdus(sdu_of(3), 2)
-        None       => test.fail("the SDU is cut")
-        Some(pdus) => test.assert_eq(list.len(pdus), 2)
-
-@test
-@satisfies("REQ-BLE-ISO-002")
-fn test_framed_segmentation_header_bits_follow_table_2_3()
-    // [Vol 6] Part G, Figure 2.3 and Table 2.3.  A 10-octet SDU in PDUs of 6
-    // is a start segment (SC 0, CMPLT 0: header octet 0x00, one octet of data
-    // beside the 3-octet Time_Offset), two continuations (SC 1, CMPLT 0:
-    // 0x01) and a last continuation (SC 1, CMPLT 1: 0x03).
-    match isoal_framed_pdus(sdu_of(10), 0x0A0B0C, 6)
-        None       => test.fail("the SDU is cut")
-        Some(pdus) =>
-            test.assert_eq(list.len(pdus), 4)
-            same_data(pdus[0].payload, [0x00, 0x04, 0x0C, 0x0B, 0x0A, 0x00])
-            same_data(pdus[1].payload, [0x01, 0x04, 0x01, 0x02, 0x03, 0x04])
-            same_data(pdus[2].payload, [0x01, 0x04, 0x05, 0x06, 0x07, 0x08])
-            same_data(pdus[3].payload, [0x03, 0x01, 0x09])
-    // SC 0, CMPLT 1 (the start of an SDU that is whole in this PDU) is 0x02;
-    // the empty SDU is "SC set to 0, CMPLT set to 1, and the length field set
-    // to the length of the Time_Offset" (Section 2.2): header 0x02, 0x03.
-    match isoal_framed_pdus([], 0xFFFFFF, 6)
-        None       => test.fail("an empty SDU is cut")
-        Some(pdus) => same_data(pdus[0].payload, [0x02, 0x03, 0xFF, 0xFF, 0xFF])
-    // Time_Offset is a 24-bit value (Table 1.1).
-    test.assert(isoal_framed_pdus(sdu_of(1), 0x1000000, 8) == None)
-    test.assert(isoal_framed_pdus(sdu_of(1), -1, 8) == None)
-
-@test
-@satisfies("REQ-BLE-ISO-002")
-fn test_framed_figure_2_2_rows_reassemble()
-    // [Vol 6] Part G, Figure 2.2: four PDU payloads carry SDU 1 (two
-    // segments), SDU 2 (three segments) and SDU 3.  Row 1 is the start of SDU
-    // 1 (SC 0, CMPLT 0, Time_Offset 1); row 2 its end (SC 1, CMPLT 1) and the
-    // start of SDU 2 (Time_Offset 2); row 3 the middle of SDU 2 (SC 1, CMPLT
-    // 0); row 4 its end and a whole SDU 3 (Time_Offset 3).
-    let row1 = IsoPdu { llid: ISO_LLID_FRAMED, payload: [0x00, 0x05, 0x01, 0x00, 0x00, 0xA1, 0xA2] }
-    let row2 = IsoPdu { llid: ISO_LLID_FRAMED, payload: [0x03, 0x01, 0xA3, 0x00, 0x05, 0x02, 0x00, 0x00, 0xB1, 0xB2] }
-    let row3 = IsoPdu { llid: ISO_LLID_FRAMED, payload: [0x01, 0x02, 0xB3, 0xB4] }
-    let row4 = IsoPdu { llid: ISO_LLID_FRAMED, payload: [0x03, 0x01, 0xB5, 0x02, 0x04, 0x03, 0x00, 0x00, 0xC1] }
-    let sdus = isoal_framed_sdus([row1, row2, row3, row4])
-    test.assert_eq(list.len(sdus), 3)
-    same_data(sdus[0].data, [0xA1, 0xA2, 0xA3])
-    test.assert_eq(sdus[0].time_offset, 1)
-    same_data(sdus[1].data, [0xB1, 0xB2, 0xB3, 0xB4, 0xB5])
-    test.assert_eq(sdus[1].time_offset, 2)
-    same_data(sdus[2].data, [0xC1])
-    test.assert_eq(sdus[2].time_offset, 3)
-
-@test
-@satisfies("REQ-BLE-ISO-002")
-fn test_framed_reader_takes_padding_and_reserved_bits()
-    // Section 2.2: "A framed PDU with zero length can be used as a padding
-    // PDU; such a PDU does not have a Segmentation Header."  The six reserved
-    // bits of the header (Figure 2.3) do not change what a segment means.
-    let padding = IsoPdu { llid: ISO_LLID_FRAMED, payload: [] }
-    let reserved = IsoPdu { llid: ISO_LLID_FRAMED, payload: [0xFE, 0x04, 0x05, 0x00, 0x00, 0xD1] }
-    let sdus = isoal_framed_sdus([padding, reserved, padding])
-    test.assert_eq(list.len(sdus), 1)
-    same_data(sdus[0].data, [0xD1])
-    test.assert_eq(sdus[0].time_offset, 5)
-
-@test
-@satisfies("REQ-BLE-ISO-002")
-fn test_fragments_refuse_a_sequence_number_or_time_stamp_out_of_range()
-    // Packet_Sequence_Number is 16 bits ([Vol 6] Part G, Section 2) and
-    // Time_Stamp 32 bits ([Vol 4] Part E, Section 5.4.5).
-    test.assert(isoal_fragments(0x0040, 0xFFFF, Some(0xFFFFFFFF), sdu_of(1), 10) != None)
-    test.assert(isoal_fragments(0x0040, 0x10000, None, sdu_of(1), 10) == None)
-    test.assert(isoal_fragments(0x0040, -1, None, sdu_of(1), 10) == None)
-    test.assert(isoal_fragments(0x0040, 0, Some(0x100000000), sdu_of(1), 10) == None)
-
-// ── Tests: Unsegmented mode, aggregation, padding ───────────────────
-
-@tier(app)
-fn framed_sdu(offset: Int, n: Int) -> IsoFramedSdu
-    IsoFramedSdu { time_offset: offset, data: sdu_of(n) }
-
-// The SDUs of `pdus`, which have to be all the SDUs the PDUs carry.
-@tier(app)
-fn assert_same_framed(got: [IsoFramedSdu], want: [IsoFramedSdu])
-    test.assert_eq(list.len(got), list.len(want))
-    for i in 0..list.len(want)
-        test.assert_eq(got[i].time_offset, want[i].time_offset)
-        same_data(got[i].data, want[i].data)
-
-@test
-@satisfies("REQ-BLE-ISO-007")
-fn test_unsegmented_pdu_is_one_complete_segment()
-    // SC clear, CMPLT set, the length counts the Time_Offset: the
-    // Time_Offset of 6.123 ms from the Part G example is 0x0017EB.
-    match isoal_framed_unsegmented_pdu([0xA1, 0xA2], 6123, 8)
-        None      => test.fail("the SDU fits")
-        Some(pdu) =>
-            test.assert_eq(pdu.llid, ISO_LLID_FRAMED)
-            same_data(pdu.payload, [0x02, 0x05, 0xEB, 0x17, 0x00, 0xA1, 0xA2])
-    // An empty SDU is the header and the Time_Offset: length 3, CMPLT set.
-    match isoal_framed_unsegmented_pdu([], 0x000010, 5)
-        None      => test.fail("an empty SDU fits")
-        Some(pdu) => same_data(pdu.payload, [0x02, 0x03, 0x10, 0x00, 0x00])
-    // The reader gives the SDU and its Time_Offset back.
-    match isoal_framed_unsegmented_pdu(sdu_of(40), 0xABCDEF, 100)
-        None      => test.fail("the SDU fits")
-        Some(pdu) =>
-            let got = isoal_framed_sdus([pdu])
-            assert_same_framed(got, [framed_sdu(0xABCDEF, 40)])
-
-@test
-@satisfies("REQ-BLE-ISO-007")
-fn test_unsegmented_pdu_refuses_what_does_not_fit_one_pdu()
-    // 2 + 3 + 3 = 8 octets fit a PDU of 8, 9 do not.
-    test.assert(isoal_framed_unsegmented_pdu(sdu_of(3), 0, 8) != None)
-    test.assert(isoal_framed_unsegmented_pdu(sdu_of(4), 0, 8) == None)
-    // The segment length is one octet and counts the Time_Offset: 252 octets
-    // of SDU are the most.
-    test.assert(isoal_framed_unsegmented_pdu(sdu_of(252), 0, 1000) != None)
-    test.assert(isoal_framed_unsegmented_pdu(sdu_of(253), 0, 1000) == None)
-    // Time_Offset is 24 bits.
-    test.assert(isoal_framed_unsegmented_pdu(sdu_of(1), 0xFFFFFF, 100) != None)
-    test.assert(isoal_framed_unsegmented_pdu(sdu_of(1), 0x1000000, 100) == None)
-    test.assert(isoal_framed_unsegmented_pdu(sdu_of(1), -1, 100) == None)
-
-@test
-@satisfies("REQ-BLE-ISO-007")
-fn test_unsegmented_aggregation_puts_whole_sdus_in_a_pdu()
-    // Segments of 9, 9 and 15 octets in PDUs of 20: two share the first PDU.
-    let sdus = [framed_sdu(100, 4), framed_sdu(200, 4), framed_sdu(300, 10)]
-    match isoal_framed_aggregate(sdus, 20, true)
-        None       => test.fail("the SDUs fit")
-        Some(pdus) =>
-            test.assert_eq(list.len(pdus), 2)
-            test.assert_eq(list.len(pdus[0].payload), 18)
-            test.assert_eq(list.len(pdus[1].payload), 15)
-            test.assert_eq(pdus[0].payload[0] as Int, 0x02)
-            assert_same_framed(isoal_framed_sdus(pdus), sdus)
-    // A PDU of exactly the size of one segment holds one SDU at a time.
-    match isoal_framed_aggregate(sdus, 15, true)
-        None       => test.fail("the SDUs fit")
-        Some(pdus) =>
-            test.assert_eq(list.len(pdus), 3)
-            assert_same_framed(isoal_framed_sdus(pdus), sdus)
-    // An SDU that does not fit an empty PDU is refused, whole.
-    test.assert(isoal_framed_aggregate([framed_sdu(0, 11)], 15, true) == None)
-    test.assert(isoal_framed_aggregate([framed_sdu(0, 253)], 1000, true) == None)
-    // No SDU, no PDU.
-    match isoal_framed_aggregate([], 20, true)
-        None       => test.fail("an empty list aggregates")
-        Some(pdus) => test.assert_eq(list.len(pdus), 0)
-
-@test
-@satisfies("REQ-BLE-ISO-007")
-fn test_segmentable_aggregation_fills_the_pdu_and_cuts_the_sdu_that_does_not_fit()
-    // SDUs of 3, 10 and 2 octets in PDUs of 12.  The first fits PDU 1 whole
-    // (8 octets); 4 are left, too few for a header, a Time_Offset and an
-    // octet, so SDU 2 starts PDU 2, fills it with 7 octets, and ends in PDU
-    // 3 with 3; SDU 3 starts in the 7 octets that remain there.
-    let sdus = [framed_sdu(100, 3), framed_sdu(200, 10), framed_sdu(300, 2)]
-    match isoal_framed_aggregate(sdus, 12, false)
-        None       => test.fail("the SDUs aggregate")
-        Some(pdus) =>
-            test.assert_eq(list.len(pdus), 3)
-            test.assert_eq(list.len(pdus[0].payload), 8)
-            test.assert_eq(list.len(pdus[1].payload), 12)
-            test.assert_eq(list.len(pdus[2].payload), 12)
-            // PDU 2 starts SDU 2 without completing it (SC 0, CMPLT 0); the
-            // first segment of PDU 3 continues and completes it (SC 1, CMPLT 1).
-            test.assert_eq(pdus[1].payload[0] as Int, 0x00)
-            test.assert_eq(pdus[2].payload[0] as Int, 0x03)
-            assert_same_framed(isoal_framed_sdus(pdus), sdus)
-
-@test
-@satisfies("REQ-BLE-ISO-007")
-fn test_segmentable_aggregation_starts_a_segment_only_where_it_fits_whole()
-    // A segment of 9 octets leaves 5 of 14: an SDU with data does not start
-    // there, an empty SDU, which needs just the header and the Time_Offset,
-    // does.
-    let with_empty = [framed_sdu(1, 4), framed_sdu(2, 0), framed_sdu(3, 1)]
-    match isoal_framed_aggregate(with_empty, 14, false)
-        None       => test.fail("the SDUs aggregate")
-        Some(pdus) =>
-            test.assert_eq(list.len(pdus), 2)
-            test.assert_eq(list.len(pdus[0].payload), 14)
-            test.assert_eq(list.len(pdus[1].payload), 6)
-            assert_same_framed(isoal_framed_sdus(pdus), with_empty)
-    // A header with nothing after it but one octet is not started either: 2
-    // octets left after a first segment of 12 in a PDU of 14.
-    let tight = [framed_sdu(1, 7), framed_sdu(2, 5)]
-    match isoal_framed_aggregate(tight, 14, false)
-        None       => test.fail("the SDUs aggregate")
-        Some(pdus) =>
-            for p in pdus
-                test.assert(list.len(p.payload) <= 14)
-            assert_same_framed(isoal_framed_sdus(pdus), tight)
-
-@test
-@satisfies("REQ-BLE-ISO-007")
-fn test_aggregation_round_trips_every_pdu_size_in_both_modes()
-    var sdus: [IsoFramedSdu] = []
-    var k = 0
-    for n in [0, 1, 2, 5, 30, 0, 300, 7, 600, 3, 0, 252]
-        list.push(sdus, framed_sdu(1000 + 7 * k, n))
-        k = k + 1
-    for max in [6, 7, 8, 11, 12, 27, 100, 251, 300, 1000]
-        match isoal_framed_aggregate(sdus, max, false)
-            None       => test.fail("Segmentable mode takes every SDU in a PDU of ${max}")
-            Some(pdus) =>
-                for p in pdus
-                    test.assert(list.len(p.payload) <= max)
-                    test.assert(list.len(p.payload) > 0)
-                assert_same_framed(isoal_framed_sdus(pdus), sdus)
-    // Unsegmented mode takes the SDUs that fit one PDU each.
-    var small: [IsoFramedSdu] = []
-    for n in [0, 1, 2, 5, 3, 0, 7]
-        list.push(small, framed_sdu(50 + n, n))
-    for max in [12, 13, 27, 251]
-        match isoal_framed_aggregate(small, max, true)
-            None       => test.fail("Unsegmented mode takes every SDU in a PDU of ${max}")
-            Some(pdus) =>
-                for p in pdus
-                    test.assert(list.len(p.payload) <= max)
-                assert_same_framed(isoal_framed_sdus(pdus), small)
-
-@test
-@satisfies("REQ-BLE-ISO-007")
-fn test_aggregation_refuses_a_pdu_without_room_and_a_time_offset_out_of_range()
-    test.assert(isoal_framed_aggregate([framed_sdu(0, 1)], 5, false) == None)
-    test.assert(isoal_framed_aggregate([framed_sdu(0, 1)], 5, true) == None)
-    test.assert(isoal_framed_aggregate([framed_sdu(0x1000000, 1)], 100, false) == None)
-    test.assert(isoal_framed_aggregate([framed_sdu(-1, 1)], 100, true) == None)
-    test.assert(isoal_framed_aggregate([framed_sdu(0, 1)], 6, false) != None)
-
-@test
-@satisfies("REQ-BLE-ISO-007")
-fn test_padding_pdus_make_up_the_burst_and_carry_no_sdu()
-    let one = isoal_framed_aggregate([framed_sdu(9, 3)], 20, false) ?? []
-    let padded = isoal_framed_pad(one, 3)
-    test.assert_eq(list.len(padded), 3)
-    test.assert_eq(list.len(padded[1].payload), 0)
-    test.assert_eq(padded[2].llid, ISO_LLID_FRAMED)
-    assert_same_framed(isoal_framed_sdus(padded), [framed_sdu(9, 3)])
-    // A burst that is full or over is left as it is.
-    test.assert_eq(list.len(isoal_framed_pad(padded, 2)), 3)
-    test.assert_eq(list.len(isoal_framed_pad([], 0)), 0)
-
-@test
-@satisfies("REQ-BLE-HCI-059")
-fn test_an_sdu_longer_than_the_host_buffer_is_lost_data_and_counted()
-    // An SDU one octet over the Host's buffer, cut into packets of 251.
-    var r = isoal_reassembler(0x0040)
-    var out: [IsoSdu] = []
-    match isoal_fragments(0x0040, 9, None, sdu_of(noble_config.ISO_SDU_OCTETS + 1), 251)
-        None          => test.fail("the SDU is cut")
-        Some(packets) =>
-            for p in packets
-                list.append(out, isoal_push(var r, p))
-    // One SDU of lost data for the sequence number, and the Host kept nothing of it.
-    test.assert_eq(list.len(out), 1)
-    test.assert_eq(out[0].packet_status, hci_codec.ISO_PSF_LOST)
-    test.assert_eq(out[0].packet_sequence_number, 9)
-    test.assert_eq(list.len(out[0].data), 0)
-    test.assert_eq(r.oversize, 1)
-    test.assert(not r.collecting)
-    // A complete SDU that is too long in one packet is the same.
-    var q = isoal_reassembler(0x0040)
-    match isoal_fragments(0x0040, 4, None, sdu_of(noble_config.ISO_SDU_OCTETS + 1), 400)
-        None          => test.fail("the SDU is cut")
-        Some(packets) =>
-            let got = isoal_push(var q, packets[0])
-            test.assert_eq(list.len(got), 1)
-            test.assert_eq(got[0].packet_status, hci_codec.ISO_PSF_LOST)
-            test.assert_eq(q.oversize, 1)
-    // The largest SDU the buffer holds is taken whole.
-    let fits = round_trip(sdu_of(noble_config.ISO_SDU_OCTETS), 251, None)
-    test.assert_eq(list.len(fits), 1)
-    test.assert_eq(fits[0].packet_status, hci_codec.ISO_PSF_VALID)

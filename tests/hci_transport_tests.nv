@@ -1,0 +1,25 @@
+// tests/hci_transport_tests.nv — the unit tests of src/hci_transport.nv.
+//
+//   novo test tests/hci_transport_tests.nv
+
+use std.test
+use hci_transport.{ HCI_TRANSPORT_ERR_DISCONNECTED, HCI_TRANSPORT_ERR_FULL, HCI_TRANSPORT_ERR_MALFORMED, HCI_TRANSPORT_OK, hci_transport_empty_payload }
+
+// ── Tests ────────────────────────────────────────────────────────────
+//
+// Only the error-code surface is testable here — a trait
+// declaration has no behaviour of its own.  Behavioural tests
+// live beside each impl (`coresident/hci_ram.nv`, `hci_uart.nv`,
+// `hci_usb_cdc.nv`).
+
+@test
+fn test_transport_error_code_constants()
+    test.assert_eq(HCI_TRANSPORT_OK, 0)
+    test.assert_eq(HCI_TRANSPORT_ERR_FULL, 1)
+    test.assert_eq(HCI_TRANSPORT_ERR_DISCONNECTED, 2)
+    test.assert_eq(HCI_TRANSPORT_ERR_MALFORMED, 3)
+
+@test
+fn test_empty_payload_has_length_zero()
+    let p = hci_transport_empty_payload()
+    test.assert_eq(list.len(p), 0)

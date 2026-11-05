@@ -71,6 +71,8 @@ novo test
 ```
 
 `novo build` type-checks and effect-checks every module under `src/`; the package is a library and writes no binary.
-`novo test` runs the suites under `tests/` (`gatt_client_engine_tests.nv`, `integration_gatt_tests.nv` and
-`two_centrals_tests.nv`), and a module's own cases run with `novo test src/<module>.nv`.  A suite that needs a
-profile takes it with `--config configs/pc.toml`.  The tests are not part of the published package.
+`novo test` runs the suites under `tests/`: one suite for each module, `tests/<module>_tests.nv`, and three that drive
+several modules together (`gatt_client_engine_tests.nv`, `integration_gatt_tests.nv` and `two_centrals_tests.nv`).
+`novo test tests/<module>_tests.nv` runs one of them.  A suite takes a profile with `--config configs/pc.toml`;
+`novo config ci` runs every suite under the smallest and the largest configuration the schema allows and under each file
+of `configs/`.  The tests are not part of the published package.

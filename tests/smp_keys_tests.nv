@@ -1,0 +1,162 @@
+// tests/smp_keys_tests.nv — the unit tests of src/smp_keys.nv.
+//
+//   novo test tests/smp_keys_tests.nv
+
+use std.test
+use prims.aes128
+use smp_keys.{ PublicKey, address_56, debug_private_key, debug_public_key, dhkey, equal_ct, is_all_zero, is_debug_public_key, is_valid_public_key, key_pair_from_private, legacy_confirm, legacy_stk, mask_key, numeric_value, passkey_r, passkey_tk, passkey_z, random_draw, random_from_seed, random_key_pair, random_reseed, resolvable_private_address, resolves, reversed, sc_check, sc_confirm, sc_keys, zeros }
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+fn hex(text: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_hex(text)!)
+
+// A value the specification prints most significant octet first, in
+// wire order.
+fn wire(text: Str) -> [u8]
+    reversed(hex(text))
+
+fn assert_bytes(got: [u8], want: [u8])
+    test.assert_eq(list.len(got), list.len(want))
+    for i in 0..list.len(want)
+        test.assert_eq(got[i] as Int, want[i] as Int)
+
+@test
+fn test_passkey_tk_matches_the_section_2_3_5_3_example()
+    assert_bytes(passkey_tk(19655), wire("00000000000000000000000000004CC7"))
+
+@test
+fn test_legacy_confirm_in_wire_order_matches_the_section_2_2_3_example()
+    let preq: [u8] = [0x01, 0x01, 0x00, 0x00, 0x10, 0x07, 0x07]
+    let pres: [u8] = [0x02, 0x03, 0x00, 0x00, 0x08, 0x00, 0x05]
+    let got = legacy_confirm(zeros(16), wire("5783D52156AD6F0E6388274EC6702EE0"), preq, pres,
+                             1, wire("A1A2A3A4A5A6"), 0, wire("B1B2B3B4B5B6"))
+    assert_bytes(got, wire("1E1E3FEF878988EAD2A74DC5BEF13B86"))
+
+@test
+fn test_legacy_stk_in_wire_order_matches_the_section_2_2_4_example()
+    let got = legacy_stk(zeros(16), wire("000F0E0D0C0B0A091122334455667788"), wire("010203040506070899AABBCCDDEEFF00"))
+    assert_bytes(got, wire("9A1FE1F0E8B0F49B5B4216AE796DA062"))
+
+@test
+fn test_mask_key_matches_the_section_2_3_4_example()
+    let got = mask_key(wire("123456789ABCDEF0123456789ABCDEF0"), 7)
+    assert_bytes(got, wire("0000000000000000003456789ABCDEF0"))
+    assert_bytes(mask_key(wire("123456789ABCDEF0123456789ABCDEF0"), 16),
+        wire("123456789ABCDEF0123456789ABCDEF0"))
+
+@test
+fn test_sc_confirm_in_wire_order_matches_appendix_d2()
+    let got = sc_confirm(wire("20b003d2f297be2c5e2c83a7e9f9a5b9eff49111acf4fddbcc0301480e359de6"),
+                         wire("55188b3d32f6bb9a900afcfbeed4e72a59cb9ac2f19d7cfb6b4fdd49f47fc5fd"),
+                         wire("d5cb8454d177733effffb2ec712baeab"), 0)
+    assert_bytes(got, wire("f2c916f107a9bd1cf1eda1bea974872d"))
+
+@test
+fn test_sc_keys_in_wire_order_match_appendix_d3()
+    // A1 00561237 37bfce and A2 00a71370 2dcfc1: public addresses.
+    let a1 = address_56(0, wire("56123737bfce"))
+    let a2 = address_56(0, wire("a713702dcfc1"))
+    assert_bytes(a1, hex("0056123737bfce"))
+    let keys = sc_keys(wire("ec0234a357c8ad05341010a60a397d9b99796b13b4f866f1868d34f373bfa698"),
+                       wire("d5cb8454d177733effffb2ec712baeab"), wire("a6e8e7cc25a75f6e216583f7ff3dc4cf"), a1, a2)
+    assert_bytes(keys.mac_key, hex("2965f176a1084a02fd3f6a20ce636e20"))
+    assert_bytes(keys.ltk, wire("6986791169d7cd23980522b594750a38"))
+
+@test
+fn test_sc_check_in_wire_order_matches_appendix_d4()
+    let got = sc_check(hex("2965f176a1084a02fd3f6a20ce636e20"),
+                       wire("d5cb8454d177733effffb2ec712baeab"), wire("a6e8e7cc25a75f6e216583f7ff3dc4cf"),
+                       wire("12a3343bb453bb5408da42d20c2d0fc8"), 0x01, 0x01, 0x02,
+                       hex("0056123737bfce"), hex("00a713702dcfc1"))
+    assert_bytes(got, wire("e3c473989cd0e8c5d26c0b09da958f61"))
+
+// Appendix D.2: the debug private key (private key A of the sample) with the public key of
+// the sample's private key B gives the sample's DHKey, from either side.
+@test
+fn test_debug_private_key_gives_the_appendix_d2_dhkey()
+    let a = key_pair_from_private(debug_private_key())
+    let b = key_pair_from_private(wire("55188b3d32f6bb9a900afcfbeed4e72a59cb9ac2f19d7cfb6b4fdd49f47fc5fd"))
+    let want = wire("ec0234a357c8ad05341010a60a397d9b99796b13b4f866f1868d34f373bfa698")
+    assert_bytes(dhkey(a.private_key, b.public_key), want)
+    assert_bytes(dhkey(b.private_key, a.public_key), want)
+
+@test
+fn test_numeric_value_matches_appendix_d5()
+    let v = numeric_value(wire("20b003d2f297be2c5e2c83a7e9f9a5b9eff49111acf4fddbcc0301480e359de6"),
+                          wire("55188b3d32f6bb9a900afcfbeed4e72a59cb9ac2f19d7cfb6b4fdd49f47fc5fd"),
+                          wire("d5cb8454d177733effffb2ec712baeab"), wire("a6e8e7cc25a75f6e216583f7ff3dc4cf"))
+    test.assert_eq(v, 0x2f9ed5ba % 1000000)
+
+@test
+fn test_passkey_r_matches_the_section_2_2_8_example()
+    assert_bytes(passkey_r(131313), wire("000000000000000000000000000200f1"))
+    test.assert_eq(passkey_z(131313, 0), 0x81)
+    test.assert_eq(passkey_z(131313, 1), 0x80)
+
+@test
+fn test_debug_key_pair_is_consistent_and_valid()
+    let kp = key_pair_from_private(debug_private_key())
+    let d = debug_public_key()
+    assert_bytes(kp.public_key.x, d.x)
+    assert_bytes(kp.public_key.y, d.y)
+    test.assert(is_valid_public_key(d))
+    test.assert(is_debug_public_key(kp.public_key))
+
+@test
+fn test_invalid_public_keys_are_refused()
+    let d = debug_public_key()
+    test.assert(not is_valid_public_key(PublicKey { x: d.x, y: zeros(32) }))
+    var flipped = d.y[:]
+    flipped[0] = (flipped[0] as Int ^ 1) as u8
+    test.assert(not is_valid_public_key(PublicKey { x: d.x, y: flipped }))
+    test.assert(not is_valid_public_key(PublicKey { x: zeros(32), y: zeros(32) }))
+    test.assert(not is_valid_public_key(PublicKey { x: zeros(31), y: zeros(32) }))
+
+@test
+fn test_dhkey_agrees_between_two_key_pairs()
+    var b_priv = zeros(32)
+    b_priv[0] = 7
+    b_priv[20] = 0x55
+    let a = key_pair_from_private(debug_private_key())
+    let b = key_pair_from_private(b_priv)
+    assert_bytes(dhkey(a.private_key, b.public_key), dhkey(b.private_key, a.public_key))
+
+@test
+fn test_resolvable_private_address_matches_appendix_d7()
+    // IRK ec0234a357c8ad05341010a60a397d9b, prand 708194, ah 0dfbaa.
+    let irk = wire("ec0234a357c8ad05341010a60a397d9b")
+    let rpa = resolvable_private_address(irk, hex("708194"))
+    assert_bytes(rpa, wire("7081940dfbaa"))
+    test.assert(resolves(irk, rpa))
+    test.assert(not resolves(wire("00000000000000000000000000000001"), rpa))
+
+@test
+fn test_equal_ct()
+    test.assert(equal_ct(hex("0102"), hex("0102")))
+    test.assert(not equal_ct(hex("0102"), hex("0103")))
+    test.assert(not equal_ct(hex("0102"), hex("01")))
+    test.assert(is_all_zero(zeros(4)))
+    test.assert(not is_all_zero(hex("0001")))
+
+@test
+fn test_random_draws_differ_and_repeat_from_the_same_seed()
+    let r0 = random_from_seed(hex("000102030405060708090a0b0c0d0e0f"))
+    let d1 = random_draw(r0)
+    let d2 = random_draw(d1.random)
+    test.assert(not equal_ct(d1.value, d2.value))
+    // The first draw is e(seed, 0).
+    assert_bytes(d1.value, aes128.aes128_encrypt(zeros(16), hex("000102030405060708090a0b0c0d0e0f")))
+    let again = random_draw(random_from_seed(hex("000102030405060708090a0b0c0d0e0f")))
+    assert_bytes(again.value, d1.value)
+    let mixed = random_draw(random_reseed(r0, hex("ffffffffffffffffffffffffffffffff")))
+    test.assert(not equal_ct(mixed.value, d1.value))
+
+@test
+fn test_a_random_key_pair_has_a_private_key_below_the_curve_order()
+    let draw = random_key_pair(random_from_seed(zeros(16)))
+    test.assert_eq(list.len(draw.key_pair.private_key), 32)
+    test.assert_eq(draw.key_pair.private_key[31] as Int & 0x80, 0)
+    test.assert(is_valid_public_key(draw.key_pair.public_key))
+    let next = random_key_pair(draw.random)
+    test.assert(not equal_ct(next.key_pair.private_key, draw.key_pair.private_key))

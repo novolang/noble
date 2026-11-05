@@ -20,5 +20,6 @@ this schema because their cost formulas multiply a key of the core.
 The public surface is what an extension module, a chip image and a PC Host call:
 the ATT and GATT server and client, the links and the HCI session, the credit
 based channels, the Security Manager, the advertisers, the isochronous tables,
-and the encodings and builders the services share.  The unit tests are cases
-beside the code in `src/` and suites in `tests/`.
+and the encodings and builders the services share.  The unit tests are the
+suites `tests/<module>_tests.nv`, which run under the smallest and the largest
+configuration and under each file of `configs/`.

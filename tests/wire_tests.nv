@@ -1,0 +1,234 @@
+// tests/wire_tests.nv — the unit tests of src/wire.nv.
+//
+//   novo test tests/wire_tests.nv
+
+use std.test
+use wire.{ FLOAT_NAN, FLOAT_NEGATIVE_INFINITY, FLOAT_NRES, FLOAT_POSITIVE_INFINITY, FLOAT_RESERVED, KIND_NAN, KIND_NEGATIVE_INFINITY, KIND_NRES, KIND_NUMBER, KIND_POSITIVE_INFINITY, KIND_RESERVED, SFLOAT_NAN, SFLOAT_NEGATIVE_INFINITY, SFLOAT_NRES, SFLOAT_POSITIVE_INFINITY, SFLOAT_RESERVED, clamp, date_time, date_time_known, date_time_unknown, date_time_valid, float, float_exponent, float_kind, float_mantissa, float_scaled, get, get_date_time, get_signed, octets, put, put_date_time, scaled, sfloat, sfloat_exponent, sfloat_kind, sfloat_mantissa, sfloat_scaled, text }
+use wire
+
+@test
+fn test_text_is_the_octets_of_a_string()
+    test.assert_eq(text("Ann"), octets([0x41, 0x6E, 0x6E]))
+    test.assert_eq(list.len(text("")), 0)
+
+@test
+fn test_put_writes_little_endian()
+    var out: [u8] = []
+    put(var out, 0x0102, 2)
+    put(var out, 0x030405, 3)
+    put(var out, 0x06070809, 4)
+    test.assert_eq(out, octets([0x02, 0x01, 0x05, 0x04, 0x03, 0x09, 0x08, 0x07, 0x06]))
+
+@test
+fn test_negative_values_are_twos_complement()
+    var out: [u8] = []
+    put(var out, -2, 2)
+    test.assert_eq(out, octets([0xFE, 0xFF]))
+    test.assert_eq(get_signed(out, 0, 2), -2)
+    test.assert_eq(get_signed(octets([0x7F, 0x00]), 0, 2), 127)
+    test.assert_eq(get_signed(octets([0x00, 0x80]), 0, 2), -32768)
+    test.assert_eq(get(out, 0, 2), 0xFFFE)
+
+@test
+fn test_get_past_the_end_is_zero()
+    test.assert_eq(get(octets([1, 2]), 1, 2), 0)
+    test.assert_eq(get(octets([1, 2, 3, 4]), 0, 4), 0x04030201)
+
+@test
+fn test_clamp()
+    test.assert_eq(clamp(5, 0, 3), 3)
+    test.assert_eq(clamp(-5, 0, 3), 0)
+    test.assert_eq(clamp(2, 0, 3), 2)
+
+@test
+fn test_date_time_is_seven_octets_and_unknown_parts_are_zero()
+    var out: [u8] = []
+    put_date_time(var out, date_time(2026, 10, 27, 13, 5, 9))
+    test.assert_eq(out, octets([0xEA, 0x07, 10, 27, 13, 5, 9]))
+    test.assert(date_time_valid(date_time(2026, 10, 27, 13, 5, 9)))
+    test.assert(date_time_valid(date_time(1582, 1, 1, 0, 0, 0)))
+    test.assert(date_time_valid(date_time(9999, 12, 31, 23, 59, 59)))
+    // 0 means not known for the year, the month and the day.
+    test.assert(date_time_valid(date_time(0, 0, 0, 12, 0, 0)))
+    test.assert(date_time_valid(date_time_unknown()))
+    test.assert(not date_time_valid(date_time(1581, 1, 1, 0, 0, 0)))
+    test.assert(not date_time_valid(date_time(10000, 1, 1, 0, 0, 0)))
+    test.assert(not date_time_valid(date_time(2026, 13, 1, 0, 0, 0)))
+    test.assert(not date_time_valid(date_time(2026, 1, 32, 0, 0, 0)))
+    test.assert(not date_time_valid(date_time(2026, 1, 1, 24, 0, 0)))
+    test.assert(not date_time_valid(date_time(2026, 1, 1, 0, 60, 0)))
+    test.assert(not date_time_valid(date_time(2026, 1, 1, 0, 0, 60)))
+    test.assert(not date_time_valid(date_time(2026, 255, 1, 0, 0, 0)))
+
+@test
+fn test_a_date_time_is_read_from_its_seven_octets()
+    let t = get_date_time(octets([0xEA, 0x07, 10, 27, 13, 5, 9, 0xAA]), 0)
+    test.assert_eq(t.year as Int, 2026)
+    test.assert_eq(t.month as Int, 10)
+    test.assert_eq(t.day as Int, 27)
+    test.assert_eq(t.hours as Int, 13)
+    test.assert_eq(t.minutes as Int, 5)
+    test.assert_eq(t.seconds as Int, 9)
+    // At an offset, and a value that is too short reads as unknown.
+    test.assert_eq(get_date_time(octets([0, 0xEA, 0x07, 10, 27, 13, 5, 9]), 1).day as Int, 27)
+    test.assert_eq(get_date_time(octets([0xEA]), 0).year as Int, 0)
+    test.assert_eq(get_date_time(octets([0xEA, 0x07, 10]), 0).day as Int, 0)
+    // A part wider than its field keeps its low octets.
+    test.assert_eq(date_time(0x10000 + 2026, 266, 1, 0, 0, 0).year as Int, 2026)
+    test.assert_eq(date_time(2026, 266, 1, 0, 0, 0).month as Int, 10)
+
+@test
+fn test_a_known_date_time_has_a_year_a_month_and_a_day()
+    test.assert(date_time_known(date_time(2026, 10, 27, 0, 0, 0)))
+    test.assert(not date_time_known(date_time(0, 10, 27, 0, 0, 0)))
+    test.assert(not date_time_known(date_time(2026, 0, 27, 0, 0, 0)))
+    test.assert(not date_time_known(date_time(2026, 10, 0, 0, 0, 0)))
+    test.assert(not date_time_known(date_time(2026, 13, 27, 0, 0, 0)))
+    test.assert(not date_time_known(date_time_unknown()))
+
+@test
+fn test_float_of_a_body_temperature_has_the_known_octets()
+    // 36.4 is mantissa 364 and exponent -1: 0xFF00016C, octets 6C 01 00 FF.
+    test.assert_eq(float(364, -1), 0xFF00016C)
+    var out: [u8] = []
+    put(var out, float(364, -1), 4)
+    test.assert_eq(out, octets([0x6C, 0x01, 0x00, 0xFF]))
+    let raw = get(out, 0, 4)
+    test.assert_eq(float_mantissa(raw), 364)
+    test.assert_eq(float_exponent(raw), -1)
+    test.assert_eq(float_kind(raw), KIND_NUMBER)
+    test.assert_eq(float_scaled(raw, 1), 364)
+    test.assert_eq(float_scaled(raw, 0), 36)
+    test.assert_eq(float_scaled(raw, 3), 36400)
+    // A negative number is the two's complement of its mantissa.
+    test.assert_eq(float(-364, -1), 0xFFFFFE94)
+    test.assert_eq(float_mantissa(0xFFFFFE94), -364)
+    test.assert_eq(float_scaled(0xFFFFFE94, 1), -364)
+    // Zero is 0 whatever exponent it came with.
+    test.assert_eq(float(0, 5), 0)
+    test.assert_eq(float(0, -128), 0)
+
+@test
+fn test_sfloat_of_whole_and_tenth_values_has_the_known_octets()
+    test.assert_eq(sfloat(98, 0), 0x0062)
+    test.assert_eq(sfloat(725, -1), 0xF2D5)
+    test.assert_eq(sfloat(-1, 0), 0x0FFF)
+    test.assert_eq(sfloat(0, -3), 0)
+    var out: [u8] = []
+    put(var out, sfloat(725, -1), 2)
+    test.assert_eq(out, octets([0xD5, 0xF2]))
+    let raw = get(out, 0, 2)
+    test.assert_eq(sfloat_mantissa(raw), 725)
+    test.assert_eq(sfloat_exponent(raw), -1)
+    test.assert_eq(sfloat_scaled(raw, 1), 725)
+    // 72.5 with no decimals rounds away from zero, in both signs.
+    test.assert_eq(sfloat_scaled(raw, 0), 73)
+    test.assert_eq(sfloat_scaled(sfloat(-725, -1), 0), -73)
+    test.assert_eq(sfloat_scaled(sfloat(724, -1), 0), 72)
+
+@test
+fn test_the_special_values_are_the_five_of_the_table()
+    test.assert_eq(FLOAT_NAN, 0x007FFFFF)
+    test.assert_eq(FLOAT_POSITIVE_INFINITY, 0x007FFFFE)
+    test.assert_eq(FLOAT_NRES, 0x00800000)
+    test.assert_eq(FLOAT_RESERVED, 0x00800001)
+    test.assert_eq(FLOAT_NEGATIVE_INFINITY, 0x00800002)
+    test.assert_eq(SFLOAT_NAN, 0x07FF)
+    test.assert_eq(SFLOAT_POSITIVE_INFINITY, 0x07FE)
+    test.assert_eq(SFLOAT_NRES, 0x0800)
+    test.assert_eq(SFLOAT_RESERVED, 0x0801)
+    test.assert_eq(SFLOAT_NEGATIVE_INFINITY, 0x0802)
+    test.assert_eq(float_kind(FLOAT_NAN), KIND_NAN)
+    test.assert_eq(float_kind(FLOAT_POSITIVE_INFINITY), KIND_POSITIVE_INFINITY)
+    test.assert_eq(float_kind(FLOAT_NEGATIVE_INFINITY), KIND_NEGATIVE_INFINITY)
+    test.assert_eq(float_kind(FLOAT_NRES), KIND_NRES)
+    test.assert_eq(float_kind(FLOAT_RESERVED), KIND_RESERVED)
+    test.assert_eq(sfloat_kind(SFLOAT_NAN), KIND_NAN)
+    test.assert_eq(sfloat_kind(SFLOAT_POSITIVE_INFINITY), KIND_POSITIVE_INFINITY)
+    test.assert_eq(sfloat_kind(SFLOAT_NEGATIVE_INFINITY), KIND_NEGATIVE_INFINITY)
+    test.assert_eq(sfloat_kind(SFLOAT_NRES), KIND_NRES)
+    test.assert_eq(sfloat_kind(SFLOAT_RESERVED), KIND_RESERVED)
+    // A special value is a special value with any exponent, and has no scaled number.
+    test.assert_eq(float_kind(0x05000000 | FLOAT_NAN), KIND_NAN)
+    test.assert_eq(sfloat_kind(0x3000 | SFLOAT_NRES), KIND_NRES)
+    test.assert_eq(float_scaled(FLOAT_NAN, 2), 0)
+    test.assert_eq(sfloat_scaled(SFLOAT_POSITIVE_INFINITY, 0), 0)
+    // The mantissas next to the specials are numbers.
+    test.assert_eq(float_kind(0x007FFFFD), KIND_NUMBER)
+    test.assert_eq(float_kind(0x00800003), KIND_NUMBER)
+    test.assert_eq(sfloat_kind(0x07FD), KIND_NUMBER)
+    test.assert_eq(sfloat_kind(0x0803), KIND_NUMBER)
+
+@test
+fn test_the_largest_and_smallest_mantissas_are_kept()
+    test.assert_eq(float(8388605, 0), 0x007FFFFD)
+    test.assert_eq(float(-8388605, 0), 0x00800003)
+    test.assert_eq(float_mantissa(0x00800003), -8388605)
+    test.assert_eq(sfloat(2045, 0), 0x07FD)
+    test.assert_eq(sfloat(-2045, 0), 0x0803)
+    test.assert_eq(sfloat_mantissa(0x0803), -2045)
+
+@test
+fn test_a_mantissa_too_large_loses_digits_and_is_rounded_once_away_from_zero()
+    // 8388606 would be the +infinity mantissa: one digit goes, 838860.6 -> 838861.
+    test.assert_eq(float(8388606, 0), 0x010CCCCD)
+    test.assert_eq(float(-8388606, 0), 0x01F33333)
+    test.assert_eq(sfloat(2046, 0), 0x10CD)
+    test.assert_eq(sfloat(-2046, 0), 0x1F33)
+    // 205.5 -> 206 and -205.5 -> -206: halves go away from zero.
+    test.assert_eq(sfloat(2055, 0), 0x10CE)
+    test.assert_eq(sfloat(-2055, 0), 0x1F32)
+    // 2044.49 is 2044, not 2045 as a digit-by-digit rounding would give.
+    test.assert_eq(sfloat(204449, 0), 0x27FC)
+    test.assert_eq(sfloat(204450, 0), 0x27FD)
+    // Several digits go at once, and the exponent grows by as many.
+    test.assert_eq(sfloat(30000000, 0), 0x512C)
+    test.assert_eq(float(123456789, 0), 0x0212D688)
+    test.assert_eq(float_scaled(float(123456789, 0), 0), 123456800)
+
+@test
+fn test_an_exponent_below_the_smallest_loses_digits_and_may_leave_zero()
+    // 0.5 at exponent -9 is 5 * 10^-9 -> one digit goes, 0.5 -> 1, exponent -8.
+    test.assert_eq(sfloat(5, -9), 0x8001)
+    test.assert_eq(sfloat(4, -9), 0)
+    test.assert_eq(sfloat(123, -10), 0x8001)
+    test.assert_eq(float(15, -129), 0x80000002)
+    test.assert_eq(float(1, -129), 0)
+    test.assert_eq(float(-15, -129), 0x80FFFFFE)
+
+@test
+fn test_an_exponent_above_the_largest_multiplies_while_it_fits_and_then_is_infinity()
+    test.assert_eq(sfloat(1, 8), 0x700A)
+    test.assert_eq(sfloat(2, 9), 0x70C8)
+    test.assert_eq(sfloat(1, 10), 0x73E8)
+    test.assert_eq(sfloat(3, 10), SFLOAT_POSITIVE_INFINITY)
+    test.assert_eq(sfloat(-3, 10), SFLOAT_NEGATIVE_INFINITY)
+    test.assert_eq(sfloat(1, 40), SFLOAT_POSITIVE_INFINITY)
+    // 2046 * 10^7 rounds to 205 * 10^8, which does not fit exponent 7 either.
+    test.assert_eq(sfloat(20460000000, 0), SFLOAT_POSITIVE_INFINITY)
+    test.assert_eq(sfloat(-20460000000, 0), SFLOAT_NEGATIVE_INFINITY)
+    test.assert_eq(float(1, 128), 0x7F00000A)
+    test.assert_eq(float(5, 128), 0x7F000032)
+    test.assert_eq(float(1, 200), FLOAT_POSITIVE_INFINITY)
+    test.assert_eq(float(-1, 200), FLOAT_NEGATIVE_INFINITY)
+    test.assert_eq(float(9, 134), FLOAT_POSITIVE_INFINITY)
+
+@test
+fn test_scaled_rounds_once_and_limits_the_result()
+    test.assert_eq(scaled(1445, -2, 1), 145)
+    test.assert_eq(scaled(1445, -2, 0), 14)
+    test.assert_eq(scaled(1450, -2, 0), 15)
+    test.assert_eq(scaled(-1450, -2, 0), -15)
+    test.assert_eq(scaled(7, 2, 0), 700)
+    test.assert_eq(scaled(0, 40, 0), 0)
+    test.assert_eq(scaled(5, 40, 0), 1000000000000000)
+    test.assert_eq(scaled(-5, 40, 0), -1000000000000000)
+    test.assert_eq(scaled(1, -19, 0), 0)
+    test.assert_eq(float_scaled(float(5, 100), 2), 1000000000000000)
+
+@test
+fn test_pow10_is_ten_to_the_power_n()
+    test.assert_eq(wire.pow10(0), 1)
+    test.assert_eq(wire.pow10(1), 10)
+    test.assert_eq(wire.pow10(6), 1000000)
+    test.assert_eq(wire.pow10(-3), 1)

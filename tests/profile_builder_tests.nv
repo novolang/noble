@@ -1,0 +1,60 @@
+// tests/profile_builder_tests.nv — the unit tests of src/profile_builder.nv.
+//
+//   novo test tests/profile_builder_tests.nv
+
+use std.test
+use gatt_server
+use profile_builder
+
+@test
+fn test_the_permission_helpers_give_one_direction_each()
+    let r = profile_builder.read_only(gatt_server.Access.Encrypted)
+    test.assert(r.read == gatt_server.Access.Encrypted)
+    test.assert(r.write == gatt_server.Access.Denied)
+    let w = profile_builder.write_only(gatt_server.Access.Open)
+    test.assert(w.read == gatt_server.Access.Denied)
+    test.assert(w.write == gatt_server.Access.Open)
+    let n = profile_builder.notify_only()
+    test.assert(n.read == gatt_server.Access.Denied)
+    test.assert(n.write == gatt_server.Access.Denied)
+
+@test
+fn test_a_service_a_value_a_descriptor_and_a_configuration_take_consecutive_handles()
+    var s = gatt_server.new_server([], 65)
+    test.assert_eq(profile_builder.start_service(var s.db, gatt_server.le16(0xAA00))!, 1)
+    // The declaration at 2, the value one after it.
+    let value = profile_builder.add_value(var s.db, gatt_server.PROP_READ | gatt_server.PROP_NOTIFY,
+        profile_builder.read_only(gatt_server.Access.Open), gatt_server.le16(0xAA01), [5, 6])!
+    test.assert_eq(value, 3)
+    test.assert_eq(gatt_server.index_of(s.db, value) >= 0, true)
+    test.assert_eq(profile_builder.add_cccd(var s.db, gatt_server.both_ways(gatt_server.Access.Open))!, 4)
+    test.assert_eq(profile_builder.add_descriptor(var s.db, profile_builder.read_only(gatt_server.Access.Open),
+        profile_builder.UUID_REPORT_REFERENCE, [1, 1])!,
+        5)
+    // An empty value leaves the value empty.
+    let empty = profile_builder.add_value(var s.db, gatt_server.PROP_READ, profile_builder.read_only(gatt_server.Access.Open),
+        gatt_server.le16(0xAA02), [])!
+    test.assert_eq(list.len(s.db.attributes[gatt_server.index_of(s.db, empty)].value), 0)
+
+@test
+fn test_a_value_longer_than_an_attribute_value_is_refused_as_invalid()
+    var s = gatt_server.new_server([], 65)
+    let _ = profile_builder.start_service(var s.db, gatt_server.le16(0xAA00))!
+    var long: [u8] = []
+    for _ in 0..gatt_server.ATT_VALUE_MAX + 1
+        list.push(long, 1)
+    match profile_builder.add_value(var s.db, gatt_server.PROP_READ, profile_builder.read_only(gatt_server.Access.Open),
+        gatt_server.le16(0xAA01), long)
+        Ok(_)  => test.fail("a value above the longest attribute value is refused")
+        Err(e) => test.assert(e == profile_builder.ProfileError.InvalidValue)
+    let _ = profile_builder.add_value(var s.db, gatt_server.PROP_READ, profile_builder.read_only(gatt_server.Access.Open),
+        gatt_server.le16(0xAA02), [])!
+    match profile_builder.add_descriptor(var s.db, profile_builder.read_only(gatt_server.Access.Open), 0x2901, long)
+        Ok(_)  => test.fail("a descriptor value above the longest attribute value is refused")
+        Err(e) => test.assert(e == profile_builder.ProfileError.InvalidValue)
+
+@test
+fn test_every_profile_error_has_a_message()
+    test.assert(profile_builder.ProfileError.NoRoom.message() != profile_builder.ProfileError.InvalidValue.message())
+    test.assert(profile_builder.ProfileError.NotPermitted.message() != profile_builder.ProfileError.NoRoom.message())
+    test.assert(str.len(profile_builder.ProfileError.NotPermitted.message()) > 0)

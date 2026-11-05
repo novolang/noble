@@ -1,0 +1,108 @@
+// tests/smp_ctx_tests.nv — the unit tests of src/smp_ctx.nv.
+//
+//   novo test tests/smp_ctx_tests.nv
+
+use std.test
+use smp_ctx.{ SMP_CTX_IAT_OFFSET, SMP_CTX_IA_OFFSET, SMP_CTX_MCONFIRM_OFFSET, SMP_CTX_MRAND_OFFSET, SMP_CTX_PREQ_OFFSET, SMP_CTX_PRES_OFFSET, SMP_CTX_RAT_OFFSET, SMP_CTX_RA_OFFSET, SMP_CTX_SCONFIRM_OFFSET, SMP_CTX_SRAND_OFFSET, SMP_CTX_TK_OFFSET, SMP_CTX_TOTAL_BYTES }
+use smp_ctx
+
+// The offset table is checked on its own: a transcription error in any constant silently corrupts every pairing
+// exchange and is impossible to debug without a sniffer.  The accessors read and write the fixed RAM with hw.mem_*,
+// which the tests below drive.
+
+@test
+fn test_offset_table_matches_documented_layout()
+    test.assert_eq(SMP_CTX_PRES_OFFSET, 0x00)
+    test.assert_eq(SMP_CTX_PREQ_OFFSET, 0x07)
+    test.assert_eq(SMP_CTX_RAT_OFFSET, 0x0E)
+    test.assert_eq(SMP_CTX_IAT_OFFSET, 0x0F)
+    test.assert_eq(SMP_CTX_RA_OFFSET, 0x10)
+    test.assert_eq(SMP_CTX_IA_OFFSET, 0x16)
+    test.assert_eq(SMP_CTX_TK_OFFSET, 0x20)
+    test.assert_eq(SMP_CTX_SRAND_OFFSET, 0x30)
+    test.assert_eq(SMP_CTX_MRAND_OFFSET, 0x40)
+    test.assert_eq(SMP_CTX_SCONFIRM_OFFSET, 0x50)
+    test.assert_eq(SMP_CTX_MCONFIRM_OFFSET, 0x60)
+    test.assert_eq(SMP_CTX_TOTAL_BYTES, 128)
+    // Total used: pres(7) + preq(7) + rat(1) + iat(1) + ra(6) +
+    // ia(6) + 4-byte gap + 5×16(TK+Srand+Mrand+Sconfirm+Mconfirm)
+    //   = 28 + 80 = 108 bytes named, < 128 sweep.
+    test.assert(SMP_CTX_MCONFIRM_OFFSET + 16 <= SMP_CTX_TOTAL_BYTES)
+
+// The 16 octets 0x10 + seed, 0x11 + seed, ... as a list.
+fn sixteen(seed: Int) -> [u8]
+    var out: [u8] = []
+    for i in 0..16
+        list.push(out, (seed + i) as u8)
+    out
+
+@test
+fn test_the_pairing_pdus_are_stored_where_the_layout_puts_them() [hw]
+    smp_ctx.clear_all()
+    let pdu: [u8] = [0x02, 0x03, 0x00, 0x01, 0x10, 0x07, 0x07]
+    smp_ctx.stash_pres(pdu)
+    smp_ctx.stash_preq([0x01, 0x04, 0x00, 0x09, 0x10, 0x0F, 0x0F])
+    for i in 0..7
+        test.assert_eq(smp_ctx.get_pres_byte(i), pdu[i] as Int)
+        test.assert_eq(hw.mem_read8(smp_ctx.smp_ctx_base() + SMP_CTX_PRES_OFFSET + i), pdu[i] as Int)
+    test.assert_eq(smp_ctx.get_preq_byte(0), 0x01)
+    test.assert_eq(smp_ctx.get_preq_byte(6), 0x0F)
+    smp_ctx.set_preq_byte(2, 0x1AA)
+    test.assert_eq(smp_ctx.get_preq_byte(2), 0xAA)
+    smp_ctx.set_pres_byte(1, 0x55)
+    test.assert_eq(smp_ctx.get_pres_byte(1), 0x55)
+
+@test
+fn test_the_address_types_and_the_addresses_are_stored_least_significant_octet_first() [hw]
+    smp_ctx.clear_all()
+    smp_ctx.set_rat(1)
+    smp_ctx.set_iat(0x101)
+    test.assert_eq(smp_ctx.get_rat(), 1)
+    test.assert_eq(smp_ctx.get_iat(), 1)
+    smp_ctx.stash_ra([1, 2, 3, 4, 5, 6])
+    smp_ctx.stash_ia([11, 12, 13, 14, 15, 16])
+    for i in 0..6
+        test.assert_eq(smp_ctx.get_ra_byte(i), i + 1)
+        test.assert_eq(smp_ctx.get_ia_byte(i), i + 11)
+    smp_ctx.set_ra_byte(5, 0x1C0)
+    smp_ctx.set_ia_byte(0, 0x7F)
+    test.assert_eq(smp_ctx.get_ra_byte(5), 0xC0)
+    test.assert_eq(smp_ctx.get_ia_byte(0), 0x7F)
+
+@test
+fn test_the_16_octet_slots_hold_their_values_apart() [hw]
+    smp_ctx.clear_all()
+    for i in 0..16
+        smp_ctx.set_tk_byte(i, i)
+        smp_ctx.set_srand_byte(i, 0x20 + i)
+        smp_ctx.set_mrand_byte(i, 0x40 + i)
+        smp_ctx.set_sconfirm_byte(i, 0x60 + i)
+        smp_ctx.set_mconfirm_byte(i, 0x80 + i)
+    for i in 0..16
+        test.assert_eq(smp_ctx.get_tk_byte(i), i)
+        test.assert_eq(smp_ctx.get_srand_byte(i), 0x20 + i)
+        test.assert_eq(smp_ctx.get_mrand_byte(i), 0x40 + i)
+        test.assert_eq(smp_ctx.get_sconfirm_byte(i), 0x60 + i)
+        test.assert_eq(smp_ctx.get_mconfirm_byte(i), 0x80 + i)
+    // The slots a list fills are the ones the same accessors read.
+    smp_ctx.stash_srand(sixteen(0x10))
+    smp_ctx.stash_sconfirm(sixteen(0x30))
+    smp_ctx.stash_mrand(sixteen(0x50))
+    smp_ctx.stash_mconfirm(sixteen(0x70))
+    let srand = smp_ctx.read_srand()
+    let sconfirm = smp_ctx.read_sconfirm()
+    test.assert_eq(list.len(srand), 16)
+    test.assert_eq(list.len(sconfirm), 16)
+    for i in 0..16
+        test.assert_eq(srand[i] as Int, 0x10 + i)
+        test.assert_eq(sconfirm[i] as Int, 0x30 + i)
+        test.assert_eq(smp_ctx.get_mrand_byte(i), 0x50 + i)
+        test.assert_eq(smp_ctx.get_mconfirm_byte(i), 0x70 + i)
+
+@test
+fn test_clear_all_wipes_the_whole_context() [hw]
+    for i in 0..128
+        hw.mem_write8(smp_ctx.smp_ctx_base() + i, 0xA5)
+    smp_ctx.clear_all()
+    for i in 0..128
+        test.assert_eq(hw.mem_read8(smp_ctx.smp_ctx_base() + i), 0)

@@ -76,12 +76,8 @@
 // same Shortened Local Name record the project's plain train carries,
 // which is what the tester's TSPX_periodic_advertising_data names.
 
-use std.test
-use bd_addr
 use hci_commands
-use hci_frame
 use gap
-use hci_codec
 
 // The advertising set this Host uses.  The Controller has one supported
 // at a time (the Zephyr hci_uart firmware the rig runs sets
@@ -161,7 +157,8 @@ fn periodic_set_parameters_command() -> HciCmdMsg
 // connectable set is not scannable.  The Unicast Server advertises its ASCS
 // Service Data that way ([BAP] 3.5.3).
 pub @tier(embedded)
-fn advertising_set_parameters_command(connectable: Bool, has_scan_response: Bool, legacy: Bool) -> HciCmdMsg
+fn advertising_set_parameters_command(connectable: Bool, has_scan_response: Bool,
+                                      legacy: Bool) -> HciCmdMsg
     let properties = if not legacy
         if connectable
             hci_commands.ADV_EVENT_PROP_CONNECTABLE
@@ -240,7 +237,8 @@ struct PeriodicAdvertising
 // flag and the data `set_data_commands` will send, or what is wrong with
 // them.
 pub @tier(embedded)
-fn make_periodic_advertising(interval_min: Int, interval_max: Int, include_tx_power: Bool, data: [u8]) -> Result<PeriodicAdvertising, Str>
+fn make_periodic_advertising(interval_min: Int, interval_max: Int, include_tx_power: Bool,
+                             data: [u8]) -> Result<PeriodicAdvertising, Str>
     let min_ok = interval_min >= hci_commands.PERIODIC_INTERVAL_RANGE_MIN and interval_min <= hci_commands.PERIODIC_INTERVAL_RANGE_MAX
     let max_ok = interval_max >= hci_commands.PERIODIC_INTERVAL_RANGE_MIN and interval_max <= hci_commands.PERIODIC_INTERVAL_RANGE_MAX
     if not min_ok or not max_ok
@@ -355,9 +353,14 @@ fn transfer_mode(flags: Int) -> Int
 // the mode `transfer_mode` gives, `skip` periodic advertising packets it
 // may skip and a synchronization timeout in 10 ms units.
 pub @tier(embedded)
-fn receive_transfer_command(connection_handle: Int, flags: Int, skip: Int, sync_timeout: Int) -> HciCmdMsg
+fn receive_transfer_command(connection_handle: Int, flags: Int, skip: Int,
+                            sync_timeout: Int) -> HciCmdMsg
     cmd(hci_commands.opcode_le_set_periodic_advertising_sync_transfer_parameters(),
-        hci_commands.build_le_set_periodic_advertising_sync_transfer_parameters(connection_handle, transfer_mode(flags), skip, sync_timeout, hci_commands.PERIODIC_TRANSFER_CTE_ANY))
+        hci_commands.build_le_set_periodic_advertising_sync_transfer_parameters(connection_handle,
+        transfer_mode(flags),
+        skip,
+        sync_timeout,
+        hci_commands.PERIODIC_TRANSFER_CTE_ANY))
 
 // The command with which a Periodic Advertiser hands the train of its own
 // advertising set to the peer of `connection_handle`: the LE Periodic
@@ -401,7 +404,10 @@ const ERR_RESPONSE_SLOTS_OUT_OF_RANGE = "the response slot count is outside 1 to
 // by the subevent count (measured 2026-10-13,
 // autopts/controller/README.md).
 pub @tier(embedded)
-fn make_pawr_advertising(interval_min: Int, interval_max: Int, num_subevents: Int, subevent_interval: Int, response_slot_delay: Int, response_slot_spacing: Int, num_response_slots: Int) -> Result<PeriodicAdvertising, Str>
+fn make_pawr_advertising(interval_min: Int, interval_max: Int, num_subevents: Int,
+                         subevent_interval: Int, response_slot_delay: Int,
+                         response_slot_spacing: Int,
+                         num_response_slots: Int) -> Result<PeriodicAdvertising, Str>
     let min_ok = interval_min >= hci_commands.PERIODIC_INTERVAL_RANGE_MIN and interval_min <= hci_commands.PERIODIC_INTERVAL_RANGE_MAX
     let max_ok = interval_max >= hci_commands.PERIODIC_INTERVAL_RANGE_MIN and interval_max <= hci_commands.PERIODIC_INTERVAL_RANGE_MAX
     if not min_ok or not max_ok
@@ -452,7 +458,7 @@ pub @satisfies("REQ-BLE-HCI-056")
 @tier(embedded)
 fn pawr_parameters_command(p: PeriodicAdvertising) -> ?HciCmdMsg
     match subevents_of(p)
-        None => None
+        None    => None
         Some(s) =>
             Some(cmd(hci_commands.opcode_le_set_periodic_advertising_parameters_v2(),
                      hci_commands.build_le_set_periodic_advertising_parameters_v2(
@@ -485,7 +491,7 @@ pub @satisfies("REQ-BLE-HCI-056")
 @tier(embedded)
 fn pawr_subevent_data_command(p: PeriodicAdvertising, request: PawrSubeventRequest) -> ?HciCmdMsg
     match subevents_of(p)
-        None => None
+        None    => None
         Some(s) =>
             if request.subevent_data_count < 1 or request.subevent_data_count > hci_commands.PAWR_SUBEVENTS_MAX
                 None
@@ -510,26 +516,26 @@ fn pawr_subevent_data_command(p: PeriodicAdvertising, request: PawrSubeventReque
 @tier(embedded)
 fn command_name(opcode: Int) -> Str
     match opcode
-        n if n == hci_commands.opcode_le_set_advertising_set_random_address() => "HCI_LE_Set_Advertising_Set_Random_Address"
-        n if n == hci_commands.opcode_le_set_extended_advertising_parameters() => "HCI_LE_Set_Extended_Advertising_Parameters"
-        n if n == hci_commands.opcode_le_set_extended_advertising_data() => "HCI_LE_Set_Extended_Advertising_Data"
-        n if n == hci_commands.opcode_le_set_extended_scan_response_data() => "HCI_LE_Set_Extended_Scan_Response_Data"
-        n if n == hci_commands.opcode_le_set_extended_advertising_enable() => "HCI_LE_Set_Extended_Advertising_Enable"
-        n if n == hci_commands.opcode_le_read_maximum_advertising_data_length() => "HCI_LE_Read_Maximum_Advertising_Data_Length"
-        n if n == hci_commands.opcode_le_read_number_of_supported_advertising_sets() => "HCI_LE_Read_Number_of_Supported_Advertising_Sets"
-        n if n == hci_commands.opcode_le_remove_advertising_set() => "HCI_LE_Remove_Advertising_Set"
-        n if n == hci_commands.opcode_le_clear_advertising_sets() => "HCI_LE_Clear_Advertising_Sets"
-        n if n == hci_commands.opcode_le_set_periodic_advertising_parameters() => "HCI_LE_Set_Periodic_Advertising_Parameters"
-        n if n == hci_commands.opcode_le_set_periodic_advertising_data() => "HCI_LE_Set_Periodic_Advertising_Data"
-        n if n == hci_commands.opcode_le_set_periodic_advertising_enable() => "HCI_LE_Set_Periodic_Advertising_Enable"
-        n if n == hci_commands.opcode_le_set_periodic_advertising_receive_enable() => "HCI_LE_Set_Periodic_Advertising_Receive_Enable"
-        n if n == hci_commands.opcode_le_periodic_advertising_sync_transfer() => "HCI_LE_Periodic_Advertising_Sync_Transfer"
-        n if n == hci_commands.opcode_le_periodic_advertising_set_info_transfer() => "HCI_LE_Periodic_Advertising_Set_Info_Transfer"
+        n if n == hci_commands.opcode_le_set_advertising_set_random_address()                => "HCI_LE_Set_Advertising_Set_Random_Address"
+        n if n == hci_commands.opcode_le_set_extended_advertising_parameters()               => "HCI_LE_Set_Extended_Advertising_Parameters"
+        n if n == hci_commands.opcode_le_set_extended_advertising_data()                     => "HCI_LE_Set_Extended_Advertising_Data"
+        n if n == hci_commands.opcode_le_set_extended_scan_response_data()                   => "HCI_LE_Set_Extended_Scan_Response_Data"
+        n if n == hci_commands.opcode_le_set_extended_advertising_enable()                   => "HCI_LE_Set_Extended_Advertising_Enable"
+        n if n == hci_commands.opcode_le_read_maximum_advertising_data_length()              => "HCI_LE_Read_Maximum_Advertising_Data_Length"
+        n if n == hci_commands.opcode_le_read_number_of_supported_advertising_sets()         => "HCI_LE_Read_Number_of_Supported_Advertising_Sets"
+        n if n == hci_commands.opcode_le_remove_advertising_set()                            => "HCI_LE_Remove_Advertising_Set"
+        n if n == hci_commands.opcode_le_clear_advertising_sets()                            => "HCI_LE_Clear_Advertising_Sets"
+        n if n == hci_commands.opcode_le_set_periodic_advertising_parameters()               => "HCI_LE_Set_Periodic_Advertising_Parameters"
+        n if n == hci_commands.opcode_le_set_periodic_advertising_data()                     => "HCI_LE_Set_Periodic_Advertising_Data"
+        n if n == hci_commands.opcode_le_set_periodic_advertising_enable()                   => "HCI_LE_Set_Periodic_Advertising_Enable"
+        n if n == hci_commands.opcode_le_set_periodic_advertising_receive_enable()           => "HCI_LE_Set_Periodic_Advertising_Receive_Enable"
+        n if n == hci_commands.opcode_le_periodic_advertising_sync_transfer()                => "HCI_LE_Periodic_Advertising_Sync_Transfer"
+        n if n == hci_commands.opcode_le_periodic_advertising_set_info_transfer()            => "HCI_LE_Periodic_Advertising_Set_Info_Transfer"
         n if n == hci_commands.opcode_le_set_periodic_advertising_sync_transfer_parameters() => "HCI_LE_Set_Periodic_Advertising_Sync_Transfer_Parameters"
         n if n == hci_commands.opcode_le_set_default_periodic_advertising_sync_transfer_parameters() => "HCI_LE_Set_Default_Periodic_Advertising_Sync_Transfer_Parameters"
-        _ => ""
+        _                                                                                    => ""
 
-// ── Tests ───────────────────────────────────────────────────────────
+// ── Fixtures that the suites of other modules share ─────────────────────
 
 // "PADV_Tester" as ASCII bytes, the shortened name the AutoPTS project
 // advertises periodically (autopts/ptsprojects/zephyr/gap.py,
@@ -546,285 +552,3 @@ fn tester_periodic_data() -> [u8]
     var out: [u8] = [0x0C, 0x08]
     list.append(out, tester_periodic_name())
     out
-
-@tier(app)
-fn test_address() -> [u8]
-    [0x01, 0x4F, 0x56, 0x4F, 0x4E, 0xC0]
-
-// The bytes of `cmd` as space-separated hex pairs.
-@tier(app)
-fn hex_bytes(pkt: [u8]) -> Str
-    var out = ""
-    for i in 0..list.len(pkt)
-        if i > 0
-            out = out + " "
-        out = out + bd_addr.hex_byte(pkt[i] as Int)
-    out
-
-@test
-@satisfies("REQ-BLE-HCI-051")
-fn test_periodic_set_parameters_bytes()
-    let c = periodic_set_parameters_command()
-    test.assert_eq(c.opcode, 0x2036)
-    test.assert_eq(list.len(c.params), 25)
-    // Handle 00, properties 0000, 100 ms primary intervals, all three
-    // channels, random own address, no peer, no filter, no TX power
-    // preference, LE 1M primary and LE 2M secondary PHY, SID 0.
-    test.assert_eq(hex_bytes(c.params), "00 00 00 A0 00 00 A0 00 00 07 01 00 00 00 00 00 00 00 00 7F 01 00 02 00 00")
-
-@test
-@satisfies("REQ-BLE-HCI-051")
-fn test_set_parameters_follow_the_legacy_types()
-    let undirected = advertising_set_parameters_command(true, true, true)
-    test.assert_eq(undirected.opcode, 0x2036)
-    // 0b00000000_00010011: legacy ADV_IND, connectable and scannable.
-    test.assert_eq(undirected.params[1] as Int, 0x13)
-    test.assert_eq(undirected.params[2] as Int, 0x00)
-    let scannable = advertising_set_parameters_command(false, true, true)
-    // 0b00000000_00010010: legacy ADV_SCAN_IND.
-    test.assert_eq(scannable.params[1] as Int, 0x12)
-    let plain = advertising_set_parameters_command(false, false, true)
-    // 0b00000000_00010000: legacy ADV_NONCONN_IND.
-    test.assert_eq(plain.params[1] as Int, 0x10)
-    test.assert_eq(plain.params[2] as Int, 0x00)
-    // The legacy types put the data on the LE 1M secondary PHY, which is
-    // what a legacy PDU has.
-    test.assert_eq(undirected.params[22] as Int, hci_commands.LE_PHY_1M)
-
-@test
-@satisfies("REQ-BLE-HCI-051")
-fn test_advertising_data_is_the_flags_and_name()
-    let flags = gap.ad_flags_for(GeneralDiscoverable, true)
-    match advertising_data(flags, ['N', 'o', 'v', 'o'])
-        None    => test.fail("a four-octet name fits")
-        Some(ad) => test.assert_eq(hex_bytes(ad), "02 01 06 05 09 4E 6F 76 6F")
-    var long: [u8] = []
-    for _ in 0..27
-        list.push(long, 'A')
-    test.assert(advertising_data(flags, long) == None)
-
-@test
-fn test_make_periodic_advertising_accepts_and_refuses()
-    let data = tester_periodic_data()
-    match make_periodic_advertising(150, 200, false, data)
-        Err(_) => test.fail("150 to 200 units are accepted")
-        Ok(p) =>
-            test.assert_eq(p.interval_min, 150)
-            test.assert_eq(p.interval_max, 200)
-            test.assert_eq(p.include_tx_power, false)
-            test.assert_eq(list.len(p.data), 13)
-    match make_periodic_advertising(0x0005, 200, false, data)
-        Err(e) => test.assert_eq(e, ERR_PERIODIC_INTERVAL_OUT_OF_RANGE)
-        Ok(_)  => test.fail("5 units is below the 7.5 ms floor")
-    match make_periodic_advertising(150, 0x10000, false, data)
-        Err(e) => test.assert_eq(e, ERR_PERIODIC_INTERVAL_OUT_OF_RANGE)
-        Ok(_)  => test.fail("65536 units is above the ceiling")
-    match make_periodic_advertising(200, 150, false, data)
-        Err(e) => test.assert_eq(e, ERR_PERIODIC_INTERVAL_MIN_ABOVE_MAX)
-        Ok(_)  => test.fail("a minimum above the maximum is refused")
-    var huge: [u8] = []
-    for _ in 0..256
-        list.push(huge, 0x00)
-    match make_periodic_advertising(150, 200, false, huge)
-        Err(e) => test.assert_eq(e, ERR_PERIODIC_DATA_TOO_LONG)
-        Ok(_)  => test.fail("256 octets do not fit one operation")
-
-@test
-@satisfies("REQ-BLE-HCI-052")
-fn test_periodic_advertising_commands_in_order()
-    match make_periodic_advertising(150, 200, true, tester_periodic_data())
-        Err(_) => test.fail("150 to 200 units are accepted")
-        Ok(p) =>
-            test.assert_eq(periodic_properties(p), hci_commands.PERIODIC_ADV_PROP_INCLUDE_TX_POWER)
-            let cmds = periodic_advertising_commands(p)
-            test.assert_eq(list.len(cmds), 2)
-            test.assert_eq(cmds[0].opcode, 0x203E)
-            // Seven octets: the properties field is two octets wide, and
-            // a Controller reads the length off the command
-            // ([Vol 4] Part E, Section 7.8.61).
-            test.assert_eq(hex_bytes(cmds[0].params), "00 96 00 C8 00 01 00")
-            test.assert_eq(cmds[1].opcode, 0x203F)
-            test.assert_eq(cmds[1].params[1] as Int, hci_commands.EXT_ADV_DATA_COMPLETE)
-            test.assert_eq(cmds[1].params[2] as Int, 13)
-            test.assert_eq(hex_bytes(cmds[1].params[3:8]), "0C 08 50 41 44")
-    match make_periodic_advertising(150, 200, false, [])
-        Err(_) => test.fail("an empty data block is a train with no data")
-        Ok(p) =>
-            test.assert_eq(periodic_properties(p), 0x0000)
-            // With no data there is nothing to set and no second command.
-            test.assert_eq(list.len(periodic_advertising_commands(p)), 1)
-
-@test
-@satisfies("REQ-BLE-HCI-052")
-fn test_start_and_stop_commands()
-    let start = start_commands()
-    test.assert_eq(list.len(start), 2)
-    // The set is enabled first and the train that rides it second.
-    test.assert_eq(start[0].opcode, 0x2039)
-    test.assert_eq(hex_bytes(start[0].params), "01 01 00 00 00 00")
-    test.assert_eq(start[1].opcode, 0x2040)
-    test.assert_eq(hex_bytes(start[1].params), "01 00")
-    let stop = stop_commands()
-    test.assert_eq(list.len(stop), 2)
-    // The train stops before the set that carries it.
-    test.assert_eq(stop[0].opcode, 0x2040)
-    test.assert_eq(hex_bytes(stop[0].params), "00 00")
-    test.assert_eq(stop[1].opcode, 0x2039)
-    test.assert_eq(hex_bytes(stop[1].params), "00 01 00 00 00 00")
-    test.assert_eq(hex_bytes(advertising_enable_command(true).params), "01 01 00 00 00 00")
-    test.assert_eq(hex_bytes(advertising_enable_command(false).params), "00 01 00 00 00 00")
-
-@test
-@satisfies("REQ-BLE-HCI-052")
-fn test_set_data_command_carries_the_whole_block()
-    match set_data_command(tester_periodic_data())
-        None    => test.fail("thirteen octets fit one operation")
-        Some(c) =>
-            test.assert_eq(c.opcode, 0x203F)
-            test.assert_eq(list.len(c.params), 16)
-            test.assert_eq(c.params[0] as Int, ADVERTISING_HANDLE)
-            test.assert_eq(c.params[2] as Int, 13)
-    var huge: [u8] = []
-    for _ in 0..256
-        list.push(huge, 0x00)
-    test.assert(set_data_command(huge) == None)
-
-@test
-@satisfies("REQ-BLE-HCI-053")
-@satisfies("REQ-BLE-HCI-054")
-fn test_transfer_commands()
-    // Reports Disabled, the "without listening" of GAP/PADV/PASE/BV-03-C.
-    test.assert_eq(transfer_mode(0x01), hci_commands.PERIODIC_TRANSFER_NO_REPORTS)
-    test.assert_eq(transfer_mode(0x00), hci_commands.PERIODIC_TRANSFER_REPORTS)
-    let listen = receive_transfer_command(0x0E41, 0x00, 0x0000, 0x01F4)
-    test.assert_eq(listen.opcode, 0x205C)
-    test.assert_eq(hex_bytes(listen.params), "41 0E 02 00 00 F4 01 00")
-    let quiet = receive_transfer_command(0x0E41, 0x01, 0x0000, 0x01F4)
-    test.assert_eq(hex_bytes(quiet.params), "41 0E 01 00 00 F4 01 00")
-    let info = set_info_transfer_command(0x0E41, 0x0000)
-    test.assert_eq(info.opcode, 0x205B)
-    test.assert_eq(hex_bytes(info.params), "41 0E 00 00 00")
-    let sync = sync_transfer_command(0x0E41, 0x1234, 0x0005)
-    test.assert_eq(sync.opcode, 0x205A)
-    test.assert_eq(hex_bytes(sync.params), "41 0E 34 12 05 00")
-
-@test
-fn test_command_names()
-    test.assert_eq(command_name(0x2036), "HCI_LE_Set_Extended_Advertising_Parameters")
-    test.assert_eq(command_name(0x2039), "HCI_LE_Set_Extended_Advertising_Enable")
-    test.assert_eq(command_name(0x203E), "HCI_LE_Set_Periodic_Advertising_Parameters")
-    test.assert_eq(command_name(0x2040), "HCI_LE_Set_Periodic_Advertising_Enable")
-    test.assert_eq(command_name(0x205B), "HCI_LE_Periodic_Advertising_Set_Info_Transfer")
-    test.assert_eq(command_name(0x205C), "HCI_LE_Set_Periodic_Advertising_Sync_Transfer_Parameters")
-    test.assert_eq(command_name(0x2099), "")
-
-@test
-@satisfies("REQ-BLE-HCI-056")
-fn test_make_pawr_advertising_accepts_and_refuses()
-    // The AutoPTS project's own numbers: 150 to 200 units, 10 subevents,
-    // subevent interval 15, response slot delay 1, response slot spacing
-    // 4 and 5 response slots.
-    match make_pawr_advertising(150, 200, 10, 15, 1, 4, 5)
-        Err(e) => test.assert_eq(e, "the framework's numbers are accepted")
-        Ok(p) =>
-            test.assert_eq(p.interval_min, 150)
-            test.assert_eq(p.include_tx_power, false)
-            match subevents_of(p)
-                None    => test.fail("a train with responses carries its subevents")
-                Some(s) =>
-                    test.assert_eq(s.num_subevents, 10)
-                    test.assert_eq(s.subevent_interval, 15)
-                    test.assert_eq(s.response_slot_delay, 1)
-                    test.assert_eq(s.response_slot_spacing, 4)
-                    test.assert_eq(s.num_response_slots, 5)
-    match make_pawr_advertising(0x0005, 200, 10, 15, 1, 4, 5)
-        Err(e) => test.assert_eq(e, ERR_PERIODIC_INTERVAL_OUT_OF_RANGE)
-        Ok(_)  => test.fail("5 units is below the 7.5 ms floor")
-    match make_pawr_advertising(200, 150, 10, 15, 1, 4, 5)
-        Err(e) => test.assert_eq(e, ERR_PERIODIC_INTERVAL_MIN_ABOVE_MAX)
-        Ok(_)  => test.fail("a minimum above the maximum is refused")
-    match make_pawr_advertising(150, 200, 0, 15, 1, 4, 5)
-        Err(e) => test.assert_eq(e, ERR_SUBEVENTS_OUT_OF_RANGE)
-        Ok(_)  => test.fail("no subevent is not a train with responses")
-    match make_pawr_advertising(150, 200, 0x81, 15, 1, 4, 5)
-        Err(e) => test.assert_eq(e, ERR_SUBEVENTS_OUT_OF_RANGE)
-        Ok(_)  => test.fail("129 subevents are above the 0x80 the field holds")
-    match make_pawr_advertising(150, 200, 10, 0x05, 1, 4, 5)
-        Err(e) => test.assert_eq(e, ERR_SUBEVENT_INTERVAL_OUT_OF_RANGE)
-        Ok(_)  => test.fail("5 units of subevent interval is below the floor")
-    // 16 units is above 150 divided by 10, which is 15.
-    match make_pawr_advertising(150, 200, 10, 16, 1, 4, 5)
-        Err(e) => test.assert_eq(e, ERR_SUBEVENT_INTERVAL_ABOVE_INTERVAL_MIN)
-        Ok(_)  => test.fail("a subevent interval above the quotient is refused")
-    match make_pawr_advertising(150, 200, 10, 15, 0, 4, 5)
-        Err(e) => test.assert_eq(e, ERR_RESPONSE_SLOT_DELAY_OUT_OF_RANGE)
-        Ok(_)  => test.fail("no response slot delay is refused")
-    match make_pawr_advertising(150, 200, 10, 15, 15, 4, 5)
-        Err(e) => test.assert_eq(e, ERR_RESPONSE_SLOT_DELAY_ABOVE_SUBEVENT_INTERVAL)
-        Ok(_)  => test.fail("a delay as long as the subevent is refused")
-    match make_pawr_advertising(150, 200, 10, 15, 1, 1, 5)
-        Err(e) => test.assert_eq(e, ERR_RESPONSE_SLOT_SPACING_OUT_OF_RANGE)
-        Ok(_)  => test.fail("1 unit of spacing is below the floor")
-    match make_pawr_advertising(150, 200, 10, 15, 1, 4, 0)
-        Err(e) => test.assert_eq(e, ERR_RESPONSE_SLOTS_OUT_OF_RANGE)
-        Ok(_)  => test.fail("no response slot is refused")
-
-@test
-@satisfies("REQ-BLE-HCI-056")
-fn test_pawr_parameters_command_bytes()
-    match make_pawr_advertising(150, 200, 10, 15, 1, 4, 5)
-        Err(_) => test.fail("the framework's numbers are accepted")
-        Ok(p) =>
-            match pawr_parameters_command(p)
-                None => test.fail("a train with responses has the [v2] parameters")
-                Some(c) =>
-                    test.assert_eq(c.opcode, 0x2086)
-                    // Twelve octets: the four of the first form and the
-                    // five subevent parameters, with the properties
-                    // between them.
-                    test.assert_eq(list.len(c.params), 12)
-                    test.assert_eq(hex_bytes(c.params), "00 96 00 C8 00 00 00 0A 0F 01 04 05")
-    // A plain train has none: its parameters are the first form's.
-    match make_periodic_advertising(150, 200, false, [])
-        Err(_) => test.fail("the plain train's numbers are accepted")
-        Ok(p)  => test.assert(pawr_parameters_command(p) == None)
-
-@test
-@satisfies("REQ-BLE-HCI-056")
-fn test_pawr_subevent_data_answers_a_request()
-    match make_pawr_advertising(150, 200, 10, 15, 1, 4, 5)
-        Err(_) => test.fail("the framework's numbers are accepted")
-        Ok(p) =>
-            // The rig's Controller asks for three subevents at a time and
-            // wraps past the last of the ten.
-            let request = PawrSubeventRequest { advertising_handle: 0x00, subevent_start: 0x09, subevent_data_count: 0x03 }
-            match pawr_subevent_data_command(p, request)
-                None => test.fail("three subevents fit one command")
-                Some(c) =>
-                    test.assert_eq(c.opcode, 0x2082)
-                    test.assert_eq(c.params[0] as Int, ADVERTISING_HANDLE)
-                    test.assert_eq(c.params[1] as Int, 3)
-                    // Subevents 9, 0 and 1 in that order, each element its four
-                    // fields and then the thirteen octets of the record, with
-                    // every response slot of the train.
-                    test.assert_eq(list.len(c.params), 2 + 3 * (4 + 13))
-                    let stride = 4 + 13
-                    let order: [Int] = [9, 0, 1]
-                    for k in 0..3
-                        let at = 2 + k * stride
-                        test.assert_eq(c.params[at] as Int, order[k])
-                        test.assert_eq(c.params[at + 1] as Int, 0x00)
-                        test.assert_eq(c.params[at + 2] as Int, 5)
-                        test.assert_eq(c.params[at + 3] as Int, 13)
-                        test.assert_eq(c.params[at + 4] as Int, 0x0C)
-                        test.assert_eq(c.params[at + 5] as Int, 0x08)
-            // A request for no subevent has no answer, and one above the
-            // 0x0F the command holds has none either.
-            let none = PawrSubeventRequest { advertising_handle: 0x00, subevent_start: 0x00, subevent_data_count: 0x00 }
-            test.assert(pawr_subevent_data_command(p, none) == None)
-            let many = PawrSubeventRequest { advertising_handle: 0x00, subevent_start: 0x00, subevent_data_count: 0x10 }
-            test.assert(pawr_subevent_data_command(p, many) == None)
-
-@test
-fn test_subevent_data_default_is_the_project_record()
-    test.assert_eq(hex_bytes(subevent_data_default()), "0C 08 50 41 44 56 5F 54 65 73 74 65 72")

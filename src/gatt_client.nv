@@ -53,7 +53,6 @@
 // indications), -006 (one outstanding transaction, the queue and the timeout),
 // -007 (the peer's database changes) and -008 (error mapping).
 
-use std.test
 use att
 use noble_config
 use links
@@ -66,7 +65,10 @@ use links
 // capacity cannot call a function of another module, and `test_the_capacities_are_the_limits` compares the two.
 
 const fn max1(n: Int) -> Int
-    if n > 1 then n else 1
+    if n > 1
+        n
+    else
+        1
 
 const fn links() -> Int
     max1(noble_config.MAX_CLIENT_LINKS)
@@ -407,9 +409,9 @@ fn init_table(var t: ClientTable)
         let _ = t.flags.push(0)
         let _ = t.sc_handle.push(0)
         let _ = t.cache_n.push(0)
-    for i in 0..(links() * HASH_OCTETS)
+    for i in 0..links() * HASH_OCTETS
         let _ = t.hash.push(0)
-    for i in 0..(links() * cache())
+    for i in 0..links() * cache()
         let _ = t.c_kind.push(0)
         let _ = t.c_flags.push(0)
         let _ = t.c_handle.push(0 as u16)
@@ -417,14 +419,14 @@ fn init_table(var t: ClientTable)
         let _ = t.c_b.push(0 as u16)
         let _ = t.c_lo.push(0)
         let _ = t.c_hi.push(0)
-    for i in 0..(links() * bearers() * REGS)
+    for i in 0..links() * bearers() * REGS
         let _ = t.regs.push(0)
-    for i in 0..(links() * bearers() * queue() * QUEUE_FIELDS)
+    for i in 0..links() * bearers() * queue() * QUEUE_FIELDS
         let _ = t.queue.push(0)
-    for i in 0..(links() * bearers() * value_octets())
+    for i in 0..links() * bearers() * value_octets()
         let _ = t.value.push(0)
         let _ = t.payload.push(0)
-    for i in 0..(links() * bearers() * pdu_octets())
+    for i in 0..links() * bearers() * pdu_octets()
         let _ = t.tx.push(0)
 
 // A table with no link open, made in the caller's frame and passed back by
@@ -614,7 +616,7 @@ fn set_mtu(var t: ClientTable, link: links.LinkId, bearer: Int, mtu: Int) -> Boo
 @tier(embedded)
 @no_alloc
 fn le16(var pdu: ClientPdu, at: Int) -> Int
-    (pdu[at] as Int) | ((pdu[at + 1] as Int) << 8)
+    pdu[at] as Int | (pdu[at + 1] as Int << 8)
 
 // The eight octets from `at`, least significant first.
 @tier(embedded)
@@ -622,7 +624,7 @@ fn le16(var pdu: ClientPdu, at: Int) -> Int
 fn le64(var pdu: ClientPdu, at: Int) -> Int
     var v = 0
     for k in 0..8
-        v = v | ((pdu[at + k] as Int) << (8 * k))
+        v = v | (pdu[at + k] as Int << (8 * k))
     v
 
 // The UUID at `at`: 16 octets when `wide`, else 2.
@@ -677,7 +679,10 @@ fn tx_range(var t: ClientTable, row: Int, opcode: Int, start: Int, end: Int, typ
 @no_alloc
 fn cache_count(var t: ClientTable, link: links.LinkId) -> Int
     let slot = slot_of(var t, link)
-    if slot < 0 then 0 else t.cache_n[slot]
+    if slot < 0
+        0
+    else
+        t.cache_n[slot]
 
 @tier(embedded)
 @no_alloc
@@ -709,7 +714,8 @@ fn cache_index(var t: ClientTable, slot: Int, kind: Int, handle: Int) -> Int
 // False when the cache is full.
 pub @tier(embedded)
 @no_alloc
-fn cache_put(var t: ClientTable, slot: Int, kind: Int, handle: Int, a: Int, b: Int, uuid: Uuid, flags: Int) -> Bool
+fn cache_put(var t: ClientTable, slot: Int, kind: Int, handle: Int, a: Int, b: Int, uuid: Uuid,
+             flags: Int) -> Bool
     var index = cache_index(var t, slot, kind, handle)
     if index < 0
         if t.cache_n[slot] >= cache()
@@ -778,7 +784,10 @@ pub @tier(embedded)
 @no_alloc
 fn cache_kind_at(var t: ClientTable, link: links.LinkId, index: Int) -> Int
     let at = cache_at(var t, link, index)
-    if at < 0 then 0 else t.c_kind[at] as Int
+    if at < 0
+        0
+    else
+        t.c_kind[at] as Int
 
 // The handle of the record: a service's first handle, a declaration's handle
 // or a descriptor's handle.
@@ -786,7 +795,10 @@ pub @tier(embedded)
 @no_alloc
 fn cache_handle_at(var t: ClientTable, link: links.LinkId, index: Int) -> Int
     let at = cache_at(var t, link, index)
-    if at < 0 then 0 else t.c_handle[at] as Int
+    if at < 0
+        0
+    else
+        t.c_handle[at] as Int
 
 // The record's first extra value: a service's last handle, an included
 // service's first handle or a characteristic's value handle.
@@ -794,7 +806,10 @@ pub @tier(embedded)
 @no_alloc
 fn cache_a_at(var t: ClientTable, link: links.LinkId, index: Int) -> Int
     let at = cache_at(var t, link, index)
-    if at < 0 then 0 else t.c_a[at] as Int
+    if at < 0
+        0
+    else
+        t.c_a[at] as Int
 
 // The record's second extra value: an included service's last handle or a
 // characteristic's properties.
@@ -802,7 +817,10 @@ pub @tier(embedded)
 @no_alloc
 fn cache_b_at(var t: ClientTable, link: links.LinkId, index: Int) -> Int
     let at = cache_at(var t, link, index)
-    if at < 0 then 0 else t.c_b[at] as Int
+    if at < 0
+        0
+    else
+        t.c_b[at] as Int
 
 // The UUID of the record: the service's, the included service's, the
 // characteristic's or the descriptor's.
@@ -812,14 +830,14 @@ fn cache_uuid_at(var t: ClientTable, link: links.LinkId, index: Int) -> Uuid
     if at < 0
         uuid16(0)
     else
-        Uuid { wide: ((t.c_flags[at] as Int) & 1) != 0, lo: t.c_lo[at], hi: t.c_hi[at] }
+        Uuid { wide: (t.c_flags[at] as Int & 1) != 0, lo: t.c_lo[at], hi: t.c_hi[at] }
 
 // Whether the record is a secondary service.
 @tier(embedded)
 @no_alloc
 fn cache_secondary_at(var t: ClientTable, link: links.LinkId, index: Int) -> Bool
     let at = cache_at(var t, link, index)
-    at >= 0 and ((t.c_flags[at] as Int) & CF_SECONDARY) != 0
+    at >= 0 and (t.c_flags[at] as Int & CF_SECONDARY) != 0
 
 // The index of the first record of `kind` and `uuid` at or after `from`, else
 // -1.
@@ -831,7 +849,7 @@ fn cache_find(var t: ClientTable, link: links.LinkId, kind: Int, uuid: Uuid, fro
     if slot >= 0
         for i in from..t.cache_n[slot]
             let at = slot * cache() + i
-            let wide = (((t.c_flags[at] as Int) & 1) != 0)
+            let wide = (t.c_flags[at] as Int & 1) != 0
             let same = wide == uuid.wide and t.c_lo[at] == uuid.lo and t.c_hi[at] == uuid.hi
             if (t.c_kind[at] as Int) == kind and same
                 found = i
@@ -868,7 +886,7 @@ fn descriptor_of(var t: ClientTable, link: links.LinkId, index: Int, type16: Int
         for i in 0..t.cache_n[slot]
             let d = slot * cache() + i
             let h = t.c_handle[d] as Int
-            let same = ((t.c_flags[d] as Int) & 1) == 0 and t.c_lo[d] == want.lo
+            let same = (t.c_flags[d] as Int & 1) == 0 and t.c_lo[d] == want.lo
             if (t.c_kind[d] as Int) == KIND_DESC and h > value_handle and h < bound and same
                 found = h
                 break
@@ -909,7 +927,8 @@ fn prepare_row(var t: ClientTable, link: links.LinkId, bearer: Int, payload: Int
 // the ticket.
 @tier(embedded)
 @no_alloc
-fn push_entry(var t: ClientTable, row: Int, op: Int, start: Int, end: Int, uuid: Uuid, arg: Int, pay_off: Int, pay_len: Int) -> Int
+fn push_entry(var t: ClientTable, row: Int, op: Int, start: Int, end: Int, uuid: Uuid, arg: Int,
+              pay_off: Int, pay_len: Int) -> Int
     let length = rd(var t, row, R_Q_LEN)
     let index = (rd(var t, row, R_Q_HEAD) + length) % queue()
     let ticket = rd(var t, row, R_NEXT_TICKET)
@@ -919,7 +938,7 @@ fn push_entry(var t: ClientTable, row: Int, op: Int, start: Int, end: Int, uuid:
     queue_put(var t, row, index, Q_END, end)
     queue_put(var t, row, index, Q_UUID_LO, uuid.lo)
     queue_put(var t, row, index, Q_UUID_HI, uuid.hi)
-    queue_put(var t, row, index, Q_UUID_WIDE, if uuid.wide then 1 else 0)
+    queue_put(var t, row, index, Q_UUID_WIDE, (if uuid.wide then 1 else 0))
     queue_put(var t, row, index, Q_ARG, arg)
     queue_put(var t, row, index, Q_PAY_OFF, pay_off)
     queue_put(var t, row, index, Q_PAY_LEN, pay_len)
@@ -931,7 +950,8 @@ fn push_entry(var t: ClientTable, row: Int, op: Int, start: Int, end: Int, uuid:
 // Queue a request that carries no payload.
 @tier(embedded)
 @no_alloc
-fn queue_plain(var t: ClientTable, link: links.LinkId, bearer: Int, op: Int, start: Int, end: Int, uuid: Uuid, arg: Int) -> Int
+fn queue_plain(var t: ClientTable, link: links.LinkId, bearer: Int, op: Int, start: Int, end: Int,
+               uuid: Uuid, arg: Int) -> Int
     let row = prepare_row(var t, link, bearer, 0)
     if row < 0
         row
@@ -941,7 +961,8 @@ fn queue_plain(var t: ClientTable, link: links.LinkId, bearer: Int, op: Int, sta
 // Queue a request that carries the first `length` octets of `data`.
 @tier(embedded)
 @no_alloc
-fn queue_with_payload(var t: ClientTable, link: links.LinkId, bearer: Int, op: Int, handle: Int, data: ClientPayload, length: Int, arg: Int) -> Int
+fn queue_with_payload(var t: ClientTable, link: links.LinkId, bearer: Int, op: Int, handle: Int,
+                      data: ClientPayload, length: Int, arg: Int) -> Int
     if length < 0 or length > value_octets() or handle < 1 or handle > 0xFFFF
         return ERR_ARGUMENT
     let row = prepare_row(var t, link, bearer, length)
@@ -958,7 +979,8 @@ fn queue_with_payload(var t: ClientTable, link: links.LinkId, bearer: Int, op: I
 // of them.
 @tier(embedded)
 @no_alloc
-fn queue_handles(var t: ClientTable, link: links.LinkId, bearer: Int, op: Int, data: ClientPayload, length: Int, least: Int) -> Int
+fn queue_handles(var t: ClientTable, link: links.LinkId, bearer: Int, op: Int, data: ClientPayload,
+                 length: Int, least: Int) -> Int
     if length < 2 * least or length % 2 != 0 or length > value_octets() or length > pdu_octets() - 1
         return ERR_ARGUMENT
     let row = prepare_row(var t, link, bearer, length)
@@ -1018,18 +1040,27 @@ fn allow_another_mtu_exchange(var t: ClientTable, link: links.LinkId, bearer: In
 pub @satisfies("REQ-BLE-GATT-CE-002")
 @tier(embedded)
 @no_alloc
-fn begin_discover_services(var t: ClientTable, link: links.LinkId, bearer: Int, start: Int, end: Int, secondary: Bool) -> Int
+fn begin_discover_services(var t: ClientTable, link: links.LinkId, bearer: Int, start: Int,
+                           end: Int, secondary: Bool) -> Int
     if not valid_range(start, end)
         ERR_ARGUMENT
     else
-        queue_plain(var t, link, bearer, OP_SERVICES, start, end, uuid16(0), if secondary then UUID_SECONDARY_SERVICE else UUID_PRIMARY_SERVICE)
+        queue_plain(var t,
+            link,
+            bearer,
+            OP_SERVICES,
+            start,
+            end,
+            uuid16(0),
+            (if secondary then UUID_SECONDARY_SERVICE else UUID_PRIMARY_SERVICE))
 
 // Discover the primary services of one UUID in `start` to `end` ([Vol 3]
 // Part G, Section 4.4.2).
 pub @satisfies("REQ-BLE-GATT-CE-002")
 @tier(embedded)
 @no_alloc
-fn begin_discover_services_by_uuid(var t: ClientTable, link: links.LinkId, bearer: Int, start: Int, end: Int, uuid: Uuid) -> Int
+fn begin_discover_services_by_uuid(var t: ClientTable, link: links.LinkId, bearer: Int, start: Int,
+                                   end: Int, uuid: Uuid) -> Int
     if not valid_range(start, end)
         ERR_ARGUMENT
     else
@@ -1041,7 +1072,8 @@ fn begin_discover_services_by_uuid(var t: ClientTable, link: links.LinkId, beare
 pub @satisfies("REQ-BLE-GATT-CE-002")
 @tier(embedded)
 @no_alloc
-fn begin_find_included(var t: ClientTable, link: links.LinkId, bearer: Int, start: Int, end: Int) -> Int
+fn begin_find_included(var t: ClientTable, link: links.LinkId, bearer: Int, start: Int,
+                       end: Int) -> Int
     if not valid_range(start, end)
         ERR_ARGUMENT
     else
@@ -1052,7 +1084,8 @@ fn begin_find_included(var t: ClientTable, link: links.LinkId, bearer: Int, star
 pub @satisfies("REQ-BLE-GATT-CE-002")
 @tier(embedded)
 @no_alloc
-fn begin_discover_characteristics(var t: ClientTable, link: links.LinkId, bearer: Int, start: Int, end: Int) -> Int
+fn begin_discover_characteristics(var t: ClientTable, link: links.LinkId, bearer: Int, start: Int,
+                                  end: Int) -> Int
     if not valid_range(start, end)
         ERR_ARGUMENT
     else
@@ -1063,7 +1096,8 @@ fn begin_discover_characteristics(var t: ClientTable, link: links.LinkId, bearer
 pub @satisfies("REQ-BLE-GATT-CE-002")
 @tier(embedded)
 @no_alloc
-fn begin_discover_characteristics_by_uuid(var t: ClientTable, link: links.LinkId, bearer: Int, start: Int, end: Int, uuid: Uuid) -> Int
+fn begin_discover_characteristics_by_uuid(var t: ClientTable, link: links.LinkId, bearer: Int,
+                                          start: Int, end: Int, uuid: Uuid) -> Int
     if not valid_range(start, end)
         ERR_ARGUMENT
     else
@@ -1074,7 +1108,8 @@ fn begin_discover_characteristics_by_uuid(var t: ClientTable, link: links.LinkId
 pub @satisfies("REQ-BLE-GATT-CE-002")
 @tier(embedded)
 @no_alloc
-fn begin_discover_descriptors(var t: ClientTable, link: links.LinkId, bearer: Int, start: Int, end: Int) -> Int
+fn begin_discover_descriptors(var t: ClientTable, link: links.LinkId, bearer: Int, start: Int,
+                              end: Int) -> Int
     if not valid_range(start, end)
         ERR_ARGUMENT
     else
@@ -1098,7 +1133,8 @@ fn begin_read(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int) 
 pub @satisfies("REQ-BLE-GATT-CE-003")
 @tier(embedded)
 @no_alloc
-fn begin_read_by_type(var t: ClientTable, link: links.LinkId, bearer: Int, start: Int, end: Int, uuid: Uuid) -> Int
+fn begin_read_by_type(var t: ClientTable, link: links.LinkId, bearer: Int, start: Int, end: Int,
+                      uuid: Uuid) -> Int
     if not valid_range(start, end)
         ERR_ARGUMENT
     else
@@ -1121,7 +1157,8 @@ fn begin_read_long(var t: ClientTable, link: links.LinkId, bearer: Int, handle: 
 pub @satisfies("REQ-BLE-GATT-CE-003")
 @tier(embedded)
 @no_alloc
-fn begin_read_long_from(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int, offset: Int) -> Int
+fn begin_read_long_from(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int,
+                        offset: Int) -> Int
     if handle < 1 or handle > 0xFFFF or offset < 0 or offset > 0xFFFF
         ERR_ARGUMENT
     else
@@ -1134,7 +1171,8 @@ fn begin_read_long_from(var t: ClientTable, link: links.LinkId, bearer: Int, han
 pub @satisfies("REQ-BLE-GATT-CE-003")
 @tier(embedded)
 @no_alloc
-fn begin_read_multiple(var t: ClientTable, link: links.LinkId, bearer: Int, data: ClientPayload, length: Int) -> Int
+fn begin_read_multiple(var t: ClientTable, link: links.LinkId, bearer: Int, data: ClientPayload,
+                       length: Int) -> Int
     queue_handles(var t, link, bearer, OP_READ_MULTI, data, length, 1)
 
 // Read the values of two or more characteristics, of any lengths, with one
@@ -1144,7 +1182,8 @@ fn begin_read_multiple(var t: ClientTable, link: links.LinkId, bearer: Int, data
 pub @satisfies("REQ-BLE-GATT-CE-003")
 @tier(embedded)
 @no_alloc
-fn begin_read_multiple_variable(var t: ClientTable, link: links.LinkId, bearer: Int, data: ClientPayload, length: Int) -> Int
+fn begin_read_multiple_variable(var t: ClientTable, link: links.LinkId, bearer: Int,
+                                data: ClientPayload, length: Int) -> Int
     queue_handles(var t, link, bearer, OP_READ_MULTI_VAR, data, length, 2)
 
 // Read the peer's Database Hash with a Read By Type Request over all
@@ -1163,7 +1202,8 @@ fn begin_database_hash(var t: ClientTable, link: links.LinkId, bearer: Int) -> I
 pub @satisfies("REQ-BLE-GATT-CE-004")
 @tier(embedded)
 @no_alloc
-fn begin_write(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int, data: ClientPayload, length: Int) -> Int
+fn begin_write(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int,
+               data: ClientPayload, length: Int) -> Int
     let row = row_of(t, link, bearer)
     if row >= 0 and length > rd(var t, row, R_MTU) - 3
         ERR_ARGUMENT
@@ -1175,7 +1215,8 @@ fn begin_write(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int,
 pub @satisfies("REQ-BLE-GATT-CE-004")
 @tier(embedded)
 @no_alloc
-fn begin_write_command(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int, data: ClientPayload, length: Int) -> Int
+fn begin_write_command(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int,
+                       data: ClientPayload, length: Int) -> Int
     let row = row_of(t, link, bearer)
     if row >= 0 and length > rd(var t, row, R_MTU) - 3
         ERR_ARGUMENT
@@ -1191,9 +1232,10 @@ fn begin_write_command(var t: ClientTable, link: links.LinkId, bearer: Int, hand
 pub @satisfies("REQ-BLE-GATT-CE-004")
 @tier(embedded)
 @no_alloc
-fn begin_signed_write(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int, data: ClientPayload, length: Int) -> Int
+fn begin_signed_write(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int,
+                      data: ClientPayload, length: Int) -> Int
     let row = row_of(t, link, bearer)
-    if length < 12 or (row >= 0 and length > rd(var t, row, R_MTU) - 3)
+    if length < 12 or row >= 0 and length > rd(var t, row, R_MTU) - 3
         ERR_ARGUMENT
     else
         queue_with_payload(var t, link, bearer, OP_WRITE_SIGNED, handle, data, length, 0)
@@ -1206,7 +1248,8 @@ fn begin_signed_write(var t: ClientTable, link: links.LinkId, bearer: Int, handl
 pub @satisfies("REQ-BLE-GATT-CE-004")
 @tier(embedded)
 @no_alloc
-fn begin_write_long(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int, data: ClientPayload, length: Int) -> Int
+fn begin_write_long(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int,
+                    data: ClientPayload, length: Int) -> Int
     begin_write_long_at(var t, link, bearer, handle, 0, data, length)
 
 // Write a value of any length from `offset` of the attribute: as
@@ -1215,7 +1258,8 @@ fn begin_write_long(var t: ClientTable, link: links.LinkId, bearer: Int, handle:
 pub @satisfies("REQ-BLE-GATT-CE-004")
 @tier(embedded)
 @no_alloc
-fn begin_write_long_at(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int, offset: Int, data: ClientPayload, length: Int) -> Int
+fn begin_write_long_at(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int,
+                       offset: Int, data: ClientPayload, length: Int) -> Int
     if length < 1 or offset < 0 or offset > 0xFFFF
         ERR_ARGUMENT
     else
@@ -1228,14 +1272,16 @@ fn begin_write_long_at(var t: ClientTable, link: links.LinkId, bearer: Int, hand
 @satisfies("REQ-BLE-GATT-CE-004")
 @tier(embedded)
 @no_alloc
-fn begin_reliable_write(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int, data: ClientPayload, length: Int) -> Int
+fn begin_reliable_write(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int,
+                        data: ClientPayload, length: Int) -> Int
     begin_reliable_write_at(var t, link, bearer, handle, 0, data, length)
 
 // A reliable write from `offset` of the attribute; see `begin_write_long_at`.
 pub @satisfies("REQ-BLE-GATT-CE-004")
 @tier(embedded)
 @no_alloc
-fn begin_reliable_write_at(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int, offset: Int, data: ClientPayload, length: Int) -> Int
+fn begin_reliable_write_at(var t: ClientTable, link: links.LinkId, bearer: Int, handle: Int,
+                           offset: Int, data: ClientPayload, length: Int) -> Int
     if length < 1 or offset < 0 or offset > 0xFFFF
         ERR_ARGUMENT
     else
@@ -1334,7 +1380,12 @@ fn build_request(var t: ClientTable, row: Int)
         tx_put16(var t, row, 1, start)
         tx_put16(var t, row, 3, end)
         tx_put16(var t, row, 5, UUID_PRIMARY_SERVICE)
-        length = tx_put_uuid(var t, row, 7, rd(var t, row, R_UUID_LO), rd(var t, row, R_UUID_HI), rd(var t, row, R_UUID_WIDE) != 0)
+        length = tx_put_uuid(var t,
+            row,
+            7,
+            rd(var t, row, R_UUID_LO),
+            rd(var t, row, R_UUID_HI),
+            rd(var t, row, R_UUID_WIDE) != 0)
     else if op == OP_INCLUDED
         if phase == PHASE_RESOLVE
             opcode = att.ATT_OP_READ_REQ
@@ -1363,7 +1414,12 @@ fn build_request(var t: ClientTable, row: Int)
         tx_put(var t, row, 0, opcode)
         tx_put16(var t, row, 1, start)
         tx_put16(var t, row, 3, end)
-        length = tx_put_uuid(var t, row, 5, rd(var t, row, R_UUID_LO), rd(var t, row, R_UUID_HI), rd(var t, row, R_UUID_WIDE) != 0)
+        length = tx_put_uuid(var t,
+            row,
+            5,
+            rd(var t, row, R_UUID_LO),
+            rd(var t, row, R_UUID_HI),
+            rd(var t, row, R_UUID_WIDE) != 0)
     else if op == OP_READ_LONG
         if phase == PHASE_BLOB or rd(var t, row, R_ARG) > 0
             opcode = att.ATT_OP_READ_BLOB_REQ
@@ -1377,7 +1433,10 @@ fn build_request(var t: ClientTable, row: Int)
             tx_put16(var t, row, 1, start)
             length = 3
     else if op == OP_READ_MULTI or op == OP_READ_MULTI_VAR
-        opcode = if op == OP_READ_MULTI then att.ATT_OP_READ_MULTIPLE_REQ else att.ATT_OP_READ_MULTIPLE_VARIABLE_REQ
+        opcode = if op == OP_READ_MULTI
+            att.ATT_OP_READ_MULTIPLE_REQ
+        else
+            att.ATT_OP_READ_MULTIPLE_VARIABLE_REQ
         tx_put(var t, row, 0, opcode)
         let n = rd(var t, row, R_PAY_LEN)
         let off = rd(var t, row, R_PAY_OFF)
@@ -1386,7 +1445,13 @@ fn build_request(var t: ClientTable, row: Int)
         length = 1 + n
     else if op == OP_WRITE or op == OP_WRITE_CMD or op == OP_WRITE_SIGNED
         awaits = op == OP_WRITE
-        opcode = if op == OP_WRITE then att.ATT_OP_WRITE_REQ else if op == OP_WRITE_CMD then att.ATT_OP_WRITE_CMD else att.ATT_OP_SIGNED_WRITE_CMD
+        opcode = if op == OP_WRITE
+            att.ATT_OP_WRITE_REQ
+        else
+            if op == OP_WRITE_CMD
+                att.ATT_OP_WRITE_CMD
+            else
+                att.ATT_OP_SIGNED_WRITE_CMD
         tx_put(var t, row, 0, opcode)
         tx_put16(var t, row, 1, start)
         let n = rd(var t, row, R_PAY_LEN)
@@ -1401,7 +1466,10 @@ fn build_request(var t: ClientTable, row: Int)
             let sent = rd(var t, row, R_WRITTEN)
             let room = rd(var t, row, R_MTU) - 5
             let left = rd(var t, row, R_PAY_LEN) - sent
-            let part = if left < room then left else room
+            let part = if left < room
+                left
+            else
+                room
             wr(var t, row, R_AUX, part)
             tx_put(var t, row, 0, opcode)
             tx_put16(var t, row, 1, start)
@@ -1413,11 +1481,14 @@ fn build_request(var t: ClientTable, row: Int)
         else
             opcode = att.ATT_OP_EXECUTE_WRITE_REQ
             tx_put(var t, row, 0, opcode)
-            tx_put(var t, row, 1, if phase == PHASE_EXECUTE then att.ATT_EXECUTE_WRITE_FLAG_WRITE else att.ATT_EXECUTE_WRITE_FLAG_CANCEL)
+            tx_put(var t,
+                row,
+                1,
+                (if phase == PHASE_EXECUTE then att.ATT_EXECUTE_WRITE_FLAG_WRITE else att.ATT_EXECUTE_WRITE_FLAG_CANCEL))
             length = 2
     wr(var t, row, R_REQ_OP, opcode)
     wr(var t, row, R_TX_LEN, length)
-    wr(var t, row, R_AWAIT, if awaits then 1 else 0)
+    wr(var t, row, R_AWAIT, (if awaits then 1 else 0))
 
 // Copy the next PDU the bearer has to send into `out` and answer what it is:
 // `TX_CONFIRM` (the confirmation of an indication, which goes first),
@@ -1428,7 +1499,8 @@ fn build_request(var t: ClientTable, row: Int)
 pub @satisfies("REQ-BLE-GATT-CE-006")
 @no_alloc
 @tier(embedded)
-fn take_tx(var t: ClientTable, link: links.LinkId, bearer: Int, now_ms: Int, var out: ClientPdu) -> Int
+fn take_tx(var t: ClientTable, link: links.LinkId, bearer: Int, now_ms: Int,
+           var out: ClientPdu) -> Int
     let row = row_of(t, link, bearer)
     if row < 0
         return TX_NONE
@@ -1486,7 +1558,8 @@ fn is_response(op: Int) -> Bool
 pub @satisfies("REQ-BLE-GATT-CE-005")
 @no_alloc
 @tier(embedded)
-fn on_pdu(var t: ClientTable, link: links.LinkId, bearer: Int, var pdu: ClientPdu, length: Int) -> Int
+fn on_pdu(var t: ClientTable, link: links.LinkId, bearer: Int, var pdu: ClientPdu,
+          length: Int) -> Int
     let row = row_of(t, link, bearer)
     if row < 0 or length < 1 or length > pdu_octets()
         return EV_NONE
@@ -1569,7 +1642,7 @@ fn on_error(var t: ClientTable, row: Int, code: Int, handle: Int) -> Int
     if code == att.ATT_ERR_DATABASE_OUT_OF_SYNC
         t.flags[slot] = t.flags[slot] | F_STALE
     let discovery = op == OP_SERVICES or op == OP_SERVICES_UUID or op == OP_CHARS or op == OP_CHARS_UUID or op == OP_DESCS
-    if code == att.ATT_ERR_ATTRIBUTE_NOT_FOUND and (discovery or (op == OP_INCLUDED and phase == PHASE_MAIN))
+    if code == att.ATT_ERR_ATTRIBUTE_NOT_FOUND and (discovery or op == OP_INCLUDED and phase == PHASE_MAIN)
         return finish_discovery(var t, row)
     if op == OP_READ_LONG and phase == PHASE_BLOB and (code == att.ATT_ERR_INVALID_OFFSET or code == att.ATT_ERR_ATTRIBUTE_NOT_LONG)
         return finish(t, row, STATUS_OK, 0)
@@ -1624,7 +1697,10 @@ fn rsp_mtu(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -> Int
         return finish(t, row, STATUS_PROTOCOL, 0)
     let server = le16(pdu, 1)
     let offered = rd(var t, row, R_RX_MTU)
-    var mtu = if server < offered then server else offered
+    var mtu = if server < offered
+        server
+    else
+        offered
     if mtu < DEFAULT_MTU
         mtu = DEFAULT_MTU
     wr(var t, row, R_MTU, mtu)
@@ -1645,22 +1721,37 @@ fn request_uuid(var t: ClientTable, row: Int) -> Uuid
 fn rsp_services(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -> Int
     let slot = row / bearers()
     let by_uuid = rd(var t, row, R_OP) == OP_SERVICES_UUID
-    let first = if by_uuid then 1 else 2
-    let item = if by_uuid then 4 else (if length > 1 then pdu[1] as Int else 0)
+    let first = if by_uuid
+        1
+    else
+        2
+    let item = if by_uuid
+        4
+    else
+        if length > 1
+            pdu[1] as Int
+        else
+            0
     let wide = item == 20
     if item != 4 and item != 6 and item != 20
         return finish(t, row, STATUS_PROTOCOL, 0)
     if length < first + item or (length - first) % item != 0
         return finish(t, row, STATUS_PROTOCOL, 0)
-    let flags = if rd(var t, row, R_ARG) == UUID_SECONDARY_SERVICE then CF_SECONDARY else 0
+    let flags = if rd(var t, row, R_ARG) == UUID_SECONDARY_SERVICE
+        CF_SECONDARY
+    else
+        0
     var last = 0
-    for k in 0..((length - first) / item)
+    for k in 0..(length - first) / item
         let at = first + k * item
         let handle = le16(pdu, at)
         let end = le16(pdu, at + 2)
         if handle < rd(var t, row, R_START) or end < handle
             return finish(t, row, STATUS_ORDER, 0)
-        let uuid = if by_uuid then request_uuid(var t, row) else uuid_at(pdu, at + 4, wide)
+        let uuid = if by_uuid
+            request_uuid(var t, row)
+        else
+            uuid_at(pdu, at + 4, wide)
         if not cache_put(var t, slot, KIND_SERVICE, handle, end, 0, uuid, flags)
             return finish(t, row, STATUS_CACHE_FULL, 0)
         wr(var t, row, R_FOUND, rd(var t, row, R_FOUND) + 1)
@@ -1676,8 +1767,8 @@ fn next_unresolved(var t: ClientTable, row: Int) -> Int
     var found = -1
     for i in 0..t.cache_n[slot]
         let at = slot * cache() + i
-        if (t.c_kind[at] as Int) == KIND_INCLUDE and ((t.c_flags[at] as Int) & CF_UNRESOLVED) != 0
-            found = (t.c_a[at] as Int)
+        if (t.c_kind[at] as Int) == KIND_INCLUDE and (t.c_flags[at] as Int & CF_UNRESOLVED) != 0
+            found = t.c_a[at] as Int
             break
     found
 
@@ -1687,17 +1778,26 @@ fn rsp_included(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -
     let slot = row / bearers()
     if rd(var t, row, R_PHASE) == PHASE_RESOLVE
         return rsp_resolve(var t, row, var pdu, length)
-    let item = if length > 1 then pdu[1] as Int else 0
-    if (item != 6 and item != 8) or length < 2 + item or (length - 2) % item != 0
+    let item = if length > 1
+        pdu[1] as Int
+    else
+        0
+    if item != 6 and item != 8 or length < 2 + item or (length - 2) % item != 0
         return finish(t, row, STATUS_PROTOCOL, 0)
     var last = 0
-    for k in 0..((length - 2) / item)
+    for k in 0..(length - 2) / item
         let at = 2 + k * item
         let handle = le16(pdu, at)
         if handle < rd(var t, row, R_START)
             return finish(t, row, STATUS_ORDER, 0)
-        let uuid = if item == 8 then uuid16(le16(pdu, at + 6)) else uuid16(0)
-        let flags = if item == 8 then 0 else CF_UNRESOLVED
+        let uuid = if item == 8
+            uuid16(le16(pdu, at + 6))
+        else
+            uuid16(0)
+        let flags = if item == 8
+            0
+        else
+            CF_UNRESOLVED
         if not cache_put(var t, slot, KIND_INCLUDE, handle, le16(pdu, at + 2), le16(pdu, at + 4), uuid, flags)
             return finish(t, row, STATUS_CACHE_FULL, 0)
         wr(var t, row, R_FOUND, rd(var t, row, R_FOUND) + 1)
@@ -1719,8 +1819,8 @@ fn rsp_resolve(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) ->
         return finish(t, row, STATUS_PROTOCOL, 0)
     for i in 0..t.cache_n[slot]
         let at = slot * cache() + i
-        if (t.c_kind[at] as Int) == KIND_INCLUDE and (t.c_a[at] as Int) == target and ((t.c_flags[at] as Int) & CF_UNRESOLVED) != 0
-            t.c_flags[at] = ((((t.c_flags[at] as Int) & 0xFA) | (if uuid.wide then 1 else 0))) as u8
+        if (t.c_kind[at] as Int) == KIND_INCLUDE and (t.c_a[at] as Int) == target and (t.c_flags[at] as Int & CF_UNRESOLVED) != 0
+            t.c_flags[at] = ((t.c_flags[at] as Int & 0xFA) | (if uuid.wide then 1 else 0)) as u8
             t.c_lo[at] = uuid.lo
             t.c_hi[at] = uuid.hi
     let more = next_unresolved(var t, row)
@@ -1739,13 +1839,16 @@ fn rsp_resolve(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) ->
 @no_alloc
 fn rsp_characteristics(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -> Int
     let slot = row / bearers()
-    let item = if length > 1 then pdu[1] as Int else 0
-    if (item != 7 and item != 21) or length < 2 + item or (length - 2) % item != 0
+    let item = if length > 1
+        pdu[1] as Int
+    else
+        0
+    if item != 7 and item != 21 or length < 2 + item or (length - 2) % item != 0
         return finish(t, row, STATUS_PROTOCOL, 0)
     let filter = rd(var t, row, R_OP) == OP_CHARS_UUID
     let want_uuid = request_uuid(var t, row)
     var last = 0
-    for k in 0..((length - 2) / item)
+    for k in 0..(length - 2) / item
         let at = 2 + k * item
         let handle = le16(pdu, at)
         let value_handle = le16(pdu, at + 3)
@@ -1763,15 +1866,21 @@ fn rsp_characteristics(var t: ClientTable, row: Int, var pdu: ClientPdu, length:
 @no_alloc
 fn rsp_descriptors(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -> Int
     let slot = row / bearers()
-    let format = if length > 1 then pdu[1] as Int else 0
+    let format = if length > 1
+        pdu[1] as Int
+    else
+        0
     let wide = format == att.ATT_FIND_INFO_FORMAT_UUID128
     if format != att.ATT_FIND_INFO_FORMAT_UUID16 and not wide
         return finish(t, row, STATUS_PROTOCOL, 0)
-    let item = if wide then 18 else 4
+    let item = if wide
+        18
+    else
+        4
     if length < 2 + item or (length - 2) % item != 0
         return finish(t, row, STATUS_PROTOCOL, 0)
     var last = 0
-    for k in 0..((length - 2) / item)
+    for k in 0..(length - 2) / item
         let at = 2 + k * item
         let handle = le16(pdu, at)
         if handle < rd(var t, row, R_START)
@@ -1790,7 +1899,10 @@ fn rsp_descriptors(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int
 @no_alloc
 fn copy_in(var t: ClientTable, row: Int, var pdu: ClientPdu, from: Int, count: Int, at: Int) -> Int
     let room = value_octets() - at
-    let n = if count < room then count else room
+    let n = if count < room
+        count
+    else
+        room
     for i in 0..n
         t.value[row * value_octets() + at + i] = pdu[from + i]
     n
@@ -1800,7 +1912,7 @@ fn copy_in(var t: ClientTable, row: Int, var pdu: ClientPdu, from: Int, count: I
 fn rsp_read(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -> Int
     let got = copy_in(var t, row, var pdu, 1, length - 1, 0)
     wr(var t, row, R_VAL_LEN, got)
-    finish(t, row, if got < length - 1 then STATUS_TRUNCATED else STATUS_OK, 0)
+    finish(t, row, (if got < length - 1 then STATUS_TRUNCATED else STATUS_OK), 0)
 
 @tier(embedded)
 @no_alloc
@@ -1810,7 +1922,7 @@ fn rsp_read_type(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) 
     let got = copy_in(var t, row, var pdu, 2, length - 2, 0)
     wr(var t, row, R_VAL_LEN, got)
     wr(var t, row, R_ITEM_LEN, pdu[1] as Int)
-    finish(t, row, if got < length - 2 then STATUS_TRUNCATED else STATUS_OK, 0)
+    finish(t, row, (if got < length - 2 then STATUS_TRUNCATED else STATUS_OK), 0)
 
 // The Database Hash answer: one handle and 16 octets.
 @tier(embedded)
@@ -1835,7 +1947,10 @@ fn rsp_hash(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -> In
 @no_alloc
 fn rsp_read_long(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -> Int
     let full = rd(var t, row, R_MTU) - 1
-    let have = if rd(var t, row, R_PHASE) == PHASE_BLOB then rd(var t, row, R_WRITTEN) else 0
+    let have = if rd(var t, row, R_PHASE) == PHASE_BLOB
+        rd(var t, row, R_WRITTEN)
+    else
+        0
     let part = length - 1
     let got = copy_in(var t, row, var pdu, 1, part, have)
     wr(var t, row, R_WRITTEN, have + got)
@@ -1880,7 +1995,10 @@ pub @tier(embedded)
 @no_alloc
 fn mtu(var t: ClientTable, link: links.LinkId, bearer: Int) -> Int
     let row = row_of(t, link, bearer)
-    if row < 0 then 0 else rd(var t, row, R_MTU)
+    if row < 0
+        0
+    else
+        rd(var t, row, R_MTU)
 
 // Whether the bearer has a request running or queued.
 @tier(embedded)
@@ -1901,7 +2019,10 @@ fn is_dead(var t: ClientTable, link: links.LinkId, bearer: Int) -> Bool
 @no_alloc
 fn result_ticket(var t: ClientTable, link: links.LinkId, bearer: Int) -> Int
     let row = row_of(t, link, bearer)
-    if row < 0 then 0 else rd(var t, row, R_DONE_TICKET)
+    if row < 0
+        0
+    else
+        rd(var t, row, R_DONE_TICKET)
 
 // How the request that ended last on the bearer ended: `STATUS_OK`, an ATT
 // Error Code or one of the engine's `STATUS_` codes.
@@ -1909,35 +2030,50 @@ pub @tier(embedded)
 @no_alloc
 fn result_status(var t: ClientTable, link: links.LinkId, bearer: Int) -> Int
     let row = row_of(t, link, bearer)
-    if row < 0 then 0 else rd(var t, row, R_STATUS)
+    if row < 0
+        0
+    else
+        rd(var t, row, R_STATUS)
 
 // The handle an Error Response named, else 0.
 @tier(embedded)
 @no_alloc
 fn result_handle(var t: ClientTable, link: links.LinkId, bearer: Int) -> Int
     let row = row_of(t, link, bearer)
-    if row < 0 then 0 else rd(var t, row, R_ERR_HANDLE)
+    if row < 0
+        0
+    else
+        rd(var t, row, R_ERR_HANDLE)
 
 // The number of records the request that ended last added to the cache.
 @tier(embedded)
 @no_alloc
 fn result_found(var t: ClientTable, link: links.LinkId, bearer: Int) -> Int
     let row = row_of(t, link, bearer)
-    if row < 0 then 0 else rd(var t, row, R_DONE_FOUND)
+    if row < 0
+        0
+    else
+        rd(var t, row, R_DONE_FOUND)
 
 // The octets in each handle and value pair of a Read By Type answer.
 pub @tier(embedded)
 @no_alloc
 fn result_item_len(var t: ClientTable, link: links.LinkId, bearer: Int) -> Int
     let row = row_of(t, link, bearer)
-    if row < 0 then 0 else rd(var t, row, R_ITEM_LEN)
+    if row < 0
+        0
+    else
+        rd(var t, row, R_ITEM_LEN)
 
 // The octets in the value buffer: the value a read produced.
 pub @tier(embedded)
 @no_alloc
 fn value_len(var t: ClientTable, link: links.LinkId, bearer: Int) -> Int
     let row = row_of(t, link, bearer)
-    if row < 0 then 0 else rd(var t, row, R_VAL_LEN)
+    if row < 0
+        0
+    else
+        rd(var t, row, R_VAL_LEN)
 
 // Octet `index` of the value buffer, 0 past its length.
 pub @tier(embedded)
@@ -1954,7 +2090,10 @@ pub @tier(embedded)
 @no_alloc
 fn event_handle(var t: ClientTable, link: links.LinkId, bearer: Int) -> Int
     let row = row_of(t, link, bearer)
-    if row < 0 then 0 else rd(var t, row, R_EVT_HANDLE)
+    if row < 0
+        0
+    else
+        rd(var t, row, R_EVT_HANDLE)
 
 // The first and the last handle of the Service Changed indication reported
 // last.
@@ -1962,13 +2101,19 @@ fn event_handle(var t: ClientTable, link: links.LinkId, bearer: Int) -> Int
 @no_alloc
 fn service_changed_first(var t: ClientTable, link: links.LinkId, bearer: Int) -> Int
     let row = row_of(t, link, bearer)
-    if row < 0 then 0 else rd(var t, row, R_SC_FIRST)
+    if row < 0
+        0
+    else
+        rd(var t, row, R_SC_FIRST)
 
 @tier(embedded)
 @no_alloc
 fn service_changed_last(var t: ClientTable, link: links.LinkId, bearer: Int) -> Int
     let row = row_of(t, link, bearer)
-    if row < 0 then 0 else rd(var t, row, R_SC_LAST)
+    if row < 0
+        0
+    else
+        rd(var t, row, R_SC_LAST)
 
 // Whether the peer answered a request Database Out Of Sync since the last
 // Database Hash read.
@@ -2026,169 +2171,3 @@ pub @satisfies("REQ-BLE-GATT-CE-008")
 @no_alloc
 fn is_local(status: Int) -> Bool
     status >= 0x100
-
-// ── Tests ───────────────────────────────────────────────────────────
-//
-// The tests of the engine against a GATT server are in
-// tests/gatt_client_engine_tests.nv; these cover what needs no peer.
-
-@test
-fn test_the_capacities_are_the_limits()
-    var t = new_table()
-    test.assert_eq(links(), max1(noble_config.MAX_CLIENT_LINKS))
-    test.assert_eq(bearers(), max1(noble_config.CLIENT_BEARERS))
-    test.assert_eq(cache(), max1(noble_config.CLIENT_CACHE_RECORDS))
-    test.assert_eq(queue(), max1(noble_config.CLIENT_QUEUE))
-    test.assert_eq(value_octets(), max1(noble_config.CLIENT_VALUE_BYTES))
-    test.assert_eq(pdu_octets(), noble_config.MAX_ATT_MTU)
-    test.assert_eq(t.generation.capacity(), links())
-    test.assert_eq(t.opened.capacity(), links())
-    test.assert_eq(t.flags.capacity(), links())
-    test.assert_eq(t.sc_handle.capacity(), links())
-    test.assert_eq(t.cache_n.capacity(), links())
-    test.assert_eq(t.hash.capacity(), links() * HASH_OCTETS)
-    test.assert_eq(t.c_kind.capacity(), links() * cache())
-    test.assert_eq(t.c_flags.capacity(), links() * cache())
-    test.assert_eq(t.c_handle.capacity(), links() * cache())
-    test.assert_eq(t.c_a.capacity(), links() * cache())
-    test.assert_eq(t.c_b.capacity(), links() * cache())
-    test.assert_eq(t.c_lo.capacity(), links() * cache())
-    test.assert_eq(t.c_hi.capacity(), links() * cache())
-    test.assert_eq(t.regs.capacity(), links() * bearers() * REGS)
-    test.assert_eq(t.queue.capacity(), links() * bearers() * queue() * QUEUE_FIELDS)
-    test.assert_eq(t.value.capacity(), links() * bearers() * value_octets())
-    test.assert_eq(t.payload.capacity(), links() * bearers() * value_octets())
-    test.assert_eq(t.tx.capacity(), links() * bearers() * pdu_octets())
-
-@test
-fn test_every_column_is_filled_to_its_capacity()
-    var t = new_table()
-    test.assert(t.regs.is_full())
-    test.assert(t.queue.is_full())
-    test.assert(t.value.is_full())
-    test.assert(t.tx.is_full())
-    test.assert(t.c_lo.is_full())
-    test.assert(t.hash.is_full())
-
-@test
-fn test_init_table_fills_a_table_of_empty_columns_and_returns_one_in_use_to_its_first_state()
-    var t = ClientTable {
-        generation: Vec.new(), opened: Vec.new(), flags: Vec.new(), sc_handle: Vec.new(), cache_n: Vec.new(),
-        hash: Vec.new(), c_kind: Vec.new(), c_flags: Vec.new(), c_handle: Vec.new(), c_a: Vec.new(),
-        c_b: Vec.new(), c_lo: Vec.new(), c_hi: Vec.new(), regs: Vec.new(), queue: Vec.new(),
-        value: Vec.new(), payload: Vec.new(), tx: Vec.new() }
-    test.assert_eq(t.regs.len(), 0)
-    init_table(var t)
-    test.assert(t.regs.is_full())
-    test.assert(t.tx.is_full())
-    let id = links.link_id(0, 1)
-    test.assert(open(t, id))
-    test.assert_eq(slot_of(var t, id), 0)
-    t.regs[3] = 77
-    init_table(var t)
-    test.assert_eq(slot_of(var t, id), -1)
-    test.assert_eq(t.regs[3], 0)
-    test.assert(t.regs.is_full())
-
-@test
-fn test_a_uuid_on_the_base_is_its_short_form()
-    let lo = base_lo()
-    let hi = 0x1000 | (0x180F << 32)
-    let u = uuid128(lo, hi)
-    test.assert(not u.wide)
-    test.assert(uuid_same(u, uuid16(0x180F)))
-    test.assert_eq(short_of(lo, hi), 0x180F)
-    test.assert_eq(short_of(lo + 1, hi), -1)
-    test.assert_eq(short_of(lo, hi | 0x10000), -1)
-
-@test
-fn test_other_uuids_stay_wide_and_compare_by_value()
-    let a = uuid128(0x1122334455667788, 0x0102030405060708)
-    let b = uuid128(0x1122334455667788, 0x0102030405060708)
-    let c = uuid128(0x1122334455667788, 0x0102030405060709)
-    test.assert(a.wide)
-    test.assert(uuid_same(a, b))
-    test.assert(not uuid_same(a, c))
-    test.assert(not uuid_same(a, uuid16(0x1122)))
-
-@test
-fn test_a_link_is_named_by_its_slot_and_generation()
-    var t = new_table()
-    let first = links.link_id(1, 4)
-    test.assert(open(t, first))
-    test.assert_eq(slot_of(var t, first), 1)
-    test.assert_eq(slot_of(var t, links.link_id(1, 5)), -1)
-    test.assert_eq(slot_of(var t, links.link_id(0, 4)), -1)
-    test.assert(open(t, links.link_id(1, 5)))
-    test.assert_eq(slot_of(var t, first), -1)
-    test.assert_eq(slot_of(var t, links.link_id(1, 5)), 1)
-
-@test
-fn test_a_slot_the_table_does_not_have_does_not_open()
-    var t = new_table()
-    test.assert(not open(t, links.link_id(links(), 0)))
-    test.assert(not open(t, links.link_id(-1, 0)))
-    test.assert_eq(slot_of(var t, links.no_link()), -1)
-
-@test
-fn test_a_closed_link_names_nothing()
-    var t = new_table()
-    let id = links.link_id(0, 1)
-    test.assert(open(t, id))
-    close(var t, id)
-    test.assert_eq(slot_of(var t, id), -1)
-    test.assert_eq(begin_read(t, id, 0, 3), ERR_NO_LINK)
-
-@test
-fn test_a_request_on_a_bearer_that_is_not_open_is_refused()
-    var t = new_table()
-    let id = links.link_id(0, 1)
-    test.assert(open(t, id))
-    test.assert_eq(begin_read(t, id, 1, 3), ERR_NO_BEARER)
-    test.assert_eq(begin_read(t, id, bearers(), 3), ERR_NO_BEARER)
-    test.assert_eq(begin_read(t, id, -1, 3), ERR_NO_BEARER)
-    test.assert(open_bearer(t, id, 1, 100))
-    test.assert_eq(mtu(var t, id, 1), 100)
-    test.assert(begin_read(t, id, 1, 3) > 0)
-
-@test
-fn test_an_enhanced_bearer_takes_the_mtu_of_its_channel_and_no_exchange()
-    var t = new_table()
-    let id = links.link_id(0, 1)
-    test.assert(open(t, id))
-    test.assert(not open_bearer(t, id, 0, 100))
-    test.assert(not open_bearer(t, id, bearers(), 100))
-    test.assert(not open_bearer(t, id, 1, DEFAULT_MTU - 1))
-    test.assert(not open_bearer(t, id, 1, pdu_octets() + 1))
-    test.assert(open_bearer(t, id, 1, 64))
-    test.assert_eq(begin_exchange_mtu(var t, id, 1), ERR_ARGUMENT)
-    close_bearer(var t, id, 1)
-    test.assert_eq(mtu(var t, id, 1), 0)
-
-@test
-fn test_a_range_is_checked_before_a_request_is_queued()
-    var t = new_table()
-    let id = links.link_id(0, 1)
-    test.assert(open(t, id))
-    test.assert_eq(begin_discover_services(var t, id, 0, 0, 5, false), ERR_ARGUMENT)
-    test.assert_eq(begin_discover_services(var t, id, 0, 6, 5, false), ERR_ARGUMENT)
-    test.assert_eq(begin_discover_characteristics(var t, id, 0, 1, 0x10000), ERR_ARGUMENT)
-    test.assert_eq(begin_read(t, id, 0, 0), ERR_ARGUMENT)
-    test.assert_eq(begin_read_long(var t, id, 0, 0x10000), ERR_ARGUMENT)
-    test.assert_eq(begin_subscribe(var t, id, 0, 9, 4), ERR_ARGUMENT)
-    test.assert(not is_busy(var t, id, 0))
-
-@test
-fn test_status_codes_map_to_what_a_caller_does_about_them()
-    test.assert(is_peer_error(att.ATT_ERR_READ_NOT_PERMITTED))
-    test.assert(not is_peer_error(STATUS_OK))
-    test.assert(not is_peer_error(STATUS_TIMEOUT))
-    test.assert(needs_security(att.ATT_ERR_INSUFFICIENT_AUTHENTICATION))
-    test.assert(needs_security(att.ATT_ERR_INSUFFICIENT_AUTHORIZATION))
-    test.assert(needs_security(att.ATT_ERR_INSUFFICIENT_ENC_KEY_SIZE))
-    test.assert(needs_security(att.ATT_ERR_INSUFFICIENT_ENCRYPTION))
-    test.assert(not needs_security(att.ATT_ERR_WRITE_NOT_PERMITTED))
-    test.assert(is_out_of_sync(att.ATT_ERR_DATABASE_OUT_OF_SYNC))
-    test.assert(is_local(STATUS_TIMEOUT))
-    test.assert(is_local(STATUS_MISMATCH))
-    test.assert(not is_local(att.ATT_ERR_INVALID_HANDLE))

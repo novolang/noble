@@ -1,0 +1,235 @@
+// tests/gatt_tests.nv — the unit tests of src/gatt.nv.
+//
+//   novo test tests/gatt_tests.nv
+
+use std.test
+use att
+use gatt.{ CCCD_INDICATE, CCCD_NOTIFY, CCCD_OFF, SUB_ENTRY_LEN, build_discover_characteristics_req, build_discover_primary_services_req, build_indicate_pdu, build_notify_pdu, build_read_characteristic_value_req, cccd_decode, cccd_indicate_enabled, cccd_notify_enabled, characteristics_rsp_count, characteristics_rsp_decl_handle_at, characteristics_rsp_pair_len, characteristics_rsp_uuid16_at, characteristics_rsp_value_handle_at, is_cccd_uuid, primary_services_rsp_count, primary_services_rsp_end_group_at, primary_services_rsp_handle_at, primary_services_rsp_triplet_len, primary_services_rsp_uuid16_at, subs_clear, subs_lookup, subs_remove, subs_set, try_build_indicate_for, try_build_notify_for }
+use gatt
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+@test
+@satisfies("REQ-BLE-GATT-CL-001")
+fn test_discover_primary_services_req_shape()
+    let req = build_discover_primary_services_req(0x0001, 0xFFFF)
+    test.assert_eq(list.len(req), 7)
+    test.assert_eq(req[0] as Int, att.ATT_OP_READ_BY_GROUP_TYPE_REQ)
+    test.assert_eq(req[1] as Int, 0x01)
+    test.assert_eq(req[3] as Int, 0xFF)
+    test.assert_eq(req[5] as Int, 0x00)   // group type lo
+    test.assert_eq(req[6] as Int, 0x28)   // group type hi (0x2800)
+
+@test
+@satisfies("REQ-BLE-GATT-CL-002")
+fn test_discover_characteristics_req_shape()
+    let req = build_discover_characteristics_req(0x0001, 0x0005)
+    test.assert_eq(list.len(req), 7)
+    test.assert_eq(req[0] as Int, att.ATT_OP_READ_BY_TYPE_REQ)
+    test.assert_eq(req[5] as Int, 0x03)   // type lo (0x2803)
+    test.assert_eq(req[6] as Int, 0x28)
+
+@test
+@satisfies("REQ-BLE-GATT-CL-003")
+fn test_read_characteristic_value_req_shape()
+    let req = build_read_characteristic_value_req(0x0003)
+    test.assert_eq(list.len(req), 3)
+    test.assert_eq(req[0] as Int, att.ATT_OP_READ_REQ)
+    test.assert_eq(req[1] as Int, 0x03)
+    test.assert_eq(req[2] as Int, 0x00)
+
+@test
+@satisfies("REQ-BLE-GATT-CL-001")
+fn test_primary_services_rsp_decode()
+    // RSP: opcode | triplet_len=6 | (handle=0x0001, end=0x0005, uuid=0x180A)
+    let rsp: [u8] = [
+        att.ATT_OP_READ_BY_GROUP_TYPE_RSP,
+        0x06,
+        0x01, 0x00,
+        0x05, 0x00,
+        0x0A, 0x18]
+    test.assert_eq(primary_services_rsp_triplet_len(rsp), 6)
+    test.assert_eq(primary_services_rsp_count(rsp), 1)
+    test.assert_eq(primary_services_rsp_handle_at(rsp, 0), 0x0001)
+    test.assert_eq(primary_services_rsp_end_group_at(rsp, 0), 0x0005)
+    test.assert_eq(primary_services_rsp_uuid16_at(rsp, 0), 0x180A)
+
+@test
+@satisfies("REQ-BLE-GATT-CL-002")
+fn test_characteristics_rsp_decode()
+    // Two characteristics: Manufacturer Name + Model Number.
+    let rsp: [u8] = [
+        att.ATT_OP_READ_BY_TYPE_RSP,
+        0x07,
+        // pair 1
+        0x02, 0x00,   // decl handle 0x0002
+        0x02,   // props
+        0x03, 0x00,   // value handle 0x0003
+        0x29, 0x2A,   // uuid 0x2A29
+        // pair 2
+        0x04, 0x00,
+        0x02,
+        0x05, 0x00,
+        0x24, 0x2A]
+    test.assert_eq(characteristics_rsp_pair_len(rsp), 7)
+    test.assert_eq(characteristics_rsp_count(rsp), 2)
+    test.assert_eq(characteristics_rsp_decl_handle_at(rsp, 0), 0x0002)
+    test.assert_eq(characteristics_rsp_value_handle_at(rsp, 0), 0x0003)
+    test.assert_eq(characteristics_rsp_uuid16_at(rsp, 0), 0x2A29)
+    test.assert_eq(characteristics_rsp_decl_handle_at(rsp, 1), 0x0004)
+    test.assert_eq(characteristics_rsp_uuid16_at(rsp, 1), 0x2A24)
+
+@test
+fn test_rsp_decoders_reject_wrong_opcode()
+    let err: [u8] = [att.ATT_OP_ERROR_RSP, 0x08, 0x00, 0x00, 0x0A]
+    test.assert_eq(primary_services_rsp_triplet_len(err), -1)
+    test.assert_eq(characteristics_rsp_pair_len(err), -1)
+
+// ── Tests: CCCD + notify/indicate + subscription registry ──────────
+
+@test
+fn test_cccd_uuid_and_decode()
+    test.assert_eq(is_cccd_uuid(0x2902), true)
+    test.assert_eq(is_cccd_uuid(0x2A37), false)
+
+    let off: [u8] = [0x00, 0x00]
+    let ntf: [u8] = [0x01, 0x00]
+    let ind: [u8] = [0x02, 0x00]
+    let both: [u8] = [0x03, 0x00]
+    test.assert_eq(cccd_decode(off), CCCD_OFF)
+    test.assert_eq(cccd_decode(ntf), CCCD_NOTIFY)
+    test.assert_eq(cccd_decode(ind), CCCD_INDICATE)
+    test.assert_eq(cccd_decode(both), 0x0003)
+
+    test.assert_eq(cccd_notify_enabled(CCCD_NOTIFY), true)
+    test.assert_eq(cccd_notify_enabled(CCCD_INDICATE), false)
+    test.assert_eq(cccd_indicate_enabled(CCCD_INDICATE), true)
+    test.assert_eq(cccd_notify_enabled(0x0003), true)
+    test.assert_eq(cccd_indicate_enabled(0x0003), true)
+
+@test
+@satisfies("REQ-BLE-GATT-CL-001")
+fn test_build_notify_indicate_pdus()
+    let v: [u8] = [0x55, 0xAA]
+    let n = build_notify_pdu(0x0011, v)
+    test.assert_eq(n[0] as Int, att.ATT_OP_HANDLE_VALUE_NTF)
+    test.assert_eq(n[1] as Int, 0x11)
+    test.assert_eq(n[3] as Int, 0x55)
+
+    let i = build_indicate_pdu(0x0011, v)
+    test.assert_eq(i[0] as Int, att.ATT_OP_HANDLE_VALUE_IND)
+
+@test
+fn test_subs_set_lookup_remove()
+    var t: [u8] = []
+    test.assert_eq(subs_lookup(t, 0x0011), -1)   // empty
+
+    t = subs_set(var t, 0x0011, CCCD_NOTIFY)
+    t = subs_set(var t, 0x0022, CCCD_INDICATE)
+    test.assert_eq(subs_lookup(t, 0x0011), CCCD_NOTIFY)
+    test.assert_eq(subs_lookup(t, 0x0022), CCCD_INDICATE)
+    test.assert_eq(subs_lookup(t, 0x0033), -1)   // not present
+
+    // Update existing entry — shouldn't grow the table.
+    t = subs_set(var t, 0x0011, 0x0003)
+    test.assert_eq(subs_lookup(t, 0x0011), 0x0003)
+    test.assert_eq(list.len(t), SUB_ENTRY_LEN * 2)
+
+    // Remove (= set to OFF).
+    t = subs_remove(var t, 0x0011)
+    test.assert_eq(subs_lookup(t, 0x0011), CCCD_OFF)
+
+    // subs_clear drops everything.
+    let empty = subs_clear()
+    test.assert_eq(list.len(empty), 0)
+
+@test
+fn test_try_build_notify_respects_subscription_state()
+    let value: [u8] = [0x01, 0x42]
+    var t: [u8] = []
+    // No subscription — empty bytes.
+    test.assert_eq(list.len(try_build_notify_for(t, 0x0011, value)), 0)
+
+    // Enable notifications.
+    t = subs_set(var t, 0x0011, CCCD_NOTIFY)
+    let pdu = try_build_notify_for(t, 0x0011, value)
+    test.assert_eq(pdu[0] as Int, att.ATT_OP_HANDLE_VALUE_NTF)
+
+    // Indication-only — notify path should remain silent.
+    t = subs_set(var t, 0x0011, CCCD_INDICATE)
+    test.assert_eq(list.len(try_build_notify_for(t, 0x0011, value)), 0)
+    let ind_pdu = try_build_indicate_for(t, 0x0011, value)
+    test.assert_eq(ind_pdu[0] as Int, att.ATT_OP_HANDLE_VALUE_IND)
+
+@test
+fn test_a_discovery_response_too_short_for_the_field_asked_for_answers_minus_one()
+    // The response of Read By Group Type is the length of one triplet and then the triplets.
+    test.assert_eq(gatt.primary_services_rsp_triplet_len([0x11]), -1)
+    test.assert_eq(gatt.primary_services_rsp_count([0x11]), -1)
+    test.assert_eq(gatt.primary_services_rsp_handle_at([0x11], 0), -1)
+    test.assert_eq(gatt.primary_services_rsp_end_group_at([0x11], 0), -1)
+    test.assert_eq(gatt.primary_services_rsp_uuid16_at([0x11], 0), -1)
+    // One triplet of 6 octets, asked for the second.
+    let one: [u8] = [0x11, 0x06, 0x01, 0x00, 0x05, 0x00, 0x00, 0x18]
+    test.assert_eq(gatt.primary_services_rsp_handle_at(one, 0), 1)
+    test.assert_eq(gatt.primary_services_rsp_end_group_at(one, 0), 5)
+    test.assert_eq(gatt.primary_services_rsp_uuid16_at(one, 0), 0x1800)
+    test.assert_eq(gatt.primary_services_rsp_handle_at(one, 1), -1)
+    test.assert_eq(gatt.primary_services_rsp_end_group_at(one, 1), -1)
+    test.assert_eq(gatt.primary_services_rsp_uuid16_at(one, 1), -1)
+    // A triplet of 20 octets holds a 128-bit UUID, which the 16-bit reader refuses.
+    var wide: [u8] = [0x11, 0x14, 0x01, 0x00, 0x05, 0x00]
+    for i in 0..16
+        list.push(wide, i)
+    test.assert_eq(gatt.primary_services_rsp_uuid16_at(wide, 0), -1)
+
+@test
+fn test_a_characteristic_response_too_short_for_the_field_asked_for_answers_minus_one()
+    test.assert_eq(gatt.characteristics_rsp_pair_len([0x09]), -1)
+    test.assert_eq(gatt.characteristics_rsp_count([0x09]), -1)
+    test.assert_eq(gatt.characteristics_rsp_count([0x09, 0x00]), -1)
+    test.assert_eq(gatt.characteristics_rsp_decl_handle_at([0x09], 0), -1)
+    test.assert_eq(gatt.characteristics_rsp_value_handle_at([0x09], 0), -1)
+    test.assert_eq(gatt.characteristics_rsp_uuid16_at([0x09], 0), -1)
+    // One pair of 7 octets: the declaration handle, the properties, the value handle and a 16-bit UUID.
+    let one: [u8] = [0x09, 0x07, 0x02, 0x00, 0x02, 0x03, 0x00, 0x00, 0x2A]
+    test.assert_eq(gatt.characteristics_rsp_count(one), 1)
+    test.assert_eq(gatt.characteristics_rsp_decl_handle_at(one, 0), 2)
+    test.assert_eq(gatt.characteristics_rsp_value_handle_at(one, 0), 3)
+    test.assert_eq(gatt.characteristics_rsp_uuid16_at(one, 0), 0x2A00)
+    test.assert_eq(gatt.characteristics_rsp_decl_handle_at(one, 1), -1)
+    test.assert_eq(gatt.characteristics_rsp_value_handle_at(one, 1), -1)
+    test.assert_eq(gatt.characteristics_rsp_uuid16_at(one, 1), -1)
+    // A pair of 21 octets holds a 128-bit UUID.
+    var wide: [u8] = [0x09, 0x15, 0x02, 0x00, 0x02, 0x03, 0x00]
+    for i in 0..16
+        list.push(wide, i)
+    test.assert_eq(gatt.characteristics_rsp_value_handle_at(wide, 0), -1)
+    test.assert_eq(gatt.characteristics_rsp_uuid16_at(wide, 0), -1)
+
+@test
+fn test_a_configuration_value_shorter_than_two_octets_is_off_and_a_full_table_takes_no_new_entry()
+    test.assert_eq(gatt.cccd_decode([]), 0)
+    test.assert_eq(gatt.cccd_decode([0x01]), 0)
+    test.assert_eq(gatt.cccd_decode([0x03, 0x00]), 3)
+    // Sixteen subscriptions fill the table; a seventeenth handle is not added and the others stay.
+    var table: [u8] = gatt.subs_clear()
+    for i in 0..16
+        table = gatt.subs_set(var table, 0x0010 + i, gatt.CCCD_NOTIFY)
+    test.assert_eq(list.len(table), 64)
+    let full = gatt.subs_set(var table, 0x0100, gatt.CCCD_NOTIFY)
+    test.assert_eq(list.len(full), 64)
+    test.assert_eq(gatt.subs_lookup(full, 0x0100), -1)
+    test.assert_eq(gatt.subs_lookup(full, 0x0010), gatt.CCCD_NOTIFY)
+
+@test
+fn test_a_handle_without_a_subscription_builds_neither_a_notification_nor_an_indication()
+    var table: [u8] = gatt.subs_clear()
+    test.assert_eq(list.len(gatt.try_build_notify_for(table, 0x0010, [1])), 0)
+    test.assert_eq(list.len(gatt.try_build_indicate_for(table, 0x0010, [1])), 0)
+    table = gatt.subs_set(var table, 0x0010, gatt.CCCD_INDICATE)
+    test.assert_eq(list.len(gatt.try_build_notify_for(table, 0x0010, [1])), 0)
+    test.assert_eq(list.len(gatt.try_build_indicate_for(table, 0x0010, [1])), 4)
+    table = gatt.subs_set(var table, 0x0010, gatt.CCCD_NOTIFY)
+    test.assert_eq(list.len(gatt.try_build_indicate_for(table, 0x0010, [1])), 0)
+    test.assert_eq(list.len(gatt.try_build_notify_for(table, 0x0010, [1])), 4)

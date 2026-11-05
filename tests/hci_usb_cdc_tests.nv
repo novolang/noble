@@ -1,0 +1,70 @@
+// tests/hci_usb_cdc_tests.nv — the unit tests of src/hci_usb_cdc.nv.
+//
+//   novo test tests/hci_usb_cdc_tests.nv
+
+use std.test
+use hci_frame
+use hci_usb_cdc.{ HciUsbCdc, USB_BMREQUESTTYPE_HCI, USB_BREQUEST_HCI_COMMAND, USB_EP_CTRL, USB_EP_HCI_ACL_IN, USB_EP_HCI_ACL_OUT, USB_EP_HCI_EVENT_IN, USB_EP_HCI_VENDOR_IN, encode_hci_cmd_usb_setup, new_hci_usb_cdc }
+
+// ── Tests (data-shape only — no I/O) ────────────────────────────────
+
+@test
+fn test_new_hci_usb_cdc_records_interface_num()
+    let t = new_hci_usb_cdc(0)
+    test.assert_eq(t.interface_num, 0)
+
+@test
+fn test_endpoint_address_constants_match_spec()
+    // Per BLE HCI USB Transport spec Vol 4 Part B §2.1.
+    test.assert_eq(USB_EP_CTRL, 0x00)
+    test.assert_eq(USB_EP_HCI_EVENT_IN, 0x81)
+    test.assert_eq(USB_EP_HCI_ACL_OUT, 0x02)
+    test.assert_eq(USB_EP_HCI_ACL_IN, 0x82)
+    test.assert_eq(USB_EP_HCI_VENDOR_IN, 0x83)
+
+@test
+fn test_setup_packet_carries_hci_command_class_request()
+    let cmd = HciCmdMsg { opcode: 0x0C03, params: [] }   // HCI_Reset
+    let body = hci_frame.encode_hci_cmd_msg(cmd)
+    let setup = encode_hci_cmd_usb_setup(list.len(body), 0)
+    test.assert_eq(list.len(setup), 8)
+    test.assert_eq(setup[0] as Int, USB_BMREQUESTTYPE_HCI)   // 0x20
+    test.assert_eq(setup[1] as Int, USB_BREQUEST_HCI_COMMAND)   // 0x00
+    test.assert_eq(setup[2] as Int, 0x00)   // wValue lo
+    test.assert_eq(setup[3] as Int, 0x00)   // wValue hi
+    test.assert_eq(setup[4] as Int, 0x00)   // wIndex lo (iface 0)
+    test.assert_eq(setup[6] as Int, 0x03)   // wLength = 3 (opcode + len)
+    test.assert_eq(setup[7] as Int, 0x00)
+
+@test
+fn test_setup_packet_wlength_includes_params()
+    let cmd = HciCmdMsg {
+        opcode: 0x200A,
+        params: [0x01] }
+    let body = hci_frame.encode_hci_cmd_msg(cmd)
+    let setup = encode_hci_cmd_usb_setup(list.len(body), 0)
+    // wLength should be 3 (opcode + len) + 1 (param) = 4.
+    test.assert_eq(setup[6] as Int, 0x04)
+
+@test
+fn test_setup_packet_encodes_interface_num_in_windex()
+    let setup = encode_hci_cmd_usb_setup(3, 0x0042)
+    test.assert_eq(setup[4] as Int, 0x42)   // wIndex lo
+    test.assert_eq(setup[5] as Int, 0x00)   // wIndex hi
+
+@test
+fn test_trait_recv_returns_none_until_runtime_lands()
+    let t = new_hci_usb_cdc(0)
+    match HciUsbCdc.recv_event(t)
+        Some(_) => test.fail("recv_event stubbed; should be None")
+        None    => test.assert(true)
+    match HciUsbCdc.recv_acl(t)
+        Some(_) => test.fail("recv_acl stubbed; should be None")
+        None    => test.assert(true)
+
+@test
+fn test_trait_is_open_false_until_usbd_runtime()
+    let t = new_hci_usb_cdc(0)
+    // Stubbed false because hal.usb.is_configured() doesn't exist
+    // yet.  Flips to a real query when the runtime patch lands.
+    test.assert_eq(HciUsbCdc.is_open(t), false)

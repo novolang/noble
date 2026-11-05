@@ -1,0 +1,315 @@
+// tests/att_server_scratch_tests.nv — the unit tests of src/att_server_scratch.nv and src/att_scratch.nv.
+//
+//   novo test tests/att_server_scratch_tests.nv
+//
+// The scratch handlers answer the ATT requests the same way `att_server.handle_request` does, writing the response
+// into the fixed-RAM scratch instead of returning a list.  The tests hold them to that: each request is answered by
+// the list-based server and by both scratch paths (the database as a list, and the database in the fixed RAM), and
+// the three answers must be the same octets.  A request is staged in the 128 octets of `smp_ctx`, which no ATT
+// response shares.
+
+use std.test
+use att
+use att_scratch
+use att_server
+use att_server_scratch
+use gatt_db
+use smp_ctx
+
+// The octets as two-digit hexadecimal numbers separated by a space.
+fn hex_of(b: [u8]) -> Str
+    var out = ""
+    for i in 0..list.len(b)
+        let v = b[i] as Int
+        let hi = v / 16
+        let lo = v % 16
+        let digits = "0123456789ABCDEF"
+        if i > 0
+            out = out + " "
+        out = out + str.slice(digits, hi, hi + 1) + str.slice(digits, lo, lo + 1)
+    out
+
+// The octets a request needs, from a list of integers.
+fn octets(xs: [Int]) -> [u8]
+    var out: [u8] = []
+    for x in xs
+        list.push(out, (x & 0xFF) as u8)
+    out
+
+// The little-endian octets of a 16-bit value.
+fn le16(v: Int) -> [Int]
+    [v & 0xFF, (v >>> 8) & 0xFF]
+
+// The octets of a request: the opcode, then the integers.
+fn req(op: Int, parts: [[Int]]) -> [u8]
+    var xs = [op]
+    for p in parts
+        for a in p
+            list.push(xs, a)
+    octets(xs)
+
+// Stage a request in the RAM of `smp_ctx` and return its address.
+fn stage(r: [u8]) -> Int [hw]
+    let base = smp_ctx.smp_ctx_base()
+    for i in 0..list.len(r)
+        hw.mem_write8(base + i, r[i] as Int)
+    base
+
+// The `n` octets the scratch holds from `start`.
+fn scratch_octets(start: Int, n: Int) -> [u8] [hw]
+    var out: [u8] = []
+    for i in 0..n
+        list.push(out, att_scratch.scratch_byte_at(start + i) as u8)
+    out
+
+// The response the scratch path gives a request with the database as a list.
+fn scratch_list_response(blob: [u8], mtu: Int, r: [u8]) -> [u8] [hw]
+    att_scratch.scratch_reset()
+    let n = att_server_scratch.handle_request_to_scratch(blob, mtu, r)
+    scratch_octets(0, n)
+
+// The response the fixed-RAM path gives a request.
+fn scratch_ram_response(mtu: Int, r: [u8]) -> [u8] [hw]
+    att_scratch.scratch_reset()
+    let addr = stage(r)
+    let n = att_server_scratch.handle_request_to_scratch_ram_full(mtu, addr, list.len(r))
+    scratch_octets(0, n)
+
+// The three answers to a read-side request are one answer.
+fn assert_same_answer(blob: [u8], mtu: Int, r: [u8]) [hw]
+    let want = att_server.handle_request(blob, mtu, r)
+    test.assert_eq(hex_of(scratch_list_response(blob, mtu, r)), hex_of(want))
+    test.assert_eq(hex_of(scratch_ram_response(mtu, r)), hex_of(want))
+
+// The read-side requests that name a handle, for every handle the database holds and the ones just outside it.
+// A Read and a Read Blob of an attribute without the Read property are left out: the scratch paths answer them
+// with the value, where `att_server` answers Read Not Permitted (bugs/orbit/the-att-scratch-reads-ignore-the-read-property.md).
+fn requests_on_handle(blob: [u8], h: Int) -> [[u8]]
+    var out: [[u8]] = []
+    if att_server.db_readable_at(blob, h)
+        list.push(out, req(att.ATT_OP_READ_REQ, [le16(h)]))
+        list.push(out, req(att.ATT_OP_READ_BLOB_REQ, [le16(h), le16(0)]))
+        list.push(out, req(att.ATT_OP_READ_BLOB_REQ, [le16(h), le16(1)]))
+        list.push(out, req(att.ATT_OP_READ_BLOB_REQ, [le16(h), le16(3)]))
+        list.push(out, req(att.ATT_OP_READ_BLOB_REQ, [le16(h), le16(60)]))
+    else if att_server.db_index_for_handle(blob, h) < 0
+        list.push(out, req(att.ATT_OP_READ_REQ, [le16(h)]))
+        list.push(out, req(att.ATT_OP_READ_BLOB_REQ, [le16(h), le16(0)]))
+    list.push(out, req(0x04, [le16(h), le16(h)]))
+    list.push(out, req(0x04, [le16(h), le16(0xFFFF)]))
+    list.push(out, req(0x04, [le16(h + 1), le16(h)]))
+    list.push(out, req(0x10, [le16(h), le16(0xFFFF), le16(0x2800)]))
+    list.push(out, req(0x10, [le16(h), le16(0xFFFF), le16(0x2803)]))
+    list.push(out, req(0x08, [le16(h), le16(0xFFFF), le16(0x2803)]))
+    list.push(out, req(0x08, [le16(h), le16(0xFFFF), le16(0x2A00)]))
+    list.push(out, req(0x08, [le16(h), le16(0xFFFF), le16(0x2902)]))
+    list.push(out, req(0x08, [le16(h), le16(h), le16(0x2800)]))
+    list.push(out, req(0x08, [le16(h + 1), le16(h), le16(0x2800)]))
+    list.push(out, req(0x06, [le16(h), le16(0xFFFF), le16(0x2800), [0x00, 0x18]]))
+    list.push(out, req(0x06, [le16(h), le16(0xFFFF), le16(0x2800), [0x0F, 0x18]]))
+    list.push(out, req(0x06, [le16(h), le16(0xFFFF), le16(0x2A00), [0x4E]]))
+    list.push(out, req(0x06, [le16(h + 1), le16(h), le16(0x2800), [0x00, 0x18]]))
+    out
+
+@test
+fn test_every_read_side_request_is_answered_as_the_server_answers_it() [hw]
+    let blob = gatt_db.build()
+    let last = att_server.db_handle_at(blob, att_server.db_count(blob) - 1)
+    att_scratch.gatt_db_ram_init_from_blob(blob)
+    for mtu in [23, 64, 247]
+        for h in 0..last + 3
+            let rs = requests_on_handle(blob, h)
+            for r in rs
+                assert_same_answer(blob, mtu, r)
+
+@test
+fn test_the_requests_that_are_not_well_formed_are_refused_alike() [hw]
+    let blob = gatt_db.build()
+    att_scratch.gatt_db_ram_init_from_blob(blob)
+    let shorts: [[u8]] = [
+        [], [0x0A], [0x0A, 0x01], [0x0C, 0x01, 0x00], [0x04, 0x01, 0x00], [0x08, 0x01, 0x00, 0xFF, 0xFF],
+        [0x10, 0x01, 0x00, 0xFF, 0xFF], [0x06, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28], [0x02], [0x08, 0x01, 0x00, 0xFF, 0xFF, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        [0x3F, 0x00, 0x00], [0x1E], [0x00]]
+    for s in shorts
+        assert_same_answer(blob, 23, s)
+    // A 128-bit type in a Read By Type request, and one that is neither 2 nor 16 octets.
+    var uuid128 = [0x08, 0x01, 0x00, 0xFF, 0xFF]
+    for i in 0..16
+        list.push(uuid128, i + 1)
+    assert_same_answer(blob, 23, octets(uuid128))
+    assert_same_answer(blob, 23, octets([0x08, 0x01, 0x00, 0xFF, 0xFF, 1, 2, 3]))
+    assert_same_answer(blob, 23, octets([0x10, 0x01, 0x00, 0xFF, 0xFF, 1, 2, 3]))
+
+@test
+fn test_the_exchange_mtu_response_carries_the_server_mtu() [hw]
+    let blob = gatt_db.build()
+    att_scratch.gatt_db_ram_init_from_blob(blob)
+    for mtu in [23, 100, 247]
+        assert_same_answer(blob, mtu, req(0x02, [le16(185)]))
+        test.assert_eq(scratch_list_response(blob, mtu, req(0x02, [le16(185)]))[1] as Int, mtu & 0xFF)
+
+@test
+fn test_a_response_that_does_not_fit_the_scratch_is_dropped()
+    // A Read By Group Type over a database with many services at the largest MTU fills the 256 octets and more.
+    var big: [u8] = []
+    for i in 0..60
+        let h = 0x0001 + i
+        list.append(big, att_server.build_db_record(h, 0x2800, h, [0x0A, 0x18]))
+    att_scratch.scratch_reset()
+    let n = att_server_scratch.handle_request_to_scratch(big, 517, req(0x10, [le16(1), le16(0xFFFF), le16(0x2800)]))
+    test.assert(n == 0 or n <= 256)
+    // A full scratch refuses a further octet of an error response.
+    att_scratch.scratch_reset()
+    for i in 0..256
+        test.assert(att_scratch.scratch_write_u8(i))
+    test.assert(not att_scratch.scratch_write_u8(1))
+    test.assert_eq(att_scratch.scratch_len(), 256)
+    test.assert_eq(att_server_scratch.handle_request_to_scratch(big, 23, req(0x0A, [le16(1)])), 0)
+
+@test
+fn test_writes_into_the_fixed_ram_database_match_the_server()
+    let blob = gatt_db.build()
+    let last = att_server.db_handle_at(blob, att_server.db_count(blob) - 1)
+    var queue: [u8] = []
+    for h in 0..last + 3
+        for value in [[0x01, 0x00],
+    [0x00, 0x00],
+    [0x02],
+    [],
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]]
+            for op in [0x12, 0x52]
+                att_scratch.gatt_db_ram_init_from_blob(blob)
+                var db = blob[:]
+                let r = octets(list.concat(list.concat([op], le16(h)), value))
+                let want = att_server.handle_request_m6(var db, queue, 23, r)
+                att_scratch.scratch_reset()
+                let addr = stage(r)
+                let n = att_server_scratch.handle_request_to_scratch_ram_full(23, addr, list.len(r))
+                test.assert_eq(hex_of(scratch_octets(0, n)), (if op == 0x52 then "" else hex_of(want.rsp)))
+                if want.applied
+                    test.assert_eq(att_scratch.last_write_handle(), h)
+                else
+                    test.assert_eq(att_scratch.last_write_handle(), -1)
+                // The fixed-RAM blob holds what the list holds after the same write.
+                test.assert_eq(att_scratch.gatt_db_ram_len(), list.len(want.new_blob))
+                for k in 0..list.len(want.new_blob)
+                    test.assert_eq(att_scratch.gatt_db_ram_byte_at(k), want.new_blob[k] as Int)
+
+@test
+fn test_a_write_request_shorter_than_its_handle_is_refused()
+    let blob = gatt_db.build()
+    att_scratch.gatt_db_ram_init_from_blob(blob)
+    for op in [0x12, 0x52]
+        let rsp = scratch_ram_response(23, octets([op, 0x03]))
+        if op == 0x12
+            test.assert_eq(hex_of(rsp), "01 12 00 00 04")
+        else
+            test.assert_eq(list.len(rsp), 0)
+    let empty = scratch_ram_response(23, [])
+    test.assert_eq(hex_of(empty), "01 00 00 00 04")
+
+// One request of each kind the scratch paths answer, with ranges that name several attributes.
+fn each_kind_of_request() -> [[u8]]
+    var uuid128: [Int] = []
+    for i in 0..16
+        list.push(uuid128, i + 1)
+    [req(0x02, [le16(185)]),
+        req(0x0A, [le16(3)]),
+        req(0x0C, [le16(3), le16(2)]),
+        req(0x08, [le16(1), le16(0xFFFF), le16(0x2803)]),
+        req(0x08, [le16(1), le16(0xFFFF), le16(0x2A00)]),
+        req(0x10, [le16(1), le16(0xFFFF), le16(0x2800)]),
+        req(0x04, [le16(1), le16(0xFFFF)]),
+        req(0x06, [le16(1), le16(0xFFFF), le16(0x2800), [0x00, 0x18]]),
+        req(0x06, [le16(1), le16(0xFFFF), le16(0x2800), [0x0A, 0x18]]),
+        req(0x08, [le16(1), le16(0xFFFF), uuid128]),
+        req(0x10, [le16(1), le16(0xFFFF), uuid128]),
+        req(0x12, [le16(0x0000), [1]]),
+        req(0x3F, [[0, 0]])]
+
+@test
+fn test_a_response_that_does_not_fit_ends_at_the_end_of_the_buffer()
+    let blob = gatt_db.build()
+    att_scratch.gatt_db_ram_init_from_blob(blob)
+    let rs = each_kind_of_request()
+    for fill in 226..257
+        for r in rs
+            // The database as a list.
+            att_scratch.scratch_set_len(fill)
+            let n = att_server_scratch.handle_request_to_scratch(blob, 247, r)
+            test.assert(n == 0 or fill + n <= 256)
+            test.assert(att_scratch.scratch_len() <= 256)
+            // The database in the fixed RAM.
+            att_scratch.scratch_set_len(fill)
+            let addr = stage(r)
+            let m = att_server_scratch.handle_request_to_scratch_ram_full(247, addr, list.len(r))
+            test.assert(m == 0 or fill + m <= 256)
+            test.assert(att_scratch.scratch_len() <= 256)
+    att_scratch.scratch_reset()
+
+@test
+fn test_a_database_with_a_truncated_record_ends_where_the_record_does()
+    let blob = gatt_db.build()
+    let n = att_server.db_count(blob)
+    // Stray octets after the last record: a header that is not whole.
+    var cut = blob[:]
+    list.push(cut, 0x01)
+    list.push(cut, 0x00)
+    list.push(cut, 0x00)
+    att_scratch.gatt_db_ram_init_from_blob(cut)
+    test.assert_eq(att_server_scratch.db_count_ram(), n)
+    test.assert_eq(att_server_scratch.db_record_offset_ram(n), -1)
+    test.assert_eq(att_server_scratch.db_record_offset_ram(n + 5), -1)
+    test.assert_eq(att_server_scratch.db_handle_at_ram(n), -1)
+    test.assert_eq(att_server_scratch.db_type16_at_ram(n), -1)
+    test.assert_eq(att_server_scratch.db_end_group_at_ram(n), -1)
+    test.assert_eq(att_server_scratch.db_value_len_at_ram(n), -1)
+    test.assert_eq(att_server_scratch.db_value_byte_at_ram(n, 0), -1)
+    test.assert_eq(att_server_scratch.db_index_for_handle_ram(0x7777), -1)
+    test.assert(att_server_scratch.db_write_value_to_scratch_ram(n))
+    test.assert(not att_server_scratch.db_writable_at_ram(0x7777))
+    test.assert(not att_server_scratch.db_apply_write_ram(0x7777, 0, att_scratch.scratch_buf_addr(), 1))
+    // A write of more octets than the attribute holds, or at a negative offset, is not applied.
+    test.assert(not att_server_scratch.db_apply_write_ram(0x0003, 0, att_scratch.scratch_buf_addr(), 200))
+    test.assert(not att_server_scratch.db_apply_write_ram(0x0003, -1, att_scratch.scratch_buf_addr(), 1))
+    // The same walk over the list.
+    test.assert_eq(att_server_scratch.db_value_byte_at(cut, n, 0), -1)
+    test.assert(att_server_scratch.db_write_value_to_scratch(cut, n))
+
+@test
+fn test_the_group_type_requests_that_name_a_128_bit_type_are_not_supported()
+    var uuid128: [Int] = []
+    for i in 0..16
+        list.push(uuid128, i + 1)
+    let blob = gatt_db.build()
+    att_scratch.gatt_db_ram_init_from_blob(blob)
+    let r = req(0x10, [le16(1), le16(0xFFFF), uuid128])
+    assert_same_answer(blob, 23, r)
+    test.assert_eq(scratch_list_response(blob, 23, r)[4] as Int, att.ATT_ERR_REQUEST_NOT_SUPPORTED)
+    // Find By Type Value shorter than its fixed part is refused as a malformed PDU.
+    for s in [req(0x06, [le16(1)]),
+    req(0x06, [le16(1), le16(0xFFFF)]),
+    req(0x06, [le16(1), le16(0xFFFF), [0x00]])]
+        assert_same_answer(blob, 23, s)
+
+@test
+fn test_a_find_by_type_value_response_ends_at_the_mtu()
+    // Three services of the same UUID, so that three handle pairs match; an ATT_MTU of 5 holds one pair.
+    var blob: [u8] = []
+    for h in [1, 2, 3]
+        list.append(blob, att_server.build_db_record(h, 0x2800, h, [0x00, 0x18]))
+    att_scratch.gatt_db_ram_init_from_blob(blob)
+    let r = req(0x06, [le16(1), le16(0xFFFF), le16(0x2800), [0x00, 0x18]])
+    for mtu in [5, 9, 13, 23]
+        assert_same_answer(blob, mtu, r)
+    test.assert_eq(list.len(scratch_list_response(blob, 5, r)), 5)
+    test.assert_eq(list.len(scratch_list_response(blob, 9, r)), 9)
+
+@test
+fn test_a_record_walk_past_the_last_record_or_before_the_first_finds_none()
+    let blob = gatt_db.build()
+    att_scratch.gatt_db_ram_init_from_blob(blob)
+    let n = att_server.db_count(blob)
+    test.assert_eq(att_server_scratch.db_record_offset_ram(n), -1)
+    test.assert_eq(att_server_scratch.db_record_offset_ram(-1), -1)
+    test.assert_eq(att_server.db_record_offset(blob, -1), -1)

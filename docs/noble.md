@@ -107,11 +107,25 @@ The configuration module `noble_config` is generated from the keys of
 
 ## Tests
 
-The unit tests of most modules are cases beside the code in `src/`, which
-`novo test src/<module>.nv` runs.  The suites in `tests/` drive several modules
-together: `gatt_client_engine_tests` runs each client procedure against the
-GATT server, `integration_gatt_tests` walks a discovery and a read from the
-wire up, and `two_centrals_tests` serves two connections from one database.
+The unit tests of a module are the suite `tests/<module>_tests.nv`, which
+`novo test tests/<module>_tests.nv` runs; `src/` holds none.  A suite sees the
+private names of the package, so it names a module's helpers directly.  A
+fixture that the suites of two modules share stays in `src/` under a heading
+that says so, because a suite cannot import another suite.  Three suites drive
+several modules together: `gatt_client_engine_tests` runs each client procedure
+against the GATT server, `integration_gatt_tests` walks a discovery and a read
+from the wire up, and `two_centrals_tests` serves two connections from one
+database.  `att_server_scratch_tests` holds the fixed-RAM ATT paths to the
+answers of `att_server.handle_request`.
+
 A test that reads a limit computes the figure it expects from the configuration
 key (`limits.frame_octets()`, `noble_config.MAX_ATT_MTU`) and not from the
-default.
+default.  The publish runs every suite under the smallest and the largest
+configuration the schema allows and under each file of `configs/` (`novo config
+ci`), so a test whose subject is absent under a configuration carries `@when` on
+the key it needs: the client engine suite on the client limits, the isochronous
+suites on `MAX_CIS`, `MAX_BIG`, `MAX_BIS` and `ISO_SDU_OCTETS`.  Every suite
+keeps at least one test that runs under every configuration.  The tooling takes
+a `@when` expression of the keys themselves; a `const fn` in the test file that
+reads the configuration fails with E2922, so the expression is written out at
+each test.

@@ -29,9 +29,6 @@
 // Satisfies: REQ-BLE-L2CAP-001 (B-frame layout), -002 (CID demux
 // for LE fixed channels), -003 (length-field validation).
 
-use std.test
-use std.bits
-
 // ── L2CAP fixed CIDs (LE) ───────────────────────────────────────────
 pub const CID_ATT = 0x0004
 // The fixed channel of the LE signaling channel ([Vol 3] Part A, Section 2.1).
@@ -57,7 +54,10 @@ pub @satisfies("REQ-BLE-L2CAP-001")
 fn build_b_frame(cid: Int, payload: [u8]) -> [u8]
     let plen = list.len(payload)
     var header: [u8] = list.with_capacity(4 + list.len(payload))
-    list.append(header, [(plen & 0xFF) as u8, ((plen >>> 8) & 0xFF) as u8, (cid & 0xFF) as u8, ((cid >>> 8) & 0xFF) as u8])
+    list.append(header, [(plen & 0xFF) as u8,
+        ((plen >>> 8) & 0xFF) as u8,
+        (cid & 0xFF) as u8,
+        ((cid >>> 8) & 0xFF) as u8])
     list.append(header, payload)
     header
 
@@ -74,7 +74,7 @@ fn b_frame_length(b: [u8]) -> Int
     if list.len(b) < L2CAP_HEADER_LEN
         -1
     else
-        (b[0] as Int) | ((b[1] as Int) << 8)
+        b[0] as Int | (b[1] as Int << 8)
 
 @satisfies("REQ-BLE-L2CAP-002")
 @tier(embedded)
@@ -83,7 +83,7 @@ fn b_frame_cid(b: [u8]) -> Int
     if list.len(b) < L2CAP_HEADER_LEN
         -1
     else
-        (b[2] as Int) | ((b[3] as Int) << 8)
+        b[2] as Int | (b[3] as Int << 8)
 
 // ── True if the framing is internally consistent ────────────────────
 //
@@ -201,7 +201,7 @@ fn le16(v: Int) -> [u8]
 @tier(embedded)
 @no_alloc
 fn read_le16(b: [u8], at: Int) -> Int
-    (b[at] as Int) | ((b[at + 1] as Int) << 8)
+    b[at] as Int | (b[at + 1] as Int << 8)
 
 // The payload of a C-frame holding one signaling packet.
 @tier(embedded)
@@ -222,7 +222,9 @@ fn parse_signaling_packet(payload: [u8]) -> ?SignalingPacket
     else if read_le16(payload, 2) != n - SIGNALING_HEADER_LEN
         None
     else
-        Some(SignalingPacket { code: payload[0] as Int, identifier: payload[1] as Int, data: payload[SIGNALING_HEADER_LEN:n] })
+        Some(SignalingPacket { code: payload[0] as Int,
+            identifier: payload[1] as Int,
+            data: payload[SIGNALING_HEADER_LEN:n] })
 
 // Whether a signaling code is a response.  A response nobody asked for
 // is silently discarded ([Vol 3] Part A, Section 4); an indication or a
@@ -232,8 +234,8 @@ fn parse_signaling_packet(payload: [u8]) -> ?SignalingPacket
 @no_alloc
 fn is_response_code(code: Int) -> Bool
     match code
-        0x01 | 0x07 | 0x13 | 0x15 | 0x18 | 0x1A => true
-        _ => false
+        0x1 | 0x7 | 0x13 | 0x15 | 0x18 | 0x1a => true
+        _                                     => false
 
 // L2CAP_COMMAND_REJECT_RSP ([Vol 3] Part A, Section 4.1): Reason, then
 // the Reason Data the reason carries: none for Command not understood,
@@ -261,7 +263,8 @@ fn build_command_reject_invalid_cid(identifier: Int, local_cid: Int, remote_cid:
 // the intervals in 1.25 ms units, the Peripheral latency in connection
 // events, the supervision timeout in 10 ms units.
 @tier(embedded)
-fn build_connection_parameter_update_req(identifier: Int, interval_min: Int, interval_max: Int, latency: Int, timeout: Int) -> [u8]
+fn build_connection_parameter_update_req(identifier: Int, interval_min: Int, interval_max: Int,
+                                         latency: Int, timeout: Int) -> [u8]
     var data = le16(interval_min)
     list.append(data, le16(interval_max))
     list.append(data, le16(latency))
@@ -293,157 +296,3 @@ fn parse_connection_parameter_update_req(p: SignalingPacket) -> ?[Int]
         None
     else
         Some([read_le16(p.data, 0), read_le16(p.data, 2), read_le16(p.data, 4), read_le16(p.data, 6)])
-
-// ── Tests ───────────────────────────────────────────────────────────
-
-@test
-fn test_signaling_packet_round_trip()
-    let pkt = build_connection_parameter_update_req(0x01, 0x0032, 0x0046, 0x0001, 0x01F4)
-    let want: [u8] = [0x12, 0x01, 0x08, 0x00, 0x32, 0x00, 0x46, 0x00, 0x01, 0x00, 0xF4, 0x01]
-    test.assert_eq(list.len(pkt), list.len(want))
-    for i in 0..list.len(want)
-        test.assert_eq(pkt[i] as Int, want[i] as Int)
-    match parse_signaling_packet(pkt)
-        None    => test.fail("the packet parses")
-        Some(p) =>
-            test.assert_eq(p.code, CODE_CONNECTION_PARAMETER_UPDATE_REQ)
-            test.assert_eq(p.identifier, 1)
-            test.assert_eq(list.len(p.data), 8)
-
-@test
-fn test_signaling_packet_not_correctly_formed()
-    test.assert(parse_signaling_packet([0x13, 0x01, 0x02]) == None)
-    // Data Length 2, one octet of data.
-    test.assert(parse_signaling_packet([0x13, 0x01, 0x02, 0x00, 0x00]) == None)
-
-@test
-fn test_connection_parameter_update_rsp_result()
-    let rsp: [u8] = [0x13, 0x07, 0x02, 0x00, 0x01, 0x00]
-    match parse_signaling_packet(rsp)
-        None    => test.fail("the response parses")
-        Some(p) => test.assert_eq(connection_parameter_update_result(p), CONNECTION_PARAMETERS_REJECTED)
-    let short: [u8] = [0x13, 0x07, 0x01, 0x00, 0x01]
-    match parse_signaling_packet(short)
-        None    => test.fail("the packet parses")
-        Some(p) => test.assert_eq(connection_parameter_update_result(p), -1)
-
-@test
-fn test_connection_parameter_update_request_round_trip()
-    let req = build_connection_parameter_update_req(0x03, 0x0032, 0x0046, 0x0200, 0x01F4)
-    match parse_signaling_packet(req)
-        None    => test.fail("the request parses")
-        Some(p) =>
-            match parse_connection_parameter_update_req(p)
-                None      => test.fail("the parameters parse")
-                Some(f)   =>
-                    test.assert_eq(f[0], 0x0032)
-                    test.assert_eq(f[1], 0x0046)
-                    test.assert_eq(f[2], 0x0200)
-                    test.assert_eq(f[3], 0x01F4)
-    // A response is not a request, and a request with 6 octets of Data
-    // has no parameters.
-    let rsp = build_connection_parameter_update_rsp(0x03, CONNECTION_PARAMETERS_ACCEPTED)
-    match parse_signaling_packet(rsp)
-        None    => test.fail("the response parses")
-        Some(p) =>
-            test.assert_eq(connection_parameter_update_result(p), CONNECTION_PARAMETERS_ACCEPTED)
-            test.assert(parse_connection_parameter_update_req(p) == None)
-
-@test
-fn test_command_reject_layouts()
-    let not_understood = build_command_reject(0x05, REJECT_COMMAND_NOT_UNDERSTOOD)
-    let want: [u8] = [0x01, 0x05, 0x02, 0x00, 0x00, 0x00]
-    test.assert_eq(list.len(not_understood), list.len(want))
-    for i in 0..list.len(want)
-        test.assert_eq(not_understood[i] as Int, want[i] as Int)
-    let mtu = build_command_reject(0x06, REJECT_SIGNALING_MTU_EXCEEDED)
-    test.assert_eq(list.len(mtu), 8)
-    test.assert_eq(mtu[4] as Int, 0x01)
-    test.assert_eq(mtu[6] as Int, MTU_SIG_LE)
-
-@test
-fn test_response_codes()
-    test.assert(is_response_code(CODE_CONNECTION_PARAMETER_UPDATE_RSP))
-    test.assert(is_response_code(CODE_COMMAND_REJECT_RSP))
-    test.assert(not is_response_code(CODE_CONNECTION_PARAMETER_UPDATE_REQ))
-    test.assert(not is_response_code(CODE_FLOW_CONTROL_CREDIT_IND))
-
-@test
-@satisfies("REQ-BLE-L2CAP-001")
-fn test_build_b_frame_att_round_trip()
-    // Mock ATT_READ_REQ: opcode 0x0A, handle 0x0001 → 3 bytes.
-    let payload: [u8] = [0x0A, 0x01, 0x00]
-    let pkt = build_b_frame(CID_ATT, payload)
-    test.assert_eq(list.len(pkt), L2CAP_HEADER_LEN + 3)
-    test.assert_eq(pkt[0] as Int, 0x03)   // length lo
-    test.assert_eq(pkt[1] as Int, 0x00)   // length hi
-    test.assert_eq(pkt[2] as Int, 0x04)   // cid lo (ATT)
-    test.assert_eq(pkt[3] as Int, 0x00)   // cid hi
-    test.assert_eq(pkt[4] as Int, 0x0A)   // first payload byte
-
-@test
-@satisfies("REQ-BLE-L2CAP-002")
-fn test_b_frame_cid_extraction()
-    let payload: [u8] = [0x00]
-    let f1 = build_b_frame(CID_ATT, payload)
-    let f2 = build_b_frame(CID_LE_SIGNALING, payload)
-    let f3 = build_b_frame(CID_SMP, payload)
-    test.assert_eq(b_frame_cid(f1), CID_ATT)
-    test.assert_eq(b_frame_cid(f2), CID_LE_SIGNALING)
-    test.assert_eq(b_frame_cid(f3), CID_SMP)
-
-@test
-@satisfies("REQ-BLE-L2CAP-003")
-fn test_b_frame_length_extraction()
-    let payload: [u8] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE]
-    let pkt = build_b_frame(CID_ATT, payload)
-    test.assert_eq(b_frame_length(pkt), 5)
-    test.assert_eq(b_frame_complete(pkt), true)
-
-@test
-@satisfies("REQ-BLE-L2CAP-003")
-fn test_b_frame_too_short_returns_minus_one()
-    let runt: [u8] = [0x01, 0x00, 0x04]   // only 3 bytes
-    test.assert_eq(b_frame_length(runt), -1)
-    test.assert_eq(b_frame_cid(runt), -1)
-    test.assert_eq(b_frame_complete(runt), false)
-
-@test
-@satisfies("REQ-BLE-L2CAP-003")
-fn test_b_frame_incomplete_when_length_field_lies()
-    // Header claims 5-byte payload, only 2 actually present.
-    let bad: [u8] = [
-        0x05, 0x00,   // length = 5
-        0x04, 0x00,   // cid    = ATT
-        0xAA, 0xBB]   // payload = 2 bytes (short!)
-    test.assert_eq(b_frame_length(bad), 5)
-    test.assert_eq(b_frame_complete(bad), false)
-
-@test
-fn test_b_frame_payload_strips_header()
-    let payload: [u8] = [0x10, 0x20, 0x30]
-    let pkt = build_b_frame(CID_ATT, payload)
-    let recovered = b_frame_payload(pkt)
-    test.assert_eq(list.len(recovered), 3)
-    test.assert_eq(recovered[0] as Int, 0x10)
-    test.assert_eq(recovered[1] as Int, 0x20)
-    test.assert_eq(recovered[2] as Int, 0x30)
-
-@test
-fn test_b_frame_payload_empty_for_header_only()
-    let pkt: [u8] = [0x00, 0x00, 0x04, 0x00]
-    let recovered = b_frame_payload(pkt)
-    test.assert_eq(list.len(recovered), 0)
-
-@test
-@satisfies("REQ-BLE-L2CAP-002")
-fn test_classify_cid_known_channels()
-    test.assert_eq(classify_cid(CID_ATT), 1)
-    test.assert_eq(classify_cid(CID_LE_SIGNALING), 2)
-    test.assert_eq(classify_cid(CID_SMP), 3)
-
-@test
-fn test_classify_cid_unknown_returns_zero()
-    test.assert_eq(classify_cid(0x0040), 0)   // dynamic-CFC range
-    test.assert_eq(classify_cid(0x0001), 0)   // BR/EDR signalling
-    test.assert_eq(classify_cid(0x0000), 0)   // null

@@ -38,10 +38,7 @@
 // the Periodic Advertising Report and Sync Lost events carry, so the Host
 // keeps it for as long as it is synchronized.
 
-use std.test
-use bd_addr
 use hci_commands
-use hci_frame
 
 // The Sync_Handle a Host that is synchronized to no train has.
 pub const NO_SYNC_HANDLE = -1
@@ -65,7 +62,9 @@ struct PeriodicSync
 // The sync `reports_disabled` asks for, or what is wrong with it.  The
 // sync timeout is in 10 ms units, the unit the command carries.
 pub @tier(embedded)
-fn make_periodic_sync(reports_disabled: Bool, advertising_sid: Int, advertiser_address_type: Int, advertiser_address: [u8], skip: Int, sync_timeout: Int) -> Result<PeriodicSync, Str>
+fn make_periodic_sync(reports_disabled: Bool, advertising_sid: Int, advertiser_address_type: Int,
+                      advertiser_address: [u8], skip: Int,
+                      sync_timeout: Int) -> Result<PeriodicSync, Str>
     if advertising_sid < 0 or advertising_sid > 0x0F
         Err(ERR_SID_OUT_OF_RANGE)
     else if sync_timeout < hci_commands.PERIODIC_SYNC_TIMEOUT_RANGE_MIN or sync_timeout > hci_commands.PERIODIC_SYNC_TIMEOUT_RANGE_MAX
@@ -96,7 +95,13 @@ fn sync_options(s: PeriodicSync) -> Int
 // None when the Controller's command would refuse the parameters.
 pub @tier(embedded)
 fn create_sync_command(s: PeriodicSync) -> ?HciCmdMsg
-    match hci_commands.build_le_periodic_advertising_create_sync(sync_options(s), s.advertising_sid, s.advertiser_address_type, s.advertiser_address, s.skip, s.sync_timeout, hci_commands.PERIODIC_SYNC_CTE_ANY)
+    match hci_commands.build_le_periodic_advertising_create_sync(sync_options(s),
+        s.advertising_sid,
+        s.advertiser_address_type,
+        s.advertiser_address,
+        s.skip,
+        s.sync_timeout,
+        hci_commands.PERIODIC_SYNC_CTE_ANY)
         None    => None
         Some(p) => Some(HciCmdMsg { opcode: hci_commands.opcode_le_periodic_advertising_create_sync(), params: p })
 
@@ -105,75 +110,3 @@ pub @tier(embedded)
 fn terminate_sync_command(sync_handle: Int) -> HciCmdMsg
     HciCmdMsg { opcode: hci_commands.opcode_le_periodic_advertising_terminate_sync(),
                 params: hci_commands.build_le_periodic_advertising_terminate_sync(sync_handle) }
-
-// ── Tests ───────────────────────────────────────────────────────────
-
-// "12:34:56:78:9A:BC" as the six octets the command carries.
-@tier(app)
-fn test_address() -> [u8]
-    [0xBC, 0x9A, 0x78, 0x56, 0x34, 0x12]
-
-// The bytes of `pkt` as space-separated hex pairs.
-@tier(app)
-fn hex_bytes(pkt: [u8]) -> Str
-    var out = ""
-    for i in 0..list.len(pkt)
-        if i > 0
-            out = out + " "
-        out = out + bd_addr.hex_byte(pkt[i] as Int)
-    out
-
-@test
-fn test_make_periodic_sync_accepts_and_refuses()
-    match make_periodic_sync(true, 0x02, 0x00, test_address(), 0x0000, 0x01F4)
-        Err(e) => test.assert_eq(e, "the parameters are accepted")
-        Ok(s) =>
-            test.assert_eq(s.reports_disabled, true)
-            test.assert_eq(s.advertising_sid, 0x02)
-            test.assert_eq(s.sync_timeout, 500)
-    match make_periodic_sync(false, 0x10, 0x00, test_address(), 0, 500)
-        Err(e) => test.assert_eq(e, ERR_SID_OUT_OF_RANGE)
-        Ok(_)  => test.fail("an SID above 0x0F is refused")
-    match make_periodic_sync(false, 0x00, 0x00, test_address(), 0, 0x0009)
-        Err(e) => test.assert_eq(e, ERR_SYNC_TIMEOUT_OUT_OF_RANGE)
-        Ok(_)  => test.fail("90 ms is below the 100 ms floor")
-    match make_periodic_sync(false, 0x00, 0x00, test_address(), 0, 0x4001)
-        Err(e) => test.assert_eq(e, ERR_SYNC_TIMEOUT_OUT_OF_RANGE)
-        Ok(_)  => test.fail("163.85 s is above the ceiling")
-
-@test
-@satisfies("REQ-BLE-HCI-055")
-fn test_create_sync_command_bytes()
-    // Without listening: Options 0x02, SID 0, a public advertiser, no
-    // skip and 5 s, which is what GAP/PADV/PASE/BV-01-C asks for.
-    match make_periodic_sync(true, 0x00, 0x00, test_address(), 0x0000, 0x01F4)
-        Err(_) => test.fail("the parameters are accepted")
-        Ok(s) =>
-            test.assert_eq(sync_options(s), hci_commands.PERIODIC_SYNC_OPTIONS_REPORTS_DISABLED)
-            match create_sync_command(s)
-                None    => test.fail("the command is built")
-                Some(c) =>
-                    test.assert_eq(c.opcode, 0x2044)
-                    test.assert_eq(list.len(c.params), 14)
-                    test.assert_eq(hex_bytes(c.params), "02 00 00 BC 9A 78 56 34 12 00 00 F4 01 00")
-    // With listening: no option bit at all, and a SID of 3.
-    match make_periodic_sync(false, 0x03, 0x01, test_address(), 0x0002, 0x0258)
-        Err(_) => test.fail("the parameters are accepted")
-        Ok(s) =>
-            test.assert_eq(sync_options(s), 0x00)
-            match create_sync_command(s)
-                None    => test.fail("the command is built")
-                Some(c) =>
-                    test.assert_eq(c.params[0] as Int, 0x00)
-                    test.assert_eq(c.params[1] as Int, 0x03)
-                    test.assert_eq(c.params[2] as Int, 0x01)
-                    test.assert_eq(c.params[11] as Int, 0x58)
-                    test.assert_eq(c.params[12] as Int, 0x02)
-
-@test
-@satisfies("REQ-BLE-HCI-055")
-fn test_terminate_sync_command_bytes()
-    let c = terminate_sync_command(0x0005)
-    test.assert_eq(c.opcode, 0x2046)
-    test.assert_eq(hex_bytes(c.params), "05 00")
-    test.assert_eq(NO_SYNC_HANDLE, -1)

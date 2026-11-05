@@ -1,0 +1,268 @@
+// tests/advertiser_tests.nv — the unit tests of src/advertiser.nv.
+//
+//   novo test tests/advertiser_tests.nv
+
+use std.test
+use hci_commands
+use advertiser.{ ERR_ADDRESS_NOT_STATIC_RANDOM, ERR_INTERVAL_OUT_OF_RANGE, ERR_NAME_TOO_LONG, STATUS_NO_ANSWER, bringup_commands, cmd, describe_local_version, describe_packet, format_address, hex_bytes, make_advertiser, parse_address, run_command, stop_command }
+use advertiser
+use hci_transport
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+// "C0:4E:4F:56:4F:01" as ASCII bytes.
+@tier(app)
+fn address_text() -> [u8]
+    ['C', '0', ':', '4', 'E', ':', '4', 'F', ':', '5', '6', ':', '4', 'F', ':', '0', '1']
+
+// The address `address_text` spells, in on-air order.
+@tier(app)
+fn test_address() -> [u8]
+    match parse_address(address_text())
+        Some(a) => a
+        None    => []
+
+// "Novo" as ASCII bytes.
+@tier(app)
+fn novo_name() -> [u8]
+    ['N', 'o', 'v', 'o']
+
+// A link that takes every packet and answers from a list.
+struct ScriptedLink
+    var replies: [[u8]]
+
+impl HciLink[mutate] for ScriptedLink
+    fn send_packet(self, pkt: [u8]) -> Bool
+        true
+
+    fn recv_packet(var self, timeout_ms: Int) -> ?[u8] [mutate]
+        if list.len(self.replies) == 0
+            None
+        else
+            let p = self.replies[0][:]
+            self.replies = self.replies[1:]
+            Some(p)
+
+@test
+fn test_parse_address_reverses_to_on_air_order()
+    match parse_address(address_text())
+        None       => test.fail("C0:4E:4F:56:4F:01 parses")
+        Some(addr) =>
+            test.assert_eq(list.len(addr), 6)
+            test.assert_eq(addr[0] as Int, 0x01)
+            test.assert_eq(addr[5] as Int, 0xC0)
+            test.assert_eq(format_address(addr), "C0:4E:4F:56:4F:01")
+
+@test
+fn test_parse_address_lower_case_and_refusals()
+    let lower: [u8] = ['d', '0', ':', 'e', 'd', ':', 'a', '0', ':', 'c', 'c', ':', '2', '4', ':', '0', '4']
+    match parse_address(lower)
+        None       => test.fail("lower-case hex parses")
+        Some(addr) => test.assert_eq(addr[5] as Int, 0xD0)
+    var no_colon = address_text()[:]
+    no_colon[2] = '-'
+    test.assert(parse_address(no_colon) == None)
+    var bad_digit = address_text()[:]
+    bad_digit[16] = 'G'
+    test.assert(parse_address(bad_digit) == None)
+    test.assert(parse_address(address_text()[0:14]) == None)
+
+@test
+fn test_make_advertiser_builds_both_data_blocks()
+    let addr = test_address()
+    match make_advertiser(novo_name(), addr, 100)
+        Err(_)  => test.fail("Novo, a static address and 100 ms are accepted")
+        Ok(adv) =>
+            test.assert_eq(adv.interval_units, 0xA0)
+            test.assert_eq(list.len(adv.adv_data), 32)
+            // Flags 02 01 06, then 05 09 "Novo".
+            test.assert_eq(hex_bytes(adv.adv_data[0:10]), "09 02 01 06 05 09 4E 6F 76 6F")
+            test.assert_eq(adv.adv_data[10] as Int, 0x00)
+            test.assert_eq(list.len(adv.scan_rsp), 32)
+            test.assert_eq(hex_bytes(adv.scan_rsp[0:7]), "06 05 09 4E 6F 76 6F")
+
+@test
+fn test_make_advertiser_refusals()
+    let addr = test_address()
+    // 26 bytes fit beside the Flags record; 27 do not.
+    var name: [u8] = []
+    for _ in 0..26
+        list.push(name, 'A')
+    match make_advertiser(name, addr, 100)
+        Err(_)  => test.fail("26 bytes fit")
+        Ok(adv) => test.assert_eq(adv.adv_data[0] as Int, 31)
+    list.push(name, 'A')
+    match make_advertiser(name, addr, 100)
+        Err(e) => test.assert_eq(e, ERR_NAME_TOO_LONG)
+        Ok(_)  => test.fail("27 bytes do not fit")
+    match make_advertiser(novo_name(), addr, 10)
+        Err(e) => test.assert_eq(e, ERR_INTERVAL_OUT_OF_RANGE)
+        Ok(_)  => test.fail("10 ms is below the 20 ms floor")
+    // Top two bits 0b01: a resolvable private address.
+    let rpa: [u8] = [0x01, 0x4F, 0x56, 0x4F, 0x4E, 0x40]
+    match make_advertiser(novo_name(), rpa, 100)
+        Err(e) => test.assert_eq(e, ERR_ADDRESS_NOT_STATIC_RANDOM)
+        Ok(_)  => test.fail("only a static random address is accepted")
+
+@test
+@satisfies("REQ-BLE-HCI-003")
+fn test_bringup_commands_in_order()
+    let addr = test_address()
+    match make_advertiser(novo_name(), addr, 100)
+        Err(_)  => test.fail("the advertiser is accepted")
+        Ok(adv) =>
+            let cmds = bringup_commands(adv)
+            test.assert_eq(list.len(cmds), 7)
+            test.assert_eq(cmds[0].opcode, 0x0C03)
+            test.assert_eq(cmds[1].opcode, 0x1001)
+            test.assert_eq(cmds[2].opcode, 0x2005)
+            test.assert_eq(hex_bytes(cmds[2].params), "01 4F 56 4F 4E C0")
+            test.assert_eq(cmds[3].opcode, 0x2006)
+            test.assert_eq(cmds[4].opcode, 0x2008)
+            test.assert_eq(cmds[5].opcode, 0x2009)
+            test.assert_eq(cmds[6].opcode, 0x200A)
+            test.assert_eq(hex_bytes(cmds[6].params), "01")
+            test.assert_eq(hex_bytes(stop_command().params), "00")
+
+@test
+@satisfies("REQ-BLE-HCI-003")
+fn test_run_command_passes_over_other_packets()
+    var link = ScriptedLink {
+        replies: [[0x04, 0x3E, 0x03, 0x02, 0x01, 0x00],
+                  [0x04, 0x0E, 0x04, 0x01, 0x03, 0x0C, 0x00]] }
+    let out = run_command(var link, cmd(hci_commands.opcode_hci_reset(), []), 100)
+    test.assert_eq(hex_bytes(out.sent), "01 03 0C 00")
+    test.assert_eq(out.status, 0)
+    test.assert_eq(list.len(out.passed_over), 1)
+    test.assert_eq(hex_bytes(out.answer), "04 0E 04 01 03 0C 00")
+
+@test
+@satisfies("REQ-BLE-HCI-003")
+fn test_run_command_reports_status_and_silence()
+    // Command Disallowed (0x0C) for LE_Set_Advertising_Enable.
+    var refusing = ScriptedLink { replies: [[0x04, 0x0E, 0x04, 0x01, 0x0A, 0x20, 0x0C]] }
+    let refused = run_command(var refusing, stop_command(), 100)
+    test.assert_eq(refused.status, 0x0C)
+    var silent = ScriptedLink { replies: [] }
+    let none = run_command(var silent, stop_command(), 100)
+    test.assert_eq(none.status, STATUS_NO_ANSWER)
+    test.assert_eq(list.len(none.answer), 0)
+
+@test
+fn test_describe_packets()
+    test.assert_eq(describe_packet([0x04, 0x0E, 0x04, 0x01, 0x03, 0x0C, 0x00]),
+        "Command Complete, HCI_Reset, status 0x00")
+    test.assert_eq(describe_packet([0x04, 0x0F, 0x04, 0x0C, 0x01, 0x0A, 0x20]),
+        "Command Status, HCI_LE_Set_Advertising_Enable, status 0x0C")
+    test.assert_eq(describe_packet([0x04, 0x0E, 0x04, 0x01, 0x0B, 0x20, 0x00]),
+        "Command Complete, HCI_LE_Set_Scan_Parameters, status 0x00")
+    test.assert_eq(describe_packet([0x04, 0x0E, 0x04, 0x01, 0x0C, 0x20, 0x00]),
+        "Command Complete, HCI_LE_Set_Scan_Enable, status 0x00")
+    test.assert_eq(describe_packet([0x04, 0x3E, 0x03, 0x01, 0x00, 0x00]),
+        "LE Meta, subevent 0x01 (LE Connection Complete)")
+    test.assert_eq(describe_packet([0x04, 0x05, 0x04, 0x00, 0x40, 0x00, 0x13]), "Disconnection Complete")
+    test.assert_eq(describe_packet([0x02, 0x40, 0x20, 0x01, 0x00, 0xAA]), "HCI ACL Data, handle 0x0040, 1 bytes")
+
+@test
+fn test_describe_local_version()
+    // The reply the Zephyr hci_uart controller gives.
+    let pkt: [u8] = [0x04, 0x0E, 0x0C, 0x01, 0x01, 0x10, 0x00, 0x0D, 0x00, 0x00, 0x0D, 0xF1, 0x05, 0xFF, 0xFF]
+    test.assert_eq(describe_local_version(pkt),
+        "HCI version 0x0D, revision 0x0000, LMP/LL version 0x0D, manufacturer 0x05F1, subversion 0xFFFF")
+
+@test
+fn test_a_static_random_address_has_its_two_top_bits_set_and_is_six_octets_long()
+    test.assert(advertiser.is_static_random([1, 2, 3, 4, 5, 0xC6]))
+    test.assert(advertiser.is_static_random([1, 2, 3, 4, 5, 0xFF]))
+    // A resolvable private address (top bits 01), a non-resolvable one (00) and a short address.
+    test.assert(not advertiser.is_static_random([1, 2, 3, 4, 5, 0x46]))
+    test.assert(not advertiser.is_static_random([1, 2, 3, 4, 5, 0x06]))
+    test.assert(not advertiser.is_static_random([1, 2, 3, 4, 0xC6]))
+    test.assert(not advertiser.is_static_random([]))
+
+@test
+fn test_hex8_writes_two_digits_after_0x_and_cuts_to_an_octet()
+    test.assert_eq(advertiser.hex8(0), "0x00")
+    test.assert_eq(advertiser.hex8(0xAB), "0xAB")
+    test.assert_eq(advertiser.hex8(0x1CD), "0xCD")
+
+// A link that takes no packet.
+struct DeafLink
+    var seen: Int
+
+impl HciLink[mutate] for DeafLink
+    fn send_packet(self, pkt: [u8]) -> Bool
+        false
+
+    fn recv_packet(var self, timeout_ms: Int) -> ?[u8] [mutate]
+        self.seen = self.seen + 1
+        None
+
+@test
+fn test_a_command_the_link_does_not_take_is_reported_as_not_sent_and_waits_for_nothing()
+    var link = DeafLink { seen: 0 }
+    let outcome = run_command(var link, cmd(hci_commands.opcode_hci_reset(), []), 10)
+    test.assert_eq(outcome.status, advertiser.STATUS_NOT_SENT)
+    test.assert_eq(list.len(outcome.answer), 0)
+    test.assert_eq(link.seen, 0)
+
+@test
+fn test_every_command_the_host_sends_is_named_as_the_core_specification_names_it()
+    let names: [(Int, Str)] = [
+        (hci_commands.opcode_hci_reset(), "HCI_Reset"),
+        (hci_commands.opcode_hci_set_event_mask(), "HCI_Set_Event_Mask"),
+        (hci_commands.opcode_read_local_version_information(), "HCI_Read_Local_Version_Information"),
+        (hci_commands.opcode_read_bd_addr(), "HCI_Read_BD_ADDR"),
+        (hci_commands.opcode_le_set_random_address(), "HCI_LE_Set_Random_Address"),
+        (hci_commands.opcode_le_set_advertising_parameters(), "HCI_LE_Set_Advertising_Parameters"),
+        (hci_commands.opcode_le_set_advertising_data(), "HCI_LE_Set_Advertising_Data"),
+        (hci_commands.opcode_le_set_scan_response_data(), "HCI_LE_Set_Scan_Response_Data"),
+        (hci_commands.opcode_le_set_scan_enable(), "HCI_LE_Set_Scan_Enable"),
+        (hci_commands.opcode_le_encrypt(), "HCI_LE_Encrypt"),
+        (hci_commands.opcode_le_rand(), "HCI_LE_Rand"),
+        (hci_commands.opcode_hci_disconnect(), "HCI_Disconnect"),
+        (hci_commands.opcode_le_set_event_mask(), "HCI_LE_Set_Event_Mask"),
+        (hci_commands.opcode_le_read_buffer_size(), "HCI_LE_Read_Buffer_Size"),
+        (hci_commands.opcode_le_connection_update(), "HCI_LE_Connection_Update"),
+        (hci_commands.opcode_le_remote_connection_parameter_request_reply(),
+            "HCI_LE_Remote_Connection_Parameter_Request_Reply"),
+        (hci_commands.opcode_le_remote_connection_parameter_request_negative_reply(),
+            "HCI_LE_Remote_Connection_Parameter_Request_Negative_Reply"),
+        (hci_commands.opcode_le_long_term_key_request_reply(), "HCI_LE_Long_Term_Key_Request_Reply"),
+        (hci_commands.opcode_le_long_term_key_request_negative_reply(),
+        "HCI_LE_Long_Term_Key_Request_Negative_Reply")]
+    for pair in names
+        test.assert_eq(advertiser.command_name(pair.0), pair.1)
+    // A command the Host does not send is named by its opcode.
+    test.assert_eq(advertiser.command_name(0x2FFF), "opcode 0x2FFF")
+
+@test
+fn test_every_subevent_that_can_reach_a_peripheral_is_named_by_its_section_heading()
+    let names: [(Int, Str)] = [
+        (0x01, "LE Connection Complete"), (0x02, "LE Advertising Report"), (0x03, "LE Connection Update Complete"),
+        (0x04, "LE Read Remote Features Page 0 Complete"), (0x05, "LE Long Term Key Request"),
+        (0x06, "LE Remote Connection Parameter Request"), (0x07, "LE Data Length Change"),
+        (0x0A, "LE Enhanced Connection Complete"), (0x0C, "LE PHY Update Complete"),
+        (0x0D, "LE Extended Advertising Report"), (0x0E, "LE Periodic Advertising Sync Established"),
+        (0x0F, "LE Periodic Advertising Report"), (0x10, "LE Periodic Advertising Sync Lost"),
+        (0x12, "LE Advertising Set Terminated"), (0x13, "LE Scan Request Received"),
+        (0x14, "LE Channel Selection Algorithm"), (0x18, "LE Periodic Advertising Sync Transfer Received")]
+    for pair in names
+        test.assert_eq(advertiser.le_subevent_name(pair.0), pair.1)
+    test.assert_eq(advertiser.le_subevent_name(0x7F), "LE subevent 0x7F")
+
+@test
+fn test_an_event_is_described_by_its_name_and_an_unknown_one_by_its_code()
+    test.assert_eq(advertiser.describe_event([0x08, 0x04, 0x00, 0x40, 0x00]), "Encryption Change")
+    test.assert_eq(advertiser.describe_event([0x10, 0x01, 0x00]), "Hardware Error")
+    test.assert_eq(advertiser.describe_event([0x13, 0x01, 0x00]), "Number Of Completed Packets")
+    test.assert_eq(advertiser.describe_event([0x77, 0x00]), "event 0x77")
+
+@test
+fn test_a_short_or_unknown_packet_is_described_as_such()
+    test.assert_eq(describe_packet([]), "short packet")
+    test.assert_eq(describe_packet([0x04]), "short packet")
+    test.assert_eq(describe_packet([0x03, 0x00]), "packet type 0x03")
+    // An ACL packet too short to hold its header is a packet of unknown type to this describer.
+    test.assert_eq(describe_packet([0x02, 0x40, 0x20, 0x01]), "packet type 0x02")
+    test.assert_eq(describe_local_version([0x04, 0x0E, 0x0C]), "short Read Local Version Information reply")

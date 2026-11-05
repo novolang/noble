@@ -19,9 +19,6 @@
 // can drop down to a single `drive_to_advertising(xport)` call
 // regardless of the transport.
 
-use std.test
-use hci_frame
-use hci_transport
 use hci_commands
 
 // ── Drive any HciTransport to the Advertising state ────────────────
@@ -70,7 +67,8 @@ fn build_le_set_advertising_parameters(interval_min: Int, interval_max: Int) -> 
 // ignores them unless the advertising is directed ([Vol 4] Part E,
 // Section 7.8.5).
 pub @tier(embedded)
-fn build_le_set_advertising_parameters_for(interval_min: Int, interval_max: Int, advertising_type: Int, own_address_type: Int) -> [u8]
+fn build_le_set_advertising_parameters_for(interval_min: Int, interval_max: Int,
+                                           advertising_type: Int, own_address_type: Int) -> [u8]
     build_le_set_advertising_parameters_to(interval_min, interval_max, advertising_type, own_address_type,
         ADV_PEER_ADDRESS_TYPE_PUBLIC, [0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
 
@@ -81,7 +79,9 @@ fn build_le_set_advertising_parameters_for(interval_min: Int, interval_max: Int,
 // fields shall be valid, and for the high duty cycle the Controller
 // ignores the two intervals ([Vol 4] Part E, Section 7.8.5).
 pub @tier(embedded)
-fn build_le_set_advertising_parameters_to(interval_min: Int, interval_max: Int, advertising_type: Int, own_address_type: Int, peer_address_type: Int, peer_address: [u8]) -> [u8]
+fn build_le_set_advertising_parameters_to(interval_min: Int, interval_max: Int,
+                                          advertising_type: Int, own_address_type: Int,
+                                          peer_address_type: Int, peer_address: [u8]) -> [u8]
     [
         // Advertising_Interval_Min  (LE)
         (interval_min & 0xFF) as u8,
@@ -102,65 +102,3 @@ fn build_le_set_advertising_parameters_to(interval_min: Int, interval_max: Int, 
         hci_commands.ADV_CHANNEL_MAP_ALL,
         // Advertising_Filter_Policy
         hci_commands.ADV_FILTER_NONE]
-
-// ── Tests ────────────────────────────────────────────────────────────
-
-@test
-fn test_build_le_set_adv_params_default_layout()
-    let p = build_le_set_adv_params_default()
-    test.assert_eq(list.len(p), 15)
-    // Interval_Min LE = 0x00A0 → bytes [0xA0, 0x00].
-    test.assert_eq(p[0] as Int, 0xA0)
-    test.assert_eq(p[1] as Int, 0x00)
-    // Interval_Max LE = 0x00A0 → bytes [0xA0, 0x00].
-    test.assert_eq(p[2] as Int, 0xA0)
-    test.assert_eq(p[3] as Int, 0x00)
-    // Adv_Type = ADV_IND = 0x00.
-    test.assert_eq(p[4] as Int, 0x00)
-    // Own_Addr_Type = RANDOM = 0x01.
-    test.assert_eq(p[5] as Int, 0x01)
-    // Peer_Addr_Type = PUBLIC = 0x00.
-    test.assert_eq(p[6] as Int, 0x00)
-    // Channel map at byte 13 (after 6 zero peer-address bytes).
-    test.assert_eq(p[13] as Int, 0x07)
-    // Filter policy at byte 14 — NONE = 0x00.
-    test.assert_eq(p[14] as Int, 0x00)
-
-@test
-fn test_build_le_set_adv_params_interval()
-    // 1 s is 1600 units, 0x0640.
-    let p = build_le_set_advertising_parameters(0x0640, 0x0640)
-    test.assert_eq(list.len(p), 15)
-    test.assert_eq(p[0] as Int, 0x40)
-    test.assert_eq(p[1] as Int, 0x06)
-    test.assert_eq(p[2] as Int, 0x40)
-    test.assert_eq(p[3] as Int, 0x06)
-    test.assert_eq(p[4] as Int, 0x00)
-    test.assert_eq(p[5] as Int, 0x01)
-    test.assert_eq(p[13] as Int, 0x07)
-
-@test
-fn test_build_le_set_adv_params_for_type_and_address()
-    // ADV_NONCONN_IND from the public address, 100 ms.
-    let p = build_le_set_advertising_parameters_for(0xA0, 0xA0, hci_commands.ADV_TYPE_ADV_NONCONN_IND, hci_commands.OWN_ADDR_TYPE_PUBLIC)
-    test.assert_eq(list.len(p), 15)
-    test.assert_eq(p[0] as Int, 0xA0)
-    test.assert_eq(p[4] as Int, 0x03)
-    test.assert_eq(p[5] as Int, 0x00)
-    test.assert_eq(p[13] as Int, 0x07)
-    test.assert_eq(p[14] as Int, 0x00)
-
-@test
-fn test_build_le_set_adv_params_to_a_peer()
-    // Low duty cycle directed advertising from the random address to
-    // the public address 66:55:44:33:22:11.
-    let peer: [u8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66]
-    let p = build_le_set_advertising_parameters_to(0xA0, 0xA0, hci_commands.ADV_TYPE_ADV_DIRECT_IND_LDC, hci_commands.OWN_ADDR_TYPE_RANDOM, 0x00, peer)
-    test.assert_eq(list.len(p), 15)
-    test.assert_eq(p[4] as Int, 0x04)
-    test.assert_eq(p[5] as Int, 0x01)
-    test.assert_eq(p[6] as Int, 0x00)
-    test.assert_eq(p[7] as Int, 0x11)
-    test.assert_eq(p[12] as Int, 0x66)
-    test.assert_eq(p[13] as Int, 0x07)
-    test.assert_eq(p[14] as Int, 0x00)

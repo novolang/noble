@@ -12,7 +12,6 @@
 // value handle of a characteristic is the declaration's handle plus one
 // ([Vol 3] Part G, Section 3.3).
 
-use std.test
 use gatt_server
 
 // Why a profile could not be added to the server.  NoRoom: the attribute
@@ -27,7 +26,7 @@ pub enum ProfileError
 impl Error for ProfileError
     fn message(self) -> Str
         match self
-            NoRoom => "the attribute table has no handle left"
+            NoRoom       => "the attribute table has no handle left"
             InvalidValue => "the value is longer than an attribute value may be"
             NotPermitted => "the profile does not allow the access of a characteristic"
 
@@ -61,7 +60,8 @@ pub fn notify_only() -> gatt_server.Permissions
 // starts as `value`; the value handle.  An empty `value` leaves the
 // value empty, and a client that may write it may write up to the longest
 // attribute value.
-pub fn add_value(var db: GattDb, properties: Int, permissions: gatt_server.Permissions, uuid: [u8], value: [u8]) -> Result<Int, ProfileError>
+pub fn add_value(var db: GattDb, properties: Int, permissions: gatt_server.Permissions, uuid: [u8],
+                 value: [u8]) -> Result<Int, ProfileError>
     let declaration = gatt_server.add_characteristic(var db, properties, gatt_server.permission_bits(permissions), uuid)
     if declaration < 0
         return Err(ProfileError.NoRoom)
@@ -71,7 +71,8 @@ pub fn add_value(var db: GattDb, properties: Int, permissions: gatt_server.Permi
 
 // Add a descriptor of type `uuid16` to the last characteristic with
 // `permissions` and `value`; its handle.
-pub fn add_descriptor(var db: GattDb, permissions: gatt_server.Permissions, uuid16: Int, value: [u8]) -> Result<Int, ProfileError>
+pub fn add_descriptor(var db: GattDb, permissions: gatt_server.Permissions, uuid16: Int,
+                      value: [u8]) -> Result<Int, ProfileError>
     let handle = gatt_server.add_descriptor(var db, gatt_server.permission_bits(permissions), gatt_server.le16(uuid16))
     if handle < 0
         return Err(ProfileError.NoRoom)

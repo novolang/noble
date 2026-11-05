@@ -1,0 +1,95 @@
+// tests/hci_uart_tests.nv — the unit tests of src/hci_uart.nv.
+//
+//   novo test tests/hci_uart_tests.nv
+
+use std.test
+use hci_uart.{ H4_PKT_ACL, H4_PKT_COMMAND, H4_PKT_EVENT, HciUart, encode_hci_cmd_h4, encode_hci_evt_h4, new_hci_uart, packet_type_matches, strip_h4_prefix }
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+@test
+fn test_strip_h4_prefix_removes_type_byte()
+    let pkt: [u8] = [0x04, 0x0E, 0x04, 0x01, 0x03, 0x0C, 0x00]
+    let body = strip_h4_prefix(pkt)
+    test.assert_eq(list.len(body), 6)
+    test.assert_eq(body[0] as Int, 0x0E)
+    test.assert_eq(body[5] as Int, 0x00)
+
+@test
+fn test_strip_h4_prefix_on_short_buffer()
+    let pkt: [u8] = [0x04]
+    let body = strip_h4_prefix(pkt)
+    test.assert_eq(list.len(body), 0)
+
+@test
+fn test_packet_type_matches_event()
+    let pkt: [u8] = [0x04, 0x0E, 0x04]
+    test.assert_eq(packet_type_matches(pkt, 0x04), true)
+    test.assert_eq(packet_type_matches(pkt, 0x01), false)
+
+@test
+fn test_packet_type_matches_empty_buffer_is_false()
+    let empty: [u8] = []
+    test.assert_eq(packet_type_matches(empty, 0x04), false)
+
+@test
+fn test_new_hci_uart_records_baud()
+    let t = new_hci_uart(1000000)
+    test.assert_eq(t.baud, 1000000)
+
+@test
+fn test_h4_packet_type_constants()
+    test.assert_eq(H4_PKT_COMMAND, 0x01)
+    test.assert_eq(H4_PKT_ACL, 0x02)
+    test.assert_eq(H4_PKT_EVENT, 0x04)
+
+// ── trait HciTransport surface tests ────────────────────────────────
+//
+// Tests cover the encode helpers + the trait's pure methods
+// (is_open / close).  send_command via the trait writes bytes
+// to stdout under the OCaml host (Hal_uart.write_byte stub) —
+// not exercised in @test to keep test output clean.
+
+@test
+fn test_encode_hci_cmd_h4_prepends_type_byte()
+    let cmd = HciCmdMsg { opcode: 0x0C03, params: [] }   // HCI_Reset
+    let frame = encode_hci_cmd_h4(cmd)
+    test.assert_eq(list.len(frame), 4)
+    test.assert_eq(frame[0] as Int, H4_PKT_COMMAND)   // 0x01
+    test.assert_eq(frame[1] as Int, 0x03)   // opcode_lo
+    test.assert_eq(frame[2] as Int, 0x0C)   // opcode_hi
+    test.assert_eq(frame[3] as Int, 0x00)   // param_len
+
+@test
+fn test_encode_hci_evt_h4_prepends_type_byte()
+    let evt = HciEvtMsg {
+        event_code: 0x0E,   // Command_Complete
+        params: [0x01, 0x03, 0x0C, 0x00] }
+    let frame = encode_hci_evt_h4(evt)
+    test.assert_eq(list.len(frame), 7)
+    test.assert_eq(frame[0] as Int, H4_PKT_EVENT)   // 0x04
+    test.assert_eq(frame[1] as Int, 0x0E)   // event_code
+    test.assert_eq(frame[2] as Int, 0x04)   // param_len
+    test.assert_eq(frame[6] as Int, 0x00)
+
+@test
+fn test_trait_is_open_after_construction()
+    let xport = new_hci_uart(115200)
+    test.assert(HciUart.is_open(xport))
+
+@test
+fn test_trait_close_is_noop_today()
+    let xport = new_hci_uart(115200)
+    HciUart.close(xport)
+    // close() is a no-op; the value's baud field is unchanged.
+    test.assert(HciUart.is_open(xport))
+
+@test
+fn test_trait_recv_returns_none_until_stateful_buffer_lands()
+    let xport = new_hci_uart(115200)
+    match HciUart.recv_event(xport)
+        Some(_) => test.fail("recv_event stubbed; should be None")
+        None    => test.assert(true)
+    match HciUart.recv_acl(xport)
+        Some(_) => test.fail("recv_acl stubbed; should be None")
+        None    => test.assert(true)

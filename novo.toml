@@ -16,8 +16,7 @@ novo        = ">= 0.23.0"
 # The embedded tier of orbit/ble, whose images (the co-resident Host and Controller on the nRF52, the one-chip nRF54 images and
 # the PC Hosts) link this package.  The Host and the HCI package stay buildable for the embedded tier.
 [tier]
-tier   = "embedded"
-target = "nrf52832-dk"
+tier = "embedded"
 
 # The modules were written as the embedded tier of orbit/ble and keep their `@tier(embedded)` marks.  Some of their functions
 # build a list, a boxed struct or call `list.append`, which the embedded tier refuses (E4000); orbit/ble carries the same findings

@@ -12,7 +12,6 @@
 // device's) takes it from `Role` in the state.  What stays in a half is
 // the order of the commands it sends and expects.
 
-use std.test
 use smp
 use smp.{ Command, Reason }
 use smp_bond
@@ -436,7 +435,10 @@ fn pairing_level(s: PairingState) -> Int
     level_of(s.method != Method.JustWorks, s.sc, s.key_size)
 
 fn required_level(s: PairingState) -> Int
-    if s.requested_level > s.config.required_level then s.requested_level else s.config.required_level
+    if s.requested_level > s.config.required_level
+        s.requested_level
+    else
+        s.config.required_level
 
 fn has(bits: Int, bit: Int) -> Bool
     (bits & bit) != 0
@@ -464,7 +466,7 @@ fn draw(var s: PairingState) -> [u8]
 // A passkey from 000000 to 999999.
 fn draw_passkey(var s: PairingState) -> Int
     let r = draw(s)
-    let v = ((r[0] as Int) | ((r[1] as Int) << 8) | ((r[2] as Int) << 16) | ((r[3] as Int) << 24))
+    let v = r[0] as Int | (r[1] as Int << 8) | (r[2] as Int << 16) | (r[3] as Int << 24)
     v % 1000000
 
 // ── Ending a pairing ────────────────────────────────────────────────
@@ -494,7 +496,8 @@ fn expire(var s: PairingState)
 
 // A connection starts: the addresses the Controller reported and the bond
 // the program found for the peer.
-fn link_up(var s: PairingState, own_type: Int, own_address: [u8], peer_type: Int, peer_address: [u8], bond: ?SmpBond)
+fn link_up(var s: PairingState, own_type: Int, own_address: [u8], peer_type: Int,
+           peer_address: [u8], bond: ?SmpBond)
     end_pairing(var s)
     s.timed_out = false
     s.encrypting_with_bond = false
@@ -567,7 +570,10 @@ fn record_failure(var s: PairingState)
     for j in 0..list.len(s.attempts)
         if j == i
             let doubled = decayed_wait(s, s.attempts[j]) * 2
-            wait = if doubled > s.config.attempt_max_wait_ms then s.config.attempt_max_wait_ms else doubled
+            wait = if doubled > s.config.attempt_max_wait_ms
+                s.config.attempt_max_wait_ms
+            else
+                doubled
         else
             list.push(kept, s.attempts[j])
     if list.len(kept) >= ATTEMPT_RECORDS
@@ -599,7 +605,10 @@ fn classify(var s: PairingState, pdu: [u8]) -> Received
     if command == Command.PairingFailed
         if s.phase == Phase.Idle
             return Received.Ignore
-        let reason = if list.len(pdu) >= 2 then pdu[1] as Int else smp.reason_code(Reason.UnspecifiedReason)
+        let reason = if list.len(pdu) >= 2
+            pdu[1] as Int
+        else
+            smp.reason_code(Reason.UnspecifiedReason)
         s.failures = s.failures + 1
         end_pairing(var s)
         return Received.PeerFailed(reason)
@@ -626,15 +635,19 @@ fn sc_missing(s: PairingState, level: Int, sc: Bool) -> Bool
 
 // The encryption key size of a pairing whose peer offered `max_key`.
 fn negotiated_key_size(s: PairingState, max_key: Int) -> Int
-    if max_key < s.config.max_key_size then max_key else s.config.max_key_size
+    if max_key < s.config.max_key_size
+        max_key
+    else
+        s.config.max_key_size
 
 // True when `key_size` is below the configured minimum, or below 16 at
 // level 4 (Section 2.3.4).
 fn key_size_too_small(s: PairingState, key_size: Int, level: Int) -> Bool
-    key_size < s.config.min_key_size or (level >= 4 and key_size < 16)
+    key_size < s.config.min_key_size or level >= 4 and key_size < 16
 
 // Record what the Pairing Feature Exchange settled.
-fn settle(var s: PairingState, sc: Bool, method: Method, key_size: Int, bonding: Bool, keypress: Bool, init_dist: Int, resp_dist: Int)
+fn settle(var s: PairingState, sc: Bool, method: Method, key_size: Int, bonding: Bool,
+          keypress: Bool, init_dist: Int, resp_dist: Int)
     s.sc = sc
     s.method = method
     s.key_size = key_size
@@ -780,10 +793,16 @@ fn r_of_local(s: PairingState) -> readonly [u8]
 // ra, the initiating device's r, and rb, the responding device's, for f6:
 // Ea takes rb and Eb takes ra.
 fn r_initiator(s: PairingState) -> readonly [u8]
-    if s.role == Role.Initiator then r_of_local(s) else r_of_peer(s)
+    if s.role == Role.Initiator
+        r_of_local(s)
+    else
+        r_of_peer(s)
 
 fn r_responder(s: PairingState) -> readonly [u8]
-    if s.role == Role.Responder then r_of_local(s) else r_of_peer(s)
+    if s.role == Role.Responder
+        r_of_local(s)
+    else
+        r_of_peer(s)
 
 // A, the initiating device's address in the f5 and f6 inputs, and B, the
 // responding device's.
@@ -801,10 +820,16 @@ fn address_b(s: PairingState) -> [u8]
 
 // Na, the initiating device's nonce, and Nb, the responding device's.
 fn nonce_a(s: PairingState) -> readonly [u8]
-    if s.role == Role.Initiator then s.local_rand else s.peer_rand
+    if s.role == Role.Initiator
+        s.local_rand
+    else
+        s.peer_rand
 
 fn nonce_b(s: PairingState) -> readonly [u8]
-    if s.role == Role.Initiator then s.peer_rand else s.local_rand
+    if s.role == Role.Initiator
+        s.peer_rand
+    else
+        s.local_rand
 
 // The MacKey and LTK of f5 over the DHKey (Section 2.2.7).
 fn sc_keys_of(s: PairingState) -> ScKeys
@@ -870,10 +895,16 @@ fn send_keypress(var s: PairingState, notification_type: Int)
 // The Key Distribution field this device sends and the one the peer does:
 // the initiator's keys come first in the order of Section 3.6.1.
 fn local_distribution(s: PairingState) -> Int
-    if s.role == Role.Initiator then s.init_dist else s.resp_dist
+    if s.role == Role.Initiator
+        s.init_dist
+    else
+        s.resp_dist
 
 fn peer_distribution(s: PairingState) -> Int
-    if s.role == Role.Initiator then s.resp_dist else s.init_dist
+    if s.role == Role.Initiator
+        s.resp_dist
+    else
+        s.init_dist
 
 // Queue this device's keys in the order of Section 3.6.1: EncKey (a random
 // LTK, EDIV and Rand in LE legacy pairing), IdKey, SignKey.
@@ -888,13 +919,14 @@ fn send_local_keys(var s: PairingState)
     if has(dist, smp.SMP_KEY_DIST_ENC) and not s.sc
         s.dist_ltk = smp_keys.mask_key(draw(s), s.key_size)
         let r = draw(s)
-        s.dist_ediv = (r[0] as Int) | ((r[1] as Int) << 8)
+        s.dist_ediv = r[0] as Int | (r[1] as Int << 8)
         s.dist_rand = r[2:10]
         send(s, smp.build_encryption_information(s.dist_ltk))
         send(s, smp.build_central_identification(s.dist_ediv, s.dist_rand))
     if has(dist, smp.SMP_KEY_DIST_ID)
         send(s, smp.build_identity_information(s.config.identity_irk))
-        send(s, smp.build_identity_address_information(s.config.identity_address_type, s.config.identity_address))
+        send(s,
+            smp.build_identity_address_information(s.config.identity_address_type, s.config.identity_address))
     if has(dist, smp.SMP_KEY_DIST_SIGN)
         s.dist_csrk = draw(s)
         send(s, smp.build_signing_information(s.dist_csrk))
@@ -913,7 +945,8 @@ fn expect_key(var s: PairingState, command: ?Command)
         Some(c) =>
             s.expect_code = c
             s.expecting = true
-        None => s.expecting = false
+        None    =>
+            s.expecting = false
 
 // What the peer still owes in the Transport Specific Key Distribution
 // phase: its Key Distribution field of the Pairing Request or Response,
@@ -941,7 +974,7 @@ fn take_distributed_key(var s: PairingState, pdu: [u8]) -> KeyResult
         expect_key(var s, Some(Command.CentralIdentification))
         return KeyResult.Waiting
     if command == Command.CentralIdentification
-        s.peer_ediv = (pdu[1] as Int) | ((pdu[2] as Int) << 8)
+        s.peer_ediv = pdu[1] as Int | (pdu[2] as Int << 8)
         s.peer_rand8 = smp.field_bytes(pdu, 3, 8)
         s.expect_dist = s.expect_dist & (0xFF ^ smp.SMP_KEY_DIST_ENC)
         return distribution_after_key(var s)
@@ -991,17 +1024,17 @@ fn pairing_bond(s: PairingState) -> SmpBond
     let central = s.role == Role.Initiator
     let has_identity = list.len(s.peer_identity_address) == 6
     SmpBond {
-        peer_address_type: if has_identity then s.peer_identity_type else s.peer_address_type,
-        peer_address: if has_identity then s.peer_identity_address else s.peer_address,
+        peer_address_type: (if has_identity then s.peer_identity_type else s.peer_address_type),
+        peer_address: (if has_identity then s.peer_identity_address else s.peer_address),
         peer_irk: s.peer_irk,
         peer_csrk: s.peer_csrk,
         peer_sign_counter: -1,
-        peer_ltk: if central then s.dist_ltk else s.peer_ltk,
-        peer_ediv: if central then s.dist_ediv else s.peer_ediv,
-        peer_rand: if central then s.dist_rand else s.peer_rand8,
-        ltk: if s.sc then s.session_key else (if central then s.peer_ltk else s.dist_ltk),
-        ediv: if s.sc then 0 else (if central then s.peer_ediv else s.dist_ediv),
-        rand: if s.sc then smp_keys.zeros(8) else (if central then s.peer_rand8 else s.dist_rand),
+        peer_ltk: (if central then s.dist_ltk else s.peer_ltk),
+        peer_ediv: (if central then s.dist_ediv else s.peer_ediv),
+        peer_rand: (if central then s.dist_rand else s.peer_rand8),
+        ltk: (if s.sc then s.session_key else (if central then s.peer_ltk else s.dist_ltk)),
+        ediv: (if s.sc then 0 else (if central then s.peer_ediv else s.dist_ediv)),
+        rand: (if s.sc then smp_keys.zeros(8) else (if central then s.peer_rand8 else s.dist_rand)),
         local_csrk: s.dist_csrk,
         key_size: s.key_size,
         authenticated: s.method != Method.JustWorks,
@@ -1037,12 +1070,13 @@ fn bond_encryption_established(var s: PairingState) -> Int
 // 2.8.  `init_*` are the Pairing Request's fields, `resp_*` the
 // Pairing Response's.
 @satisfies("REQ-BLE-SMP-023")
-fn select_method(sc: Bool, init_io: Int, init_oob: Bool, init_mitm: Bool, resp_io: Int, resp_oob: Bool, resp_mitm: Bool) -> Method
+fn select_method(sc: Bool, init_io: Int, init_oob: Bool, init_mitm: Bool, resp_io: Int,
+                 resp_oob: Bool, resp_mitm: Bool) -> Method
     if sc and (init_oob or resp_oob)
         return Method.OutOfBand
-    if (not sc) and init_oob and resp_oob
+    if not sc and init_oob and resp_oob
         return Method.OutOfBand
-    if (not init_mitm) and (not resp_mitm)
+    if not init_mitm and not resp_mitm
         return Method.JustWorks
     io_method(sc, init_io, resp_io)
 
@@ -1056,7 +1090,10 @@ fn io_method(sc: Bool, init_io: Int, resp_io: Int) -> Method
     if init_io == smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT or resp_io == smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT
         Method.JustWorks
     else if resp_io == display_only
-        if init_io == keyboard or init_io == keyboard_display then Method.PasskeyDisplay else Method.JustWorks
+        if init_io == keyboard or init_io == keyboard_display
+            Method.PasskeyDisplay
+        else
+            Method.JustWorks
     else if resp_io == yes_no
         if init_io == display_only
             Method.JustWorks
@@ -1098,200 +1135,10 @@ fn local_auth_req(config: SmpConfig, level: Int) -> Int
     var a = 0
     if config.bondable
         a = a | smp.SMP_AUTHREQ_BONDING
-    if level >= 3 or (config.request_mitm and config.io_capability != smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT)
+    if level >= 3 or config.request_mitm and config.io_capability != smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT
         a = a | smp.SMP_AUTHREQ_MITM
     if config.secure_connections
         a = a | smp.SMP_AUTHREQ_SC
     if config.keypress
         a = a | smp.SMP_AUTHREQ_KEYPRESS
     a | smp.SMP_AUTHREQ_CT2
-
-// ── Tests ───────────────────────────────────────────────────────────
-
-@test
-fn test_the_feature_fields_are_checked_in_one_place()
-    test.assert(feature_fault(4, 1, 16) == None)
-    test.assert(feature_fault(5, 0, 16) == Some(Reason.InvalidParameters))
-    test.assert(feature_fault(0, 2, 16) == Some(Reason.InvalidParameters))
-    test.assert(feature_fault(0, 0, 6) == Some(Reason.InvalidParameters))
-    test.assert(feature_fault(0, 0, 17) == Some(Reason.InvalidParameters))
-
-@test
-fn test_a_key_distribution_field_asks_for_enckey_then_idkey_then_signkey()
-    test.assert(first_expected_code(0) == None)
-    test.assert(first_expected_code(smp.SMP_KEY_DIST_SIGN) == Some(Command.SigningInformation))
-    test.assert(first_expected_code(smp.SMP_KEY_DIST_ID | smp.SMP_KEY_DIST_SIGN) == Some(Command.IdentityInformation))
-    test.assert(first_expected_code(smp.SMP_KEY_DIST_ENC | smp.SMP_KEY_DIST_SIGN) == Some(Command.EncryptionInformation))
-
-// ── Tests of what both halves share ─────────────────────────────────
-//
-// The two halves' own tests walk the whole procedures; these pin the pieces
-// that differ between the ends.
-
-fn received_text(r: Received) -> Str
-    match r
-        Ignore => "ignore"
-        PeerFailed(reason) => "peer failed ${reason}"
-        Refuse(reason) => "refuse ${smp.reason_code(reason)}"
-        Fail(reason) => "fail ${smp.reason_code(reason)}"
-        Handle(command) => "handle ${smp.command_code(command)}"
-
-fn key_result_text(r: KeyResult) -> Str
-    match r
-        Rejected(reason) => "rejected ${smp.reason_code(reason)}"
-        Waiting => "waiting"
-        Complete => "complete"
-
-fn core_config(min_key_size: Int, max_key_size: Int, pairing_supported: Bool) -> SmpConfig
-    let d = default_config()
-    SmpConfig {
-        io_capability: d.io_capability, bondable: d.bondable, secure_connections: d.secure_connections,
-        sc_only: d.sc_only, required_level: d.required_level, keypress: d.keypress, request_mitm: d.request_mitm,
-        max_key_size: max_key_size, min_key_size: min_key_size, identity_irk: d.identity_irk,
-        identity_address_type: d.identity_address_type, identity_address: d.identity_address,
-        distribute_csrk: d.distribute_csrk, accept_debug_key: d.accept_debug_key,
-        pairing_supported: pairing_supported, attempt_min_wait_ms: d.attempt_min_wait_ms,
-        attempt_max_wait_ms: d.attempt_max_wait_ms }
-
-fn core_state_with(role: Role, config: SmpConfig) -> PairingState
-    let no_keys = KeyPair { private_key: [], public_key: empty_key() }
-    new_pairing_state(role, config, no_keys, smp_keys.zeros(16))
-
-fn core_state(role: Role) -> PairingState
-    core_state_with(role, default_config())
-
-@test
-fn test_a_new_state_is_idle_and_has_no_timer()
-    let s = core_state(Role.Responder)
-    test.assert(not is_pairing(s))
-    test.assert_eq(s.timer_deadline, -1)
-    test.assert_eq(s.role == Role.Responder, true)
-    test.assert_eq(core_state(Role.Initiator).role == Role.Initiator, true)
-
-@test
-fn test_the_key_distribution_fields_are_this_devices_and_the_peers()
-    var i = core_state(Role.Initiator)
-    i.init_dist = smp.SMP_KEY_DIST_ID
-    i.resp_dist = smp.SMP_KEY_DIST_SIGN
-    test.assert_eq(local_distribution(i), smp.SMP_KEY_DIST_ID)
-    test.assert_eq(peer_distribution(i), smp.SMP_KEY_DIST_SIGN)
-    var r = copy(i)
-    r.role = Role.Responder
-    test.assert_eq(local_distribution(r), smp.SMP_KEY_DIST_SIGN)
-    test.assert_eq(peer_distribution(r), smp.SMP_KEY_DIST_ID)
-
-@test
-fn test_the_addresses_and_nonces_of_f5_and_f6_follow_the_role()
-    var i = core_state(Role.Initiator)
-    i.own_address = [1, 1, 1, 1, 1, 1]
-    i.peer_address = [2, 2, 2, 2, 2, 2]
-    i.local_rand = smp_keys.zeros(16)
-    i.peer_rand = [7, 7, 7, 7, 7, 7, 7, 7,
-                   7, 7, 7, 7, 7, 7, 7, 7]
-    var r = copy(i)
-    r.role = Role.Responder
-    test.assert(smp_keys.equal_ct(address_a(i), address_b(r)))
-    test.assert(smp_keys.equal_ct(address_b(i), address_a(r)))
-    test.assert(smp_keys.equal_ct(nonce_a(i), smp_keys.zeros(16)))
-    test.assert(smp_keys.equal_ct(nonce_b(i), i.peer_rand))
-    test.assert(smp_keys.equal_ct(nonce_a(r), r.peer_rand))
-    test.assert(smp_keys.equal_ct(nonce_b(r), smp_keys.zeros(16)))
-
-@test
-fn test_the_user_who_types_the_passkey_is_the_other_end_of_the_model()
-    var r = core_state(Role.Responder)
-    r.method = Method.PasskeyInput
-    test.assert(local_user_types(r))
-    r.method = Method.PasskeyDisplay
-    test.assert(not local_user_types(r))
-    var i = copy(r)
-    i.role = Role.Initiator
-    test.assert(local_user_types(i))
-    i.method = Method.PasskeyInput
-    test.assert(not local_user_types(i))
-
-@test
-fn test_classify_reads_the_code_and_the_length()
-    var s = core_state(Role.Responder)
-    test.assert_eq(received_text(classify(var s, [])), received_text(Received.Ignore))
-    test.assert_eq(received_text(classify(var s, [0x0F])), received_text(Received.Ignore))
-    test.assert_eq(received_text(classify(var s, smp.build_pairing_failed(smp.SMP_FAIL_BUSY))), received_text(Received.Ignore))
-    test.assert_eq(received_text(classify(var s, [smp.SMP_OP_PAIRING_CONFIRM])), received_text(Received.Refuse(Reason.InvalidParameters)))
-    s.phase = Phase.LegacyConfirm
-    test.assert_eq(received_text(classify(var s, [smp.SMP_OP_PAIRING_CONFIRM])), received_text(Received.Fail(Reason.InvalidParameters)))
-    test.assert_eq(received_text(classify(var s, smp.build_pairing_confirm(smp_keys.zeros(16)))), received_text(Received.Handle(Command.PairingConfirm)))
-    test.assert_eq(s.failures, 0)
-    test.assert_eq(received_text(classify(var s, smp.build_pairing_failed(smp.SMP_FAIL_BUSY))), received_text(Received.PeerFailed(smp.SMP_FAIL_BUSY)))
-    test.assert_eq(s.failures, 1)
-    test.assert(not is_pairing(s))
-
-@test
-fn test_a_keypress_notification_only_resets_the_timer()
-    var s = core_state(Role.Initiator)
-    s.now = 100
-    s.timer_deadline = 500
-    test.assert_eq(received_text(classify(var s, smp.build_keypress_notification(smp.SMP_KEYPRESS_DIGIT_ENTERED))), received_text(Received.Ignore))
-    test.assert_eq(s.timer_deadline, 100 + SMP_TIMEOUT_MS)
-
-@test
-fn test_a_device_that_does_not_pair_refuses_every_command_but_pairing_failed()
-    var s = core_state_with(Role.Initiator, core_config(7, 16, false))
-    test.assert_eq(received_text(classify(var s, smp.build_security_request(0))), received_text(Received.Refuse(Reason.PairingNotSupported)))
-
-@test
-fn test_the_key_size_is_negotiated_in_one_place()
-    let s = core_state_with(Role.Responder, core_config(10, 16, true))
-    test.assert_eq(negotiated_key_size(s, 12), 12)
-    test.assert_eq(negotiated_key_size(s, 16), 16)
-    let narrow = core_state_with(Role.Responder, core_config(10, 14, true))
-    test.assert_eq(negotiated_key_size(narrow, 16), 14)
-    test.assert(key_size_too_small(s, 9, 2))
-    test.assert(not key_size_too_small(s, 10, 2))
-    test.assert(key_size_too_small(s, 15, 4))
-    test.assert(sc_missing(s, 4, false))
-    test.assert(not sc_missing(s, 3, false))
-    test.assert(not sc_missing(s, 4, true))
-
-@test
-fn test_an_abort_queues_pairing_failed_and_counts_the_failure_once()
-    var s = core_state(Role.Initiator)
-    s.phase = Phase.ScRandom
-    abort(var s, Reason.ConfirmValueFailed, false)
-    test.assert_eq(s.failures, 1)
-    test.assert_eq(s.outbox[0][1] as Int, smp.SMP_FAIL_CONFIRM_VALUE_FAILED)
-    test.assert(not is_pairing(s))
-    decline(var s, Reason.CommandNotSupported)
-    test.assert_eq(s.failures, 1)
-    test.assert_eq(list.len(s.outbox), 2)
-
-@test
-fn test_the_distributed_keys_must_come_in_the_order_of_section_3_6_1()
-    var s = core_state(Role.Initiator)
-    s.resp_dist = smp.SMP_KEY_DIST_ENC | smp.SMP_KEY_DIST_SIGN
-    s.phase = Phase.KeyDistribution
-    expect_distribution(var s)
-    test.assert(expected_key(s) == Some(Command.EncryptionInformation))
-    let wrong = take_distributed_key(var s, smp.build_signing_information(smp_keys.zeros(16)))
-    test.assert_eq(key_result_text(wrong), key_result_text(KeyResult.Rejected(Reason.UnspecifiedReason)))
-    test.assert_eq(key_result_text(take_distributed_key(var s, smp.build_encryption_information(smp_keys.zeros(16)))), key_result_text(KeyResult.Waiting))
-    test.assert(expected_key(s) == Some(Command.CentralIdentification))
-    test.assert_eq(key_result_text(take_distributed_key(var s, smp.build_central_identification(7, smp_keys.zeros(8)))), key_result_text(KeyResult.Waiting))
-    test.assert_eq(s.peer_ediv, 7)
-    test.assert(expected_key(s) == Some(Command.SigningInformation))
-    test.assert_eq(key_result_text(take_distributed_key(var s, smp.build_signing_information(smp_keys.zeros(16)))), key_result_text(KeyResult.Complete))
-
-@test
-fn test_the_bond_of_a_pairing_is_laid_out_for_the_role()
-    var c = core_state(Role.Initiator)
-    c.peer_ltk = smp_keys.zeros(16)
-    c.dist_ltk = smp.build_encryption_information(smp_keys.zeros(16))[1:17]
-    c.peer_ediv = 3
-    c.dist_ediv = 5
-    var p = copy(c)
-    p.role = Role.Responder
-    test.assert_eq(pairing_bond(c).ediv, 3)
-    test.assert_eq(pairing_bond(c).peer_ediv, 5)
-    test.assert_eq(pairing_bond(p).ediv, 5)
-    test.assert_eq(pairing_bond(p).peer_ediv, 3)
-    c.sc = true
-    test.assert_eq(pairing_bond(c).ediv, 0)

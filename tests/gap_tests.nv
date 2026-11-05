@@ -1,0 +1,160 @@
+// tests/gap_tests.nv — the unit tests of src/gap.nv.
+//
+//   novo test tests/gap_tests.nv
+
+use std.test
+use gap.{ AD_TYPE_APPEARANCE, AD_TYPE_COMPLETE_LIST_16, AD_TYPE_COMPLETE_LOCAL_NAME, AD_TYPE_FLAGS, AD_TYPE_SERVICE_DATA_16, ConnectableMode, DiscoverableMode, Role, ad_flags_for, ad_flags_of, build_ad_flags_record, build_appearance_record, build_complete_list_16_record, build_flags_and_name_ad, build_local_name_record, build_service_data_16_record, complete_local_name_of, connectable_mode_name, discoverable_mode_name, is_discovered, role_name }
+
+// ── Tests ──────────────────────────────────────────────────────────
+
+@test
+fn test_ad_flags_of_finds_the_flags_ad_type()
+    test.assert_eq(ad_flags_of([0x02, 0x01, 0x05]) ?? -1, 0x05)
+    // After a Complete Local Name.
+    test.assert_eq(ad_flags_of([0x03, 0x09, 'h', 'i', 0x02, 0x01, 0x06]) ?? -1, 0x06)
+    // None at all, an empty list, a zero Length first, and a truncated
+    // structure.
+    test.assert_eq(ad_flags_of([0x03, 0x09, 'h', 'i']) ?? -1, -1)
+    test.assert_eq(ad_flags_of([]) ?? -1, -1)
+    test.assert_eq(ad_flags_of([0x00, 0x02, 0x01, 0x06]) ?? -1, -1)
+    test.assert_eq(ad_flags_of([0x02, 0x01]) ?? -1, -1)
+
+@test
+fn test_is_discovered_by_procedure()
+    let limited: [u8] = [0x02, 0x01, 0x05]
+    let general: [u8] = [0x02, 0x01, 0x06]
+    let neither: [u8] = [0x02, 0x01, 0x04]
+    // The Simultaneous LE and BR/EDR (Controller) bit alone.
+    let simultaneous: [u8] = [0x02, 0x01, 0x08]
+    let no_flags: [u8] = [0x03, 0x09, 'h', 'i']
+    test.assert_eq(is_discovered(limited, true), true)
+    test.assert_eq(is_discovered(general, true), false)
+    test.assert_eq(is_discovered(neither, true), false)
+    test.assert_eq(is_discovered(limited, false), true)
+    test.assert_eq(is_discovered(general, false), true)
+    test.assert_eq(is_discovered(neither, false), false)
+    test.assert_eq(is_discovered(simultaneous, false), false)
+    test.assert_eq(is_discovered(no_flags, false), false)
+    test.assert_eq(is_discovered([], true), false)
+
+@test
+@satisfies("REQ-BLE-GAP-001")
+fn test_role_names()
+    test.assert_eq(role_name(Peripheral), "Peripheral")
+    test.assert_eq(role_name(Central), "Central")
+    test.assert_eq(role_name(Broadcaster), "Broadcaster")
+    test.assert_eq(role_name(Observer), "Observer")
+
+@test
+@satisfies("REQ-BLE-GAP-002")
+fn test_ad_flags_for_general_discoverable_le_only()
+    // General + LE-only → bit 1 (general) + bit 2 (BR/EDR not supp) = 0x06
+    test.assert_eq(ad_flags_for(GeneralDiscoverable, true), 0x06)
+
+@test
+@satisfies("REQ-BLE-GAP-002")
+fn test_ad_flags_for_limited_discoverable_le_only()
+    // Limited + LE-only → bit 0 + bit 2 = 0x05
+    test.assert_eq(ad_flags_for(LimitedDiscoverable, true), 0x05)
+
+@test
+@satisfies("REQ-BLE-GAP-002")
+fn test_ad_flags_for_non_discoverable_le_only()
+    // Non + LE-only → just bit 2 = 0x04
+    test.assert_eq(ad_flags_for(NonDiscoverable, true), 0x04)
+
+@test
+@satisfies("REQ-BLE-GAP-002")
+fn test_ad_flags_for_general_dual_mode()
+    // General + dual-mode (le_only=false) → just bit 1 = 0x02
+    test.assert_eq(ad_flags_for(GeneralDiscoverable, false), 0x02)
+
+@test
+@satisfies("REQ-BLE-GAP-003")
+fn test_connectable_mode_names()
+    test.assert_eq(connectable_mode_name(NonConnectable), "Non")
+    test.assert_eq(connectable_mode_name(DirectedConnectable), "Directed")
+    test.assert_eq(connectable_mode_name(UndirectedConnectable), "Undirected")
+
+@test
+@satisfies("REQ-BLE-GAP-002")
+fn test_discoverable_mode_names()
+    test.assert_eq(discoverable_mode_name(NonDiscoverable), "Non")
+    test.assert_eq(discoverable_mode_name(LimitedDiscoverable), "Limited")
+    test.assert_eq(discoverable_mode_name(GeneralDiscoverable), "General")
+
+@test
+@satisfies("REQ-BLE-GAP-004")
+fn test_ad_flags_record_shape()
+    let r = build_ad_flags_record(0x06)
+    test.assert_eq(list.len(r), 3)
+    test.assert_eq(r[0] as Int, 2)   // length
+    test.assert_eq(r[1] as Int, AD_TYPE_FLAGS)
+    test.assert_eq(r[2] as Int, 0x06)
+
+@test
+@satisfies("REQ-BLE-GAP-004")
+fn test_local_name_record_shape()
+    let name: [u8] = [0x4E, 0x6F, 0x76, 0x6F]   // "Novo"
+    let r = build_local_name_record(name)
+    test.assert_eq(list.len(r), 6)
+    test.assert_eq(r[0] as Int, 5)   // 1 (type) + 4 (name)
+    test.assert_eq(r[1] as Int, AD_TYPE_COMPLETE_LOCAL_NAME)
+    test.assert_eq(r[2] as Int, 0x4E)
+    test.assert_eq(r[5] as Int, 0x6F)
+
+@test
+@satisfies("REQ-BLE-GAP-004")
+fn test_complete_list_16_record_shape()
+    // Two services: 0x180D + 0x180F (LE).
+    let uuids: [u8] = [0x0D, 0x18, 0x0F, 0x18]
+    let r = build_complete_list_16_record(uuids)
+    test.assert_eq(list.len(r), 6)
+    test.assert_eq(r[0] as Int, 5)   // 1 (type) + 4 (uuids)
+    test.assert_eq(r[1] as Int, AD_TYPE_COMPLETE_LIST_16)
+    test.assert_eq(r[2] as Int, 0x0D)
+    test.assert_eq(r[3] as Int, 0x18)
+
+@test
+@satisfies("REQ-BLE-GAP-004")
+fn test_flags_and_name_ad_layout()
+    let name: [u8] = [0x4E, 0x6F, 0x76, 0x6F]   // "Novo"
+    let ad = build_flags_and_name_ad(ad_flags_for(GeneralDiscoverable, true), name)
+    test.assert_eq(list.len(ad), 9)
+    test.assert_eq(ad[0] as Int, 0x02)
+    test.assert_eq(ad[1] as Int, AD_TYPE_FLAGS)
+    test.assert_eq(ad[2] as Int, 0x06)
+    test.assert_eq(ad[3] as Int, 5)
+    test.assert_eq(ad[4] as Int, AD_TYPE_COMPLETE_LOCAL_NAME)
+    test.assert_eq(ad[5] as Int, 0x4E)
+    test.assert_eq(ad[8] as Int, 0x6F)
+
+@test
+fn test_appearance_and_service_data_records()
+    let a = build_appearance_record(0x0441)
+    test.assert_eq(list.len(a), 4)
+    test.assert_eq(a[0] as Int, 3)
+    test.assert_eq(a[1] as Int, AD_TYPE_APPEARANCE)
+    test.assert_eq(a[2] as Int, 0x41)
+    test.assert_eq(a[3] as Int, 0x04)
+    let sd = build_service_data_16_record(0x1826, [0x01, 0x20, 0x00])
+    test.assert_eq(list.len(sd), 7)
+    test.assert_eq(sd[0] as Int, 6)
+    test.assert_eq(sd[1] as Int, AD_TYPE_SERVICE_DATA_16)
+    test.assert_eq(sd[2] as Int, 0x26)
+    test.assert_eq(sd[3] as Int, 0x18)
+    test.assert_eq(sd[6] as Int, 0x00)
+
+@test
+fn test_complete_local_name_of()
+    let ad: [u8] = [0x02, 0x01, 0x06, 0x03, 0x09, 'h', 'i']
+    match complete_local_name_of(ad)
+        None       => test.fail("the name is found")
+        Some(name) =>
+            test.assert_eq(list.len(name), 2)
+            test.assert_eq(name[1] as Int, 'i' as Int)
+    // An empty name, none, a Shortened Local Name only, a truncated one.
+    test.assert_eq(list.len(complete_local_name_of([0x01, 0x09]) ?? [0xFF]), 0)
+    test.assert(complete_local_name_of([0x02, 0x01, 0x06]) == None)
+    test.assert(complete_local_name_of([0x03, 0x08, 'h', 'i']) == None)
+    test.assert(complete_local_name_of([0x05, 0x09, 'h']) == None)

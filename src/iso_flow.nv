@@ -26,9 +26,7 @@
 //
 // Satisfies: REQ-BLE-ISO-005.
 
-use std.test
 use hci_codec
-use isoal
 use noble_config
 // The sequence numbers are 16 bits.
 const SEQUENCE_MODULUS = 0x10000
@@ -51,7 +49,7 @@ fn iso_credits_new() -> IsoCredits
     var c = IsoCredits {
         packet_length: 0, total: 0, free: 0, used: Vec.new(), handles: Vec.new(),
         in_flight: Vec.new(), sequence: Vec.new() }
-    for _ in 0..(noble_config.MAX_CIS + noble_config.MAX_BIS)
+    for _ in 0..noble_config.MAX_CIS + noble_config.MAX_BIS
         let _a = c.used.push(false)
         let _b = c.handles.push(0)
         let _c = c.in_flight.push(0)
@@ -165,10 +163,10 @@ fn iso_credits_take(var c: IsoCredits, handle: Int, packets: Int) -> Bool
     let i = iso_stream_slot(var c, handle)
     if i < 0 or packets < 1 or not iso_credits_ready(var c) or packets > (c.free as Int)
         return false
-    if (c.in_flight[i] as Int) + packets > 0xFF
+    if c.in_flight[i] as Int + packets > 0xFF
         return false
-    c.in_flight[i] = ((c.in_flight[i] as Int) + packets) as u8
-    c.free = ((c.free as Int) - packets) as u8
+    c.in_flight[i] = (c.in_flight[i] as Int + packets) as u8
+    c.free = (c.free as Int - packets) as u8
     true
 
 // The Number Of Completed Packets event named `handle` with `count`
@@ -184,9 +182,12 @@ fn iso_credits_completed(var c: IsoCredits, handle: Int, count: Int) -> Int
     if i < 0 or count < 1
         return 0
     let held = c.in_flight[i] as Int
-    let back = if count < held then count else held
+    let back = if count < held
+        count
+    else
+        held
     c.in_flight[i] = (held - back) as u8
-    c.free = ((c.free as Int) + back) as u8
+    c.free = (c.free as Int + back) as u8
     back
 
 // The pairs of a Number Of Completed Packets event.  The answer is the
@@ -233,226 +234,10 @@ fn iso_in_flight(var c: IsoCredits, handle: Int) -> Int
     else
         c.in_flight[i] as Int
 
-// ── Tests ────────────────────────────────────────────────────────────
+// ── Fixtures that the suites of other modules share ─────────────────────
 
 @tier(app)
 fn sizes(iso_length: Int, iso_total: Int) -> hci_codec.LeBufferSizeV2
     hci_codec.LeBufferSizeV2 {
         acl_data_packet_length: 251, total_acl_data_packets: 3,
         iso_data_packet_length: iso_length, total_iso_data_packets: iso_total }
-
-// A configured pool of 3 buffers of 255 octets.
-@tier(app)
-fn pool() -> IsoCredits
-    var c = iso_credits_new()
-    test.assert(iso_credits_configure(var c, sizes(255, 3)))
-    c
-
-@test
-@satisfies("REQ-BLE-ISO-005")
-fn test_a_new_pool_is_empty_and_unconfigured()
-    var c = iso_credits_new()
-    test.assert_eq(c.used.capacity(), noble_config.MAX_CIS + noble_config.MAX_BIS)
-    test.assert_eq(c.handles.capacity(), noble_config.MAX_CIS + noble_config.MAX_BIS)
-    test.assert_eq(c.in_flight.capacity(), noble_config.MAX_CIS + noble_config.MAX_BIS)
-    test.assert_eq(c.sequence.capacity(), noble_config.MAX_CIS + noble_config.MAX_BIS)
-    test.assert(not iso_credits_ready(var c))
-    test.assert_eq(iso_packet_length(var c), 0)
-    // Nothing is sent before the sizes are known.
-    test.assert(iso_credits_open(var c, 0x0040))
-    test.assert(not iso_credits_take(var c, 0x0040, 1))
-    test.assert(not iso_may_send(var c, 0x0040))
-
-@test
-@satisfies("REQ-BLE-ISO-005")
-fn test_the_pool_takes_the_iso_half_of_read_buffer_size_v2()
-    var c = iso_credits_new()
-    test.assert(iso_credits_configure(var c, sizes(255, 3)))
-    test.assert(iso_credits_ready(var c))
-    test.assert_eq(iso_packet_length(var c), 255)
-    test.assert_eq(c.total as Int, 3)
-    test.assert_eq(c.free as Int, 3)
-    // The bounds: one octet and one buffer, the 14-bit length and 255 buffers.
-    test.assert(iso_credits_configure(var c, sizes(1, 1)))
-    test.assert(iso_credits_configure(var c, sizes(0x3FFF, 255)))
-
-@test
-@satisfies("REQ-BLE-ISO-005")
-fn test_a_controller_without_iso_buffers_leaves_the_pool_unconfigured()
-    var c = pool()
-    // ISO_Data_Packet_Length 0: no dedicated ISO buffer exists.
-    test.assert(not iso_credits_configure(var c, sizes(0, 3)))
-    test.assert(not iso_credits_ready(var c))
-    test.assert_eq(c.free as Int, 0)
-    test.assert(not iso_credits_configure(var c, sizes(255, 0)))
-    test.assert(not iso_credits_configure(var c, sizes(0x4000, 3)))
-    test.assert(not iso_credits_configure(var c, sizes(255, 256)))
-    test.assert(not iso_credits_ready(var c))
-    test.assert(iso_credits_open(var c, 0x0040))
-    test.assert(not iso_credits_take(var c, 0x0040, 1))
-
-@test
-@satisfies("REQ-BLE-ISO-005")
-fn test_open_refuses_a_handle_out_of_range_a_duplicate_and_a_full_table()
-    var c = pool()
-    test.assert(not iso_credits_open(var c, -1))
-    test.assert(not iso_credits_open(var c, 0x0F00))
-    test.assert(iso_credits_open(var c, 0x0EFF))
-    test.assert(not iso_credits_open(var c, 0x0EFF))
-    for i in 1..(noble_config.MAX_CIS + noble_config.MAX_BIS)
-        test.assert(iso_credits_open(var c, 0x0040 + i))
-    test.assert(not iso_credits_open(var c, 0x0100))
-
-@test
-@satisfies("REQ-BLE-ISO-005")
-fn test_take_gives_a_credit_per_buffer_and_refuses_when_none_is_free()
-    var c = pool()
-    test.assert(iso_credits_open(var c, 0x0040))
-    test.assert(iso_credits_open(var c, 0x0041))
-    test.assert(iso_credits_take(var c, 0x0040, 2))
-    test.assert_eq(c.free as Int, 1)
-    test.assert_eq(iso_in_flight(var c, 0x0040), 2)
-    // All or none: two packets do not fit one free buffer.
-    test.assert(not iso_credits_take(var c, 0x0041, 2))
-    test.assert_eq(c.free as Int, 1)
-    test.assert_eq(iso_in_flight(var c, 0x0041), 0)
-    test.assert(iso_may_send(var c, 0x0041))
-    test.assert(iso_credits_take(var c, 0x0041, 1))
-    test.assert_eq(c.free as Int, 0)
-    test.assert(not iso_may_send(var c, 0x0040))
-    test.assert(not iso_credits_take(var c, 0x0040, 1))
-
-@test
-@satisfies("REQ-BLE-ISO-005")
-fn test_take_refuses_a_stream_the_pool_does_not_hold_and_less_than_one_packet()
-    var c = pool()
-    test.assert(not iso_credits_take(var c, 0x0040, 1))
-    test.assert(not iso_may_send(var c, 0x0040))
-    test.assert(iso_credits_open(var c, 0x0040))
-    test.assert(not iso_credits_take(var c, 0x0040, 0))
-    test.assert(not iso_credits_take(var c, 0x0040, -1))
-    test.assert_eq(c.free as Int, 3)
-
-@test
-@satisfies("REQ-BLE-ISO-005")
-fn test_number_of_completed_packets_returns_credits_to_the_stream_it_names()
-    var c = pool()
-    test.assert(iso_credits_open(var c, 0x0040))
-    test.assert(iso_credits_open(var c, 0x0041))
-    test.assert(iso_credits_take(var c, 0x0040, 2))
-    test.assert(iso_credits_take(var c, 0x0041, 1))
-    test.assert_eq(iso_credits_completed(var c, 0x0040, 1), 1)
-    test.assert_eq(c.free as Int, 1)
-    test.assert_eq(iso_in_flight(var c, 0x0040), 1)
-    test.assert_eq(iso_in_flight(var c, 0x0041), 1)
-    // The pairs of an event, in order, ACL handles among them.
-    let pairs = [
-        hci_codec.CompletedPackets { connection_handle: 0x0001, count: 3 },
-        hci_codec.CompletedPackets { connection_handle: 0x0040, count: 1 },
-        hci_codec.CompletedPackets { connection_handle: 0x0041, count: 1 }]
-    test.assert_eq(iso_credits_on_completed(var c, pairs), 2)
-    test.assert_eq(c.free as Int, 3)
-    test.assert_eq(iso_in_flight(var c, 0x0040), 0)
-
-@test
-@satisfies("REQ-BLE-ISO-005")
-fn test_completed_packets_never_return_more_than_the_stream_took()
-    var c = pool()
-    test.assert(iso_credits_open(var c, 0x0040))
-    test.assert(iso_credits_take(var c, 0x0040, 1))
-    // The Controller reports 5 for 1 in flight.
-    test.assert_eq(iso_credits_completed(var c, 0x0040, 5), 1)
-    test.assert_eq(c.free as Int, 3)
-    test.assert_eq(iso_credits_completed(var c, 0x0040, 1), 0)
-    test.assert_eq(c.free as Int, 3)
-    // An unknown handle, and a count of none.
-    test.assert_eq(iso_credits_completed(var c, 0x0099, 1), 0)
-    test.assert(iso_credits_take(var c, 0x0040, 1))
-    test.assert_eq(iso_credits_completed(var c, 0x0040, 0), 0)
-    test.assert_eq(iso_credits_completed(var c, 0x0040, -1), 0)
-    test.assert_eq(c.free as Int, 2)
-
-@test
-@satisfies("REQ-BLE-ISO-005")
-fn test_a_stream_that_ends_gives_its_buffers_back()
-    var c = pool()
-    test.assert(iso_credits_open(var c, 0x0040))
-    test.assert(iso_credits_open(var c, 0x0041))
-    test.assert(iso_credits_take(var c, 0x0040, 2))
-    test.assert(iso_credits_take(var c, 0x0041, 1))
-    test.assert_eq(c.free as Int, 0)
-    test.assert_eq(iso_credits_close(var c, 0x0040), 2)
-    test.assert_eq(c.free as Int, 2)
-    test.assert_eq(iso_in_flight(var c, 0x0040), -1)
-    // Closed twice, or never opened: nothing returns.
-    test.assert_eq(iso_credits_close(var c, 0x0040), 0)
-    test.assert_eq(iso_credits_close(var c, 0x0099), 0)
-    test.assert_eq(c.free as Int, 2)
-    // The slot and the handle are free to be used again, with no history.
-    test.assert(iso_credits_open(var c, 0x0040))
-    test.assert_eq(iso_in_flight(var c, 0x0040), 0)
-    // A completed-packets event for the closed stream returns nothing more.
-    test.assert_eq(iso_credits_completed(var c, 0x0042, 1), 0)
-
-@test
-@satisfies("REQ-BLE-ISO-005")
-fn test_configuring_again_starts_with_every_buffer_free()
-    var c = pool()
-    test.assert(iso_credits_open(var c, 0x0040))
-    test.assert(iso_credits_take(var c, 0x0040, 3))
-    test.assert(iso_credits_configure(var c, sizes(100, 7)))
-    test.assert_eq(c.free as Int, 7)
-    test.assert_eq(iso_in_flight(var c, 0x0040), 0)
-
-@test
-@satisfies("REQ-BLE-ISO-005")
-fn test_the_sequence_number_counts_sdus_and_wraps_at_16_bits()
-    var c = pool()
-    test.assert(iso_credits_open(var c, 0x0040))
-    test.assert(iso_credits_open(var c, 0x0041))
-    test.assert_eq(iso_next_sequence(var c, 0x0040), 0)
-    test.assert_eq(iso_next_sequence(var c, 0x0040), 1)
-    test.assert_eq(iso_next_sequence(var c, 0x0041), 0)
-    test.assert_eq(iso_next_sequence(var c, 0x0099), -1)
-    for _ in 0..0xFFFD
-        let _s = iso_next_sequence(var c, 0x0040)
-    test.assert_eq(iso_next_sequence(var c, 0x0040), 0xFFFF)
-    test.assert_eq(iso_next_sequence(var c, 0x0040), 0)
-    // A stream opened again starts at 0.
-    test.assert_eq(iso_credits_close(var c, 0x0040), 0)
-    test.assert(iso_credits_open(var c, 0x0040))
-    test.assert_eq(iso_next_sequence(var c, 0x0040), 0)
-
-// The packet count agrees with the cut `isoal_fragments` makes.
-@test
-@satisfies("REQ-BLE-ISO-005")
-fn test_packets_for_sdu_counts_the_fragments()
-    // 255 octets: an SDU of up to 251 octets fits one packet with its header.
-    test.assert_eq(iso_packets_for_sdu(0, 255, false), 1)
-    test.assert_eq(iso_packets_for_sdu(251, 255, false), 1)
-    test.assert_eq(iso_packets_for_sdu(252, 255, false), 2)
-    // The first fragment holds 251, each later one 255.
-    test.assert_eq(iso_packets_for_sdu(251 + 255, 255, false), 2)
-    test.assert_eq(iso_packets_for_sdu(251 + 256, 255, false), 3)
-    // A Time_Stamp widens the header to 8 octets.
-    test.assert_eq(iso_packets_for_sdu(247, 255, true), 1)
-    test.assert_eq(iso_packets_for_sdu(248, 255, true), 2)
-    // The largest SDU.
-    test.assert_eq(iso_packets_for_sdu(4095, 255, false), 1 + (4095 - 251 + 254) / 255)
-    // Refusals: no room beside the header, an SDU too long, a length too long.
-    test.assert_eq(iso_packets_for_sdu(1, 4, false), 0)
-    test.assert_eq(iso_packets_for_sdu(1, 8, true), 0)
-    test.assert_eq(iso_packets_for_sdu(4096, 255, false), 0)
-    test.assert_eq(iso_packets_for_sdu(-1, 255, false), 0)
-    test.assert_eq(iso_packets_for_sdu(1, 0x4000, false), 0)
-
-@test
-@satisfies("REQ-BLE-ISO-005")
-fn test_packets_for_sdu_is_the_length_of_the_cut_isoal_makes()
-    for max in [5, 9, 12, 27, 251, 255]
-        for n in [0, 1, 4, 5, 11, 12, 13, 26, 27, 28, 100, 251, 252, 255, 256, 510, 511, 1000, 4095]
-            for ts in [false, true]
-                let stamp = if ts then Some(7) else None
-                match isoal.isoal_fragments(0x0040, 1, stamp, isoal.sdu_of(n), max)
-                    None          => test.assert_eq(iso_packets_for_sdu(n, max, ts), 0)
-                    Some(packets) => test.assert_eq(iso_packets_for_sdu(n, max, ts), list.len(packets))

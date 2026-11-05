@@ -34,10 +34,8 @@
 //
 // Satisfies REQ-BLE-SMP-010 (peripheral-side SMP FSM coverage).
 
-use std.test
 use smp
 use smp_ctx
-
 
 // ── state_machine SmpPairing ────────────────────────────────────────
 state_machine SmpPairing
@@ -92,34 +90,33 @@ state_machine SmpPairing
         HostAbort
 
     transitions
-        // Happy path: Idle → … → Encrypted.
-        (SmpIdle,         RxPairingRequest)   => ResponseSent
-        (ResponseSent,    RxPairingConfirm)   => SconfirmSent
-        (SconfirmSent,    RxPairingRandom)    => MrandReceived
-        (MrandReceived,   ConfirmVerifyOk)    => StkReady
-        (StkReady,        LlEncryptionDone)   => Encrypted
+        (SmpIdle, RxPairingRequest)          => ResponseSent
+        (ResponseSent, RxPairingConfirm)     => SconfirmSent
+        (SconfirmSent, RxPairingRandom)      => MrandReceived
+        (MrandReceived, ConfirmVerifyOk)     => StkReady
+        (StkReady, LlEncryptionDone)         => Encrypted
+        (MrandReceived, ConfirmVerifyFailed) => SmpFailed
+        (SmpIdle, RxPairingFailed)           => SmpFailed
+        (ResponseSent, RxPairingFailed)      => SmpFailed
+        (SconfirmSent, RxPairingFailed)      => SmpFailed
+        (MrandReceived, RxPairingFailed)     => SmpFailed
+        (StkReady, RxPairingFailed)          => SmpFailed
+        (SmpIdle, HostAbort)                 => SmpIdle
+        (ResponseSent, HostAbort)            => SmpFailed
+        (SconfirmSent, HostAbort)            => SmpFailed
+        (MrandReceived, HostAbort)           => SmpFailed
+        (StkReady, HostAbort)                => SmpFailed
+// Happy path: Idle → … → Encrypted.
 
-        // Verification failure path.
-        (MrandReceived,   ConfirmVerifyFailed) => SmpFailed
+// Verification failure path.
 
-        // Peer-aborted paths — RxPairingFailed from any pre-Encrypted
-        // state lands us in SmpFailed.
-        (SmpIdle,         RxPairingFailed)    => SmpFailed
-        (ResponseSent,    RxPairingFailed)    => SmpFailed
-        (SconfirmSent,    RxPairingFailed)    => SmpFailed
-        (MrandReceived,   RxPairingFailed)    => SmpFailed
-        (StkReady,        RxPairingFailed)    => SmpFailed
+// Peer-aborted paths — RxPairingFailed from any pre-Encrypted
+// state lands us in SmpFailed.
 
-        // Host-cancelled paths.  HostAbort from Idle is a no-op
-        // (nothing to cancel); from any in-flight state it lands
-        // in SmpFailed and the caller emits Pairing_Failed to
-        // the peer.
-        (SmpIdle,         HostAbort)          => SmpIdle
-        (ResponseSent,    HostAbort)          => SmpFailed
-        (SconfirmSent,    HostAbort)          => SmpFailed
-        (MrandReceived,   HostAbort)          => SmpFailed
-        (StkReady,        HostAbort)          => SmpFailed
-
+// Host-cancelled paths.  HostAbort from Idle is a no-op
+// (nothing to cancel); from any in-flight state it lands
+// in SmpFailed and the caller emits Pairing_Failed to
+// the peer.
 
 // ── Cross-module accessor helpers (finding #8 — variant exports) ────
 
@@ -166,13 +163,13 @@ fn smp_event_host_abort() -> SmpPairingEvent
 pub @tier(embedded)
 fn smp_state_name(s: SmpPairingState) -> Str
     match s
-        SmpIdle        => "Idle"
-        ResponseSent   => "ResponseSent"
-        SconfirmSent   => "SconfirmSent"
-        MrandReceived  => "MrandReceived"
-        StkReady       => "StkReady"
-        Encrypted      => "Encrypted"
-        SmpFailed      => "Failed"
+        SmpIdle       => "Idle"
+        ResponseSent  => "ResponseSent"
+        SconfirmSent  => "SconfirmSent"
+        MrandReceived => "MrandReceived"
+        StkReady      => "StkReady"
+        Encrypted     => "Encrypted"
+        SmpFailed     => "Failed"
 
 @tier(embedded)
 @no_alloc
@@ -196,14 +193,13 @@ fn smp_is_failed(s: SmpPairingState) -> Bool
 @no_alloc
 fn smp_in_progress(s: SmpPairingState) -> Bool
     match s
-        SmpIdle        => false
-        Encrypted      => false
-        SmpFailed      => false
-        ResponseSent   => true
-        SconfirmSent   => true
-        MrandReceived  => true
-        StkReady       => true
-
+        SmpIdle       => false
+        Encrypted     => false
+        SmpFailed     => false
+        ResponseSent  => true
+        SconfirmSent  => true
+        MrandReceived => true
+        StkReady      => true
 
 // ── State → reply PDU mapping ───────────────────────────────────────
 //
@@ -242,110 +238,18 @@ fn smp_in_progress(s: SmpPairingState) -> Bool
 @tier(embedded)
 fn smp_reply_for_state_pure(state: SmpPairingState, sconfirm: [u8], srand: [u8]) -> [u8]
     match state
-        ResponseSent  =>
+        ResponseSent =>
             smp.build_pairing_response_just_works()
-        SconfirmSent  =>
+        SconfirmSent =>
             smp.build_pairing_confirm(sconfirm)
-        StkReady      =>
+        StkReady     =>
             smp.build_pairing_random(srand)
-        SmpFailed     =>
+        SmpFailed    =>
             smp.build_pairing_failed(smp.SMP_FAIL_UNSPECIFIED_REASON)
-        _             => []
+        _            => []
 
 // Production reply-builder: pulls the current Sconfirm and
 // Srand bytes from smp_ctx and routes through the pure form.
 @tier(embedded)
 fn smp_reply_for_state(state: SmpPairingState) -> [u8] [hw]
     smp_reply_for_state_pure(state, smp_ctx.read_sconfirm(), smp_ctx.read_srand())
-
-
-// ── Tests ────────────────────────────────────────────────────────────
-
-@test
-fn test_initial_state_is_idle()
-    let s = smp_initial_state()
-    test.assert_eq(smp_state_name(s), "Idle")
-    test.assert(not smp_is_encrypted(s))
-    test.assert(not smp_is_failed(s))
-    test.assert(not smp_in_progress(s))
-
-@test
-fn test_rx_pairing_request_advances_to_response_sent()
-    let s = smppairing_step(SmpIdle, RxPairingRequest)
-    test.assert_eq(smp_state_name(s), "ResponseSent")
-    test.assert(smp_in_progress(s))
-
-@test
-fn test_rx_pairing_confirm_advances_to_sconfirm_sent()
-    let s = smppairing_step(ResponseSent, RxPairingConfirm)
-    test.assert_eq(smp_state_name(s), "SconfirmSent")
-
-@test
-fn test_rx_pairing_random_advances_to_mrand_received()
-    let s = smppairing_step(SconfirmSent, RxPairingRandom)
-    test.assert_eq(smp_state_name(s), "MrandReceived")
-
-@test
-fn test_confirm_verify_ok_advances_to_stk_ready()
-    let s = smppairing_step(MrandReceived, ConfirmVerifyOk)
-    test.assert_eq(smp_state_name(s), "StkReady")
-
-@test
-fn test_ll_encryption_done_lands_in_encrypted()
-    let s = smppairing_step(StkReady, LlEncryptionDone)
-    test.assert_eq(smp_state_name(s), "Encrypted")
-    test.assert(smp_is_encrypted(s))
-    test.assert(not smp_in_progress(s))
-
-@test
-fn test_full_just_works_happy_path()
-    let s0 = smp_initial_state()
-    let s1 = smppairing_step(s0, RxPairingRequest)
-    let s2 = smppairing_step(s1, RxPairingConfirm)
-    let s3 = smppairing_step(s2, RxPairingRandom)
-    let s4 = smppairing_step(s3, ConfirmVerifyOk)
-    let s5 = smppairing_step(s4, LlEncryptionDone)
-    test.assert(smp_is_encrypted(s5))
-
-@test
-fn test_confirm_verify_failed_lands_in_failed()
-    let s = smppairing_step(MrandReceived, ConfirmVerifyFailed)
-    test.assert(smp_is_failed(s))
-    test.assert(not smp_is_encrypted(s))
-
-@test
-fn test_rx_pairing_failed_aborts_from_every_in_progress_state()
-    test.assert(smp_is_failed(smppairing_step(ResponseSent,   RxPairingFailed)))
-    test.assert(smp_is_failed(smppairing_step(SconfirmSent,   RxPairingFailed)))
-    test.assert(smp_is_failed(smppairing_step(MrandReceived,  RxPairingFailed)))
-    test.assert(smp_is_failed(smppairing_step(StkReady,       RxPairingFailed)))
-
-@test
-fn test_rx_pairing_failed_from_idle_is_recorded()
-    // Idle + RxPairingFailed → SmpFailed.  The peer pushed a
-    // protocol error before we ever started; we still record
-    // it as a failure for the caller's logging.
-    let s = smppairing_step(SmpIdle, RxPairingFailed)
-    test.assert(smp_is_failed(s))
-
-@test
-fn test_host_abort_from_idle_stays_idle()
-    let s = smppairing_step(SmpIdle, HostAbort)
-    test.assert_eq(smp_state_name(s), "Idle")
-
-@test
-fn test_host_abort_from_in_progress_states_lands_in_failed()
-    test.assert(smp_is_failed(smppairing_step(ResponseSent,  HostAbort)))
-    test.assert(smp_is_failed(smppairing_step(SconfirmSent,  HostAbort)))
-    test.assert(smp_is_failed(smppairing_step(MrandReceived, HostAbort)))
-    test.assert(smp_is_failed(smppairing_step(StkReady,      HostAbort)))
-
-@test
-fn test_smp_in_progress_classification()
-    test.assert(not smp_in_progress(SmpIdle))
-    test.assert(not smp_in_progress(Encrypted))
-    test.assert(not smp_in_progress(SmpFailed))
-    test.assert(smp_in_progress(ResponseSent))
-    test.assert(smp_in_progress(SconfirmSent))
-    test.assert(smp_in_progress(MrandReceived))
-    test.assert(smp_in_progress(StkReady))

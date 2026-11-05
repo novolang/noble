@@ -29,9 +29,6 @@
 // Satisfies: REQ-BLE-HCI-003 (Command_Complete flow per
 // command), REQ-BLE-ARCH-002 (HCI boundary from host side).
 
-use std.test
-use std.bits
-use hci_frame
 use hci_codec
 
 // ── State codes ─────────────────────────────────────────────────────
@@ -92,7 +89,7 @@ pub @satisfies("REQ-BLE-HCI-003")
 @tier(embedded)
 fn session_feed_event(state: Int, pending: Int, evt: [u8]) -> FeedResult
     // Strip the H4 type-byte prefix if present.
-    let body = if list.len(evt) > 0 and evt[0] as Int == 0x04
+    let body = if list.len(evt) > 0 and (evt[0] as Int) == 0x04
         drop_h4_prefix(evt)
     else
         evt
@@ -136,67 +133,3 @@ fn session_is_idle(state: Int) -> Bool
 @no_alloc
 fn session_is_waiting(state: Int) -> Bool
     state == SESSION_WAITING_CMD_COMPLETE
-
-// ── Tests ────────────────────────────────────────────────────────────
-
-@test
-fn test_state_constants()
-    test.assert_eq(SESSION_IDLE, 0)
-    test.assert_eq(SESSION_WAITING_CMD_COMPLETE, 1)
-
-@test
-fn test_outcome_constants()
-    test.assert_eq(SESSION_OUTCOME_MATCH, 0)
-    test.assert_eq(SESSION_OUTCOME_MISMATCH, 1)
-    test.assert_eq(SESSION_OUTCOME_NOT_WAITING, 2)
-    test.assert_eq(SESSION_OUTCOME_MALFORMED, 3)
-
-@test
-fn test_drop_h4_prefix_strips_first_byte()
-    let evt: [u8] = [0x04, 0x0E, 0x04, 0x01, 0x03, 0x0C, 0x00]
-    let body = drop_h4_prefix(evt)
-    test.assert_eq(list.len(body), 6)
-    test.assert_eq(body[0] as Int, 0x0E)
-
-@test
-fn test_drop_h4_prefix_on_short_buffer()
-    let evt: [u8] = [0x04]
-    let body = drop_h4_prefix(evt)
-    test.assert_eq(list.len(body), 0)
-
-@test
-fn test_session_is_idle_inspector()
-    test.assert_eq(session_is_idle(SESSION_IDLE), true)
-    test.assert_eq(session_is_idle(SESSION_WAITING_CMD_COMPLETE), false)
-
-@test
-fn test_session_is_waiting_inspector()
-    test.assert_eq(session_is_waiting(SESSION_WAITING_CMD_COMPLETE), true)
-    test.assert_eq(session_is_waiting(SESSION_IDLE), false)
-
-@test
-@satisfies("REQ-BLE-HCI-003")
-fn test_feed_command_complete_matches_pending()
-    let issue = session_issue(SESSION_IDLE, 0, [0x01, 0x03, 0x0C, 0x00], 0x0C03)
-    let evt: [u8] = [0x04, 0x0E, 0x04, 0x01, 0x03, 0x0C, 0x00]
-    let r = session_feed_event(issue.state, issue.pending, evt)
-    test.assert_eq(r.outcome, SESSION_OUTCOME_MATCH)
-    test.assert_eq(r.state, SESSION_IDLE)
-
-@test
-@satisfies("REQ-BLE-HCI-003")
-fn test_feed_command_status_matches_pending()
-    // Command_Status for LE_Create_Connection (0x200D).
-    let evt: [u8] = [0x0F, 0x04, 0x00, 0x01, 0x0D, 0x20]
-    let r = session_feed_event(SESSION_WAITING_CMD_COMPLETE, 0x200D, evt)
-    test.assert_eq(r.outcome, SESSION_OUTCOME_MATCH)
-    test.assert_eq(r.state, SESSION_IDLE)
-
-@test
-fn test_feed_other_event_keeps_waiting()
-    // An LE Advertising Report while HCI_Reset is pending.
-    let evt: [u8] = [0x3E, 0x03, 0x02, 0x01, 0x00]
-    let r = session_feed_event(SESSION_WAITING_CMD_COMPLETE, 0x0C03, evt)
-    test.assert_eq(r.outcome, SESSION_OUTCOME_MISMATCH)
-    test.assert_eq(r.state, SESSION_WAITING_CMD_COMPLETE)
-    test.assert_eq(r.pending, 0x0C03)

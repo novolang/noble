@@ -1,0 +1,177 @@
+// tests/iso_setup_tests.nv — the unit tests of src/iso_setup.nv.
+//
+//   novo test tests/iso_setup_tests.nv
+
+use std.test
+use hci_commands
+use iso_cis
+use iso_flow
+use iso_setup.{ BringUpStep, buffer_size_return, complete, feature_set, iso_bringup_answer, iso_bringup_buffer_size, iso_bringup_command, iso_bringup_finish, iso_bringup_new, iso_event_mask, iso_features, iso_has_cis, iso_supported }
+
+@test
+@satisfies("REQ-BLE-ISO-006")
+fn test_the_four_feature_bits_are_28_to_31()
+    let none = iso_features(feature_set([]))
+    test.assert(not iso_supported(none))
+    let c = iso_features(feature_set([28]))
+    test.assert(c.cis_central and not c.cis_peripheral and not c.broadcaster and not c.receiver)
+    let p = iso_features(feature_set([29]))
+    test.assert(not p.cis_central and p.cis_peripheral and not p.broadcaster and not p.receiver)
+    let b = iso_features(feature_set([30]))
+    test.assert(not b.cis_central and not b.cis_peripheral and b.broadcaster and not b.receiver)
+    let r = iso_features(feature_set([31]))
+    test.assert(not r.cis_central and not r.cis_peripheral and not r.broadcaster and r.receiver)
+    // The neighbouring bits are other features.
+    let other = iso_features(feature_set([27, 32, 33]))
+    test.assert(not iso_supported(other))
+    // The bit is in octet 3 for 24 to 31, and a short set reports none.
+    test.assert_eq(feature_set([28])[3] as Int, 0x10)
+    test.assert(not iso_supported(iso_features([0xFF, 0xFF, 0xFF])))
+    test.assert(iso_has_cis(c) and iso_has_cis(p) and not iso_has_cis(b) and not iso_has_cis(r))
+
+@test
+@satisfies("REQ-BLE-ISO-006")
+fn test_the_event_mask_gains_only_the_bits_of_the_reported_roles()
+    let base = hci_commands.LE_EVENT_MASK_DEFAULT
+    test.assert_eq(iso_event_mask(base, iso_features(feature_set([]))), base)
+    // A Central: CIS Established in both forms, no CIS Request.
+    test.assert_eq(iso_event_mask(base, iso_features(feature_set([28]))), base | (1 << 24) | (1 << 41))
+    // A Peripheral adds CIS Request.
+    test.assert_eq(iso_event_mask(base, iso_features(feature_set([29]))),
+        base | (1 << 24) | (1 << 25) | (1 << 41))
+    // A Broadcaster: bits 26 and 27.
+    test.assert_eq(iso_event_mask(base, iso_features(feature_set([30]))), base | (1 << 26) | (1 << 27))
+    // A Receiver: bits 28, 29 and 33.
+    test.assert_eq(iso_event_mask(base, iso_features(feature_set([31]))),
+        base | (1 << 28) | (1 << 29) | (1 << 33))
+    // Every role is the whole isochronous set, and the base is kept.
+    let all = iso_event_mask(base, iso_features(feature_set([28, 29, 30, 31])))
+    test.assert_eq(all, base | hci_commands.LE_EVENT_MASK_ISOCHRONOUS)
+    test.assert_eq(all & base, base)
+
+@test
+@satisfies("REQ-BLE-ISO-006")
+fn test_a_controller_without_isochronous_channels_needs_no_command()
+    var b = iso_bringup_new(feature_set([]), hci_commands.LE_EVENT_MASK_DEFAULT)
+    test.assert(b.step == BringUpStep.Done)
+    test.assert_eq(b.mask, hci_commands.LE_EVENT_MASK_DEFAULT)
+    test.assert(iso_bringup_command(b) == None)
+    // A Controller with other LE Audio features only, such as the Host
+    // Support bit itself, is still without a role.
+    var o = iso_bringup_new(feature_set([32]), hci_commands.LE_EVENT_MASK_DEFAULT)
+    test.assert(o.step == BringUpStep.Done)
+    // An answer with nothing waiting changes nothing.
+    test.assert(iso_bringup_answer(var b, 0) == BringUpStep.Done)
+    test.assert(iso_bringup_answer(var b, 0x0C) == BringUpStep.Done)
+    var cis = iso_cis.cis_table_new()
+    iso_bringup_finish(b, var cis)
+    test.assert(not cis.host_support)
+
+@test
+@satisfies("REQ-BLE-ISO-006")
+fn test_the_bring_up_of_a_cis_controller_runs_three_commands_in_order()
+    var b = iso_bringup_new(feature_set([28, 29, 30, 31]), hci_commands.LE_EVENT_MASK_DEFAULT)
+    var credits = iso_flow.iso_credits_new()
+    var cis = iso_cis.cis_table_new()
+    test.assert(b.step == BringUpStep.ReadBufferSize)
+    match iso_bringup_command(b)
+        None    => test.fail("a command is waiting")
+        Some(c) =>
+            test.assert_eq(c.opcode, 0x2060)
+            test.assert_eq(list.len(c.params), 0)
+    let after_sizes = iso_bringup_buffer_size(var b, var credits, complete(0x2060, 0, buffer_size_return(255, 3)))
+    test.assert(after_sizes == BringUpStep.SetEventMask)
+    test.assert(iso_flow.iso_credits_ready(var credits))
+    test.assert_eq(iso_flow.iso_packet_length(var credits), 255)
+    match iso_bringup_command(b)
+        None    => test.fail("a command is waiting")
+        Some(c) =>
+            test.assert_eq(c.opcode, 0x2001)
+            test.assert_eq(list.len(c.params), 8)
+            // The mask: the default and bits 24 to 29, 33 and 41.
+            test.assert_eq(c.params[0] as Int, 0x1F)
+            test.assert_eq(c.params[3] as Int, 0x3F)
+            test.assert_eq(c.params[4] as Int, 0x02)
+            test.assert_eq(c.params[5] as Int, 0x02)
+    test.assert(iso_bringup_answer(var b, 0) == BringUpStep.SetHostFeature)
+    match iso_bringup_command(b)
+        None    => test.fail("a command is waiting")
+        Some(c) =>
+            test.assert_eq(c.opcode, 0x2074)
+            test.assert_eq(c.params[0] as Int, 32)
+            test.assert_eq(c.params[1] as Int, 1)
+    test.assert(iso_bringup_answer(var b, 0) == BringUpStep.Done)
+    test.assert(b.host_support)
+    test.assert(iso_bringup_command(b) == None)
+    iso_bringup_finish(b, var cis)
+    test.assert(cis.host_support)
+
+@test
+@satisfies("REQ-BLE-ISO-006")
+fn test_a_broadcaster_or_receiver_alone_does_not_set_the_host_support_bit()
+    var credits = iso_flow.iso_credits_new()
+    for bit in [30, 31]
+        var b = iso_bringup_new(feature_set([bit]), 0)
+        test.assert(b.step == BringUpStep.ReadBufferSize)
+        test.assert(iso_bringup_buffer_size(var b, var credits, complete(0x2060, 0, buffer_size_return(255, 3))) == BringUpStep.SetEventMask)
+        test.assert(iso_bringup_answer(var b, 0) == BringUpStep.Done)
+        test.assert(not b.host_support)
+        var cis = iso_cis.cis_table_new()
+        iso_bringup_finish(b, var cis)
+        test.assert(not cis.host_support)
+
+@test
+@satisfies("REQ-BLE-ISO-006")
+fn test_a_refused_command_ends_the_bring_up_at_the_step_it_failed_in()
+    var credits = iso_flow.iso_credits_new()
+    // Read Buffer Size refused.
+    var a = iso_bringup_new(feature_set([28]), 0)
+    test.assert(iso_bringup_buffer_size(var a, var credits, complete(0x2060, 0x01, [])) == BringUpStep.Failed)
+    test.assert(a.failed_at == BringUpStep.ReadBufferSize)
+    test.assert(iso_bringup_command(a) == None)
+    // The mask refused.
+    var b = iso_bringup_new(feature_set([28]), 0)
+    test.assert(iso_bringup_buffer_size(var b, var credits, complete(0x2060, 0, buffer_size_return(255, 3))) == BringUpStep.SetEventMask)
+    test.assert(iso_bringup_answer(var b, 0x12) == BringUpStep.Failed)
+    test.assert(b.failed_at == BringUpStep.SetEventMask)
+    // Set Host Feature refused with Command Disallowed: a connection exists.
+    var c = iso_bringup_new(feature_set([29]), 0)
+    test.assert(iso_bringup_buffer_size(var c, var credits, complete(0x2060, 0, buffer_size_return(255, 3))) == BringUpStep.SetEventMask)
+    test.assert(iso_bringup_answer(var c, 0) == BringUpStep.SetHostFeature)
+    test.assert(iso_bringup_answer(var c, 0x0C) == BringUpStep.Failed)
+    test.assert(c.failed_at == BringUpStep.SetHostFeature)
+    test.assert(not c.host_support)
+    // A failed bring-up stays failed.
+    test.assert(iso_bringup_answer(var c, 0) == BringUpStep.Failed)
+    var cis = iso_cis.cis_table_new()
+    iso_bringup_finish(c, var cis)
+    test.assert(not cis.host_support)
+
+@test
+@satisfies("REQ-BLE-ISO-006")
+fn test_read_buffer_size_with_no_iso_buffer_fails_the_step()
+    var credits = iso_flow.iso_credits_new()
+    // ISO_Data_Packet_Length 0: the Controller has no dedicated ISO buffer.
+    var a = iso_bringup_new(feature_set([28]), 0)
+    test.assert(iso_bringup_buffer_size(var a, var credits, complete(0x2060, 0, buffer_size_return(0, 3))) == BringUpStep.Failed)
+    test.assert(a.failed_at == BringUpStep.ReadBufferSize)
+    test.assert(not iso_flow.iso_credits_ready(var credits))
+    // Zero packets.
+    var b = iso_bringup_new(feature_set([28]), 0)
+    test.assert(iso_bringup_buffer_size(var b, var credits, complete(0x2060, 0, buffer_size_return(255, 0))) == BringUpStep.Failed)
+    // A [v1] answer, too short for the ISO half.
+    var c = iso_bringup_new(feature_set([28]), 0)
+    test.assert(iso_bringup_buffer_size(var c, var credits, complete(0x2060, 0, [0xFB, 0x00, 0x03])) == BringUpStep.Failed)
+    test.assert(not iso_flow.iso_credits_ready(var credits))
+    // A truncated event.
+    var d = iso_bringup_new(feature_set([28]), 0)
+    test.assert(iso_bringup_buffer_size(var d, var credits, [0x0E, 0x03, 0x01]) == BringUpStep.Failed)
+
+@test
+@satisfies("REQ-BLE-ISO-006")
+fn test_the_buffer_answer_is_read_only_in_its_own_step()
+    var credits = iso_flow.iso_credits_new()
+    var b = iso_bringup_new(feature_set([28]), 0)
+    test.assert(iso_bringup_answer(var b, 0) == BringUpStep.SetEventMask)
+    test.assert(iso_bringup_buffer_size(var b, var credits, complete(0x2060, 0, buffer_size_return(255, 3))) == BringUpStep.SetEventMask)
+    test.assert(not iso_flow.iso_credits_ready(var credits))

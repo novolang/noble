@@ -77,11 +77,10 @@
 // 2.3.5.7) is outside an LE-only Host, and the LinkKey bit is answered as
 // zero; signing data with a CSRK (Section 2.4.5) is the ATT layer's.
 
-use std.test
 use smp
 use smp.{ Command, Reason }
 use smp_core
-use smp_core.{ Role, Phase, Method, SmpConfig, PairingState, PairingResult, Received, Taken, KeyResult }
+use smp_core.{ Role, Phase, Method, SmpConfig, PairingState, PairingResult }
 use smp_keys
 use smp_keys.{ PublicKey, KeyPair }
 use smp_bond
@@ -111,7 +110,8 @@ use smp_bond
 // connection's role names.  Reseed mixes 16 octets into the random number
 // generator.  Cancel aborts a pairing in progress.
 pub enum SmpInput
-    Connected(own_address_type: Int, own_address: [u8], peer_address_type: Int, peer_address: [u8], bond: ?SmpBond)
+    Connected(own_address_type: Int, own_address: [u8], peer_address_type: Int, peer_address: [u8],
+              bond: ?SmpBond)
     Disconnected
     Pdu(pdu: [u8])
     Tick
@@ -256,7 +256,10 @@ fn on_pairing_request(var s: SmpState, pdu: [u8]) -> SmpStep
     let key_size = smp_core.negotiated_key_size(s, max_key)
     if smp_core.key_size_too_small(s, key_size, level)
         return refuse(var s, Reason.EncryptionKeySize)
-    let resp_oob = if sc then list.len(s.peer_oob_c) == 16 else list.len(s.legacy_oob_tk) == 16
+    let resp_oob = if sc
+        list.len(s.peer_oob_c) == 16
+    else
+        list.len(s.legacy_oob_tk) == 16
     var resp_auth = smp_core.local_auth_req(s.config, level)
     // The MITM flag of a Pairing Response asks for an authenticated key,
     // so it goes out only when the two devices' capabilities leave an
@@ -284,15 +287,18 @@ fn on_pairing_request(var s: SmpState, pdu: [u8]) -> SmpStep
     var resp_dist = 0
     if bonding
         let init_ok = smp.SMP_KEY_DIST_ID | smp.SMP_KEY_DIST_SIGN | (if sc then 0 else smp.SMP_KEY_DIST_ENC)
-        var resp_ok = if sc then 0 else smp.SMP_KEY_DIST_ENC
+        var resp_ok = if sc
+            0
+        else
+            smp.SMP_KEY_DIST_ENC
         if list.len(s.config.identity_irk) == 16 and list.len(s.config.identity_address) == 6
             resp_ok = resp_ok | smp.SMP_KEY_DIST_ID
         if s.config.distribute_csrk
             resp_ok = resp_ok | smp.SMP_KEY_DIST_SIGN
-        init_dist = (pdu[5] as Int) & init_ok
-        resp_dist = (pdu[6] as Int) & resp_ok
+        init_dist = pdu[5] as Int & init_ok
+        resp_dist = pdu[6] as Int & resp_ok
     let pres = smp.build_pairing_response(s.config.io_capability,
-                                          if resp_oob then smp.SMP_OOB_PRESENT else smp.SMP_OOB_NOT_PRESENT,
+                                          (if resp_oob then smp.SMP_OOB_PRESENT else smp.SMP_OOB_NOT_PRESENT),
                                           resp_auth, s.config.max_key_size, init_dist, resp_dist)
     if sc
         smp_core.renew_key_pair(var s)
@@ -372,7 +378,8 @@ fn on_public_key(var s: SmpState, pdu: [u8]) -> SmpStep
     if s.method == Method.JustWorks or s.method == Method.NumericComparison
         // Steps 2 to 4 of Figure 2.3: Nb, then Cb = f4(PKbx, PKax, Nb, 0).
         s.local_rand = smp_core.draw(var s)
-        smp_core.send(var s, smp.build_pairing_confirm(smp_keys.sc_confirm(smp_core.local_x(s), peer.x, s.local_rand, 0)))
+        smp_core.send(var s,
+            smp.build_pairing_confirm(smp_keys.sc_confirm(smp_core.local_x(s), peer.x, s.local_rand, 0)))
         s.phase = Phase.ScRandom
     else if s.method == Method.OutOfBand
         s.phase = Phase.ScRandom
@@ -407,7 +414,10 @@ fn on_sc_random(var s: SmpState, pdu: [u8]) -> SmpStep
         smp_core.send(var s, smp.build_pairing_random(s.local_rand))
         s.round = s.round + 1
         s.peer_confirm = []
-        s.phase = if s.round >= smp_core.PASSKEY_ROUNDS then Phase.DhKeyCheck else Phase.ScConfirm
+        s.phase = if s.round >= smp_core.PASSKEY_ROUNDS
+            Phase.DhKeyCheck
+        else
+            Phase.ScConfirm
     else if s.method == Method.OutOfBand
         // Step 5 of Figure 2.5: check Ca = f4(PKax, PKax, ra, 0) when the
         // peer's out of band data was received.
@@ -473,8 +483,8 @@ fn hold_key(var s: SmpState, pdu: [u8]) -> SmpStep
 fn on_distributed_key(var s: SmpState, pdu: [u8]) -> SmpStep
     match smp_core.take_distributed_key(var s, pdu)
         Rejected(reason) => fail(s, reason, false)
-        Waiting => finish(s, None)
-        Complete => complete(s)
+        Waiting          => finish(s, None)
+        Complete         => complete(s)
 
 fn complete(var s: SmpState) -> SmpStep
     let result = smp_core.conclude(var s)
@@ -484,11 +494,11 @@ fn complete(var s: SmpState) -> SmpStep
 
 fn on_pdu(var s: SmpState, pdu: [u8]) -> SmpStep
     match smp_core.classify(var s, pdu)
-        Ignore => finish(s, None)
+        Ignore             => finish(s, None)
         PeerFailed(reason) => finish(s, Some(PairingFailed(reason, true)))
-        Refuse(reason) => refuse(var s, reason)
-        Fail(reason) => fail(s, reason, false)
-        Handle(command) => on_command(var s, command, pdu)
+        Refuse(reason)     => refuse(var s, reason)
+        Fail(reason)       => fail(s, reason, false)
+        Handle(command)    => on_command(var s, command, pdu)
 
 fn on_command(var s: SmpState, command: Command, pdu: [u8]) -> SmpStep
     if command == Command.PairingRequest
@@ -554,9 +564,9 @@ fn on_encryption_changed(var s: SmpState, enabled: Bool) -> SmpStep
 // the first round needs it.
 fn on_passkey(var s: SmpState, passkey: Int) -> SmpStep
     match smp_core.take_passkey(var s, passkey)
-        Ignored => finish(s, None)
+        Ignored         => finish(s, None)
         Refused(reason) => fail(s, reason, false)
-        Accepted =>
+        Accepted        =>
             if s.sc
                 passkey_send_confirm(var s)
             else
@@ -565,15 +575,15 @@ fn on_passkey(var s: SmpState, passkey: Int) -> SmpStep
 
 fn on_numeric(var s: SmpState, accepted: Bool) -> SmpStep
     match smp_core.take_numeric(var s, accepted)
-        Ignored => finish(s, None)
+        Ignored         => finish(s, None)
         Refused(reason) => fail(s, reason, false)
-        Accepted => stage2_or_wait(var s)
+        Accepted        => stage2_or_wait(var s)
 
 fn on_dhkey(var s: SmpState, dhkey: [u8]) -> SmpStep
     match smp_core.take_dhkey(var s, dhkey)
-        Ignored => finish(s, None)
+        Ignored         => finish(s, None)
         Refused(reason) => fail(s, reason, false)
-        Accepted => stage2_or_wait(var s)
+        Accepted        => stage2_or_wait(var s)
 
 fn stage2_or_wait(var s: SmpState) -> SmpStep
     let done = try_stage2(var s)
@@ -589,10 +599,14 @@ fn on_request_security(var s: SmpState, level: Int) -> SmpStep
     if s.phase != Phase.Idle or s.encrypting_with_bond or s.timed_out
         return finish(s, None)
     let can_mitm = s.config.io_capability != smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT or list.len(s.legacy_oob_tk) == 16 or list.len(s.peer_oob_c) == 16
-    let wanted = if level >= 3 and not can_mitm then 2 else level
+    let wanted = if level >= 3 and not can_mitm
+        2
+    else
+        level
     s.requested_level = wanted
     smp_core.start_timer(var s)
-    smp_core.send(var s, smp.build_security_request(smp_core.local_auth_req(s.config, if wanted > s.config.required_level then wanted else s.config.required_level)))
+    smp_core.send(var s,
+        smp.build_security_request(smp_core.local_auth_req(s.config, (if wanted > s.config.required_level then wanted else s.config.required_level))))
     finish(s, None)
 
 fn on_keypress(var s: SmpState, notification_type: Int) -> SmpStep
@@ -614,8 +628,8 @@ fn on_tick(var s: SmpState) -> SmpStep
 fn is_link_event(input: SmpInput) -> Bool
     match input
         Connected(_, _, _, _, _) => true
-        Disconnected => true
-        _ => false
+        Disconnected             => true
+        _                        => false
 
 // Advance the procedure by one input at time `now_ms`.
 pub fn handle(state: SmpState, input: SmpInput, now_ms: Int) -> SmpStep
@@ -629,38 +643,38 @@ pub fn handle(state: SmpState, input: SmpInput, now_ms: Int) -> SmpStep
         Connected(own_type, own_address, peer_type, peer_address, bond) =>
             smp_core.link_up(var s, own_type, own_address, peer_type, peer_address, bond)
             finish(s, None)
-        Disconnected =>
+        Disconnected                                                    =>
             if smp_core.link_down(var s)
                 return finish(s, Some(PairingFailed(smp.reason_code(Reason.UnspecifiedReason), false)))
             finish(s, None)
-        Pdu(pdu) => on_pdu(s, pdu)
-        Tick => on_tick(var s)
-        LtkRequest(ediv, rand) => on_ltk_request(var s, ediv, rand)
-        EncryptionChanged(enabled) => on_encryption_changed(var s, enabled)
-        PasskeyEntered(passkey) => on_passkey(var s, passkey)
-        NumericConfirmed(accepted) => on_numeric(var s, accepted)
-        DhKeyComputed(dhkey) => on_dhkey(var s, dhkey)
-        RequestSecurity(level) => on_request_security(var s, level)
-        SendKeypress(t) => on_keypress(var s, t)
-        SetLegacyOobTk(tk) =>
+        Pdu(pdu)                                                        => on_pdu(s, pdu)
+        Tick                                                            => on_tick(var s)
+        LtkRequest(ediv, rand)                                          => on_ltk_request(var s, ediv, rand)
+        EncryptionChanged(enabled)                                      => on_encryption_changed(var s, enabled)
+        PasskeyEntered(passkey)                                         => on_passkey(var s, passkey)
+        NumericConfirmed(accepted)                                      => on_numeric(var s, accepted)
+        DhKeyComputed(dhkey)                                            => on_dhkey(var s, dhkey)
+        RequestSecurity(level)                                          => on_request_security(var s, level)
+        SendKeypress(t)                                                 => on_keypress(var s, t)
+        SetLegacyOobTk(tk)                                              =>
             smp_core.set_legacy_oob_tk(var s, tk)
             finish(s, None)
-        SetPeerOobData(r, c) =>
+        SetPeerOobData(r, c)                                            =>
             smp_core.set_peer_oob_data(var s, r, c)
             finish(s, None)
-        CreateOobData => on_create_oob(var s)
-        SetLocalOobData(r) =>
+        CreateOobData                                                   => on_create_oob(var s)
+        SetLocalOobData(r)                                              =>
             smp_core.set_local_oob_data(var s, r)
             finish(s, None)
-        Reseed(seed) =>
+        Reseed(seed)                                                    =>
             smp_core.reseed(var s, seed)
             finish(s, None)
-        Cancel =>
+        Cancel                                                          =>
             if s.phase == Phase.Idle
                 return finish(s, None)
             fail(s, Reason.UnspecifiedReason, false)
 
-// ── Tests ───────────────────────────────────────────────────────────
+// ── Fixtures that the suites of other modules share ─────────────────────
 //
 // The tests play the initiator: they compute its confirm values, nonces
 // and DHKey checks with the same toolbox functions, from values the
@@ -679,1105 +693,3 @@ fn peer_address() -> [u8]
 
 fn seed() -> [u8]
     hex("0f0e0d0c0b0a09080706050403020100")
-
-fn no_key_pair() -> KeyPair
-    KeyPair { private_key: [], public_key: PublicKey { x: smp_keys.zeros(32), y: smp_keys.zeros(32) } }
-
-fn config_with(io_cap: Int) -> SmpConfig
-    let d = default_config()
-    SmpConfig {
-        io_capability: io_cap, bondable: d.bondable, secure_connections: d.secure_connections,
-        sc_only: d.sc_only, required_level: d.required_level, keypress: d.keypress, request_mitm: d.request_mitm,
-        max_key_size: d.max_key_size, min_key_size: d.min_key_size,
-        identity_irk: hex("00112233445566778899aabbccddeeff"), identity_address_type: 1,
-        identity_address: own_address(), distribute_csrk: true, accept_debug_key: false,
-        pairing_supported: true, attempt_min_wait_ms: 2000, attempt_max_wait_ms: 32000 }
-
-// A connected responder.
-fn connected(config: SmpConfig, key_pair: KeyPair) -> SmpState
-    let s = new_state(config, key_pair, seed())
-    handle(s, Connected(1, own_address(), 0, peer_address(), None), 0).state
-
-fn preq_of(io_cap: Int, oob: Int, auth: Int, max_key: Int, init_dist: Int, resp_dist: Int) -> [u8]
-    smp.build_pairing_request(io_cap, oob, auth, max_key, init_dist, resp_dist)
-
-fn action_name(step: SmpStep) -> Str
-    if step.action == None
-        return "none"
-    match step.action!
-        DisplayPasskey(_) => "display"
-        RequestPasskey => "request"
-        ConfirmNumericValue(_) => "numeric"
-        ReplyLtk(_) => "reply"
-        NegativeReplyLtk => "negative"
-        PairingComplete(_) => "complete"
-        PairingFailed(_, _) => "failed"
-        PairingTimeout => "timeout"
-        SecurityEstablished(_) => "established"
-        LocalOobData(_, _) => "oob"
-
-// The number an action carries: a passkey, a value, a reason or a level.
-fn action_int(step: SmpStep) -> Int
-    match step.action!
-        DisplayPasskey(p) => p
-        ConfirmNumericValue(v) => v
-        PairingFailed(r, by_peer) => if by_peer then 0x100 + r else r
-        SecurityEstablished(l) => l
-        _ => -1
-
-fn action_ltk(step: SmpStep) -> [u8]
-    match step.action!
-        ReplyLtk(k) => k[:]
-        _ => []
-
-fn action_result(step: SmpStep) -> SmpResult
-    match step.action!
-        PairingComplete(r) => r
-        _ => PairingResult { bond: smp_core.pairing_bond(step.state), bonded: false, level: -1, replaced_bond: false }
-
-// r || C of LocalOobData.
-fn action_oob(step: SmpStep) -> [u8]
-    match step.action!
-        LocalOobData(r, c) => list.concat(r, c)
-        _ => []
-
-fn assert_bytes(got: [u8], want: [u8])
-    test.assert_eq(list.len(got), list.len(want))
-    for i in 0..list.len(want)
-        test.assert_eq(got[i] as Int, want[i] as Int)
-
-fn assert_failed_with(step: SmpStep, reason: Int)
-    test.assert_eq(list.len(step.pdus), 1)
-    assert_bytes(step.pdus[0], [smp.SMP_OP_PAIRING_FAILED, reason as u8])
-
-fn value16(step: SmpStep, i: Int) -> [u8]
-    smp.field_bytes(step.pdus[i], 1, 16)
-
-// ── LE legacy pairing ───────────────────────────────────────────────
-
-// The legacy key generation from the initiator's side with `tk`, from
-// the state after the Pairing Response: answers the state after LP_RAND_R and
-// checks LP_CONFIRM_R against it.
-fn legacy_phase2(s0: SmpState, preq: [u8], pres: [u8], tk: [u8], rand_i: [u8]) -> SmpState
-    let confirm_i = smp_keys.legacy_confirm(tk, rand_i, preq, pres, 0, peer_address(), 1, own_address())
-    let a = handle(s0, Pdu(smp.build_pairing_confirm(confirm_i)), 10)
-    test.assert_eq(list.len(a.pdus), 1)
-    test.assert_eq(a.pdus[0][0] as Int, smp.SMP_OP_PAIRING_CONFIRM)
-    let confirm_r = value16(a, 0)
-    let b = handle(a.state, Pdu(smp.build_pairing_random(rand_i)), 20)
-    test.assert_eq(list.len(b.pdus), 1)
-    test.assert_eq(b.pdus[0][0] as Int, smp.SMP_OP_PAIRING_RANDOM)
-    let rand_r = value16(b, 0)
-    assert_bytes(smp_keys.legacy_confirm(tk, rand_r, preq, pres, 0, peer_address(), 1, own_address()), confirm_r)
-    b.state
-
-@test
-fn test_legacy_just_works_reaches_encryption_with_the_stk()
-    // SM/PER/JW/BV-02-C: NoInputNoOutput, no MITM, no keys.
-    let s = connected(config_with(smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT), no_key_pair())
-    let preq = preq_of(smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT, 0, smp.SMP_AUTHREQ_BONDING, 16, 0, 0)
-    let r = handle(s, Pdu(preq), 0)
-    test.assert_eq(action_name(r), "none")
-    let pres = r.pdus[0]
-    test.assert_eq(list.len(pres), 7)
-    test.assert_eq(pres[0] as Int, smp.SMP_OP_PAIRING_RESPONSE)
-    test.assert_eq(pres[1] as Int, smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT)
-    test.assert_eq(pres[3] as Int, smp.SMP_AUTHREQ_BONDING | smp.SMP_AUTHREQ_SC | smp.SMP_AUTHREQ_CT2)
-    let rand_i = hex("5783D52156AD6F0E6388274EC6702EE0")
-    let st = legacy_phase2(r.state, preq, pres, smp_keys.zeros(16), rand_i)
-    let ltk = handle(st, LtkRequest(0, smp_keys.zeros(8)), 30)
-    test.assert_eq(action_name(ltk), "reply")
-    let rand_r = st.local_rand
-    assert_bytes(action_ltk(ltk), smp_keys.legacy_stk(smp_keys.zeros(16), rand_r, rand_i))
-    let done = handle(ltk.state, EncryptionChanged(true), 40)
-    test.assert_eq(list.len(done.pdus), 0)
-    test.assert_eq(action_name(done), "complete")
-    let result = action_result(done)
-    test.assert_eq(result.level, 2)
-    test.assert(result.bonded)
-    test.assert(not is_pairing(done.state))
-
-@test
-fn test_the_pairing_response_asks_mitm_only_for_a_model_that_can_give_it()
-    // SM/PER/PKE/BV-06-C: a No Input No Output initiator with MITM 0
-    // leaves Just Works and nothing else, so the Pairing Response asks no
-    // MITM protection (Table 4.3 asks the flag 0 of a Host of Core v6.2
-    // or later; the v6.1-and-earlier row reads 1).
-    let s = connected(config_with(smp.SMP_IO_CAP_DISPLAY_ONLY), no_key_pair())
-    let preq = preq_of(smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT, 0, 0, 16, 0, 0)
-    let r = handle(s, Pdu(preq), 0)
-    let pres = r.pdus[0]
-    test.assert_eq(pres[3] as Int & smp.SMP_AUTHREQ_MITM, 0)
-    test.assert(r.state.method == Method.JustWorks)
-    let st = legacy_phase2(r.state, preq, pres, smp_keys.zeros(16), hex("00112233445566778899aabbccddeeff"))
-    test.assert(st.phase == Phase.Encryption)
-    // An initiator that can give MITM keeps the request: the flag is the
-    // pairing's own, not dropped with the model that cannot reach it.
-    let k = connected(config_with(smp.SMP_IO_CAP_DISPLAY_ONLY), no_key_pair())
-    let preq2 = preq_of(smp.SMP_IO_CAP_KEYBOARD_ONLY, 0, smp.SMP_AUTHREQ_MITM, 16, 0, 0)
-    let r2 = handle(k, Pdu(preq2), 0)
-    test.assert_eq(r2.pdus[0][3] as Int & smp.SMP_AUTHREQ_MITM, smp.SMP_AUTHREQ_MITM)
-    test.assert(r2.state.method == Method.PasskeyDisplay)
-
-@test
-fn test_an_echoed_lp_confirm_i_fails_with_confirm_value_failed()
-    // The responding half's mirror of SM/CEN/JW/BI-06-C: the initiator
-    // sends back the LP_CONFIRM_R it received as its own LP_CONFIRM_I,
-    // with the LP_RAND_R this device sent as LP_RAND_I.  The c1 check
-    // alone accepts that pair, so the equality of the two confirms has to
-    // end the pairing.
-    let s = connected(config_with(smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT), no_key_pair())
-    let preq = preq_of(smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT, 0, smp.SMP_AUTHREQ_BONDING, 16, 0, 0)
-    let r = handle(s, Pdu(preq), 0)
-    let pres = r.pdus[0]
-    let tk = smp_keys.zeros(16)
-    // The LP_CONFIRM_R this device is about to send, and the LP_RAND_R it
-    // draws with it: the reflecting peer sends both back.
-    let rand_r = r.state.local_rand
-    let confirm_r = smp_keys.legacy_confirm(tk, rand_r, preq, pres, 0, peer_address(), 1, own_address())
-    let a = handle(r.state, Pdu(smp.build_pairing_confirm(confirm_r)), 10)
-    assert_bytes(value16(a, 0), confirm_r)
-    let b = handle(a.state, Pdu(smp.build_pairing_random(rand_r)), 20)
-    assert_failed_with(b, smp.SMP_FAIL_CONFIRM_VALUE_FAILED)
-
-@test
-fn test_reserved_auth_req_bits_are_ignored_and_never_sent()
-    // SM/PER/JW/BI-03-C: every reserved AuthReq bit set by the initiator.
-    let s = connected(config_with(smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT), no_key_pair())
-    let preq = preq_of(smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT, 0, 0xC2, 16, 0xF0, 0xF0)
-    let r = handle(s, Pdu(preq), 0)
-    let pres = r.pdus[0]
-    test.assert_eq((pres[3] as Int) & 0xC2, 0)
-    test.assert_eq(pres[5] as Int, 0)
-    test.assert_eq(pres[6] as Int, 0)
-    let st = legacy_phase2(r.state, preq, pres, smp_keys.zeros(16), hex("00112233445566778899aabbccddeeff"))
-    test.assert(st.phase == Phase.Encryption)
-
-@test
-fn test_wrong_confirm_fails_and_earns_a_waiting_interval()
-    // SM/PER/JW/BI-02-C, then Section 2.3.6.
-    let s = connected(config_with(smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT), no_key_pair())
-    let preq = preq_of(smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT, 0, smp.SMP_AUTHREQ_BONDING, 16, 0, 0)
-    let r = handle(s, Pdu(preq), 0)
-    let a = handle(r.state, Pdu(smp.build_pairing_confirm(hex("000102030405060708090a0b0c0d0e0f"))), 10)
-    let b = handle(a.state, Pdu(smp.build_pairing_random(hex("ffeeddccbbaa99887766554433221100"))), 20)
-    assert_failed_with(b, smp.SMP_FAIL_CONFIRM_VALUE_FAILED)
-    test.assert_eq(action_int(b), smp.SMP_FAIL_CONFIRM_VALUE_FAILED)
-    test.assert(not is_pairing(b.state))
-    let again = handle(b.state, Pdu(preq), 1000)
-    assert_failed_with(again, smp.SMP_FAIL_REPEATED_ATTEMPTS)
-    let later = handle(again.state, Pdu(preq), 2100)
-    test.assert_eq(later.pdus[0][0] as Int, smp.SMP_OP_PAIRING_RESPONSE)
-
-@test
-fn test_waiting_interval_doubles_and_decays()
-    let s = connected(config_with(smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT), no_key_pair())
-    // copy(): a `var` bound to a `let` value and then reassigned leaks, so the state is taken as a copy, not as a second name.
-    var t = copy(s)
-    var now = 0
-    for i in 0..2
-        let preq = preq_of(smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT, 0, 0, 16, 0, 0)
-        let r = handle(t, Pdu(preq), now)
-        test.assert_eq(r.pdus[0][0] as Int, smp.SMP_OP_PAIRING_RESPONSE)
-        let a = handle(r.state, Pdu(smp.build_pairing_confirm(smp_keys.zeros(16))), now + 1)
-        let b = handle(a.state, Pdu(smp.build_pairing_random(smp_keys.zeros(16))), now + 2)
-        t = b.state
-        now = now + 2500
-    // Failures at 2 and 2502: the second interval is 4000 ms.
-    test.assert_eq(t.attempts[0].wait_ms, 4000)
-    let preq = preq_of(smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT, 0, 0, 16, 0, 0)
-    assert_failed_with(handle(t, Pdu(preq), 6000), smp.SMP_FAIL_REPEATED_ATTEMPTS)
-    test.assert_eq(handle(t, Pdu(preq), 6600).pdus[0][0] as Int, smp.SMP_OP_PAIRING_RESPONSE)
-    // 64 s without a failure halves the interval twice, to the minimum.
-    var later = copy(t)
-    later.now = 2502 + 64000
-    test.assert_eq(smp_core.decayed_wait(later, t.attempts[0]), 2000)
-
-@test
-fn test_legacy_passkey_displayed_by_the_responder()
-    // SM/PER/PKE/BV-02-C with a DisplayOnly IUT.
-    let s = connected(config_with(smp.SMP_IO_CAP_DISPLAY_ONLY), no_key_pair())
-    let preq = preq_of(smp.SMP_IO_CAP_KEYBOARD_ONLY, 0, smp.SMP_AUTHREQ_BONDING | smp.SMP_AUTHREQ_MITM, 16, 0, 0)
-    let r = handle(s, Pdu(preq), 0)
-    test.assert_eq(action_name(r), "display")
-    let passkey = action_int(r)
-    test.assert(passkey >= 0 and passkey <= 999999)
-    let st = legacy_phase2(r.state, preq, r.pdus[0], smp_keys.passkey_tk(passkey), hex("0102030405060708090a0b0c0d0e0f10"))
-    let done = handle(handle(st, LtkRequest(0, smp_keys.zeros(8)), 30).state, EncryptionChanged(true), 40)
-    test.assert_eq(action_result(done).level, 3)
-
-@test
-fn test_legacy_passkey_mismatch_fails_with_confirm_value_failed()
-    // SM/PER/PKE/BI-03-C: the initiator uses a different passkey.
-    let s = connected(config_with(smp.SMP_IO_CAP_DISPLAY_ONLY), no_key_pair())
-    let preq = preq_of(smp.SMP_IO_CAP_KEYBOARD_ONLY, 0, smp.SMP_AUTHREQ_MITM, 16, 0, 0)
-    let r = handle(s, Pdu(preq), 0)
-    let wrong = smp_keys.passkey_tk((action_int(r) + 1) % 1000000)
-    let rand_i = hex("0102030405060708090a0b0c0d0e0f10")
-    let ci = smp_keys.legacy_confirm(wrong, rand_i, preq, r.pdus[0], 0, peer_address(), 1, own_address())
-    let a = handle(r.state, Pdu(smp.build_pairing_confirm(ci)), 10)
-    let b = handle(a.state, Pdu(smp.build_pairing_random(rand_i)), 20)
-    assert_failed_with(b, smp.SMP_FAIL_CONFIRM_VALUE_FAILED)
-
-@test
-fn test_legacy_passkey_typed_after_the_initiator_confirm()
-    // A KeyboardOnly IUT: LP_CONFIRM_I waits for the user's passkey.
-    let s = connected(config_with(smp.SMP_IO_CAP_KEYBOARD_ONLY), no_key_pair())
-    let preq = preq_of(smp.SMP_IO_CAP_DISPLAY_ONLY, 0, smp.SMP_AUTHREQ_MITM, 16, 0, 0)
-    let r = handle(s, Pdu(preq), 0)
-    test.assert_eq(action_name(r), "request")
-    let tk = smp_keys.passkey_tk(19655)
-    let rand_i = hex("aa02030405060708090a0b0c0d0e0f10")
-    let ci = smp_keys.legacy_confirm(tk, rand_i, preq, r.pdus[0], 0, peer_address(), 1, own_address())
-    let a = handle(r.state, Pdu(smp.build_pairing_confirm(ci)), 10)
-    test.assert_eq(list.len(a.pdus), 0)
-    let b = handle(a.state, PasskeyEntered(19655), 20)
-    test.assert_eq(b.pdus[0][0] as Int, smp.SMP_OP_PAIRING_CONFIRM)
-    let c = handle(b.state, Pdu(smp.build_pairing_random(rand_i)), 30)
-    test.assert_eq(c.pdus[0][0] as Int, smp.SMP_OP_PAIRING_RANDOM)
-    // A cancelled entry fails with Passkey Entry Failed.
-    let r2 = handle(connected(config_with(smp.SMP_IO_CAP_KEYBOARD_ONLY), no_key_pair()), Pdu(preq), 0)
-    assert_failed_with(handle(r2.state, PasskeyEntered(-1), 5), smp.SMP_FAIL_PASSKEY_ENTRY_FAILED)
-
-@test
-fn test_legacy_key_distribution_bonds_and_answers_the_ltk_later()
-    // SM/PER/KDU/BV-01-C and BV-02-C together, with a 7-octet key
-    // (SM/PER/EKS/BV-02-C), and the reconnection of SM/PER/PIS/BV-02-C.
-    let s = connected(config_with(smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT), no_key_pair())
-    let all = smp.SMP_KEY_DIST_ENC | smp.SMP_KEY_DIST_ID | smp.SMP_KEY_DIST_SIGN
-    let preq = preq_of(smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT, 0, smp.SMP_AUTHREQ_BONDING, 7, smp.SMP_KEY_DIST_ID, all)
-    let r = handle(s, Pdu(preq), 0)
-    let pres = r.pdus[0]
-    test.assert_eq(pres[5] as Int, smp.SMP_KEY_DIST_ID)
-    test.assert_eq(pres[6] as Int, all)
-    let rand_i = hex("1112131415161718191a1b1c1d1e1f20")
-    let st = legacy_phase2(r.state, preq, pres, smp_keys.zeros(16), rand_i)
-    let stk = action_ltk(handle(st, LtkRequest(0, smp_keys.zeros(8)), 30))
-    for i in 7..16
-        test.assert_eq(stk[i] as Int, 0)
-    let enc = handle(st, EncryptionChanged(true), 40)
-    test.assert_eq(list.len(enc.pdus), 5)
-    test.assert_eq(enc.pdus[0][0] as Int, smp.SMP_OP_ENCRYPTION_INFORMATION)
-    test.assert_eq(enc.pdus[1][0] as Int, smp.SMP_OP_CENTRAL_IDENTIFICATION)
-    test.assert_eq(enc.pdus[2][0] as Int, smp.SMP_OP_IDENTITY_INFORMATION)
-    test.assert_eq(enc.pdus[3][0] as Int, smp.SMP_OP_IDENTITY_ADDRESS_INFORMATION)
-    test.assert_eq(enc.pdus[4][0] as Int, smp.SMP_OP_SIGNING_INFORMATION)
-    let ltk = value16(enc, 0)
-    for i in 7..16
-        test.assert_eq(ltk[i] as Int, 0)
-    let ediv = (enc.pdus[1][1] as Int) | ((enc.pdus[1][2] as Int) << 8)
-    let central_rand = smp.field_bytes(enc.pdus[1], 3, 8)
-    assert_bytes(enc.pdus[3], smp.build_identity_address_information(1, own_address()))
-    test.assert_eq(action_name(enc), "none")
-    let peer_irk = hex("ec0234a357c8ad05341010a60a397d9b")
-    let i1 = handle(enc.state, Pdu(smp.build_identity_information(peer_irk)), 50)
-    test.assert_eq(action_name(i1), "none")
-    let done = handle(i1.state, Pdu(smp.build_identity_address_information(0, hex("605040302010"))), 60)
-    test.assert_eq(action_name(done), "complete")
-    let result = action_result(done)
-    test.assert(result.bonded)
-    test.assert_eq(result.bond.key_size, 7)
-    test.assert_eq(result.bond.peer_address_type, 0)
-    assert_bytes(result.bond.peer_address, hex("605040302010"))
-    assert_bytes(result.bond.peer_irk, peer_irk)
-    assert_bytes(result.bond.ltk, ltk)
-    test.assert_eq(result.bond.ediv, ediv)
-    // SM/PER/KDU/BV-07-C: the live link is re-encrypted with the LTK.
-    let again = handle(done.state, LtkRequest(ediv, central_rand), 70)
-    assert_bytes(action_ltk(again), ltk)
-    // A later connection from a Resolvable Private Address of that IRK.
-    var bonds = smp_bond.new_bond_table(4)
-    bonds.save(result.bond)
-    let rpa = smp_keys.resolvable_private_address(peer_irk, hex("4a1b2c"))
-    let found = bonds.find(1, rpa)
-    let s2 = handle(done.state, Disconnected, 100).state
-    let s3 = handle(s2, Connected(1, own_address(), 1, rpa, found), 200).state
-    let wrong = handle(s3, LtkRequest(ediv ^ 1, central_rand), 210)
-    test.assert_eq(action_name(wrong), "negative")
-    let right = handle(s3, LtkRequest(ediv, central_rand), 210)
-    assert_bytes(action_ltk(right), ltk)
-    let est = handle(right.state, EncryptionChanged(true), 220)
-    test.assert_eq(action_name(est), "established")
-    test.assert_eq(action_int(est), 2)
-
-// GAP/SEC/CSIGN/BI-03-C: the Central distributes SignKey over a link it
-// is encrypting at the same time, so the Signing Information command can
-// arrive before the Controller reports the encryption.  The command is
-// held, not taken: nothing is accepted from a link not known to be
-// encrypted ([Vol 3] Part H, Section 3.6).  The pairing completes when the
-// encryption is up, and the bond carries the CSRK the signed write is
-// verified with.
-@test
-fn test_a_key_that_arrives_before_the_encryption_completes()
-    let s = connected(config_with(smp.SMP_IO_CAP_KEYBOARD_DISPLAY), no_key_pair())
-    let preq = preq_of(smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT, 0, smp.SMP_AUTHREQ_BONDING, 16, smp.SMP_KEY_DIST_SIGN, 0)
-    let r = handle(s, Pdu(preq), 0)
-    let pres = r.pdus[0]
-    test.assert(r.state.method == Method.JustWorks)
-    let rand_i = hex("5783D52156AD6F0E6388274EC6702EE0")
-    let st = legacy_phase2(r.state, preq, pres, smp_keys.zeros(16), rand_i)
-    test.assert(st.phase == Phase.Encryption)
-    test.assert_eq(st.expect_dist, smp.SMP_KEY_DIST_SIGN)
-    // The Central's CSRK, before any Encryption Change event.
-    let csrk = hex("e36479e25c581b8b682c8cd151b482c0")
-    let distributed = handle(st, Pdu(smp.build_signing_information(csrk)), 30)
-    test.assert_eq(list.len(distributed.pdus), 0)
-    test.assert_eq(action_name(distributed), "none")
-    test.assert_eq(list.len(distributed.state.peer_csrk), 0)
-    test.assert_eq(list.len(distributed.state.held_keys), 1)
-    test.assert(is_pairing(distributed.state))
-    // The STK answers the Controller's key request, and the pairing
-    // completes once the link is encrypted.
-    let ltk = handle(distributed.state, LtkRequest(0, smp_keys.zeros(8)), 40)
-    test.assert_eq(action_name(ltk), "reply")
-    assert_bytes(action_ltk(ltk), smp_keys.legacy_stk(smp_keys.zeros(16), st.local_rand, rand_i))
-    let done = handle(ltk.state, EncryptionChanged(true), 50)
-    test.assert_eq(action_name(done), "complete")
-    assert_bytes(action_result(done).bond.peer_csrk, csrk)
-    test.assert_eq(action_result(done).level, 2)
-
-// A key that arrives before the link is encrypted is not kept when the
-// encryption never comes up, a key out of order ends the pairing when the
-// encryption does, and a flood of them ends the pairing.
-@test
-fn test_a_key_before_the_encryption_is_dropped_when_the_encryption_fails()
-    let s = connected(config_with(smp.SMP_IO_CAP_KEYBOARD_DISPLAY), no_key_pair())
-    let preq = preq_of(smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT, 0, smp.SMP_AUTHREQ_BONDING, 16, smp.SMP_KEY_DIST_SIGN, 0)
-    let r = handle(s, Pdu(preq), 0)
-    let rand_i = hex("5783D52156AD6F0E6388274EC6702EE0")
-    let st = legacy_phase2(r.state, preq, r.pdus[0], smp_keys.zeros(16), rand_i)
-    let csrk = hex("e36479e25c581b8b682c8cd151b482c0")
-    let held = handle(st, Pdu(smp.build_signing_information(csrk)), 30)
-    test.assert(list.len(held.state.held_keys) == 1)
-    let dropped = handle(held.state, EncryptionChanged(false), 40)
-    test.assert_eq(action_name(dropped), "failed")
-    test.assert_eq(list.len(dropped.state.held_keys), 0)
-    test.assert_eq(list.len(dropped.state.peer_csrk), 0)
-    // Held keys are handled in order when the encryption comes up, and the
-    // first one out of order ends the pairing before the rest are looked at.
-    let first_wrong = handle(handle(st, Pdu(smp.build_identity_information(csrk)), 30).state, Pdu(smp.build_signing_information(csrk)), 31)
-    test.assert_eq(list.len(first_wrong.state.held_keys), 2)
-    assert_failed_with(handle(first_wrong.state, EncryptionChanged(true), 40), smp.SMP_FAIL_UNSPECIFIED_REASON)
-    var flood = st
-    for i in 0..MAX_HELD_KEYS
-        flood = handle(flood, Pdu(smp.build_signing_information(csrk)), 30).state
-    test.assert_eq(list.len(flood.held_keys), smp_core.MAX_HELD_KEYS)
-    assert_failed_with(handle(flood, Pdu(smp.build_signing_information(csrk)), 31), smp.SMP_FAIL_UNSPECIFIED_REASON)
-
-@test
-fn test_no_keys_are_distributed_without_bonding()
-    // GAP/BOND/NBON/BV-03-C and a non-bondable responder.
-    let s = connected(config_with(smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT), no_key_pair())
-    let r = handle(s, Pdu(preq_of(smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT, 0, 0, 16, 7, 7)), 0)
-    test.assert_eq(r.pdus[0][5] as Int, 0)
-    test.assert_eq(r.pdus[0][6] as Int, 0)
-
-@test
-fn test_key_size_checks()
-    let s = connected(config_with(smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT), no_key_pair())
-    assert_failed_with(handle(s, Pdu(preq_of(3, 0, 0, 6, 0, 0)), 0), smp.SMP_FAIL_INVALID_PARAMETERS)
-    assert_failed_with(handle(s, Pdu(preq_of(3, 0, 0, 17, 0, 0)), 0), smp.SMP_FAIL_INVALID_PARAMETERS)
-    let d = config_with(smp.SMP_IO_CAP_DISPLAY_YES_NO)
-    let level4 = SmpConfig {
-        io_capability: d.io_capability, bondable: true, secure_connections: true, sc_only: false,
-        required_level: 4, keypress: false, request_mitm: true, max_key_size: 16, min_key_size: 10, identity_irk: [],
-        identity_address_type: 1, identity_address: [], distribute_csrk: false, accept_debug_key: false,
-        pairing_supported: true, attempt_min_wait_ms: 0, attempt_max_wait_ms: 0 }
-    let s4 = connected(level4, no_key_pair())
-    // GAP/SEC/SEM/BI-09-C: key sizes 7 to 15 at level 4.
-    assert_failed_with(handle(s4, Pdu(preq_of(1, 0, 0x0D, 15, 0, 0)), 0), smp.SMP_FAIL_ENC_KEY_SIZE)
-    // Below the configured minimum (SM/PER/EKS/BI-02-C).
-    let s10 = connected(SmpConfig {
-        io_capability: 3, bondable: true, secure_connections: true, sc_only: false,
-        required_level: 2, keypress: false, request_mitm: true, max_key_size: 16, min_key_size: 10, identity_irk: [],
-        identity_address_type: 1, identity_address: [], distribute_csrk: false, accept_debug_key: false,
-        pairing_supported: true, attempt_min_wait_ms: 0, attempt_max_wait_ms: 0 }, no_key_pair())
-    assert_failed_with(handle(s10, Pdu(preq_of(3, 0, 0, 9, 0, 0)), 0), smp.SMP_FAIL_ENC_KEY_SIZE)
-    // Level 4 refuses LE legacy pairing (GAP/SEC/SEM/BV-24-C).
-    assert_failed_with(handle(s4, Pdu(preq_of(1, 0, 0x05, 16, 0, 0)), 0), smp.SMP_FAIL_AUTH_REQUIREMENTS)
-    // Level 3 refuses Just Works.
-    let s3 = connected(SmpConfig {
-        io_capability: 3, bondable: true, secure_connections: true, sc_only: false,
-        required_level: 3, keypress: false, request_mitm: true, max_key_size: 16, min_key_size: 7, identity_irk: [],
-        identity_address_type: 1, identity_address: [], distribute_csrk: false, accept_debug_key: false,
-        pairing_supported: true, attempt_min_wait_ms: 0, attempt_max_wait_ms: 0 }, no_key_pair())
-    assert_failed_with(handle(s3, Pdu(preq_of(3, 0, 0x0D, 16, 0, 0)), 0), smp.SMP_FAIL_AUTH_REQUIREMENTS)
-
-@test
-fn test_malformed_unexpected_and_reserved_commands()
-    let s = connected(config_with(smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT), no_key_pair())
-    let reserved = handle(s, Pdu([0x0F, 0x00]), 0)
-    test.assert_eq(list.len(reserved.pdus), 0)
-    assert_failed_with(handle(s, Pdu([0x01, 0x03]), 0), smp.SMP_FAIL_INVALID_PARAMETERS)
-    assert_failed_with(handle(s, Pdu(smp.build_pairing_confirm(smp_keys.zeros(16))), 0), smp.SMP_FAIL_UNSPECIFIED_REASON)
-    assert_failed_with(handle(s, Pdu(smp.build_security_request(1)), 0), smp.SMP_FAIL_COMMAND_NOT_SUPPORTED)
-    test.assert_eq(list.len(handle(s, Pdu(smp.build_pairing_failed(8)), 0).pdus), 0)
-    let preq = preq_of(3, 0, 1, 16, 0, 0)
-    let r = handle(s, Pdu(preq), 0)
-    let twice = handle(r.state, Pdu(preq), 5)
-    assert_failed_with(twice, smp.SMP_FAIL_UNSPECIFIED_REASON)
-    test.assert_eq(action_name(twice), "failed")
-    // An IO capability or OOB flag out of range.
-    assert_failed_with(handle(s, Pdu(preq_of(5, 0, 0, 16, 0, 0)), 0), smp.SMP_FAIL_INVALID_PARAMETERS)
-    assert_failed_with(handle(s, Pdu(preq_of(3, 2, 0, 16, 0, 0)), 0), smp.SMP_FAIL_INVALID_PARAMETERS)
-    // A device without pairing (SM/PER/PROT/BV-02-C alternative 2B).
-    let off = SmpConfig {
-        io_capability: 3, bondable: false, secure_connections: false, sc_only: false,
-        required_level: 1, keypress: false, request_mitm: true, max_key_size: 16, min_key_size: 7, identity_irk: [],
-        identity_address_type: 1, identity_address: [], distribute_csrk: false, accept_debug_key: false,
-        pairing_supported: false, attempt_min_wait_ms: 0, attempt_max_wait_ms: 0 }
-    assert_failed_with(handle(connected(off, no_key_pair()), Pdu(preq), 0), smp.SMP_FAIL_PAIRING_NOT_SUPPORTED)
-
-@test
-fn test_peer_pairing_failed_ends_the_pairing_without_a_waiting_interval()
-    // SM/PER/KDU/BI-02-C (Key Rejected) and SM/PER/SCPK/BI-04-C.
-    let s = connected(config_with(smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT), no_key_pair())
-    let preq = preq_of(3, 0, 1, 16, 0, 7)
-    let r = handle(s, Pdu(preq), 0)
-    let st = legacy_phase2(r.state, preq, r.pdus[0], smp_keys.zeros(16), hex("1112131415161718191a1b1c1d1e1f20"))
-    let enc = handle(st, EncryptionChanged(true), 40)
-    test.assert_eq(list.len(enc.pdus), 5)
-    // Every key went out, nothing is expected back: the pairing completed.
-    test.assert_eq(action_name(enc), "complete")
-    let r2 = handle(enc.state, Pdu(preq_of(3, 0, 1, 16, 2, 7)), 100)
-    let st2 = legacy_phase2(r2.state, preq_of(3, 0, 1, 16, 2, 7), r2.pdus[0], smp_keys.zeros(16), hex("2112131415161718191a1b1c1d1e1f20"))
-    let enc2 = handle(st2, EncryptionChanged(true), 140)
-    test.assert(enc2.state.phase == Phase.KeyDistribution)
-    let rejected = handle(enc2.state, Pdu(smp.build_pairing_failed(smp.SMP_FAIL_KEY_REJECTED)), 150)
-    test.assert_eq(list.len(rejected.pdus), 0)
-    test.assert_eq(action_int(rejected), 0x100 + smp.SMP_FAIL_KEY_REJECTED)
-    let r3 = handle(rejected.state, Pdu(preq), 160)
-    test.assert_eq(r3.pdus[0][0] as Int, smp.SMP_OP_PAIRING_RESPONSE)
-
-@test
-fn test_timeout_silences_the_channel_until_the_next_connection()
-    // SM/PER/PROT/BV-02-C.
-    let s = connected(config_with(smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT), no_key_pair())
-    let r = handle(s, Pdu(preq_of(3, 0, 1, 16, 0, 0)), 1000)
-    test.assert_eq(action_name(handle(r.state, Tick, 30999)), "none")
-    let t = handle(r.state, Tick, 31000)
-    test.assert_eq(action_name(t), "timeout")
-    test.assert_eq(list.len(t.pdus), 0)
-    let late = handle(t.state, Pdu(smp.build_pairing_confirm(smp_keys.zeros(16))), 45000)
-    test.assert_eq(list.len(late.pdus), 0)
-    test.assert_eq(action_name(late), "none")
-    test.assert_eq(list.len(handle(t.state, Pdu(preq_of(3, 0, 1, 16, 0, 0)), 46000).pdus), 0)
-    let next = handle(handle(t.state, Disconnected, 50000).state, Connected(1, own_address(), 0, peer_address(), None), 51000)
-    test.assert_eq(handle(next.state, Pdu(preq_of(3, 0, 1, 16, 0, 0)), 52000).pdus[0][0] as Int, smp.SMP_OP_PAIRING_RESPONSE)
-    // A timer that runs out under a later command fires first.
-    let z = handle(r.state, Pdu(smp.build_pairing_confirm(smp_keys.zeros(16))), 40000)
-    test.assert_eq(action_name(z), "timeout")
-
-@test
-fn test_security_request()
-    // SM/PER/PIS/BV-01-C and GAP/SEC/AUT/BV-18-C.
-    let s = connected(config_with(smp.SMP_IO_CAP_KEYBOARD_DISPLAY), no_key_pair())
-    let r = handle(s, RequestSecurity(3), 0)
-    assert_bytes(r.pdus[0], [smp.SMP_OP_SECURITY_REQUEST, 0x2D])
-    // NoInputNoOutput cannot ask for MITM protection (Section 2.4.6).
-    let n = handle(connected(config_with(smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT), no_key_pair()), RequestSecurity(3), 0)
-    assert_bytes(n.pdus[0], [smp.SMP_OP_SECURITY_REQUEST, 0x29])
-    // A Pairing Request after it must meet the requested level.
-    let jw = handle(r.state, Pdu(preq_of(3, 0, 0x09, 16, 0, 0)), 10)
-    assert_failed_with(jw, smp.SMP_FAIL_AUTH_REQUIREMENTS)
-    // Not sent while a pairing is in progress.
-    let p = handle(s, Pdu(preq_of(3, 0, 1, 16, 0, 0)), 0)
-    test.assert_eq(list.len(handle(p.state, RequestSecurity(2), 5).pdus), 0)
-
-@test
-fn test_keypress_notifications_only_when_both_set_keypress()
-    let d = config_with(smp.SMP_IO_CAP_KEYBOARD_ONLY)
-    let cfg = SmpConfig {
-        io_capability: d.io_capability, bondable: true, secure_connections: false, sc_only: false,
-        required_level: 2, keypress: true, request_mitm: true, max_key_size: 16, min_key_size: 7, identity_irk: [],
-        identity_address_type: 1, identity_address: [], distribute_csrk: false, accept_debug_key: false,
-        pairing_supported: true, attempt_min_wait_ms: 0, attempt_max_wait_ms: 0 }
-    let with = handle(connected(cfg, no_key_pair()), Pdu(preq_of(0, 0, 0x15, 16, 0, 0)), 0)
-    test.assert_eq((with.pdus[0][3] as Int) & smp.SMP_AUTHREQ_KEYPRESS, smp.SMP_AUTHREQ_KEYPRESS)
-    assert_bytes(handle(with.state, SendKeypress(smp.SMP_KEYPRESS_ENTRY_STARTED), 5).pdus[0], [0x0E, 0x00])
-    let without = handle(connected(cfg, no_key_pair()), Pdu(preq_of(0, 0, 0x05, 16, 0, 0)), 0)
-    test.assert_eq(list.len(handle(without.state, SendKeypress(0), 5).pdus), 0)
-    // A received notification restarts the timer (Section 3.4).
-    let k = handle(with.state, Pdu(smp.build_keypress_notification(1)), 20000)
-    test.assert_eq(k.state.timer_deadline, 50000)
-
-@test
-fn test_method_selection_tables()
-    // Table 2.8, from the responder's view; Tables 2.6 and 2.7 for OOB.
-    let jw = Method.JustWorks
-    test.assert(smp_core.select_method(false, 4, false, true, 0, false, false) == Method.PasskeyDisplay)
-    test.assert(smp_core.select_method(false, 0, false, true, 4, false, false) == Method.PasskeyInput)
-    test.assert(smp_core.select_method(false, 1, false, true, 1, false, false) == jw)
-    test.assert(smp_core.select_method(true, 1, false, true, 1, false, false) == Method.NumericComparison)
-    test.assert(smp_core.select_method(true, 4, false, true, 4, false, true) == Method.NumericComparison)
-    test.assert(smp_core.select_method(false, 4, false, true, 4, false, true) == Method.PasskeyInput)
-    test.assert(smp_core.select_method(false, 2, false, true, 2, false, true) == Method.PasskeyInput)
-    test.assert(smp_core.select_method(false, 2, false, true, 4, false, true) == Method.PasskeyDisplay)
-    test.assert(smp_core.select_method(false, 2, false, true, 1, false, true) == Method.PasskeyDisplay)
-    test.assert(smp_core.select_method(false, 3, false, true, 4, false, true) == jw)
-    test.assert(smp_core.select_method(false, 4, false, false, 4, false, false) == jw)
-    test.assert(smp_core.select_method(false, 4, true, false, 4, false, false) == jw)
-    test.assert(smp_core.select_method(false, 4, true, false, 4, true, false) == Method.OutOfBand)
-    test.assert(smp_core.select_method(true, 4, true, false, 4, false, false) == Method.OutOfBand)
-    test.assert(smp_core.select_method(true, 3, false, false, 3, true, false) == Method.OutOfBand)
-    test.assert_eq(smp_core.level_of(false, true, 16), 2)
-    test.assert_eq(smp_core.level_of(true, false, 16), 3)
-    test.assert_eq(smp_core.level_of(true, true, 15), 3)
-    test.assert_eq(smp_core.level_of(true, true, 16), 4)
-
-// ── LE Secure Connections ───────────────────────────────────────────
-
-fn initiator_private() -> [u8]
-    hex("0300000000000000000000000000000000000000000000000000000000000012")
-
-// One LE Secure Connections pairing from the initiator's side.
-struct ScRun
-    state: SmpState
-    initiator: KeyPair
-    responder: KeyPair
-    preq: [u8]
-    pres: [u8]
-    first: SmpStep
-
-// A responder with `config` after the Pairing Request `preq` and the
-// public key exchange, with the DHKey supplied.
-fn sc_start(config: SmpConfig, preq: [u8]) -> ScRun
-    let responder = smp_keys.key_pair_from_private(smp_keys.debug_private_key())
-    let initiator = smp_keys.key_pair_from_private(initiator_private())
-    let s = connected(config, responder)
-    let r = handle(s, Pdu(preq), 0)
-    test.assert_eq((r.pdus[0][3] as Int) & smp.SMP_AUTHREQ_SC, smp.SMP_AUTHREQ_SC)
-    let pk = handle(r.state, Pdu(smp.build_pairing_public_key(initiator.public_key.x, initiator.public_key.y)), 10)
-    test.assert_eq(pk.pdus[0][0] as Int, smp.SMP_OP_PAIRING_PUBLIC_KEY)
-    assert_bytes(smp.field_bytes(pk.pdus[0], 1, 32), responder.public_key.x)
-    let wanted = dhkey_request(pk.state)
-    test.assert(wanted != None)
-    assert_bytes(wanted!.x, initiator.public_key.x)
-    let dh = handle(pk.state, DhKeyComputed(smp_keys.dhkey(responder.private_key, initiator.public_key)), 15)
-    test.assert_eq(list.len(dh.pdus), 0)
-    test.assert(dhkey_request(dh.state) == None)
-    ScRun { state: dh.state, initiator: initiator, responder: responder, preq: preq, pres: r.pdus[0], first: pk }
-
-fn a_initiator() -> [u8]
-    smp_keys.address_56(0, peer_address())
-
-fn b_responder() -> [u8]
-    smp_keys.address_56(1, own_address())
-
-// Stage 2 from the initiator's side: answers the step after Ea and
-// checks Eb and the LTK.
-fn sc_stage2(run: ScRun, s: SmpState, na: [u8], nb: [u8], ra: [u8], rb: [u8]) -> SmpStep
-    let dh = smp_keys.dhkey(run.initiator.private_key, run.responder.public_key)
-    let keys = smp_keys.sc_keys(dh, na, nb, a_initiator(), b_responder())
-    let ea = smp_keys.sc_check(keys.mac_key, na, nb, rb, run.preq[3] as Int, run.preq[2] as Int, run.preq[1] as Int, a_initiator(), b_responder())
-    let e = handle(s, Pdu(smp.build_pairing_dhkey_check(ea)), 100)
-    if list.len(e.pdus) == 1 and e.pdus[0][0] as Int == smp.SMP_OP_PAIRING_DHKEY_CHECK
-        let eb = smp_keys.sc_check(keys.mac_key, nb, na, ra, run.pres[3] as Int, run.pres[2] as Int, run.pres[1] as Int, b_responder(), a_initiator())
-        assert_bytes(value16(e, 0), eb)
-        let ltk = handle(e.state, LtkRequest(0, smp_keys.zeros(8)), 110)
-        assert_bytes(action_ltk(ltk), keys.ltk)
-    e
-
-fn sc_finish(e: SmpStep) -> SmpResult
-    let ltk = handle(e.state, LtkRequest(0, smp_keys.zeros(8)), 110)
-    let done = handle(ltk.state, EncryptionChanged(true), 120)
-    test.assert_eq(action_name(done), "complete")
-    action_result(done)
-
-@test
-fn test_sc_just_works()
-    // SM/PER/SCJW/BV-02-C.
-    let preq = preq_of(3, 0, smp.SMP_AUTHREQ_BONDING | smp.SMP_AUTHREQ_SC, 16, 0, 0)
-    let run = sc_start(config_with(smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT), preq)
-    test.assert_eq(list.len(run.first.pdus), 2)
-    let cb = value16(run.first, 1)
-    let na = hex("d5cb8454d177733effffb2ec712baeab")
-    let r = handle(run.state, Pdu(smp.build_pairing_random(na)), 20)
-    let nb = value16(r, 0)
-    assert_bytes(smp_keys.sc_confirm(run.responder.public_key.x, run.initiator.public_key.x, nb, 0), cb)
-    let e = sc_stage2(run, r.state, na, nb, smp_keys.zeros(16), smp_keys.zeros(16))
-    test.assert_eq(e.pdus[0][0] as Int, smp.SMP_OP_PAIRING_DHKEY_CHECK)
-    let result = sc_finish(e)
-    test.assert_eq(result.level, 2)
-    test.assert(result.bond.secure_connections)
-    test.assert_eq(result.bond.ediv, 0)
-
-@test
-fn test_sc_dhkey_check_failure()
-    let preq = preq_of(3, 0, smp.SMP_AUTHREQ_SC, 16, 0, 0)
-    let run = sc_start(config_with(smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT), preq)
-    let r = handle(run.state, Pdu(smp.build_pairing_random(hex("d5cb8454d177733effffb2ec712baeab"))), 20)
-    let e = handle(r.state, Pdu(smp.build_pairing_dhkey_check(smp_keys.zeros(16))), 30)
-    assert_failed_with(e, smp.SMP_FAIL_DHKEY_CHECK_FAILED)
-
-@test
-fn test_sc_dhkey_check_waits_for_the_dhkey()
-    let responder = smp_keys.key_pair_from_private(smp_keys.debug_private_key())
-    let initiator = smp_keys.key_pair_from_private(initiator_private())
-    let preq = preq_of(3, 0, smp.SMP_AUTHREQ_SC, 16, 0, 0)
-    let r = handle(connected(config_with(3), responder), Pdu(preq), 0)
-    let pk = handle(r.state, Pdu(smp.build_pairing_public_key(initiator.public_key.x, initiator.public_key.y)), 10)
-    let na = hex("00cb8454d177733effffb2ec712baeab")
-    let rr = handle(pk.state, Pdu(smp.build_pairing_random(na)), 20)
-    let nb = value16(rr, 0)
-    let run = ScRun { state: rr.state, initiator: initiator, responder: responder, preq: preq, pres: r.pdus[0], first: pk }
-    let dh = smp_keys.dhkey(initiator.private_key, responder.public_key)
-    let keys = smp_keys.sc_keys(dh, na, nb, a_initiator(), b_responder())
-    let ea = smp_keys.sc_check(keys.mac_key, na, nb, smp_keys.zeros(16), preq[3] as Int, preq[2] as Int, preq[1] as Int, a_initiator(), b_responder())
-    let held = handle(rr.state, Pdu(smp.build_pairing_dhkey_check(ea)), 30)
-    test.assert_eq(list.len(held.pdus), 0)
-    let e = handle(held.state, DhKeyComputed(smp_keys.dhkey(responder.private_key, initiator.public_key)), 40)
-    test.assert_eq(e.pdus[0][0] as Int, smp.SMP_OP_PAIRING_DHKEY_CHECK)
-    let failed = handle(held.state, DhKeyComputed([]), 40)
-    assert_failed_with(failed, smp.SMP_FAIL_UNSPECIFIED_REASON)
-    test.assert(run.preq[0] as Int == 1)
-
-@test
-fn test_sc_numeric_comparison()
-    // SM/PER/SCJW/BV-02-C with DisplayYesNo on both sides.
-    let preq = preq_of(1, 0, smp.SMP_AUTHREQ_BONDING | smp.SMP_AUTHREQ_MITM | smp.SMP_AUTHREQ_SC, 16, 0, 0)
-    let run = sc_start(config_with(smp.SMP_IO_CAP_DISPLAY_YES_NO), preq)
-    let na = hex("a6e8e7cc25a75f6e216583f7ff3dc4cf")
-    let r = handle(run.state, Pdu(smp.build_pairing_random(na)), 20)
-    test.assert_eq(action_name(r), "numeric")
-    let nb = value16(r, 0)
-    test.assert_eq(action_int(r), smp_keys.numeric_value(run.initiator.public_key.x, run.responder.public_key.x, na, nb))
-    // The user answers before Ea arrives.
-    let early = handle(r.state, NumericConfirmed(true), 21)
-    test.assert_eq(list.len(early.pdus), 0)
-    test.assert_eq(sc_stage2(run, early.state, na, nb, smp_keys.zeros(16), smp_keys.zeros(16)).pdus[0][0] as Int, smp.SMP_OP_PAIRING_DHKEY_CHECK)
-    // Ea arrives before the user answers: Eb waits for the answer.
-    let e = sc_stage2(run, r.state, na, nb, smp_keys.zeros(16), smp_keys.zeros(16))
-    test.assert_eq(list.len(e.pdus), 0)
-    let yes = handle(e.state, NumericConfirmed(true), 200)
-    test.assert_eq(yes.pdus[0][0] as Int, smp.SMP_OP_PAIRING_DHKEY_CHECK)
-    test.assert_eq(sc_finish(yes).level, 4)
-    let no = handle(e.state, NumericConfirmed(false), 200)
-    assert_failed_with(no, smp.SMP_FAIL_NUMERIC_COMPARISON_FAILED)
-
-// Passkey Entry rounds from the initiator's side with `passkey`;
-// answers the last step and Na20, Nb20.  Stops at a failure.
-struct PasskeyRounds
-    step: SmpStep
-    na: [u8]
-    nb: [u8]
-
-fn passkey_rounds(run: ScRun, s0: SmpState, passkey: Int) -> PasskeyRounds
-    // copy(): a `var` bound to a `let` value and then reassigned leaks, so the state is taken as a copy, not as a second name.
-    var s = copy(s0)
-    var na: [u8] = []
-    var nb: [u8] = []
-    var last = handle(s, Tick, 19)
-    for i in 0..PASSKEY_ROUNDS
-        na = hex("00112233445566778899aabbccddee00")
-        na[15] = i as u8
-        let z = smp_keys.passkey_z(passkey, i)
-        let c = handle(s, Pdu(smp.build_pairing_confirm(smp_keys.sc_confirm(run.initiator.public_key.x, run.responder.public_key.x, na, z))), 20 + i)
-        let cb = value16(c, 0)
-        last = handle(c.state, Pdu(smp.build_pairing_random(na)), 20 + i)
-        if last.pdus[0][0] as Int != smp.SMP_OP_PAIRING_RANDOM
-            return PasskeyRounds { step: last, na: na, nb: nb }
-        nb = value16(last, 0)
-        assert_bytes(smp_keys.sc_confirm(run.responder.public_key.x, run.initiator.public_key.x, nb, z), cb)
-        s = last.state
-    PasskeyRounds { step: last, na: na, nb: nb }
-
-@test
-fn test_sc_passkey_displayed_by_the_responder()
-    // SM/PER/SCPK/BV-02-C with a DisplayOnly IUT.
-    let preq = preq_of(2, 0, smp.SMP_AUTHREQ_BONDING | smp.SMP_AUTHREQ_MITM | smp.SMP_AUTHREQ_SC, 16, 0, 0)
-    let run = sc_start(config_with(smp.SMP_IO_CAP_DISPLAY_ONLY), preq)
-    test.assert_eq(list.len(run.first.pdus), 1)
-    test.assert_eq(action_name(run.first), "display")
-    let passkey = action_int(run.first)
-    let rounds = passkey_rounds(run, run.state, passkey)
-    test.assert(rounds.step.state.phase == Phase.DhKeyCheck)
-    let r = smp_keys.passkey_r(passkey)
-    let e = sc_stage2(run, rounds.step.state, rounds.na, rounds.nb, r, r)
-    test.assert_eq(e.pdus[0][0] as Int, smp.SMP_OP_PAIRING_DHKEY_CHECK)
-    test.assert_eq(sc_finish(e).level, 4)
-
-@test
-fn test_sc_passkey_mismatch_fails_in_the_first_differing_round()
-    // SM/PER/SCPK/BI-05-C: the initiator enters a different passkey.
-    let preq = preq_of(2, 0, smp.SMP_AUTHREQ_MITM | smp.SMP_AUTHREQ_SC, 16, 0, 0)
-    let run = sc_start(config_with(smp.SMP_IO_CAP_DISPLAY_ONLY), preq)
-    let passkey = action_int(run.first)
-    let rounds = passkey_rounds(run, run.state, passkey ^ 4)
-    assert_failed_with(rounds.step, smp.SMP_FAIL_CONFIRM_VALUE_FAILED)
-    test.assert_eq(list.len(rounds.nb), 16 * 2 / 2)
-
-@test
-fn test_sc_passkey_typed_by_the_responder()
-    let preq = preq_of(0, 0, smp.SMP_AUTHREQ_MITM | smp.SMP_AUTHREQ_SC, 16, 0, 0)
-    let run = sc_start(config_with(smp.SMP_IO_CAP_KEYBOARD_ONLY), preq)
-    test.assert_eq(action_name(run.first), "request")
-    let ca = smp_keys.sc_confirm(run.initiator.public_key.x, run.responder.public_key.x, hex("00112233445566778899aabbccddee00"), smp_keys.passkey_z(123456, 0))
-    let held = handle(run.state, Pdu(smp.build_pairing_confirm(ca)), 20)
-    test.assert_eq(list.len(held.pdus), 0)
-    let typed = handle(held.state, PasskeyEntered(123456), 30)
-    test.assert_eq(typed.pdus[0][0] as Int, smp.SMP_OP_PAIRING_CONFIRM)
-    // Typed before the first Cai, the rounds run straight through.
-    let early = handle(run.state, PasskeyEntered(123456), 20).state
-    let rounds = passkey_rounds(run, early, 123456)
-    test.assert(rounds.step.state.phase == Phase.DhKeyCheck)
-
-@test
-fn test_sc_invalid_public_keys_fail_with_dhkey_check_failed()
-    // SM/PER/KDU/BI-04-C rounds 1, 3 and 4.
-    let responder = smp_keys.key_pair_from_private(smp_keys.debug_private_key())
-    let preq = preq_of(3, 0, smp.SMP_AUTHREQ_SC, 16, 0, 0)
-    let s = handle(connected(config_with(3), responder), Pdu(preq), 0).state
-    let g = smp_keys.key_pair_from_private(initiator_private()).public_key
-    assert_failed_with(handle(s, Pdu(smp.build_pairing_public_key(g.x, smp_keys.zeros(32))), 10), smp.SMP_FAIL_DHKEY_CHECK_FAILED)
-    var flipped = g.y[:]
-    flipped[0] = ((flipped[0] as Int) ^ 1) as u8
-    assert_failed_with(handle(s, Pdu(smp.build_pairing_public_key(g.x, flipped)), 10), smp.SMP_FAIL_DHKEY_CHECK_FAILED)
-    assert_failed_with(handle(s, Pdu(smp.build_pairing_public_key(smp_keys.zeros(32), smp_keys.zeros(32))), 10), smp.SMP_FAIL_DHKEY_CHECK_FAILED)
-    // The debug key, not accepted by this configuration.
-    let d = smp_keys.debug_public_key()
-    let other = smp_keys.key_pair_from_private(initiator_private())
-    let s2 = handle(connected(config_with(3), other), Pdu(preq), 0).state
-    assert_failed_with(handle(s2, Pdu(smp.build_pairing_public_key(d.x, d.y)), 10), smp.SMP_FAIL_INVALID_PARAMETERS)
-    // The peer echoing the responder's own public key.
-    assert_failed_with(handle(s2, Pdu(smp.build_pairing_public_key(other.public_key.x, other.public_key.y)), 10), smp.SMP_FAIL_UNSPECIFIED_REASON)
-
-// The r values of f6 follow [Vol 3] Part H, Section 2.3.5.6.4: a device
-// sets the peer's r to what it received out of band when its own Out of
-// Band Data Flag says it did, and sets its own r to zero when the remote
-// device's flag says "not present".  For the responder, ra (the peer's r)
-// is guarded by the Pairing Response flag and rb (its own r) by the
-// Pairing Request flag.
-@test
-fn test_the_out_of_band_r_values_follow_the_specifications_rule()
-    let responder = smp_keys.key_pair_from_private(smp_keys.debug_private_key())
-    let local = handle(connected(config_with(3), responder), CreateOobData, 0)
-    let rb = local.state.local_oob_r
-    let ra = hex("12a3343bb453bb5408da42d20c2d0fc8")
-    let ca = smp_keys.sc_confirm(responder.public_key.x, responder.public_key.x, ra, 0)
-    let held = handle(local.state, SetPeerOobData(ra, ca), 0).state
-    // The responder holds the initiator's r (its flag is set) and the
-    // initiator's flag is clear: ra is the received r, and rb is zero.
-    let only_responder_received = handle(held, Pdu(preq_of(3, 0, smp.SMP_AUTHREQ_BONDING | smp.SMP_AUTHREQ_SC, 16, 0, 0)), 0)
-    test.assert(only_responder_received.state.method == Method.OutOfBand)
-    test.assert_eq(only_responder_received.state.pres[2] as Int, smp.SMP_OOB_PRESENT)
-    assert_bytes(smp_core.r_initiator(only_responder_received.state), ra)
-    assert_bytes(smp_core.r_responder(only_responder_received.state), smp_keys.zeros(16))
-    // The initiator's flag is set and the responder's is clear: ra is zero
-    // and rb is the responder's own r.
-    let only_initiator_received = with_oob_flags(held, 1, smp.SMP_OOB_NOT_PRESENT)
-    assert_bytes(smp_core.r_initiator(only_initiator_received), smp_keys.zeros(16))
-    assert_bytes(smp_core.r_responder(only_initiator_received), rb)
-    // Both flags set: both r values count.
-    let both = with_oob_flags(held, 1, smp.SMP_OOB_PRESENT)
-    assert_bytes(smp_core.r_initiator(both), ra)
-    assert_bytes(smp_core.r_responder(both), rb)
-    // Neither flag set: both are zero.
-    let neither = with_oob_flags(held, 0, smp.SMP_OOB_NOT_PRESENT)
-    assert_bytes(smp_core.r_initiator(neither), smp_keys.zeros(16))
-    assert_bytes(smp_core.r_responder(neither), smp_keys.zeros(16))
-
-// A copy of `s` in the Out of Band method holding Pairing Request and
-// Pairing Response PDUs that carry the given Out of Band Data Flags.
-fn with_oob_flags(s: SmpState, request_flag: Int, response_flag: Int) -> SmpState
-    var out = s
-    out.method = Method.OutOfBand
-    out.preq = preq_of(3, request_flag, smp.SMP_AUTHREQ_BONDING | smp.SMP_AUTHREQ_SC, 16, 0, 0)
-    out.pres = pres_with_oob(response_flag)
-    out
-
-fn pres_with_oob(oob: Int) -> [u8]
-    smp.build_pairing_response(3, oob, smp.SMP_AUTHREQ_BONDING | smp.SMP_AUTHREQ_SC, 16, 0, 0)
-
-// The r this device published out of band is the one the responding half
-// pairs with when the connection's role gives the pairing to it, and the
-// session hands it over because the BTP commands that carry out of band
-// data run before that connection (SM/PER/SCOB/BV-02-C here, the CEN
-// Secure Connections Out of Band rows in the initiator): rb must be the
-// published r, since the peer checks this device's C against it
-// (Section 2.3.5.6.4, Table 2.2).
-@test
-fn test_the_published_r_reaches_the_responding_half()
-    let responder = smp_keys.key_pair_from_private(smp_keys.debug_private_key())
-    let initiator = smp_keys.key_pair_from_private(initiator_private())
-    let rb = hex("0f1e2d3c4b5a69788796a5b4c3d2e1f0")
-    let ra = hex("12a3343bb453bb5408da42d20c2d0fc8")
-    let ca = smp_keys.sc_confirm(initiator.public_key.x, initiator.public_key.x, ra, 0)
-    let s = handle(connected(config_with(3), responder), SetLocalOobData(rb), 0).state
-    let s1 = handle(s, SetPeerOobData(ra, ca), 0).state
-    assert_bytes(s1.local_oob_r, rb)
-    let preq = preq_of(3, 1, smp.SMP_AUTHREQ_BONDING | smp.SMP_AUTHREQ_SC, 16, 0, 0)
-    let r = handle(s1, Pdu(preq), 0)
-    test.assert(r.state.method == Method.OutOfBand)
-    test.assert_eq(r.pdus[0][2] as Int, smp.SMP_OOB_PRESENT)
-    assert_bytes(smp_core.r_initiator(r.state), ra)
-    assert_bytes(smp_core.r_responder(r.state), rb)
-
-@test
-fn test_sc_out_of_band_both_directions()
-    // SM/PER/SCOB/BV-02-C with both OOB data flags set.
-    let responder = smp_keys.key_pair_from_private(smp_keys.debug_private_key())
-    let initiator = smp_keys.key_pair_from_private(initiator_private())
-    let s0 = connected(config_with(3), responder)
-    let local = handle(s0, CreateOobData, 0)
-    test.assert_eq(action_name(local), "oob")
-    let rb = local.state.local_oob_r
-    let ra = hex("12a3343bb453bb5408da42d20c2d0fc8")
-    let ca = smp_keys.sc_confirm(initiator.public_key.x, initiator.public_key.x, ra, 0)
-    let s1 = handle(local.state, SetPeerOobData(ra, ca), 0).state
-    let preq = preq_of(3, 1, smp.SMP_AUTHREQ_BONDING | smp.SMP_AUTHREQ_SC, 16, 0, 0)
-    let r = handle(s1, Pdu(preq), 0)
-    test.assert_eq(r.pdus[0][2] as Int, 1)
-    let pk = handle(r.state, Pdu(smp.build_pairing_public_key(initiator.public_key.x, initiator.public_key.y)), 10)
-    test.assert_eq(list.len(pk.pdus), 1)
-    let dh = handle(pk.state, DhKeyComputed(smp_keys.dhkey(responder.private_key, initiator.public_key)), 15)
-    let run = ScRun { state: dh.state, initiator: initiator, responder: responder, preq: preq, pres: r.pdus[0], first: pk }
-    let na = hex("d5cb8454d177733effffb2ec712baeab")
-    let n = handle(dh.state, Pdu(smp.build_pairing_random(na)), 20)
-    let nb = value16(n, 0)
-    // The C sent out of band is f4(PKbx, PKbx, rb, 0).
-    assert_bytes(action_oob(local), list.concat(rb, smp_keys.sc_confirm(responder.public_key.x, responder.public_key.x, rb, 0)))
-    let e = sc_stage2(run, n.state, na, nb, ra, rb)
-    test.assert_eq(e.pdus[0][0] as Int, smp.SMP_OP_PAIRING_DHKEY_CHECK)
-    test.assert_eq(sc_finish(e).level, 4)
-    // SM/PER/SCOB/BI-03-C: wrong out of band data from the peer.
-    let bad = handle(handle(local.state, SetPeerOobData(ra, smp_keys.zeros(16)), 0).state, Pdu(preq), 0)
-    let bpk = handle(bad.state, Pdu(smp.build_pairing_public_key(initiator.public_key.x, initiator.public_key.y)), 10)
-    assert_failed_with(handle(bpk.state, Pdu(smp.build_pairing_random(na)), 20), smp.SMP_FAIL_CONFIRM_VALUE_FAILED)
-
-@test
-fn test_sc_key_distribution_sends_no_ltk()
-    // SM/PER/KDU/BV-08-C and BV-09-C.
-    let preq = preq_of(3, 0, smp.SMP_AUTHREQ_BONDING | smp.SMP_AUTHREQ_SC, 16, smp.SMP_KEY_DIST_ENC, 7)
-    let run = sc_start(config_with(3), preq)
-    test.assert_eq(run.pres[5] as Int, 0)
-    test.assert_eq(run.pres[6] as Int, smp.SMP_KEY_DIST_ID | smp.SMP_KEY_DIST_SIGN)
-    let na = hex("d5cb8454d177733effffb2ec712baeab")
-    let r = handle(run.state, Pdu(smp.build_pairing_random(na)), 20)
-    let e = sc_stage2(run, r.state, na, value16(r, 0), smp_keys.zeros(16), smp_keys.zeros(16))
-    let enc = handle(e.state, EncryptionChanged(true), 120)
-    test.assert_eq(list.len(enc.pdus), 3)
-    test.assert_eq(enc.pdus[0][0] as Int, smp.SMP_OP_IDENTITY_INFORMATION)
-    test.assert_eq(enc.pdus[2][0] as Int, smp.SMP_OP_SIGNING_INFORMATION)
-    let result = action_result(enc)
-    assert_bytes(result.bond.local_csrk, value16(enc, 2))
-    test.assert_eq(list.len(result.bond.ltk), 16)
-
-@test
-fn test_sc_only_mode_refuses_legacy_pairing()
-    let cfg = SmpConfig {
-        io_capability: 3, bondable: true, secure_connections: true, sc_only: true,
-        required_level: 2, keypress: false, request_mitm: true, max_key_size: 16, min_key_size: 7, identity_irk: [],
-        identity_address_type: 1, identity_address: [], distribute_csrk: false, accept_debug_key: false,
-        pairing_supported: true, attempt_min_wait_ms: 0, attempt_max_wait_ms: 0 }
-    assert_failed_with(handle(connected(cfg, no_key_pair()), Pdu(preq_of(3, 0, 1, 16, 0, 0)), 0), smp.SMP_FAIL_AUTH_REQUIREMENTS)
-
-// [Vol 3] Part H, Section 2.3.6: the key pair is replaced when S + 3F > 8,
-// so the pairing that follows runs on a new key and the counters restart.
-@test
-fn test_the_key_pair_is_replaced_before_a_pairing_once_the_count_is_over()
-    let responder = smp_keys.key_pair_from_private(smp_keys.debug_private_key())
-    let initiator = smp_keys.key_pair_from_private(initiator_private())
-    let preq = preq_of(3, 0, smp.SMP_AUTHREQ_BONDING | smp.SMP_AUTHREQ_SC, 16, 0, 0)
-    var worn = copy(connected(config_with(3), responder))
-    worn.successes = 9
-    let r = handle(worn, Pdu(preq), 0)
-    test.assert_eq(r.state.successes, 0)
-    test.assert_eq(r.state.failures, 0)
-    test.assert_eq(list.len(r.state.key_pair.private_key), 32)
-    test.assert(not smp_keys.equal_ct(r.state.key_pair.public_key.x, responder.public_key.x))
-    let pk = handle(r.state, Pdu(smp.build_pairing_public_key(initiator.public_key.x, initiator.public_key.y)), 10)
-    assert_bytes(smp.field_bytes(pk.pdus[0], 1, 32), r.state.key_pair.public_key.x)
-    // At the limit the key stays.
-    var at_limit = copy(connected(config_with(3), responder))
-    at_limit.successes = 8
-    let kept = handle(at_limit, Pdu(preq), 0)
-    assert_bytes(kept.state.key_pair.public_key.x, responder.public_key.x)
-    test.assert_eq(kept.state.successes, 8)
-    // A key pair whose public key was published out of band stays too, and
-    // so does one whose private key the Controller holds.
-    let published = handle(worn, CreateOobData, 0).state
-    assert_bytes(handle(published, Pdu(preq), 0).state.key_pair.public_key.x, responder.public_key.x)
-    var held = copy(connected(config_with(3), no_key_pair()))
-    held.successes = 9
-    test.assert_eq(handle(held, Pdu(preq), 0).state.successes, 9)
-
-@test
-fn test_key_pair_counters_and_cancel()
-    let s = connected(config_with(3), no_key_pair())
-    let r = handle(s, Pdu(preq_of(3, 0, 1, 16, 0, 0)), 0)
-    let c = handle(r.state, Cancel, 5)
-    assert_failed_with(c, smp.SMP_FAIL_UNSPECIFIED_REASON)
-    test.assert_eq(c.state.failures, 1)
-    // copy(): a `var` bound to a `let` value and then reassigned leaks, so the state is taken as a copy, not as a second name.
-    var t = copy(c.state)
-    for i in 0..2
-        t = handle(handle(t, Pdu(preq_of(3, 0, 1, 16, 0, 0)), 10).state, Cancel, 11).state
-    test.assert(needs_new_key_pair(t))
-    test.assert(not needs_new_key_pair(with_key_pair(t, no_key_pair())))
-    let d = handle(handle(t, Pdu(preq_of(3, 0, 1, 16, 0, 0)), 20).state, Disconnected, 21)
-    test.assert_eq(action_name(d), "failed")
-    test.assert_eq(list.len(handle(d.state, Reseed(seed()), 22).pdus), 0)
-
-@test
-fn test_legacy_out_of_band()
-    // SM/PER/OOB/BV-02-C: both devices hold the same TK.
-    let tk = hex("a0a1a2a3a4a5a6a7a8a9aaabacadaeaf")
-    let s = handle(connected(config_with(3), no_key_pair()), SetLegacyOobTk(tk), 0).state
-    let preq = preq_of(3, 1, smp.SMP_AUTHREQ_BONDING, 16, 0, 0)
-    let r = handle(s, Pdu(preq), 0)
-    test.assert_eq(r.pdus[0][2] as Int, 1)
-    let st = legacy_phase2(r.state, preq, r.pdus[0], tk, hex("0102030405060708090a0b0c0d0e0f10"))
-    let done = handle(handle(st, LtkRequest(0, smp_keys.zeros(8)), 30).state, EncryptionChanged(true), 40)
-    test.assert_eq(action_result(done).level, 3)
-    // SM/PER/OOB/BV-08-C: only the initiator has OOB data, Just Works.
-    let jw = handle(connected(config_with(3), no_key_pair()), Pdu(preq), 0)
-    test.assert_eq(jw.pdus[0][2] as Int, 0)
-    test.assert(jw.state.method == Method.JustWorks)
-
-@test
-fn test_central_keys_arrive_in_order()
-    // EncKey, IdKey and SignKey from the Central (Section 3.6.1 order).
-    let s = connected(config_with(3), no_key_pair())
-    let preq = preq_of(3, 0, smp.SMP_AUTHREQ_BONDING, 16, 7, 0)
-    let r = handle(s, Pdu(preq), 0)
-    test.assert_eq(r.pdus[0][5] as Int, 7)
-    let st = legacy_phase2(r.state, preq, r.pdus[0], smp_keys.zeros(16), hex("1112131415161718191a1b1c1d1e1f20"))
-    let enc = handle(st, EncryptionChanged(true), 40)
-    test.assert_eq(list.len(enc.pdus), 0)
-    // A key out of order.
-    assert_failed_with(handle(enc.state, Pdu(smp.build_identity_information(smp_keys.zeros(16))), 41), smp.SMP_FAIL_UNSPECIFIED_REASON)
-    let k1 = handle(enc.state, Pdu(smp.build_encryption_information(hex("000102030405060708090a0b0c0d0e0f"))), 42)
-    let k2 = handle(k1.state, Pdu(smp.build_central_identification(0x4321, hex("0807060504030201"))), 43)
-    let k3 = handle(k2.state, Pdu(smp.build_identity_information(hex("ec0234a357c8ad05341010a60a397d9b"))), 44)
-    // AddrType 0x02 is reserved (Section 3.6.5).
-    assert_failed_with(handle(k3.state, Pdu(smp.build_identity_address_information(2, peer_address())), 45), smp.SMP_FAIL_INVALID_PARAMETERS)
-    let k4 = handle(k3.state, Pdu(smp.build_identity_address_information(1, hex("c1c2c3c4c5d6"))), 45)
-    test.assert_eq(action_name(k4), "none")
-    let k5 = handle(k4.state, Pdu(smp.build_signing_information(hex("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"))), 46)
-    test.assert_eq(action_name(k5), "complete")
-    let b = action_result(k5).bond
-    test.assert_eq(b.peer_ediv, 0x4321)
-    test.assert_eq(b.peer_rand[7] as Int, 1)
-    test.assert_eq(b.peer_ltk[15] as Int, 0x0f)
-    test.assert_eq(b.peer_csrk[0] as Int, 0xf0)
-    test.assert_eq(b.peer_address_type, 1)
-
-@test
-fn test_failures_in_the_middle_of_a_pairing()
-    let s = connected(config_with(3), no_key_pair())
-    let preq = preq_of(3, 0, 1, 16, 0, 0)
-    let r = handle(s, Pdu(preq), 0)
-    // A command of the wrong length, and one the procedure does not expect.
-    assert_failed_with(handle(r.state, Pdu([0x03, 0x00]), 1), smp.SMP_FAIL_INVALID_PARAMETERS)
-    assert_failed_with(handle(r.state, Pdu(smp.build_pairing_random(smp_keys.zeros(16))), 1), smp.SMP_FAIL_UNSPECIFIED_REASON)
-    assert_failed_with(handle(r.state, Pdu(smp.build_security_request(1)), 1), smp.SMP_FAIL_COMMAND_NOT_SUPPORTED)
-    // Encryption that does not come up ends the pairing.
-    let st = legacy_phase2(r.state, preq, r.pdus[0], smp_keys.zeros(16), hex("1112131415161718191a1b1c1d1e1f20"))
-    let off = handle(st, EncryptionChanged(false), 40)
-    test.assert_eq(action_name(off), "failed")
-    test.assert_eq(list.len(off.pdus), 0)
-    // An LE Long Term Key Request with a non-zero EDIV during pairing.
-    test.assert_eq(action_name(handle(st, LtkRequest(1, smp_keys.zeros(8)), 40)), "negative")
-    // Inputs that do not apply are ignored.
-    test.assert_eq(action_name(handle(s, EncryptionChanged(true), 2)), "none")
-    test.assert_eq(action_name(handle(s, PasskeyEntered(1), 2)), "none")
-    test.assert_eq(action_name(handle(s, NumericConfirmed(true), 2)), "none")
-    test.assert_eq(action_name(handle(s, DhKeyComputed(smp_keys.zeros(32)), 2)), "none")
-    test.assert_eq(action_name(handle(s, Cancel, 2)), "none")
-    test.assert_eq(action_name(handle(s, SendKeypress(0), 2)), "none")
-    test.assert_eq(action_name(handle(s, Tick, 2)), "none")
-    // A Passkey Entry responder ignores a passkey once it has one, or
-    // before the procedure waits for one.
-    let ki = handle(connected(config_with(2), no_key_pair()), Pdu(preq_of(0, 0, 5, 16, 0, 0)), 0)
-    let typed = handle(ki.state, PasskeyEntered(42), 1)
-    test.assert_eq(action_name(handle(typed.state, PasskeyEntered(43), 2)), "none")
-    test.assert_eq(handle(typed.state, PasskeyEntered(43), 2).state.passkey, 42)
-
-@test
-fn test_connection_events_pass_an_expired_timer()
-    let s = connected(config_with(3), no_key_pair())
-    let r = handle(s, Pdu(preq_of(3, 0, 1, 16, 0, 0)), 0)
-    let d = handle(r.state, Disconnected, 40000)
-    test.assert_eq(action_name(d), "failed")
-    test.assert(not d.state.timed_out)
-    let c = handle(r.state, Connected(1, own_address(), 0, peer_address(), None), 40000)
-    test.assert_eq(action_name(c), "none")
-    test.assert(not is_pairing(c.state))
-
-@test
-fn test_attempt_records_are_bounded_and_per_device()
-    var t = connected(config_with(3), no_key_pair())
-    for i in 0..5
-        let c = handle(t, Connected(1, own_address(), 0, [i as u8, 1, 2, 3, 4, 5], None), 0)
-        let r = handle(c.state, Pdu(preq_of(3, 0, 0, 16, 0, 0)), 0)
-        let a = handle(r.state, Pdu(smp.build_pairing_confirm(smp_keys.zeros(16))), 1)
-        t = handle(a.state, Pdu(smp.build_pairing_random(smp_keys.zeros(16))), 2).state
-    test.assert_eq(list.len(t.attempts), smp_core.ATTEMPT_RECORDS)
-    test.assert_eq(t.attempts[0].address[0] as Int, 1)
-    // Disabled by a zero minimum.
-    let cfg = SmpConfig {
-        io_capability: 3, bondable: true, secure_connections: false, sc_only: false,
-        required_level: 1, keypress: false, request_mitm: true, max_key_size: 16, min_key_size: 7, identity_irk: [],
-        identity_address_type: 1, identity_address: [], distribute_csrk: false, accept_debug_key: false,
-        pairing_supported: true, attempt_min_wait_ms: 0, attempt_max_wait_ms: 0 }
-    let r = handle(connected(cfg, no_key_pair()), Pdu(preq_of(3, 0, 0, 16, 0, 0)), 0)
-    let a = handle(r.state, Pdu(smp.build_pairing_confirm(smp_keys.zeros(16))), 1)
-    test.assert_eq(list.len(handle(a.state, Pdu(smp.build_pairing_random(smp_keys.zeros(16))), 2).state.attempts), 0)
-    // The decayed interval never falls below the minimum.
-    var later = copy(t)
-    later.now = 1000000
-    let odd = AttemptRecord { address_type: 0, address: peer_address(), wait_ms: 3000, blocked_until: 0, last_failure: 0 }
-    let cfg2 = SmpConfig {
-        io_capability: 3, bondable: true, secure_connections: false, sc_only: false,
-        required_level: 1, keypress: false, request_mitm: true, max_key_size: 16, min_key_size: 7, identity_irk: [],
-        identity_address_type: 1, identity_address: [], distribute_csrk: false, accept_debug_key: false,
-        pairing_supported: true, attempt_min_wait_ms: 2000, attempt_max_wait_ms: 3000 }
-    later.config = cfg2
-    test.assert_eq(smp_core.decayed_wait(later, odd), 2000)
-
-@test
-fn test_the_action_readers_answer_their_fallbacks()
-    let r = handle(connected(config_with(2), no_key_pair()), Pdu(preq_of(0, 0, 5, 16, 0, 0)), 0)
-    test.assert_eq(action_int(r), -1)
-    test.assert_eq(list.len(action_ltk(r)), 0)
-    test.assert_eq(action_result(r).level, -1)
-    test.assert_eq(list.len(action_oob(r)), 0)
-    // A passkey typed before the public key exchange is kept.
-    let sc = handle(connected(config_with(2), no_key_pair()), Pdu(preq_of(0, 0, 0x0D, 16, 0, 0)), 0)
-    test.assert_eq(handle(sc.state, PasskeyEntered(7), 1).state.passkey, 7)
-
-@test
-fn test_display_and_yes_no_rows_of_table_2_8()
-    test.assert(smp_core.io_method(false, 1, 0) == Method.JustWorks)
-    test.assert(smp_core.io_method(false, 0, 1) == Method.JustWorks)
-    test.assert(smp_core.io_method(false, 4, 1) == Method.PasskeyDisplay)
-    test.assert(smp_core.io_method(true, 4, 1) == Method.NumericComparison)
-    test.assert(smp_core.io_method(false, 0, 2) == Method.PasskeyInput)
-
-@test
-fn test_mitm_is_asked_for_but_not_required_at_level_2()
-    // SM/PER/PKE/BV-06-C: a Display Only responder of Core v6.2 or later
-    // asks a NoInputNoOutput initiator for no MITM protection -- no model
-    // the two capabilities leave can authenticate the key, Table 4.3
-    // reads the flag 0 for this row -- and the pairing is Just Works all
-    // the same, at the level the configuration requires.  The
-    // v6.1-and-earlier row of the same procedure (SM/PER/PKE/BV-05-C)
-    // reads the same request with the flag set; the v6.2 text of Section
-    // 2.3.5.1 is what moved it.
-    let s = connected(config_with(smp.SMP_IO_CAP_DISPLAY_ONLY), no_key_pair())
-    let r = handle(s, Pdu(preq_of(smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT, 0, 0, 16, 0, 0)), 0)
-    test.assert_eq((r.pdus[0][3] as Int) & smp.SMP_AUTHREQ_MITM, 0)
-    test.assert(r.state.method == Method.JustWorks)
-    test.assert_eq(action_name(r), "none")
-    // SM/PER/PIS/BV-02-C: with request_mitm off, the Security Request
-    // leaves MITM clear.
-    let d = config_with(smp.SMP_IO_CAP_DISPLAY_ONLY)
-    let quiet = SmpConfig {
-        io_capability: d.io_capability, bondable: true, secure_connections: true, sc_only: false,
-        required_level: 2, keypress: false, request_mitm: false, max_key_size: 16, min_key_size: 7, identity_irk: [],
-        identity_address_type: 1, identity_address: [], distribute_csrk: false, accept_debug_key: false,
-        pairing_supported: true, attempt_min_wait_ms: 0, attempt_max_wait_ms: 0 }
-    let q = handle(connected(quiet, no_key_pair()), RequestSecurity(2), 0)
-    test.assert_eq((q.pdus[0][1] as Int) & smp.SMP_AUTHREQ_MITM, 0)
-

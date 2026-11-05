@@ -1,0 +1,332 @@
+// tests/att_tests.nv — the unit tests of src/att.nv.
+//
+//   novo test tests/att_tests.nv
+
+use std.test
+use att.{ ATT_ERR_INVALID_HANDLE, ATT_ERR_REQUEST_NOT_SUPPORTED, ATT_EXECUTE_WRITE_FLAG_CANCEL, ATT_EXECUTE_WRITE_FLAG_WRITE, ATT_FIND_INFO_FORMAT_UUID16, ATT_OP_EXCHANGE_MTU_REQ, ATT_OP_EXCHANGE_MTU_RSP, ATT_OP_EXECUTE_WRITE_REQ, ATT_OP_EXECUTE_WRITE_RSP, ATT_OP_FIND_BY_TYPE_VALUE_REQ, ATT_OP_FIND_INFORMATION_REQ, ATT_OP_HANDLE_VALUE_CFM, ATT_OP_HANDLE_VALUE_IND, ATT_OP_HANDLE_VALUE_NTF, ATT_OP_PREPARE_WRITE_REQ, ATT_OP_PREPARE_WRITE_RSP, ATT_OP_READ_BLOB_REQ, ATT_OP_READ_BY_GROUP_TYPE_REQ, ATT_OP_READ_BY_GROUP_TYPE_RSP, ATT_OP_READ_BY_TYPE_REQ, ATT_OP_READ_BY_TYPE_RSP, ATT_OP_READ_REQ, ATT_OP_READ_RSP, ATT_OP_WRITE_CMD, ATT_OP_WRITE_REQ, ATT_OP_WRITE_RSP, build_error_rsp, build_exchange_mtu_rsp, build_execute_write_rsp, build_find_info_rsp, build_handle_value_cfm, build_handle_value_ind, build_handle_value_ntf, build_prepare_write_rsp, build_read_by_group_type_rsp, build_read_by_type_rsp, build_read_rsp, build_write_rsp, is_m5_request, is_m6_request, is_write_command, opcode_is_command, opcode_is_signed, opcode_method, read_exchange_mtu_req_mtu, read_execute_write_req_flags, read_find_by_type_value_req_end, read_find_by_type_value_req_start, read_find_by_type_value_req_type16, read_find_info_req_end, read_find_info_req_start, read_prepare_write_req_handle, read_prepare_write_req_offset, read_prepare_write_req_value, read_read_blob_req_handle, read_read_blob_req_offset, read_read_by_group_type_req_start, read_read_by_group_type_req_type16, read_read_by_type_req_end, read_read_by_type_req_start, read_read_by_type_req_type16, read_read_by_type_req_type_len, read_read_req_handle, read_write_req_handle, read_write_req_value }
+use att
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+@test
+@satisfies("REQ-BLE-ATT-PDU-001")
+fn test_opcode_field_extraction()
+    // 0x52 = 0101 0010 — bit 6 (command) set, bit 7 (signed) clear,
+    // method = 0x12: the write command.
+    test.assert_eq(opcode_method(0x52), 0x12)
+    test.assert_eq(opcode_is_command(0x52), true)
+    test.assert_eq(opcode_is_signed(0x52), false)
+
+    // 0xD2 = 1101 0010 — both top bits set: signed-write command.
+    test.assert_eq(opcode_method(0xD2), 0x12)
+    test.assert_eq(opcode_is_command(0xD2), true)
+    test.assert_eq(opcode_is_signed(0xD2), true)
+
+    // 0x0A = 0000 1010 — plain READ_REQ (request, not signed).
+    test.assert_eq(opcode_method(0x0A), 0x0A)
+    test.assert_eq(opcode_is_command(0x0A), false)
+    test.assert_eq(opcode_is_signed(0x0A), false)
+
+@test
+@satisfies("REQ-BLE-ATT-PDU-002")
+fn test_error_rsp_shape()
+    // ERROR_RSP for READ_REQ on handle 0x000F with INVALID_HANDLE.
+    let e = build_error_rsp(ATT_OP_READ_REQ, 0x000F, ATT_ERR_INVALID_HANDLE)
+    test.assert_eq(list.len(e), 5)
+    test.assert_eq(e[0] as Int, 0x01)   // opcode
+    test.assert_eq(e[1] as Int, 0x0A)   // request opcode (READ)
+    test.assert_eq(e[2] as Int, 0x0F)   // handle lo
+    test.assert_eq(e[3] as Int, 0x00)   // handle hi
+    test.assert_eq(e[4] as Int, 0x01)   // err code
+
+@test
+@satisfies("REQ-BLE-ATT-PDU-002")
+fn test_error_rsp_request_not_supported()
+    let e = build_error_rsp(ATT_OP_WRITE_REQ, 0x0000, ATT_ERR_REQUEST_NOT_SUPPORTED)
+    test.assert_eq(e[1] as Int, ATT_OP_WRITE_REQ)
+    test.assert_eq(e[4] as Int, ATT_ERR_REQUEST_NOT_SUPPORTED)
+
+@test
+@satisfies("REQ-BLE-ATT-PDU-003")
+fn test_exchange_mtu_req_round_trip()
+    let req: [u8] = [ATT_OP_EXCHANGE_MTU_REQ, 0x17, 0x00]
+    test.assert_eq(read_exchange_mtu_req_mtu(req), 23)
+
+    let rsp = build_exchange_mtu_rsp(23)
+    test.assert_eq(list.len(rsp), 3)
+    test.assert_eq(rsp[0] as Int, ATT_OP_EXCHANGE_MTU_RSP)
+    test.assert_eq(rsp[1] as Int, 0x17)
+    test.assert_eq(rsp[2] as Int, 0x00)
+
+@test
+@satisfies("REQ-BLE-ATT-PDU-003")
+fn test_read_req_handle_extraction()
+    // READ_REQ for handle 0x0042.
+    let req: [u8] = [ATT_OP_READ_REQ, 0x42, 0x00]
+    test.assert_eq(read_read_req_handle(req), 0x0042)
+
+@test
+@satisfies("REQ-BLE-ATT-PDU-004")
+fn test_read_rsp_carries_value_bytes()
+    let value: [u8] = [0x4E, 0x6F, 0x76, 0x6F]   // "Novo"
+    let rsp = build_read_rsp(value)
+    test.assert_eq(list.len(rsp), 1 + 4)
+    test.assert_eq(rsp[0] as Int, ATT_OP_READ_RSP)
+    test.assert_eq(rsp[1] as Int, 0x4E)
+    test.assert_eq(rsp[4] as Int, 0x6F)
+
+@test
+@satisfies("REQ-BLE-ATT-PDU-003")
+fn test_read_blob_req_handle_and_offset()
+    // READ_BLOB_REQ for handle 0x0042, offset 12.
+    let req: [u8] = [
+        ATT_OP_READ_BLOB_REQ,
+        0x42, 0x00,
+        0x0C, 0x00]
+    test.assert_eq(read_read_blob_req_handle(req), 0x0042)
+    test.assert_eq(read_read_blob_req_offset(req), 12)
+
+@test
+@satisfies("REQ-BLE-ATT-PDU-003")
+fn test_read_by_type_req_uuid16_path()
+    // READ_BY_TYPE_REQ start=0x0001 end=0xFFFF type=0x2803 (Characteristic).
+    let req: [u8] = [
+        ATT_OP_READ_BY_TYPE_REQ,
+        0x01, 0x00,
+        0xFF, 0xFF,
+        0x03, 0x28]
+    test.assert_eq(read_read_by_type_req_start(req), 0x0001)
+    test.assert_eq(read_read_by_type_req_end(req), 0xFFFF)
+    test.assert_eq(read_read_by_type_req_type_len(req), 2)
+    test.assert_eq(read_read_by_type_req_type16(req), 0x2803)
+
+@test
+@satisfies("REQ-BLE-ATT-PDU-004")
+fn test_read_by_type_rsp_shape()
+    // One pair: handle 0x0010 + 5-byte value → pair_len = 7.
+    let pair: [u8] = [
+        0x10, 0x00,
+        0x02, 0x11, 0x00, 0x29, 0x2A]
+    let rsp = build_read_by_type_rsp(7, pair)
+    test.assert_eq(list.len(rsp), 2 + 7)
+    test.assert_eq(rsp[0] as Int, ATT_OP_READ_BY_TYPE_RSP)
+    test.assert_eq(rsp[1] as Int, 7)
+
+@test
+@satisfies("REQ-BLE-ATT-PDU-003")
+fn test_read_by_group_type_aliases_read_by_type()
+    // RBGT_REQ start=0x0001 end=0xFFFF type=0x2800 (Primary Service).
+    let req: [u8] = [
+        ATT_OP_READ_BY_GROUP_TYPE_REQ,
+        0x01, 0x00,
+        0xFF, 0xFF,
+        0x00, 0x28]
+    test.assert_eq(read_read_by_group_type_req_start(req), 0x0001)
+    test.assert_eq(read_read_by_group_type_req_type16(req), 0x2800)
+
+@test
+@satisfies("REQ-BLE-ATT-PDU-004")
+fn test_read_by_group_type_rsp_shape()
+    // One triplet: handle 0x0001 + group_end 0x0006 + 2-byte UUID → triplet_len 6.
+    let triplet: [u8] = [
+        0x01, 0x00,
+        0x06, 0x00,
+        0x0A, 0x18]
+    let rsp = build_read_by_group_type_rsp(6, triplet)
+    test.assert_eq(rsp[0] as Int, ATT_OP_READ_BY_GROUP_TYPE_RSP)
+    test.assert_eq(rsp[1] as Int, 6)
+
+@test
+@satisfies("REQ-BLE-ATT-PDU-003")
+fn test_find_info_req_extraction()
+    let req: [u8] = [
+        ATT_OP_FIND_INFORMATION_REQ,
+        0x01, 0x00,
+        0x05, 0x00]
+    test.assert_eq(read_find_info_req_start(req), 1)
+    test.assert_eq(read_find_info_req_end(req), 5)
+
+@test
+@satisfies("REQ-BLE-ATT-PDU-004")
+fn test_find_info_rsp_format_byte()
+    let data: [u8] = [
+        0x10, 0x00,
+        0x29, 0x2A]
+    let rsp = build_find_info_rsp(ATT_FIND_INFO_FORMAT_UUID16, data)
+    test.assert_eq(rsp[1] as Int, ATT_FIND_INFO_FORMAT_UUID16)
+
+@test
+@satisfies("REQ-BLE-ATT-PDU-003")
+fn test_find_by_type_value_req_extraction()
+    // FBTV start=1 end=0xFFFF uuid=0x2800 value=[0x0A,0x18] (Device Info)
+    let req: [u8] = [
+        ATT_OP_FIND_BY_TYPE_VALUE_REQ,
+        0x01, 0x00,
+        0xFF, 0xFF,
+        0x00, 0x28,
+        0x0A, 0x18]
+    test.assert_eq(read_find_by_type_value_req_start(req), 1)
+    test.assert_eq(read_find_by_type_value_req_end(req), 0xFFFF)
+    test.assert_eq(read_find_by_type_value_req_type16(req), 0x2800)
+
+@test
+fn test_short_buffer_returns_minus_one()
+    let runt: [u8] = [ATT_OP_READ_REQ]
+    test.assert_eq(read_read_req_handle(runt), -1)
+    test.assert_eq(read_exchange_mtu_req_mtu(runt), -1)
+
+@test
+fn test_is_m5_request_classification()
+    test.assert_eq(is_m5_request(ATT_OP_READ_REQ), true)
+    test.assert_eq(is_m5_request(ATT_OP_READ_BY_GROUP_TYPE_REQ), true)
+    test.assert_eq(is_m5_request(ATT_OP_FIND_BY_TYPE_VALUE_REQ), true)
+    test.assert_eq(is_m5_request(ATT_OP_WRITE_REQ), false)   // write side
+    test.assert_eq(is_m5_request(ATT_OP_HANDLE_VALUE_NTF), false)   // write side
+
+// ── Write-side tests: write / prepare / execute / notify / indicate
+
+@test
+@satisfies("REQ-BLE-ATT-PDU-003")
+fn test_write_req_handle_and_value_extraction()
+    // WRITE_REQ for handle 0x002A with payload [0xAA 0xBB 0xCC].
+    let req: [u8] = [
+        ATT_OP_WRITE_REQ,
+        0x2A, 0x00,
+        0xAA, 0xBB, 0xCC]
+    test.assert_eq(read_write_req_handle(req), 0x002A)
+    let v = read_write_req_value(req)
+    test.assert_eq(list.len(v), 3)
+    test.assert_eq(v[0] as Int, 0xAA)
+    test.assert_eq(v[2] as Int, 0xCC)
+
+@test
+@satisfies("REQ-BLE-ATT-PDU-004")
+fn test_write_rsp_is_one_byte_opcode()
+    let rsp = build_write_rsp()
+    test.assert_eq(list.len(rsp), 1)
+    test.assert_eq(rsp[0] as Int, ATT_OP_WRITE_RSP)
+
+@test
+fn test_write_cmd_uses_same_extractors()
+    // WRITE_CMD (0x52) for handle 0x0010 with payload [0x42].
+    let cmd: [u8] = [
+        ATT_OP_WRITE_CMD,
+        0x10, 0x00,
+        0x42]
+    test.assert_eq(read_write_req_handle(cmd), 0x0010)
+    let v = read_write_req_value(cmd)
+    test.assert_eq(list.len(v), 1)
+    test.assert_eq(v[0] as Int, 0x42)
+    test.assert_eq(opcode_is_command(ATT_OP_WRITE_CMD), true)
+    test.assert_eq(is_write_command(ATT_OP_WRITE_CMD), true)
+    test.assert_eq(is_write_command(ATT_OP_WRITE_REQ), false)
+
+@test
+@satisfies("REQ-BLE-ATT-PDU-004")
+fn test_handle_value_ntf_shape()
+    let value: [u8] = [0x01, 0x55]   // measurement, etc.
+    let ntf = build_handle_value_ntf(0x0011, value)
+    test.assert_eq(list.len(ntf), 1 + 2 + 2)
+    test.assert_eq(ntf[0] as Int, ATT_OP_HANDLE_VALUE_NTF)
+    test.assert_eq(ntf[1] as Int, 0x11)   // handle lo
+    test.assert_eq(ntf[2] as Int, 0x00)   // handle hi
+    test.assert_eq(ntf[3] as Int, 0x01)
+    test.assert_eq(ntf[4] as Int, 0x55)
+
+@test
+@satisfies("REQ-BLE-ATT-PDU-004")
+fn test_handle_value_ind_shape_and_cfm_one_byte()
+    let value: [u8] = [0x99]
+    let ind = build_handle_value_ind(0x0042, value)
+    test.assert_eq(ind[0] as Int, ATT_OP_HANDLE_VALUE_IND)
+    test.assert_eq(ind[1] as Int, 0x42)
+    test.assert_eq(ind[3] as Int, 0x99)
+
+    let cfm = build_handle_value_cfm()
+    test.assert_eq(list.len(cfm), 1)
+    test.assert_eq(cfm[0] as Int, ATT_OP_HANDLE_VALUE_CFM)
+
+@test
+@satisfies("REQ-BLE-ATT-PDU-003")
+fn test_prepare_write_req_extraction()
+    // PREPARE_WRITE_REQ handle=0x0030 offset=4 value=[0xDE 0xAD]
+    let req: [u8] = [
+        ATT_OP_PREPARE_WRITE_REQ,
+        0x30, 0x00,
+        0x04, 0x00,
+        0xDE, 0xAD]
+    test.assert_eq(read_prepare_write_req_handle(req), 0x0030)
+    test.assert_eq(read_prepare_write_req_offset(req), 4)
+    let v = read_prepare_write_req_value(req)
+    test.assert_eq(list.len(v), 2)
+    test.assert_eq(v[0] as Int, 0xDE)
+    test.assert_eq(v[1] as Int, 0xAD)
+
+@test
+@satisfies("REQ-BLE-ATT-PDU-004")
+fn test_prepare_write_rsp_echoes_handle_offset_value()
+    let value: [u8] = [0xBE, 0xEF]
+    let rsp = build_prepare_write_rsp(0x0030, 4, value)
+    test.assert_eq(list.len(rsp), 1 + 2 + 2 + 2)
+    test.assert_eq(rsp[0] as Int, ATT_OP_PREPARE_WRITE_RSP)
+    test.assert_eq(rsp[1] as Int, 0x30)   // handle lo
+    test.assert_eq(rsp[2] as Int, 0x00)   // handle hi
+    test.assert_eq(rsp[3] as Int, 0x04)   // offset lo
+    test.assert_eq(rsp[4] as Int, 0x00)   // offset hi
+    test.assert_eq(rsp[5] as Int, 0xBE)
+    test.assert_eq(rsp[6] as Int, 0xEF)
+
+@test
+@satisfies("REQ-BLE-ATT-PDU-003")
+fn test_execute_write_req_flag_extraction()
+    let cancel: [u8] = [ATT_OP_EXECUTE_WRITE_REQ, 0x00]
+    test.assert_eq(read_execute_write_req_flags(cancel), ATT_EXECUTE_WRITE_FLAG_CANCEL)
+
+    let commit: [u8] = [ATT_OP_EXECUTE_WRITE_REQ, 0x01]
+    test.assert_eq(read_execute_write_req_flags(commit), ATT_EXECUTE_WRITE_FLAG_WRITE)
+
+@test
+@satisfies("REQ-BLE-ATT-PDU-004")
+fn test_execute_write_rsp_one_byte()
+    let rsp = build_execute_write_rsp()
+    test.assert_eq(list.len(rsp), 1)
+    test.assert_eq(rsp[0] as Int, ATT_OP_EXECUTE_WRITE_RSP)
+
+@test
+fn test_is_m6_request_classification()
+    test.assert_eq(is_m6_request(ATT_OP_WRITE_REQ), true)
+    test.assert_eq(is_m6_request(ATT_OP_PREPARE_WRITE_REQ), true)
+    test.assert_eq(is_m6_request(ATT_OP_EXECUTE_WRITE_REQ), true)
+    test.assert_eq(is_m6_request(ATT_OP_HANDLE_VALUE_CFM), true)
+    test.assert_eq(is_m6_request(ATT_OP_READ_REQ), false)   // read side
+    test.assert_eq(is_m6_request(ATT_OP_HANDLE_VALUE_NTF), false)   // server-emitted
+
+@test
+fn test_a_request_too_short_for_its_fields_reads_as_minus_one_or_empty()
+    test.assert_eq(att.read_read_by_type_req_start([0x08, 0x01]), -1)
+    test.assert_eq(att.read_read_by_type_req_end([0x08, 0x01]), -1)
+    // A type of 3 octets is neither a 16-bit nor a 128-bit UUID.
+    test.assert_eq(att.read_read_by_type_req_type16([0x08, 0x01, 0x00, 0xFF, 0xFF, 0xAA, 0xBB, 0xCC]), -1)
+    test.assert_eq(att.read_read_by_type_req_type16([0x08, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28]), 0x2800)
+    test.assert_eq(att.read_write_req_handle([0x12, 0x03]), -1)
+    test.assert_eq(att.read_write_req_handle([0x12, 0x03, 0x00]), 3)
+    test.assert_eq(list.len(att.read_write_req_value([0x12, 0x03])), 0)
+    test.assert_eq(list.len(att.read_write_req_value([0x12, 0x03, 0x00, 0x44, 0x55])), 2)
+    test.assert_eq(att.read_prepare_write_req_handle([0x16, 0x03, 0x00, 0x00]), -1)
+    test.assert_eq(att.read_prepare_write_req_offset([0x16, 0x03, 0x00, 0x00]), -1)
+    test.assert_eq(list.len(att.read_prepare_write_req_value([0x16, 0x03, 0x00, 0x00])), 0)
+    test.assert_eq(att.read_prepare_write_req_handle([0x16, 0x03, 0x00, 0x05, 0x00, 0x77]), 3)
+    test.assert_eq(att.read_prepare_write_req_offset([0x16, 0x03, 0x00, 0x05, 0x00, 0x77]), 5)
+    test.assert_eq(att.read_execute_write_req_flags([0x18]), -1)
+    test.assert_eq(att.read_execute_write_req_flags([0x18, 0x01]), 1)
+    test.assert_eq(att.read_exchange_mtu_req_mtu([0x02, 0x17]), -1)
+    test.assert_eq(att.read_exchange_mtu_req_mtu([0x02, 0x17, 0x00]), 23)
+
+@test
+fn test_the_opcode_flags_and_the_confirmation_pdu()
+    test.assert(att.opcode_is_command(0x52))
+    test.assert(not att.opcode_is_command(0x12))
+    test.assert(att.opcode_is_signed(0xD2))
+    test.assert(not att.opcode_is_signed(0x52))
+    test.assert_eq(att.build_handle_value_cfm()[0] as Int, att.ATT_OP_HANDLE_VALUE_CFM)
+    test.assert_eq(list.len(att.build_handle_value_cfm()), 1)

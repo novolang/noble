@@ -1,0 +1,210 @@
+// tests/smp_core_tests.nv — the unit tests of src/smp_core.nv.
+//
+//   novo test tests/smp_core_tests.nv
+
+use std.test
+use smp
+use smp.{ Command, Reason }
+use smp_keys
+use smp_keys.{ KeyPair }
+use smp_core.{ KeyResult, Method, PairingState, Phase, Received, Role, SMP_TIMEOUT_MS, SmpConfig, abort, address_a, address_b, classify, copy, decline, default_config, empty_key, expect_distribution, expected_key, feature_fault, first_expected_code, is_pairing, key_size_too_small, local_distribution, local_user_types, negotiated_key_size, new_pairing_state, nonce_a, nonce_b, pairing_bond, peer_distribution, required_level, sc_missing, take_distributed_key }
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+@test
+fn test_the_feature_fields_are_checked_in_one_place()
+    test.assert(feature_fault(4, 1, 16) == None)
+    test.assert(feature_fault(5, 0, 16) == Some(Reason.InvalidParameters))
+    test.assert(feature_fault(0, 2, 16) == Some(Reason.InvalidParameters))
+    test.assert(feature_fault(0, 0, 6) == Some(Reason.InvalidParameters))
+    test.assert(feature_fault(0, 0, 17) == Some(Reason.InvalidParameters))
+
+@test
+fn test_a_key_distribution_field_asks_for_enckey_then_idkey_then_signkey()
+    test.assert(first_expected_code(0) == None)
+    test.assert(first_expected_code(smp.SMP_KEY_DIST_SIGN) == Some(Command.SigningInformation))
+    test.assert(first_expected_code(smp.SMP_KEY_DIST_ID | smp.SMP_KEY_DIST_SIGN) == Some(Command.IdentityInformation))
+    test.assert(first_expected_code(smp.SMP_KEY_DIST_ENC | smp.SMP_KEY_DIST_SIGN) == Some(Command.EncryptionInformation))
+
+// ── Tests of what both halves share ─────────────────────────────────
+//
+// The two halves' own tests walk the whole procedures; these pin the pieces
+// that differ between the ends.
+
+fn received_text(r: Received) -> Str
+    match r
+        Ignore             => "ignore"
+        PeerFailed(reason) => "peer failed ${reason}"
+        Refuse(reason)     => "refuse ${smp.reason_code(reason)}"
+        Fail(reason)       => "fail ${smp.reason_code(reason)}"
+        Handle(command)    => "handle ${smp.command_code(command)}"
+
+fn key_result_text(r: KeyResult) -> Str
+    match r
+        Rejected(reason) => "rejected ${smp.reason_code(reason)}"
+        Waiting          => "waiting"
+        Complete         => "complete"
+
+fn core_config(min_key_size: Int, max_key_size: Int, pairing_supported: Bool) -> SmpConfig
+    let d = default_config()
+    SmpConfig {
+        io_capability: d.io_capability, bondable: d.bondable, secure_connections: d.secure_connections,
+        sc_only: d.sc_only, required_level: d.required_level, keypress: d.keypress, request_mitm: d.request_mitm,
+        max_key_size: max_key_size, min_key_size: min_key_size, identity_irk: d.identity_irk,
+        identity_address_type: d.identity_address_type, identity_address: d.identity_address,
+        distribute_csrk: d.distribute_csrk, accept_debug_key: d.accept_debug_key,
+        pairing_supported: pairing_supported, attempt_min_wait_ms: d.attempt_min_wait_ms,
+        attempt_max_wait_ms: d.attempt_max_wait_ms }
+
+fn core_state_with(role: Role, config: SmpConfig) -> PairingState
+    let no_keys = KeyPair { private_key: [], public_key: empty_key() }
+    new_pairing_state(role, config, no_keys, smp_keys.zeros(16))
+
+fn core_state(role: Role) -> PairingState
+    core_state_with(role, default_config())
+
+@test
+fn test_a_new_state_is_idle_and_has_no_timer()
+    let s = core_state(Role.Responder)
+    test.assert(not is_pairing(s))
+    test.assert_eq(s.timer_deadline, -1)
+    test.assert_eq(s.role == Role.Responder, true)
+    test.assert_eq(core_state(Role.Initiator).role == Role.Initiator, true)
+
+@test
+fn test_the_key_distribution_fields_are_this_devices_and_the_peers()
+    var i = core_state(Role.Initiator)
+    i.init_dist = smp.SMP_KEY_DIST_ID
+    i.resp_dist = smp.SMP_KEY_DIST_SIGN
+    test.assert_eq(local_distribution(i), smp.SMP_KEY_DIST_ID)
+    test.assert_eq(peer_distribution(i), smp.SMP_KEY_DIST_SIGN)
+    var r = copy(i)
+    r.role = Role.Responder
+    test.assert_eq(local_distribution(r), smp.SMP_KEY_DIST_SIGN)
+    test.assert_eq(peer_distribution(r), smp.SMP_KEY_DIST_ID)
+
+@test
+fn test_the_addresses_and_nonces_of_f5_and_f6_follow_the_role()
+    var i = core_state(Role.Initiator)
+    i.own_address = [1, 1, 1, 1, 1, 1]
+    i.peer_address = [2, 2, 2, 2, 2, 2]
+    i.local_rand = smp_keys.zeros(16)
+    i.peer_rand = [7, 7, 7, 7, 7, 7, 7, 7,
+                   7, 7, 7, 7, 7, 7, 7, 7]
+    var r = copy(i)
+    r.role = Role.Responder
+    test.assert(smp_keys.equal_ct(address_a(i), address_b(r)))
+    test.assert(smp_keys.equal_ct(address_b(i), address_a(r)))
+    test.assert(smp_keys.equal_ct(nonce_a(i), smp_keys.zeros(16)))
+    test.assert(smp_keys.equal_ct(nonce_b(i), i.peer_rand))
+    test.assert(smp_keys.equal_ct(nonce_a(r), r.peer_rand))
+    test.assert(smp_keys.equal_ct(nonce_b(r), smp_keys.zeros(16)))
+
+@test
+fn test_the_user_who_types_the_passkey_is_the_other_end_of_the_model()
+    var r = core_state(Role.Responder)
+    r.method = Method.PasskeyInput
+    test.assert(local_user_types(r))
+    r.method = Method.PasskeyDisplay
+    test.assert(not local_user_types(r))
+    var i = copy(r)
+    i.role = Role.Initiator
+    test.assert(local_user_types(i))
+    i.method = Method.PasskeyInput
+    test.assert(not local_user_types(i))
+
+@test
+fn test_classify_reads_the_code_and_the_length()
+    var s = core_state(Role.Responder)
+    test.assert_eq(received_text(classify(var s, [])), received_text(Received.Ignore))
+    test.assert_eq(received_text(classify(var s, [0x0F])), received_text(Received.Ignore))
+    test.assert_eq(received_text(classify(var s, smp.build_pairing_failed(smp.SMP_FAIL_BUSY))),
+        received_text(Received.Ignore))
+    test.assert_eq(received_text(classify(var s, [smp.SMP_OP_PAIRING_CONFIRM])),
+        received_text(Received.Refuse(Reason.InvalidParameters)))
+    s.phase = Phase.LegacyConfirm
+    test.assert_eq(received_text(classify(var s, [smp.SMP_OP_PAIRING_CONFIRM])),
+        received_text(Received.Fail(Reason.InvalidParameters)))
+    test.assert_eq(received_text(classify(var s, smp.build_pairing_confirm(smp_keys.zeros(16)))),
+        received_text(Received.Handle(Command.PairingConfirm)))
+    test.assert_eq(s.failures, 0)
+    test.assert_eq(received_text(classify(var s, smp.build_pairing_failed(smp.SMP_FAIL_BUSY))),
+        received_text(Received.PeerFailed(smp.SMP_FAIL_BUSY)))
+    test.assert_eq(s.failures, 1)
+    test.assert(not is_pairing(s))
+
+@test
+fn test_a_keypress_notification_only_resets_the_timer()
+    var s = core_state(Role.Initiator)
+    s.now = 100
+    s.timer_deadline = 500
+    test.assert_eq(received_text(classify(var s, smp.build_keypress_notification(smp.SMP_KEYPRESS_DIGIT_ENTERED))),
+        received_text(Received.Ignore))
+    test.assert_eq(s.timer_deadline, 100 + SMP_TIMEOUT_MS)
+
+@test
+fn test_a_device_that_does_not_pair_refuses_every_command_but_pairing_failed()
+    var s = core_state_with(Role.Initiator, core_config(7, 16, false))
+    test.assert_eq(received_text(classify(var s, smp.build_security_request(0))),
+        received_text(Received.Refuse(Reason.PairingNotSupported)))
+
+@test
+fn test_the_key_size_is_negotiated_in_one_place()
+    let s = core_state_with(Role.Responder, core_config(10, 16, true))
+    test.assert_eq(negotiated_key_size(s, 12), 12)
+    test.assert_eq(negotiated_key_size(s, 16), 16)
+    let narrow = core_state_with(Role.Responder, core_config(10, 14, true))
+    test.assert_eq(negotiated_key_size(narrow, 16), 14)
+    test.assert(key_size_too_small(s, 9, 2))
+    test.assert(not key_size_too_small(s, 10, 2))
+    test.assert(key_size_too_small(s, 15, 4))
+    test.assert(sc_missing(s, 4, false))
+    test.assert(not sc_missing(s, 3, false))
+    test.assert(not sc_missing(s, 4, true))
+
+@test
+fn test_an_abort_queues_pairing_failed_and_counts_the_failure_once()
+    var s = core_state(Role.Initiator)
+    s.phase = Phase.ScRandom
+    abort(var s, Reason.ConfirmValueFailed, false)
+    test.assert_eq(s.failures, 1)
+    test.assert_eq(s.outbox[0][1] as Int, smp.SMP_FAIL_CONFIRM_VALUE_FAILED)
+    test.assert(not is_pairing(s))
+    decline(var s, Reason.CommandNotSupported)
+    test.assert_eq(s.failures, 1)
+    test.assert_eq(list.len(s.outbox), 2)
+
+@test
+fn test_the_distributed_keys_must_come_in_the_order_of_section_3_6_1()
+    var s = core_state(Role.Initiator)
+    s.resp_dist = smp.SMP_KEY_DIST_ENC | smp.SMP_KEY_DIST_SIGN
+    s.phase = Phase.KeyDistribution
+    expect_distribution(var s)
+    test.assert(expected_key(s) == Some(Command.EncryptionInformation))
+    let wrong = take_distributed_key(var s, smp.build_signing_information(smp_keys.zeros(16)))
+    test.assert_eq(key_result_text(wrong), key_result_text(KeyResult.Rejected(Reason.UnspecifiedReason)))
+    test.assert_eq(key_result_text(take_distributed_key(var s, smp.build_encryption_information(smp_keys.zeros(16)))),
+        key_result_text(KeyResult.Waiting))
+    test.assert(expected_key(s) == Some(Command.CentralIdentification))
+    test.assert_eq(key_result_text(take_distributed_key(var s, smp.build_central_identification(7, smp_keys.zeros(8)))),
+        key_result_text(KeyResult.Waiting))
+    test.assert_eq(s.peer_ediv, 7)
+    test.assert(expected_key(s) == Some(Command.SigningInformation))
+    test.assert_eq(key_result_text(take_distributed_key(var s, smp.build_signing_information(smp_keys.zeros(16)))),
+        key_result_text(KeyResult.Complete))
+
+@test
+fn test_the_bond_of_a_pairing_is_laid_out_for_the_role()
+    var c = core_state(Role.Initiator)
+    c.peer_ltk = smp_keys.zeros(16)
+    c.dist_ltk = smp.build_encryption_information(smp_keys.zeros(16))[1:17]
+    c.peer_ediv = 3
+    c.dist_ediv = 5
+    var p = copy(c)
+    p.role = Role.Responder
+    test.assert_eq(pairing_bond(c).ediv, 3)
+    test.assert_eq(pairing_bond(c).peer_ediv, 5)
+    test.assert_eq(pairing_bond(p).ediv, 5)
+    test.assert_eq(pairing_bond(p).peer_ediv, 3)
+    c.sc = true
+    test.assert_eq(pairing_bond(c).ediv, 0)

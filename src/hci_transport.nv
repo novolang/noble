@@ -14,8 +14,6 @@
 // Satisfies: REQ-BLE-ARCH-002 (HCI is the host-controller
 // boundary; one trait, interchangeable transports).
 
-use std.test
-
 // ── Transport error codes ───────────────────────────────────────────
 //
 // Plain integer codes rather than an enum: these cross the
@@ -96,22 +94,3 @@ trait HciTransport
 trait HciLink[e]
     fn send_packet(self, pkt: [u8]) -> Bool [e]
     fn recv_packet(var self, timeout_ms: Int) -> ?[u8] [e]
-
-// ── Tests ────────────────────────────────────────────────────────────
-//
-// Only the error-code surface is testable here — a trait
-// declaration has no behaviour of its own.  Behavioural tests
-// live beside each impl (`coresident/hci_ram.nv`, `hci_uart.nv`,
-// `hci_usb_cdc.nv`).
-
-@test
-fn test_transport_error_code_constants()
-    test.assert_eq(HCI_TRANSPORT_OK, 0)
-    test.assert_eq(HCI_TRANSPORT_ERR_FULL, 1)
-    test.assert_eq(HCI_TRANSPORT_ERR_DISCONNECTED, 2)
-    test.assert_eq(HCI_TRANSPORT_ERR_MALFORMED, 3)
-
-@test
-fn test_empty_payload_has_length_zero()
-    let p = hci_transport_empty_payload()
-    test.assert_eq(list.len(p), 0)

@@ -249,6 +249,48 @@ fn db_writable_at_ram(value_handle: Int) -> Bool [hw]
             // 0x08 = Write, 0x04 = Write Without Response.
             (props & 0x0C) != 0
 
+// Whether the attribute at `handle` can be read, as `att_server.db_readable_at` answers it, read from the fixed-RAM
+// database: a characteristic value whose declaration lacks the Read property (0x02) is not readable, and every other
+// attribute is.  The walk reads the declarations in place and builds no list.
+@tier(embedded)
+@no_alloc
+fn db_readable_at_ram(handle: Int) -> Bool [hw]
+    let count = db_count_ram()
+    var i = 0
+    var props = -1
+    loop
+        if i >= count
+            break
+        if db_type16_at_ram(i) == 0x2803   // CHARACTERISTIC
+            let v_off = db_record_offset_ram(i) + att_server.DB_REC_HEADER_LEN
+            if db_value_len_at_ram(i) >= 3
+                let vh = att_scratch.gatt_db_ram_byte_at(v_off + 1) | (att_scratch.gatt_db_ram_byte_at(v_off + 2) << 8)
+                if vh == handle
+                    props = att_scratch.gatt_db_ram_byte_at(v_off)
+                    break
+        i = i + 1
+    props < 0 or (props & 0x02) != 0
+
+// The same answer for a database held as a list: `att_server.db_readable_at` without the list it builds for each
+// declaration.
+@tier(embedded)
+@no_alloc
+fn db_readable_at_list(blob: [u8], handle: Int) -> Bool [hw]
+    let count = att_server.db_count(blob)
+    var i = 0
+    var props = -1
+    loop
+        if i >= count
+            break
+        if att_server.db_type16_at(blob, i) == att_server.GATT_UUID_CHARACTERISTIC
+            if att_server.db_value_len_at(blob, i) >= 3
+                let vh = db_value_byte_at(blob, i, 1) | (db_value_byte_at(blob, i, 2) << 8)
+                if vh == handle
+                    props = db_value_byte_at(blob, i, 0)
+                    break
+        i = i + 1
+    props < 0 or (props & 0x02) != 0
+
 // ── Helper: write an ERROR_RSP into scratch at the current cursor ─
 //
 // Drop-in replacement for att.build_error_rsp's caller side.  Writes
@@ -284,6 +326,8 @@ fn handle_read_to_scratch(blob: [u8], req: [u8]) -> Bool [hw]
         let idx = att_server.db_index_for_handle(blob, handle)
         if idx < 0
             write_error_rsp(att.ATT_OP_READ_REQ, handle, att.ATT_ERR_INVALID_HANDLE)
+        else if not db_readable_at_list(blob, handle)
+            write_error_rsp(att.ATT_OP_READ_REQ, handle, att.ATT_ERR_READ_NOT_PERMITTED)
         else
             if not att_scratch.scratch_write_u8(att.ATT_OP_READ_RSP)
                 false
@@ -301,6 +345,8 @@ fn handle_read_blob_to_scratch(blob: [u8], my_mtu: Int, req: [u8]) -> Bool [hw]
         let idx = att_server.db_index_for_handle(blob, handle)
         if idx < 0
             write_error_rsp(att.ATT_OP_READ_BLOB_REQ, handle, att.ATT_ERR_INVALID_HANDLE)
+        else if not db_readable_at_list(blob, handle)
+            write_error_rsp(att.ATT_OP_READ_BLOB_REQ, handle, att.ATT_ERR_READ_NOT_PERMITTED)
         else
             let value_len = att_server.db_value_len_at(blob, idx)
             if offset > value_len
@@ -672,6 +718,8 @@ fn handle_read_ram(req_addr: Int, req_len: Int) -> Bool [hw]
         let idx = db_index_for_handle_ram(handle)
         if idx < 0
             write_error_rsp(att.ATT_OP_READ_REQ, handle, att.ATT_ERR_INVALID_HANDLE)
+        else if not db_readable_at_ram(handle)
+            write_error_rsp(att.ATT_OP_READ_REQ, handle, att.ATT_ERR_READ_NOT_PERMITTED)
         else
             if not att_scratch.scratch_write_u8(att.ATT_OP_READ_RSP)
                 false
@@ -688,6 +736,8 @@ fn handle_read_blob_ram(my_mtu: Int, req_addr: Int, req_len: Int) -> Bool [hw]
         let idx = db_index_for_handle_ram(handle)
         if idx < 0
             write_error_rsp(att.ATT_OP_READ_BLOB_REQ, handle, att.ATT_ERR_INVALID_HANDLE)
+        else if not db_readable_at_ram(handle)
+            write_error_rsp(att.ATT_OP_READ_BLOB_REQ, handle, att.ATT_ERR_READ_NOT_PERMITTED)
         else
             let value_len = db_value_len_at_ram(idx)
             if offset > value_len

@@ -81,20 +81,16 @@ fn assert_same_answer(blob: [u8], mtu: Int, r: [u8]) [hw]
     test.assert_eq(hex_of(scratch_list_response(blob, mtu, r)), hex_of(want))
     test.assert_eq(hex_of(scratch_ram_response(mtu, r)), hex_of(want))
 
-// The read-side requests that name a handle, for every handle the database holds and the ones just outside it.
-// A Read and a Read Blob of an attribute without the Read property are left out: the scratch paths answer them
-// with the value, where `att_server` answers Read Not Permitted (bugs/orbit/the-att-scratch-reads-ignore-the-read-property.md).
+// The read-side requests that name a handle, for every handle the database holds and the ones just outside it.  A Read and
+// a Read Blob are asked of every handle, an attribute without the Read property among them: all three servers answer
+// Read Not Permitted there.
 fn requests_on_handle(blob: [u8], h: Int) -> [[u8]]
     var out: [[u8]] = []
-    if att_server.db_readable_at(blob, h)
-        list.push(out, req(att.ATT_OP_READ_REQ, [le16(h)]))
-        list.push(out, req(att.ATT_OP_READ_BLOB_REQ, [le16(h), le16(0)]))
-        list.push(out, req(att.ATT_OP_READ_BLOB_REQ, [le16(h), le16(1)]))
-        list.push(out, req(att.ATT_OP_READ_BLOB_REQ, [le16(h), le16(3)]))
-        list.push(out, req(att.ATT_OP_READ_BLOB_REQ, [le16(h), le16(60)]))
-    else if att_server.db_index_for_handle(blob, h) < 0
-        list.push(out, req(att.ATT_OP_READ_REQ, [le16(h)]))
-        list.push(out, req(att.ATT_OP_READ_BLOB_REQ, [le16(h), le16(0)]))
+    list.push(out, req(att.ATT_OP_READ_REQ, [le16(h)]))
+    list.push(out, req(att.ATT_OP_READ_BLOB_REQ, [le16(h), le16(0)]))
+    list.push(out, req(att.ATT_OP_READ_BLOB_REQ, [le16(h), le16(1)]))
+    list.push(out, req(att.ATT_OP_READ_BLOB_REQ, [le16(h), le16(3)]))
+    list.push(out, req(att.ATT_OP_READ_BLOB_REQ, [le16(h), le16(60)]))
     list.push(out, req(0x04, [le16(h), le16(h)]))
     list.push(out, req(0x04, [le16(h), le16(0xFFFF)]))
     list.push(out, req(0x04, [le16(h + 1), le16(h)]))
@@ -313,3 +309,52 @@ fn test_a_record_walk_past_the_last_record_or_before_the_first_finds_none()
     test.assert_eq(att_server_scratch.db_record_offset_ram(n), -1)
     test.assert_eq(att_server_scratch.db_record_offset_ram(-1), -1)
     test.assert_eq(att_server.db_record_offset(blob, -1), -1)
+
+// The handles of the database that hold an attribute whose characteristic lacks the Read property.
+fn unreadable_handles(blob: [u8]) -> [Int]
+    var out: [Int] = []
+    let last = att_server.db_handle_at(blob, att_server.db_count(blob) - 1)
+    for h in 0..last + 1
+        if att_server.db_index_for_handle(blob, h) >= 0 and not att_server.db_readable_at(blob, h)
+            list.push(out, h)
+    out
+
+@test
+fn test_a_read_and_a_read_blob_of_an_attribute_without_the_read_property_are_not_permitted() [hw]
+    let blob = gatt_db.build()
+    att_scratch.gatt_db_ram_init_from_blob(blob)
+    let hs = unreadable_handles(blob)
+    test.assert(list.len(hs) > 0)
+    for h in hs
+        // Read, and Read Blob at the start, inside the value and past it: Read Not Permitted, never the value or Invalid Offset.
+        let want_read = octets([0x01, att.ATT_OP_READ_REQ, h & 0xFF, (h >>> 8) & 0xFF, att.ATT_ERR_READ_NOT_PERMITTED])
+        let want_blob = octets([0x01, att.ATT_OP_READ_BLOB_REQ, h & 0xFF, (h >>> 8) & 0xFF, att.ATT_ERR_READ_NOT_PERMITTED])
+        let r = req(att.ATT_OP_READ_REQ, [le16(h)])
+        test.assert_eq(hex_of(att_server.handle_request(blob, 23, r)), hex_of(want_read))
+        test.assert_eq(hex_of(scratch_list_response(blob, 23, r)), hex_of(want_read))
+        test.assert_eq(hex_of(scratch_ram_response(23, r)), hex_of(want_read))
+        for offset in [0, 3, 60]
+            let b = req(att.ATT_OP_READ_BLOB_REQ, [le16(h), le16(offset)])
+            test.assert_eq(hex_of(scratch_list_response(blob, 23, b)), hex_of(want_blob))
+            test.assert_eq(hex_of(scratch_ram_response(23, b)), hex_of(want_blob))
+
+@test
+fn test_a_characteristic_declaration_too_short_to_name_its_value_holds_nothing_back() [hw]
+    // A declaration with a 2-octet value names no value handle, so it holds no handle back.
+    var blob: [u8] = []
+    list.append(blob, att_server.build_db_record(1, 0x2800, 3, [0x0A, 0x18]))
+    list.append(blob, att_server.build_db_record(2, 0x2803, 2, [0x00, 0x03]))
+    list.append(blob, att_server.build_db_record(3, 0x2A00, 3, [0x41]))
+    att_scratch.gatt_db_ram_init_from_blob(blob)
+    test.assert(att_server_scratch.db_readable_at_list(blob, 3))
+    test.assert(att_server_scratch.db_readable_at_ram(3))
+    // A declaration of five octets whose properties lack Read holds its value back; it and the service declaration stay readable.
+    var held: [u8] = []
+    list.append(held, att_server.build_db_record(1, 0x2800, 3, [0x0A, 0x18]))
+    list.append(held, att_server.build_db_record(2, 0x2803, 2, [0x08, 0x03, 0x00, 0x00, 0x2A]))
+    list.append(held, att_server.build_db_record(3, 0x2A00, 3, [0x41]))
+    att_scratch.gatt_db_ram_init_from_blob(held)
+    test.assert(not att_server_scratch.db_readable_at_list(held, 3))
+    test.assert(not att_server_scratch.db_readable_at_ram(3))
+    test.assert(att_server_scratch.db_readable_at_list(held, 2))
+    test.assert(att_server_scratch.db_readable_at_ram(1))

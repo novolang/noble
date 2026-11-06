@@ -32,9 +32,9 @@ sibling_check = "warn"
 coverage_floor = 0
 
 [dependencies]
-noble-hci = "^0.1.0"
+noble-hci = { path = "../noble-hci" }
 # The software AES-128, AES-CMAC and P-256 the Security Manager and the Database Hash use.
-crypto-ble-ecc = "^0.1.0"
+crypto-ble-ecc = { path = "../crypto-ble-ecc" }
 
 # Package configuration (docs/config.md).  One [config.<key>] table for each limit of the Host core, with the `device` profile
 # as the default.  A consumer writes a [noble] section in its config file; the generated module is `noble_config`, read in the

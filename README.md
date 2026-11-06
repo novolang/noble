@@ -27,7 +27,7 @@ they import its modules by name.
 | `gap`, `advertiser`, `extended_advertiser`, `periodic_sync`, `private_address` | the GAP roles and AD data, the bring-up and legacy advertising, extended and periodic advertising, periodic advertising synchronization, and the resolvable and non-resolvable private addresses |
 | `smp`, `smp_core`, `smp_initiator`, `smp_responder`, `smp_fsm`, `smp_handler`, `smp_ctx`, `smp_keys`, `smp_bond`, `encrypted_data` | the Security Manager of both roles with LE Secure Connections and legacy pairing, the keys in wire byte order, the bond table, and Encrypted Advertising Data |
 | `iso_host`, `iso_cis`, `iso_big`, `iso_flow`, `iso_event`, `iso_setup`, `isoal`, `isoal_timing` | the Host's connected and broadcast isochronous tables, the credits of the HCI ISO buffers, the bring-up, and the Isochronous Adaptation Layer |
-| `profile_builder`, `notify`, `wire`, `control_common` | what a service adds to a `GattServer` (the steps that add its characteristics, the notifications a change owes the clients, the integer encodings, and the steps the control services share) |
+| `profile_builder`, `notify`, `wire`, `control_common`, `fixtures` | what a service adds to a `GattServer` (the steps that add its characteristics, the notifications a change owes the clients, the integer encodings, and the steps the control services share), and the helpers the tests of the services share (an ATT request, the first connection, a descriptor write and a read) |
 | `limits`, `budget` | the values the configuration derives, and the RAM the configured tables add up to, held to the total `novo config explain` prints |
 
 A program creates a `GattServer`, adds the services it offers, opens a link in

@@ -48,10 +48,11 @@ crypto-ble-ecc = { path = "../crypto-ble-ecc" }
 # storage of a group of features sits on `max_connections`, `max_attributes` and the like, which are never 0.
 #
 # A cost formula and a relation read only the keys of their own schema.  The keys of the audio roles and the services whose storage
-# is a product of a key of the core therefore stay in this schema until the packages of the roles exist: `max_ases`, `max_aics`,
+# is a product of a key of the core therefore stay in this schema, though the packages of the roles exist: `max_ases`, `max_aics`,
 # `max_vocs`, `max_presets`, `max_set_size`, `max_unicast_streams`, `max_bcast_sources`, `max_bcast_sinks`, `max_gaf_clients`,
-# `max_ctl_instances`, `max_has_cache` and `max_bas`.  The keys whose storage reads no core key (the BTP faces, the Unicast Client,
-# the Broadcast Assistant, the content control servers, the HID Service) and the Host's RAM budget are in the schema of orbit/ble.
+# `max_ctl_instances`, `max_has_cache` and `max_bas` (features/tooling/config-keys-of-a-dependency-in-a-cost-formula.md).  The keys
+# whose storage reads no core key are in the schemas of the packages that read them: the Unicast Client and the Broadcast Assistant in
+# noble-audio, the Device Information, Battery and HID Services in noble-services, and the BTP faces and the Host's RAM budget in orbit/ble.
 [config.max_connections]
 type    = "int"
 default = 1

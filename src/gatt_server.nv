@@ -69,7 +69,7 @@
 // answer a stale Change_Counter, a gain out of range or a lock held by
 // another client with an Application Error Code, and the response to a write
 // cannot wait for the program.  The rules belong to the service that adds the
-// guard and reach this module as a `GuardRule` (`gaf/control_rules.nv` holds
+// guard and reach this module as a `GuardRule` (`orbit/noble-audio/src/control_rules.nv` holds
 // those of the control services); this module imports none of them.
 //
 // `receive` answers one ATT PDU of the unenhanced bearer and

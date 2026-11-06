@@ -1,0 +1,30 @@
+// tests/fixtures_tests.nv — the unit tests of src/fixtures.nv.
+//
+//   novo test tests/fixtures_tests.nv
+
+use std.test
+use fixtures.{ client_engine_present, peer, read, req, subscribe }
+use noble_config
+use gatt_server
+use links
+
+@test
+fn test_req_is_the_opcode_the_handle_least_significant_octet_first_and_the_value()
+    test.assert_eq(req(0x0A, 0x0102, []), [0x0A, 0x02, 0x01])
+    test.assert_eq(req(0x12, 0x0003, [1, 0]), [0x12, 0x03, 0x00, 0x01, 0x00])
+
+@test
+fn test_peer_is_the_first_connection_of_the_first_slot()
+    test.assert(links.same_link(peer(), links.link_id(0, 1)))
+
+@test
+fn test_subscribe_writes_the_descriptor_and_read_gives_it_back()
+    var s = gatt_server.test_server()
+    // The test service has a configuration descriptor at 0x0013 that any client may write.
+    subscribe(var s, 0x0013, 0x02)
+    test.assert_eq(read(var s, 0x0013), [0x0B, 0x02, 0x00])
+
+@test
+fn test_the_client_engine_is_present_where_the_keys_size_a_session()
+    let sized = noble_config.MAX_CLIENT_LINKS >= 1 and noble_config.CLIENT_BEARERS >= 1 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256
+    test.assert_eq(client_engine_present(), sized)

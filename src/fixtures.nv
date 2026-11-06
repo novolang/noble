@@ -1,0 +1,45 @@
+// src/fixtures.nv — the fixtures that the tests of the services
+// share: an ATT request, the connection a request comes from, a write of a Client
+// Characteristic Configuration descriptor and a read, and whether the configuration holds a GATT client engine that
+// serves a client session of the size the sessions of the tests need.
+//
+// No device image imports this module.  Its functions are @tier(app) because only
+// tests call them.
+
+use std.test
+use gatt_server
+use links
+use noble_config
+use wire
+
+// The ATT request with the opcode `op` for the attribute `handle` and the
+// parameter octets `value`.
+pub @tier(app)
+fn req(op: Int, handle: Int, value: [Int]) -> [u8]
+    var pdu = wire.octets([op, handle & 0xFF, handle >>> 8])
+    list.append(pdu, wire.octets(value))
+    pdu
+
+// The first connection of the first slot.
+pub @tier(app)
+fn peer() -> links.LinkId
+    links.link_id(0, 1)
+
+// Write `bits` to the Client Characteristic Configuration descriptor at `cccd`
+// and check the Write Response.
+pub @tier(app)
+fn subscribe(var s: GattServer, cccd: Int, bits: Int)
+    let r = gatt_server.receive(var s.db, var s.link, req(0x12, cccd, [bits, 0]), 0)
+    test.assert_eq(r[0], [0x13])
+
+// The first PDU the server answers to a Read Request for `handle`.
+pub @tier(app)
+fn read(var s: GattServer, handle: Int) -> [u8]
+    gatt_server.receive(var s.db, var s.link, req(0x0A, handle, []), 0)[0]
+
+// Whether the configuration holds a GATT client engine of the size the client sessions of the tests need: one link, one
+// bearer, 24 cache records, 4 queued requests and 256 octets of value.  A test that runs a session returns at once where
+// it is false, as the tests of the Controller's features do where the feature is off.
+pub @tier(app)
+fn client_engine_present() -> Bool
+    noble_config.MAX_CLIENT_LINKS >= 1 and noble_config.CLIENT_BEARERS >= 1 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256

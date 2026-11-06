@@ -50,8 +50,10 @@ this package imports a module of the Controller or of `orbit/ble`.
    `isoal` and `isoal_timing` are the Isochronous Adaptation Layer.
 
 `profile_builder`, `notify`, `wire` and `control_common` are what the modules
-that add a service to a `GattServer` share.  The audio roles and the generic
-services live in `orbit/ble` for now and import them by name.
+that add a service to a `GattServer` share.  The audio roles are the package
+`noble-audio` and the generic services are the package `noble-services`; both
+import these modules by name, and `fixtures`, the helpers their tests share, is a
+module of this package.
 
 ## Configuration
 
@@ -72,15 +74,17 @@ Twelve more keys size the storage of the audio roles and the services
 because a cost formula reads only the keys of its own schema, and each of them
 multiplies a key of the core: the ASE rows of every connection, the Broadcast
 Source rows over the BIS count, the Unicast streams over the SDU octets.  They
-move to the packages of the roles when a formula can read the keys of another
-package.
+belong to `noble-audio` and `noble-services` by what they size, and move there when
+a formula can read the keys of another package
+(`features/tooling/config-keys-of-a-dependency-in-a-cost-formula.md`).
 
 A key that is `0` switches its feature off, and the table of the feature keeps
 one slot.  `limits` derives the values the keys do not say by themselves, and
 `budget` adds the storage of the tables up and holds the sum to the total
 `novo config explain` prints.  The RAM the board leaves the Host
 (`host_budget_bytes`) is a key of `orbit/ble`, which adds the storage of its
-own modules to the sum of this package.
+own modules and the sums of `noble-audio` and `noble-services` to the sum of
+this package.
 
 `configs/<profile>.toml` are the profiles the package's tests run under.  The
 same names exist in `orbit/ble/configs/`, whose `[noble]` sections equal these;
@@ -88,19 +92,19 @@ the script `tests/orbit/test_ble_config_equals_limits.sh` checks the two.
 
 ## The public surface
 
-An extension module, a chip image and a PC Host name 583 items of the package;
+An extension module, a chip image and a PC Host name 591 items of the package;
 they are `pub`, each with a doc comment, and every other item is private.
 `novo doc` prints them.
 
 | Layer | Modules and public items |
 |---|---|
-| ATT and GATT | `gatt_server` (89), `gatt_client` (75), `att` (36), `att_scratch` (11), `gatt_db` (8), `att_server` (3), `att_server_scratch` (2) |
+| ATT and GATT | `gatt_server` (89), `gatt_client` (78), `att` (36), `att_scratch` (11), `gatt_db` (8), `att_server` (3), `att_server_scratch` (2) |
 | Links and HCI | `le_link` (38), `links` (16), `hci_session` (4), `hci_init` (3), `hci_deframer` (1) |
 | Channels | `l2cap_coc` (17), `l2cap` (7) |
 | Security | `smp` (26), `smp_ctx` (23), `smp_keys` (18), `smp_bond` (7), `smp_initiator` (7), `smp_responder` (6), `smp_fsm` (4), `smp_core` (2), `smp_handler` (1) |
 | GAP | `advertiser` (16), `extended_advertiser` (15), `private_address` (7), `periodic_sync` (4), `gap` (3) |
 | Isochronous | `iso_cis` (17), `iso_host` (14), `iso_big` (13), `iso_setup` (10), `iso_flow` (8), `iso_event` (6), `isoal` (4) |
-| Shared with the services | `wire` (39), `profile_builder` (9), `control_common` (7), `encrypted_data` (5), `notify` (1), `limits` (1) |
+| Shared with the services | `wire` (39), `profile_builder` (9), `control_common` (7), `encrypted_data` (5), `notify` (1), `limits` (1), `fixtures` (5) |
 
 The configuration module `noble_config` is generated from the keys of
 `novo.toml`; a consumer reads its constants and sets them in its own config file.

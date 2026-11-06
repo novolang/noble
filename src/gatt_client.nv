@@ -675,7 +675,7 @@ fn tx_range(var t: ClientTable, row: Int, opcode: Int, start: Int, end: Int, typ
 
 // The number of records the cache of `link` holds, 0 for a link that is not
 // open.
-@tier(embedded)
+pub @tier(embedded)
 @no_alloc
 fn cache_count(var t: ClientTable, link: links.LinkId) -> Int
     let slot = slot_of(var t, link)

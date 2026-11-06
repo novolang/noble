@@ -76,20 +76,20 @@ const BCAST_PROC = 1536
 const BAP_LTV_OCTETS = 255
 const BAP_SCALARS = 64
 
-// One stream of the Unicast Server (gaf/unicast_iso.nv) without the buffer an
+// One stream of the Unicast Server (orbit/noble-audio/src/unicast_iso.nv) without the buffer an
 // SDU is put together in, and the queue of steps with the registers of the BTP
 // face.
 const UNI_STREAM_FIXED = 128
 const UNI_PROC = 512
 
-// The Scan Delegator and the Broadcast Sink (gaf/bcast_sink.nv): the scalars of
+// The Scan Delegator and the Broadcast Sink (orbit/noble-audio/src/bcast_sink.nv): the scalars of
 // a receive state and its synchronization, its lists at their largest (address,
 // codes, subgroups with their Metadata, requests, the periodic data and the
 // BASE), and the table's command, queues, script and handles.
 const SINK_ROW_FIXED = 448
 const SINK_ROW_LISTS = 1088
 const SINK_TABLE = 768
-// The control clients (gaf/control_client.nv, csip_coordinator.nv, cap_commander.nv):
+// The control clients (orbit/noble-audio/src/control_client.nv, csip_coordinator.nv, cap_commander.nv):
 // the registers of a link's row and of a service instance, the steps of a job, the
 // octets it stages and the SIRK a link read; the Set Coordinator's scalars and one
 // member of its set, the Commander's scalars, and the BTP face (btp/btp_gaf_client.nv).
@@ -102,7 +102,7 @@ const CTL_COORD_FIXED = 256
 const CTL_COORD_MEMBER = 40
 const CTL_CMD_FIXED = 128
 const CTL_BTP_STATE = 512
-// The Hearing Access Profile clients (gaf/has_client.nv, ias_client.nv): the service instances of a
+// The Hearing Access Profile clients (orbit/noble-audio/src/has_client.nv, ias_client.nv): the service instances of a
 // link's row, the registers of the Remote Controller's row, the fields of a cached preset record and
 // the longest name, and the BTP face (btp/btp_hap.nv).
 const HAP_INSTANCES = 3
@@ -241,7 +241,7 @@ const fn bridge_bytes() -> Int
     else
         noble_config.MAX_CLIENT_LINKS * BRIDGE_ROW
 
-// The Broadcast Source (host/gaf/bcast_source.nv): a row for each stream, the
+// The Broadcast Source (orbit/noble-audio/src/bcast_source.nv): a row for each stream, the
 // candidate row that a reconfigure or a Metadata update builds, and the
 // procedure.
 @tier(embedded)
@@ -268,7 +268,7 @@ const fn bap_bytes() -> Int
     else
         draft + vec_bytes(sources, 8) + slot(250) + ltv + BAP_SCALARS
 
-// The isochronous side of the Unicast Server (host/gaf/unicast_iso.nv): for
+// The isochronous side of the Unicast Server (orbit/noble-audio/src/unicast_iso.nv): for
 // each stream its scalars and the buffer an SDU is put together in, and the
 // queue of steps.
 @tier(embedded)
@@ -279,7 +279,7 @@ const fn unicast_bytes() -> Int
     else
         streams * (UNI_STREAM_FIXED + slot(noble_config.ISO_SDU_OCTETS)) + UNI_PROC
 
-// The Scan Delegator and the Broadcast Sink (host/gaf/bcast_sink.nv): a row for
+// The Scan Delegator and the Broadcast Sink (orbit/noble-audio/src/bcast_sink.nv): a row for
 // each receive state, with the lists of BIS numbers and handles that follow
 // MAX_BIS, and the table.
 @tier(embedded)
@@ -300,8 +300,8 @@ const fn control_client_bytes() -> Int
             + vec_bytes(CTL_JOB_INTS, 8) + slot(CTL_STAGE) + slot(CTL_SIRK))
             + CTL_COORD_FIXED + noble_config.MAX_SET_SIZE * CTL_COORD_MEMBER + CTL_CMD_FIXED + noble_config.MAX_SET_SIZE * 8 + CTL_BTP_STATE
 
-// The per-link state of the Battery and HID Services (profiles/bas_policy.nv,
-// profiles/hogp.nv): the level last sent for each instance on each link, and
+// The per-link state of the Battery and HID Services (orbit/noble-services/src/bas_policy.nv,
+// orbit/noble-services/src/hogp.nv): the level last sent for each instance on each link, and
 // the Protocol Mode and the suspend state of each link.
 @tier(embedded)
 const fn profile_link_bytes() -> Int

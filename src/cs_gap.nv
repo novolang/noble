@@ -1,0 +1,589 @@
+// src/cs_gap.nv — the GAP procedures of Channel Sounding as a plan engine: the CS initiator procedure and the CS reflector procedure of [Vol 3] Part C,
+// Section 9.7, and the security levels of Section 10.11.1, for a Host on either ACL role.
+//
+// `btp_hci.action_plan` turns one BTP action into the HCI commands that perform it, and the program sends them and reports the answers.  This module does
+// the same for a procedure that waits on the Controller's events between its commands: the program asks `cs_gap_next` for the next command, sends it,
+// feeds every HCI event it receives to `cs_gap_event`, and calls `cs_gap_tick` with its clock.  The module performs no I/O.
+//
+// The order of an initiator that creates the configuration and an ACL Central (the stages are the constants `STAGE_*`; a stage whose command the Host does
+// not issue is skipped or waits for the event instead):
+//
+//   READ_LOCAL    LE CS Read Local Supported Capabilities                      Command Complete with the record
+//   READ_REMOTE   LE CS Read Remote Supported Capabilities                     Command Status, then the Complete event (0x2C or 0x38)
+//   DEFAULTS      LE CS Set Default Settings (Role_Enable from the CS role)    Command Complete
+//   SECURITY      LE CS Security Enable (the Central only; a Peripheral        Command Status, then the Security Enable Complete event
+//                 waits for the event)
+//   REQUIREMENTS  LE CS Set Security Requirements (with `set_requirements`)    Command Complete
+//   FAE           LE CS Read Remote FAE Table (an initiator, when the          Command Status, then the Complete event; a failure of
+//                 remote has a table)                                          either leaves the table unread and is not fatal
+//   CONFIG        LE CS Create Config (the Host that `creates_config`;         Command Status, then the Config Complete event
+//                 the other waits for the event)
+//   PARAMS        LE CS Set Procedure Parameters (the creating Host)           Command Complete
+//   ENABLE        LE CS Procedure Enable (the creating Host; the other         Command Status, then the Procedure Enable Complete event
+//                 waits for the event)
+//   RUNNING       the Subevent Result and Continue events of each procedure are joined into a `HciCsProcResult`; `cs_gap_take_result` hands each one out
+//
+// The reflector's Host runs the same stages with the reflector role in Role_Enable and in the configuration.  Who creates the configuration is the program's
+// choice (`creates_config`); the initiator's Host does by default, since it knows the accuracy it wants, but a Host whose Controller cannot send the longer
+// control PDUs (`orbit/ble/autopts/controller/ll_nrf54_cs_check.py`, `--driver sdc`) leaves it to the peer.
+//
+// What the module does not do: it sets neither LE Set Host Feature bit 47 nor the event mask (`cs_gap_prelude` gives those two commands, which a Host sends
+// before its first connection), and it does not encrypt the link (the Host starts encryption first, [Vol 3] Part C, Section 10.11; the module takes the
+// link as encrypted).  A step that waits for an event for longer than `timeout_ms` fails the procedure with `GAP_TIMEOUT`.
+//
+// The state is one value, `CsGap`, which holds the capability records, the answers of the Controller and the result being collected, all in fixed
+// capacity.  The program keeps it and passes it `var`.
+//
+// The security levels (Section 10.11.1) are tied to a configuration and to the requirements of LE CS Set Security Requirements:
+//
+//   level 1   main mode 2 (tones), no requirement
+//   level 2   main mode 3 with RTT of the access address only, requirements: tone and the 150 ns RTT
+//   level 3   main mode 3, the 10 ns RTT class in both Controllers, requirements: tone and the 10 ns RTT
+//   level 4   level 3 with a sounding or random sequence (the 32-bit random sequence first), requirements: tone, 10 ns, sequence and the NADM
+//
+// A level the two capability records do not meet fails the procedure before the configuration, with `GAP_LEVEL_NOT_MET`: the Ranging Profile asks a Host to
+// end the connection then (RAP section 4.2).
+
+use hci_cs
+use hci_commands
+use hci_frame
+
+// ── Constants ───────────────────────────────────────────────────────
+
+// The stages of the procedure.
+pub const STAGE_IDLE = 0
+pub const STAGE_READ_LOCAL = 1
+pub const STAGE_READ_REMOTE = 2
+pub const STAGE_DEFAULTS = 3
+pub const STAGE_SECURITY = 4
+pub const STAGE_REQUIREMENTS = 5
+pub const STAGE_FAE = 6
+pub const STAGE_CONFIG = 7
+pub const STAGE_PARAMS = 8
+pub const STAGE_ENABLE = 9
+pub const STAGE_RUNNING = 10
+pub const STAGE_DONE = 11
+pub const STAGE_FAILED = 12
+
+// The statuses beyond the HCI error codes: a wait that ended without the event (0x100), a security level the Controllers do not meet (0x101), a Controller
+// without the role this Host wants (0x102) and an event or return parameter that did not read (0x103).
+pub const GAP_TIMEOUT = 0x100
+pub const GAP_LEVEL_NOT_MET = 0x101
+pub const GAP_ROLE_UNSUPPORTED = 0x102
+pub const GAP_MALFORMED = 0x103
+
+// The HCI status codes the module reads: Unsupported Feature or Parameter Value, which a Controller answers LE CS Read Remote FAE Table with when the remote has
+// no table.
+const HCI_UNSUPPORTED_FEATURE = 0x11
+
+// The wait for an event, in milliseconds, when the program gives none.
+pub const TIMEOUT_MS = 10000
+
+// ── The parameters ──────────────────────────────────────────────────
+
+// What the Host wants.
+//
+//   handle          the ACL connection, encrypted
+//   cs_role         `hci_cs.CS_ROLE_INITIATOR` or `hci_cs.CS_ROLE_REFLECTOR`
+//   acl_central     the Host is the ACL Central, which issues LE CS Security Enable
+//   creates_config  this Host issues Create Config, Set Procedure Parameters and Procedure Enable
+//   level           the security level 1 to 4 (0 asks for the mode 2 configuration without a level)
+//   procedures      procedures to run (0 until the program disables them); the engine is done after that many results
+//   max_len         Max_Procedure_Len in units of 0.625 ms; `sub_len` the subevent length in microseconds
+//   sync_antenna    CS_SYNC_Antenna_Selection; `max_tx_power` Max_TX_Power in dBm
+//   set_requirements   issue LE CS Set Security Requirements (a [v2] Controller)
+//   read_fae        read the remote FAE table when the remote has one
+//   v2_caps         read the [v2] capability record
+//   timeout_ms      the longest wait for an event
+//   rtt_type        the RTT_Type of the configuration when `level` is 0 or below 4; 0 for the access address only
+pub @value
+struct CsGapParams
+    handle: Int
+    cs_role: Int
+    acl_central: Bool
+    creates_config: Bool
+    level: Int
+    procedures: Int
+    max_len: Int
+    sub_len: Int
+    sync_antenna: Int
+    max_tx_power: Int
+    set_requirements: Bool
+    read_fae: Bool
+    v2_caps: Bool
+    timeout_ms: Int
+    rtt_type: Int
+
+// The parameters of an initiator that creates the configuration: level 1, `procedures` procedures of `max_len` units of 0.625 ms (a procedure of 62.5 ms is
+// 100) and subevents of `sub_len` microseconds.
+pub @tier(embedded)
+fn cs_gap_params(handle: Int, cs_role: Int, acl_central: Bool, procedures: Int, max_len: Int, sub_len: Int) -> CsGapParams
+    CsGapParams { handle: handle, cs_role: cs_role, acl_central: acl_central, creates_config: cs_role == hci_cs.CS_ROLE_INITIATOR, level: 1,
+                  procedures: procedures, max_len: max_len, sub_len: sub_len, sync_antenna: 1, max_tx_power: 0, set_requirements: false,
+                  read_fae: true, v2_caps: false, timeout_ms: TIMEOUT_MS, rtt_type: 0 }
+
+// The setters of the parameters (a `@value` record is changed through a `var` parameter).  `level` is the security level, `requirements` whether
+// LE CS Set Security Requirements is issued, `rtt_type` the RTT_Type of the configuration below level 4, `procedures` the count after which the engine is
+// done, `creates_config` whether this Host issues the configuration commands, `timeout_ms` the longest wait.
+pub @tier(embedded)
+@no_alloc
+fn cs_gap_set_level(var p: CsGapParams, level: Int, requirements: Bool)
+    p.level = level
+    p.set_requirements = requirements
+
+pub @tier(embedded)
+@no_alloc
+fn cs_gap_set_rtt_type(var p: CsGapParams, rtt_type: Int)
+    p.rtt_type = rtt_type
+
+pub @tier(embedded)
+@no_alloc
+fn cs_gap_set_procedures(var p: CsGapParams, procedures: Int)
+    p.procedures = procedures
+
+pub @tier(embedded)
+@no_alloc
+fn cs_gap_set_creates_config(var p: CsGapParams, creates_config: Bool)
+    p.creates_config = creates_config
+
+pub @tier(embedded)
+@no_alloc
+fn cs_gap_set_timeout(var p: CsGapParams, timeout_ms: Int)
+    p.timeout_ms = timeout_ms
+
+// ── The state ───────────────────────────────────────────────────────
+
+// The engine.  `sent` is set when the command of the stage went out, `acked` when its Command Complete or Command Status arrived; `pending` is the opcode
+// the Host waits for; `since_ms` the time the wait began.  The flags `sec_done`, `cfg_done` and `en_done` are set by their events whenever they arrive, since
+// the peer's Host may start the procedure before this Host asks.
+pub @value
+struct CsGap
+    p: CsGapParams
+    stage: Int
+    status: Int
+    sent: Bool
+    acked: Bool
+    pending: Int
+    since_ms: Int
+    timed_stage: Int
+    local: hci_cs.HciCsCaps
+    remote: hci_cs.HciCsCaps
+    have_remote: Bool
+    sec_done: Bool
+    sec_status: Int
+    cfg_done: Bool
+    cfg: hci_cs.HciCsConfigComplete
+    en_done: Bool
+    en: hci_cs.HciCsProcedureEnableComplete
+    fae_status: Int
+    fae: hci_cs.HciCsRemoteFae
+    ev: hci_cs.HciCsResultEvent
+    res: hci_cs.HciCsProcResult
+    have_result: Bool
+    results: Int
+    lost: Int
+    selected_tx_power: Int
+
+pub @tier(embedded)
+fn cs_gap_new(p: CsGapParams) -> CsGap
+    CsGap { p: p, stage: STAGE_READ_LOCAL, status: 0, sent: false, acked: false, pending: 0, since_ms: 0, timed_stage: -1, local: hci_cs.cs_caps_none(),
+            remote: hci_cs.cs_caps_none(), have_remote: false, sec_done: false, sec_status: 0, cfg_done: false, cfg: hci_cs.cs_config_complete_new(),
+            en_done: false, en: hci_cs.cs_procedure_enable_complete_new(), fae_status: -1, fae: hci_cs.cs_remote_fae_new(),
+            ev: hci_cs.cs_result_event_new(), res: hci_cs.cs_proc_result_new(), have_result: false, results: 0, lost: 0, selected_tx_power: 0 }
+
+// Whether the procedure ended, with the result it came to.
+pub @tier(embedded)
+@no_alloc
+fn cs_gap_done(g: CsGap) -> Bool
+    g.stage == STAGE_DONE
+
+pub @tier(embedded)
+@no_alloc
+fn cs_gap_failed(g: CsGap) -> Bool
+    g.stage == STAGE_FAILED
+
+// The status the procedure failed with: an HCI error code, or one of the `GAP_*` codes; 0 while it has not failed.
+pub @tier(embedded)
+@no_alloc
+fn cs_gap_status(g: CsGap) -> Int
+    g.status
+
+// ── Before the first connection ─────────────────────────────────────
+
+// The two commands a Host sends before its first connection to use Channel Sounding: LE Set Host Feature with bit 47 (the Controller refuses it once it holds
+// a connection) and LE Set Event Mask with the bits of the nine events added to `base_mask`, the mask the Host sets otherwise ([Vol 4] Part E, Section 7.8.1).
+// `v2` adds the bit of the [v2] Read Remote Supported Capabilities Complete event.
+pub @tier(app)
+fn cs_gap_prelude(base_mask: Int, v2: Bool) -> [hci_frame.HciCmdMsg]
+    var mask = base_mask | hci_cs.LE_EVENT_MASK_CS
+    if v2
+        mask = mask | hci_cs.LE_EVENT_MASK_CS_V2
+    [hci_frame.HciCmdMsg { opcode: hci_commands.opcode_le_set_host_feature(), params: hci_commands.build_le_set_host_feature(hci_cs.FEATURE_CS_HOST_SUPPORT, true) },
+     hci_frame.HciCmdMsg { opcode: hci_commands.opcode_le_set_event_mask(), params: hci_commands.build_set_event_mask(mask) }]
+
+// ── The security levels ─────────────────────────────────────────────
+
+// The CS_Security_Requirements of a level (bit 0 tone, 1 150 ns RTT, 2 10 ns RTT, 3 sequence, 4 NADM); 0 for level 1 and an unknown level.
+pub @tier(embedded)
+@no_alloc
+fn cs_level_requirements(level: Int) -> Int
+    if level == 2
+        hci_cs.CS_SEC_TONE | hci_cs.CS_SEC_RTT_150NS
+    else if level == 3
+        hci_cs.CS_SEC_TONE | hci_cs.CS_SEC_RTT_10NS
+    else if level == 4
+        hci_cs.CS_SEC_TONE | hci_cs.CS_SEC_RTT_10NS | hci_cs.CS_SEC_SEQUENCE | hci_cs.CS_SEC_NADM
+    else
+        0
+
+// Whether the 10 ns class is declared for the access address only RTT: bit 0 of RTT_Capability.
+@tier(embedded)
+@no_alloc
+fn accuracy_10ns(c: hci_cs.HciCsCaps) -> Bool
+    (c.rtt_capability & 1) != 0
+
+// Whether the two records meet the security level: the tones (every level, as the Host configures them), main mode 3 and the access address RTT for levels
+// 2 to 4, the 10 ns class for levels 3 and 4, and for level 4 a sequence and the attack detector metric in both.
+pub @tier(embedded)
+@no_alloc
+fn cs_level_met(level: Int, a: hci_cs.HciCsCaps, b: hci_cs.HciCsCaps) -> Bool
+    if level < 2
+        return true
+    if (a.modes & 1) == 0 or (b.modes & 1) == 0 or a.rtt_aa_only_n == 0 or b.rtt_aa_only_n == 0
+        return false
+    if level == 2
+        return true
+    if not accuracy_10ns(a) or not accuracy_10ns(b)
+        return false
+    if level == 3
+        return true
+    (a.rtt_random_n != 0 or a.rtt_sounding_n != 0) and (b.rtt_random_n != 0 or b.rtt_sounding_n != 0) and a.nadm_random != 0 and b.nadm_random != 0
+
+// The configuration the Host creates for the level: mode 2 only at level 1 and 0, mode 3 above; the RTT type is the 32-bit random sequence at level 4 and
+// `rtt_type` of the parameters at the others; the role is the Host's CS role; the channel map is every usable channel.
+pub @tier(embedded)
+fn cs_gap_config(p: CsGapParams, config_id: Int) -> hci_cs.HciCsConfig
+    let base = hci_cs.cs_config_new(p.handle, config_id, p.cs_role)
+    let main = if p.level >= 2 then 3 else 2
+    let rtt = if p.level == 4 then hci_cs.CS_RTT_RANDOM_32 else p.rtt_type
+    hci_cs.HciCsConfig { handle: base.handle, config_id: base.config_id, create_context: base.create_context, main_mode: main, sub_mode: base.sub_mode,
+                      min_main_steps: base.min_main_steps, max_main_steps: base.max_main_steps, main_repetition: base.main_repetition,
+                      mode0_steps: base.mode0_steps, role: base.role, rtt_type: rtt, sync_phy: base.sync_phy, channel_map: base.channel_map,
+                      channel_map_repetition: base.channel_map_repetition, channel_selection: base.channel_selection, ch3c_shape: base.ch3c_shape,
+                      ch3c_jump: base.ch3c_jump, enhancements: base.enhancements }
+
+// ── The plan ────────────────────────────────────────────────────────
+
+@tier(embedded)
+fn fail(var g: CsGap, status: Int)
+    g.stage = STAGE_FAILED
+    g.status = status
+
+@tier(embedded)
+fn begin(var g: CsGap, stage: Int)
+    g.stage = stage
+    g.sent = false
+    g.acked = false
+    g.pending = 0
+
+// Whether the Host issues a command at the stage, given the answers so far.
+@tier(embedded)
+@no_alloc
+fn security_issued(g: CsGap) -> Bool
+    g.p.acl_central
+
+@tier(embedded)
+@no_alloc
+fn fae_wanted(g: CsGap) -> Bool
+    g.p.read_fae and g.p.cs_role == hci_cs.CS_ROLE_INITIATOR and g.have_remote and (g.remote.subfeatures & hci_cs.CS_SUB_NO_FAE) == 0
+
+// Leave the stage `from` for the next one that has anything to do.
+@tier(embedded)
+fn advance(var g: CsGap)
+    var s = g.stage
+    if s == STAGE_READ_LOCAL
+        // The Controller must hold the role the Host wants.
+        let need = if g.p.cs_role == hci_cs.CS_ROLE_INITIATOR then 1 else 2
+        if (g.local.roles & need) == 0
+            fail(var g, GAP_ROLE_UNSUPPORTED)
+            return
+        begin(var g, STAGE_READ_REMOTE)
+        return
+    if s == STAGE_READ_REMOTE
+        if not levels_ok(g)
+            fail(var g, GAP_LEVEL_NOT_MET)
+            return
+        begin(var g, STAGE_DEFAULTS)
+        return
+    if s == STAGE_DEFAULTS
+        begin(var g, STAGE_SECURITY)
+        return
+    if s == STAGE_SECURITY
+        if g.p.set_requirements and g.p.level >= 2
+            begin(var g, STAGE_REQUIREMENTS)
+        else
+            begin(var g, STAGE_FAE)
+        return
+    if s == STAGE_REQUIREMENTS
+        begin(var g, STAGE_FAE)
+        return
+    if s == STAGE_FAE
+        begin(var g, STAGE_CONFIG)
+        return
+    if s == STAGE_CONFIG
+        begin(var g, STAGE_PARAMS)
+        return
+    if s == STAGE_PARAMS
+        begin(var g, STAGE_ENABLE)
+        return
+    if s == STAGE_ENABLE
+        begin(var g, STAGE_RUNNING)
+        return
+
+@tier(embedded)
+@no_alloc
+fn levels_ok(g: CsGap) -> Bool
+    cs_level_met(g.p.level, g.local, g.remote)
+
+// The command for the stage, or None when the Host issues none.  Sets `pending`.
+@tier(app)
+fn stage_command(var g: CsGap) -> ?hci_frame.HciCmdMsg
+    let p = g.p
+    if g.stage == STAGE_READ_LOCAL
+        g.pending = if p.v2_caps then hci_cs.opcode_le_cs_read_local_supported_capabilities_v2() else hci_cs.opcode_le_cs_read_local_supported_capabilities()
+        return Some(hci_cs.cs_cmd_msg(hci_cs.cs_read_local_supported_capabilities(p.v2_caps)))
+    if g.stage == STAGE_READ_REMOTE
+        g.pending = hci_cs.opcode_le_cs_read_remote_supported_capabilities()
+        return Some(hci_cs.cs_cmd_msg(hci_cs.cs_read_remote_supported_capabilities(p.handle)))
+    if g.stage == STAGE_DEFAULTS
+        g.pending = hci_cs.opcode_le_cs_set_default_settings()
+        let enable = if p.cs_role == hci_cs.CS_ROLE_INITIATOR then hci_cs.CS_ROLE_ENABLE_INITIATOR else hci_cs.CS_ROLE_ENABLE_REFLECTOR
+        return Some(hci_cs.cs_cmd_msg(hci_cs.cs_set_default_settings(p.handle, enable, p.sync_antenna, p.max_tx_power)))
+    if g.stage == STAGE_SECURITY and security_issued(g)
+        g.pending = hci_cs.opcode_le_cs_security_enable()
+        return Some(hci_cs.cs_cmd_msg(hci_cs.cs_security_enable(p.handle)))
+    if g.stage == STAGE_REQUIREMENTS
+        g.pending = hci_cs.opcode_le_cs_set_security_requirements()
+        return Some(hci_cs.cs_cmd_msg(hci_cs.cs_set_security_requirements(p.handle, cs_level_requirements(p.level))))
+    if g.stage == STAGE_FAE and fae_wanted(g)
+        g.pending = hci_cs.opcode_le_cs_read_remote_fae_table()
+        return Some(hci_cs.cs_cmd_msg(hci_cs.cs_read_remote_fae_table(p.handle)))
+    if g.stage == STAGE_CONFIG and p.creates_config
+        g.pending = hci_cs.opcode_le_cs_create_config()
+        return Some(hci_cs.cs_cmd_msg(hci_cs.cs_create_config(cs_gap_config(p, 0))))
+    if g.stage == STAGE_PARAMS and p.creates_config
+        g.pending = hci_cs.opcode_le_cs_set_procedure_parameters()
+        return Some(hci_cs.cs_cmd_msg(hci_cs.cs_set_procedure_parameters(hci_cs.cs_procedure_params_new(p.handle, 0, p.procedures, p.max_len, p.sub_len))))
+    if g.stage == STAGE_ENABLE and p.creates_config
+        g.pending = hci_cs.opcode_le_cs_procedure_enable()
+        return Some(hci_cs.cs_cmd_msg(hci_cs.cs_procedure_enable(p.handle, 0, true)))
+    None
+
+// Whether the stage has nothing more to wait for: its answers and its event have come.  A stage the Host does not issue a command in waits for the event only.
+@tier(embedded)
+fn stage_finished(g: CsGap) -> Bool
+    let s = g.stage
+    if s == STAGE_READ_LOCAL or s == STAGE_DEFAULTS or s == STAGE_REQUIREMENTS or s == STAGE_PARAMS
+        return g.acked and g.sent
+    if s == STAGE_READ_REMOTE
+        return g.have_remote
+    if s == STAGE_SECURITY
+        return g.sec_done
+    if s == STAGE_FAE
+        return not fae_wanted(g) or g.fae_status >= 0
+    if s == STAGE_CONFIG
+        return g.cfg_done
+    if s == STAGE_ENABLE
+        return g.en_done
+    false
+
+// Move on past every stage that is finished.  Stages whose command the Host does not issue are finished by their event (or by nothing, for the
+// stages that have no event).
+@tier(embedded)
+fn settle(var g: CsGap)
+    var guard = 0
+    while guard < 16 and g.stage != STAGE_FAILED and g.stage != STAGE_DONE and g.stage != STAGE_RUNNING and g.stage != STAGE_IDLE
+        guard = guard + 1
+        // A stage that is skipped by this Host: the parameters stage of a Host that does not create the configuration has no event; the peer's Procedure Enable
+        // Complete stands for it.
+        var skip = false
+        if g.stage == STAGE_PARAMS and not g.p.creates_config
+            skip = true
+        if g.stage == STAGE_REQUIREMENTS and not g.p.set_requirements
+            skip = true
+        if skip or stage_finished(g)
+            advance(var g)
+        else
+            return
+
+// The next command to send, or None when the Host has none now: it waits for an answer or an event, or the procedure ended.  `now_ms` starts the clock of
+// the wait.  A command it returns is outstanding until its Command Complete or Command Status event arrives; asking again before that returns None.
+pub @tier(app)
+fn cs_gap_next(var g: CsGap, now_ms: Int) -> ?hci_frame.HciCmdMsg
+    settle(var g)
+    if g.stage == STAGE_FAILED or g.stage == STAGE_DONE or g.stage == STAGE_RUNNING or g.stage == STAGE_IDLE or g.sent
+        return None
+    if g.timed_stage != g.stage
+        g.timed_stage = g.stage
+        g.since_ms = now_ms
+    match stage_command(var g)
+        None    => None
+        Some(c) =>
+            g.sent = true
+            Some(c)
+
+// End the procedure when a wait lasts longer than `timeout_ms`.  A procedure that runs (STAGE_RUNNING) waits for results and has no limit but the
+// program's.
+pub @tier(embedded)
+fn cs_gap_tick(var g: CsGap, now_ms: Int)
+    if g.stage == STAGE_FAILED or g.stage == STAGE_DONE or g.stage == STAGE_RUNNING or g.stage == STAGE_IDLE
+        return
+    if now_ms - g.since_ms > g.p.timeout_ms
+        fail(var g, GAP_TIMEOUT)
+
+// ── The events ──────────────────────────────────────────────────────
+
+@tier(embedded)
+fn on_command_complete(var g: CsGap, evt: [u8])
+    if list.len(evt) < 6
+        return
+    let op = (evt[3] as Int) | ((evt[4] as Int) << 8)
+    if op != g.pending or not g.sent or g.acked
+        return
+    let status = evt[5] as Int
+    if status != 0
+        fail(var g, status)
+        return
+    if g.stage == STAGE_READ_LOCAL
+        var st = 0
+        if not hci_cs.cs_read_local_capabilities(evt, g.p.v2_caps, var g.local, var st)
+            fail(var g, GAP_MALFORMED)
+            return
+    g.acked = true
+    settle(var g)
+
+@tier(embedded)
+fn on_command_status(var g: CsGap, evt: [u8])
+    if list.len(evt) < 6
+        return
+    let status = evt[2] as Int
+    let op = (evt[4] as Int) | ((evt[5] as Int) << 8)
+    if op != g.pending or not g.sent or g.acked
+        return
+    g.acked = true
+    if status == 0
+        return
+    // A remote with no FAE table answers the read with Unsupported Feature or Parameter Value; the procedure goes on without it.
+    if g.stage == STAGE_FAE
+        g.fae_status = status
+        settle(var g)
+        return
+    fail(var g, status)
+
+@tier(embedded)
+fn on_cs_event(var g: CsGap, evt: [u8], sub: Int)
+    if sub == hci_cs.SUB_CS_READ_REMOTE_SUPPORTED_CAPABILITIES_COMPLETE or sub == hci_cs.SUB_CS_READ_REMOTE_SUPPORTED_CAPABILITIES_COMPLETE_V2
+        var rc = hci_cs.HciCsRemoteCapabilities { status: 0, handle: 0, caps: hci_cs.cs_caps_none() }
+        if not hci_cs.cs_read_remote_capabilities(evt, var rc)
+            fail(var g, GAP_MALFORMED)
+            return
+        if rc.status != 0
+            fail(var g, rc.status)
+            return
+        g.remote = rc.caps
+        g.have_remote = true
+    else if sub == hci_cs.SUB_CS_READ_REMOTE_FAE_TABLE_COMPLETE
+        if not hci_cs.cs_read_remote_fae(evt, var g.fae)
+            fail(var g, GAP_MALFORMED)
+            return
+        g.fae_status = g.fae.status
+    else if sub == hci_cs.SUB_CS_SECURITY_ENABLE_COMPLETE
+        var sc = hci_cs.HciCsSecurityComplete { status: 0, handle: 0 }
+        if not hci_cs.cs_read_security_enable_complete(evt, var sc)
+            fail(var g, GAP_MALFORMED)
+            return
+        if sc.status != 0
+            fail(var g, sc.status)
+            return
+        g.sec_status = sc.status
+        g.sec_done = true
+    else if sub == hci_cs.SUB_CS_CONFIG_COMPLETE
+        if not hci_cs.cs_read_config_complete(evt, var g.cfg)
+            fail(var g, GAP_MALFORMED)
+            return
+        if g.cfg.status != 0
+            fail(var g, g.cfg.status)
+            return
+        g.cfg_done = g.cfg.action == 1
+    else if sub == hci_cs.SUB_CS_PROCEDURE_ENABLE_COMPLETE
+        if not hci_cs.cs_read_procedure_enable_complete(evt, var g.en)
+            fail(var g, GAP_MALFORMED)
+            return
+        if g.en.status != 0
+            fail(var g, g.en.status)
+            return
+        g.selected_tx_power = g.en.selected_tx_power
+        if g.en.state == 1
+            g.en_done = true
+        else if g.stage == STAGE_RUNNING
+            g.stage = STAGE_DONE
+    else if sub == hci_cs.SUB_CS_SUBEVENT_RESULT or sub == hci_cs.SUB_CS_SUBEVENT_RESULT_CONTINUE
+        on_result(var g, evt)
+
+@tier(embedded)
+fn on_result(var g: CsGap, evt: [u8])
+    if not hci_cs.cs_read_result(evt, var g.ev)
+        fail(var g, GAP_MALFORMED)
+        return
+    // The first event of a procedure finds the earlier one complete: the program did not take it if `have_result` is still set, and it is lost.
+    if not g.ev.cont and g.res.complete
+        if g.have_result
+            g.lost = g.lost + 1
+            g.have_result = false
+        hci_cs.cs_proc_clear(var g.res)
+    var code = hci_cs.cs_proc_add(var g.res, g.ev)
+    if code == 2
+        // Another Procedure_Counter before the held procedure was complete: it ended short, and the new one starts.
+        hci_cs.cs_proc_clear(var g.res)
+        code = hci_cs.cs_proc_add(var g.res, g.ev)
+    if g.res.complete
+        g.have_result = true
+        g.results = g.results + 1
+        if g.res.aborted
+            // The Controller aborted this and every later procedure.
+            g.stage = STAGE_DONE
+        else if g.p.procedures != 0 and g.results >= g.p.procedures
+            g.stage = STAGE_DONE
+
+// Feed the HCI event `evt` (event code, length, parameters; no H4 type byte) to the engine.  Events that are not its own are ignored.
+pub @tier(embedded)
+fn cs_gap_event(var g: CsGap, evt: [u8])
+    if g.stage == STAGE_FAILED or g.stage == STAGE_IDLE or list.len(evt) < 2
+        return
+    let code = evt[0] as Int
+    if code == hci_frame.EVT_COMMAND_COMPLETE
+        on_command_complete(var g, evt)
+        return
+    if code == hci_frame.EVT_COMMAND_STATUS
+        on_command_status(var g, evt)
+        return
+    let sub = hci_cs.cs_subevent(evt)
+    if sub >= 0 and hci_cs.cs_is_event(sub) and g.stage != STAGE_DONE
+        on_cs_event(var g, evt, sub)
+        settle(var g)
+
+// The result of the last procedure that completed, copied to `out`; false when none is waiting.  The next completed procedure may then be taken.
+pub @tier(embedded)
+fn cs_gap_take_result(var g: CsGap, var out: hci_cs.HciCsProcResult) -> Bool
+    if not g.have_result
+        return false
+    out = g.res
+    g.have_result = false
+    hci_cs.cs_proc_clear(var g.res)
+    true
+
+// Procedure Enable with Enable 0 for the configuration of the procedure: the program sends it to stop the procedures, and the engine is done when the
+// Procedure Enable Complete event with State 0 arrives.
+pub @tier(app)
+fn cs_gap_stop_command(g: CsGap) -> hci_frame.HciCmdMsg
+    hci_cs.cs_cmd_msg(hci_cs.cs_procedure_enable(g.p.handle, 0, false))

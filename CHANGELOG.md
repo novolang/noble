@@ -4,6 +4,10 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
+## Unreleased
+
+`cs_gap`: the Channel Sounding GAP procedures of Core Vol 3 Part C, Sections 9.7 and 10.11.1, as an engine that a program drives with `cs_gap_next`, `cs_gap_event`, `cs_gap_tick` and `cs_gap_take_result`: the capabilities of both Controllers, the default settings, the security start, the remote FAE table, the configuration, the procedure parameters and Procedure Enable, then the result events of each procedure joined into one `HciCsProcResult`.  Either ACL role and either CS role; the security levels 1 to 4 choose the configuration and the requirements.
+
 ## 0.1.0
 
 First release.  The Host core of the noble Bluetooth stack, extracted from

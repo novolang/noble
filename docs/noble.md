@@ -44,7 +44,13 @@ this package imports a module of the Controller or of `orbit/ble`.
    pairing over `smp_core`, `smp` and `smp_keys`, `smp_bond` keeps the bonds, and
    `encrypted_data` is Encrypted Advertising Data.  `smp_fsm`, `smp_handler` and
    `smp_ctx` are the Just Works state machine of the fixed-RAM image.
-7. **Isochronous transport.**  `iso_cis` and `iso_big` hold the connected and
+7. **Channel Sounding.**  `cs_gap` is the Host's side of the GAP procedures of
+   Core Vol 3 Part C, Sections 9.7 and 10.11: a state engine in the shape of the
+   plans of `orbit/ble/src/btp/btp_hci.nv`.  The program asks `cs_gap_next` for the
+   next command, sends it, feeds each HCI event to `cs_gap_event` and calls
+   `cs_gap_tick` with its clock.  It reads and writes the records of `noble-hci`
+   (`hci_cs`) and performs no I/O.
+8. **Isochronous transport.**  `iso_cis` and `iso_big` hold the connected and
    broadcast isochronous tables, `iso_host` routes an HCI event to them, `iso_flow`
    counts the Controller's ISO buffers, `iso_setup` brings the feature up, and
    `isoal` and `isoal_timing` are the Isochronous Adaptation Layer.

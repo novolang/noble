@@ -1,0 +1,493 @@
+// tests/cs_gap_tests.nv — the Channel Sounding GAP procedures of src/cs_gap.nv, driven against a scripted Controller.
+//
+// The scripted Controller answers each command with the events Core 6.3 gives it (Command Complete with the capability record, Command Status followed by the
+// Complete event, ...), and the tests feed the result events of a procedure the way a Controller sends them.  Nothing here touches a radio.
+//
+//   novo test tests/cs_gap_tests.nv
+
+use std.test
+use cs_gap
+use hci_cs
+use hci_frame
+
+const HANDLE = 0x0041
+
+fn cat(a: [Int], b: [Int]) -> [Int]
+    var out: [Int] = []
+    for v in a
+        list.push(out, v)
+    for v in b
+        list.push(out, v)
+    out
+
+fn u8s(l: [Int]) -> [u8]
+    var out: [u8] = []
+    for v in l
+        list.push(out, v as u8)
+    out
+
+fn meta(sub: Int, p: [Int]) -> [u8]
+    var e: [u8] = [0x3E, (list.len(p) + 1) as u8, sub as u8]
+    for v in p
+        list.push(e, v as u8)
+    e
+
+// A capability record: both roles, mode 3, the 150 ns class with 30 exchanges, a random sequence of 20, and the 10 ns class when `ten_ns`.
+fn caps_bytes(roles: Int, modes: Int, ten_ns: Bool, no_fae: Bool) -> [Int]
+    [1, 0x05, 0x00, 1, 1, roles, modes, (if ten_ns then 1 else 0), 30, 0, 20, 0x00, 0x00, 0x03, 0x00, 0x00, (if no_fae then 0x02 else 0x00), 0x00,
+     0x7C, 0x00, 0x7E, 0x00, 0xE0, 0x01, 0x03, 0x00, 0, 0x1F]
+
+// The knobs of the scripted Controller.
+struct Scn
+    local: [Int]
+    remote: [Int]
+    // The status of the Command Status of the opcode `fail_op`, 0 for none.
+    var fail_op: Int
+    var fail_status: Int
+    // The status in the Complete event of the opcode `fail_op`'s command, when the Command Status was success; used for the FAE table.
+    var event_status: Int
+
+fn scn(local: [Int], remote: [Int]) -> Scn
+    Scn { local: local, remote: remote, fail_op: 0, fail_status: 0, event_status: 0 }
+
+fn cc(op: Int, status: Int, ret: [Int]) -> [u8]
+    u8s(cat([0x0E, 4 + list.len(ret), 1, op & 0xFF, op >>> 8, status], ret))
+
+fn cs(op: Int, status: Int) -> [u8]
+    u8s([0x0F, 4, status, 1, op & 0xFF, op >>> 8])
+
+fn zeros(n: Int) -> [Int]
+    var out: [Int] = []
+    for _ in 0..n
+        list.push(out, 0)
+    out
+
+// The events the scripted Controller sends for `cmd`.
+fn reply(s: Scn, cmd: hci_frame.HciCmdMsg) -> [[u8]]
+    let op = cmd.opcode
+    var out: [[u8]] = []
+    if op == s.fail_op and s.fail_status != 0
+        if op == 0x2089 or op == 0x208D or op == 0x2093 or op == 0x20A7
+            list.push(out, cc(op, s.fail_status, []))
+        else
+            list.push(out, cs(op, s.fail_status))
+        return out
+    if op == 0x2089
+        list.push(out, cc(op, 0, s.local))
+    else if op == 0x208A
+        list.push(out, cs(op, 0))
+        list.push(out, meta(0x2C, cat([0, HANDLE, 0], s.remote)))
+    else if op == 0x208D or op == 0x2093 or op == 0x20A7
+        list.push(out, cc(op, 0, [HANDLE, 0]))
+    else if op == 0x208C
+        list.push(out, cs(op, 0))
+        list.push(out, meta(0x2E, [0, HANDLE, 0]))
+    else if op == 0x208E
+        list.push(out, cs(op, 0))
+        list.push(out, meta(0x2D, cat([s.event_status, HANDLE, 0], zeros(72))))
+    else if op == 0x2090
+        list.push(out, cs(op, 0))
+        list.push(out, config_complete(cmd.params))
+    else if op == 0x2094
+        list.push(out, cs(op, 0))
+        list.push(out, enable_complete(1))
+    out
+
+// The Config Complete event for the Create Config parameters `p`: Action 1 and the same configuration, with the mandatory times.
+fn config_complete(p: [u8]) -> [u8]
+    var body: [Int] = [0, HANDLE, 0, p[2] as Int, 1]
+    for i in 4..13
+        list.push(body, p[i] as Int)
+    for i in 13..28
+        list.push(body, p[i] as Int)
+    meta(0x2F, cat(body, [145, 145, 150, 40]))
+
+fn enable_complete(state: Int) -> [u8]
+    meta(0x30, [0, HANDLE, 0, 0, state, 0, 0xFE, 0xC4, 0x09, 0x00, 1, 0, 0, 1, 0, 3, 0, 5, 0, 100, 0])
+
+// Send every command the engine has and feed the answers back; the opcodes sent, in order.
+fn drive(var g: cs_gap.CsGap, s: Scn, now_ms: Int) -> [Int]
+    var sent: [Int] = []
+    for _ in 0..30
+        match cs_gap.cs_gap_next(var g, now_ms)
+            None => return sent
+            Some(c) =>
+                list.push(sent, c.opcode)
+                for e in reply(s, c)
+                    cs_gap.cs_gap_event(var g, e)
+    sent
+
+fn initiator(central: Bool) -> cs_gap.CsGap
+    cs_gap.cs_gap_new(cs_gap.cs_gap_params(HANDLE, hci_cs.CS_ROLE_INITIATOR, central, 2, 100, 2500))
+
+fn reflector(central: Bool) -> cs_gap.CsGap
+    cs_gap.cs_gap_new(cs_gap.cs_gap_params(HANDLE, hci_cs.CS_ROLE_REFLECTOR, central, 2, 100, 2500))
+
+fn both() -> Scn
+    scn(caps_bytes(3, 0, false, false), caps_bytes(3, 0, false, false))
+
+// The steps of a subevent of an initiator: a mode 0 step and a mode 2 step of one path (two slots).
+fn steps() -> [Int]
+    cat([0, 4, 5, 0x00, 0xD8, 0x01, 0x96, 0x00], [2, 12, 9, 5, 100, 0xC0, 0xF9, 0x00, 0, 0, 0, 0x23])
+
+// A Subevent Result of the procedure `counter` with two steps.
+fn result(counter: Int, pdone: Int, sdone: Int) -> [u8]
+    meta(0x31, cat([HANDLE, 0, 0, 0x34, 0x12, counter, 0x00, 0xF0, 0x2E, 0xE2, pdone, sdone, 0, 1, 2], steps()))
+
+// ── The initiator ───────────────────────────────────────────────────
+
+@test
+fn test_an_initiator_that_is_the_central_runs_every_stage_in_order()
+    var g = initiator(true)
+    let sent = drive(var g, both(), 0)
+    // Capabilities, remote capabilities, default settings, security enable, the FAE table, the configuration, the parameters and the enable.
+    test.assert_eq(sent, [0x2089, 0x208A, 0x208D, 0x208C, 0x208E, 0x2090, 0x2093, 0x2094])
+    test.assert_eq(g.status, 0)
+    test.assert_eq(g.stage, cs_gap.STAGE_RUNNING)
+    test.assert_eq(g.have_remote, true)
+    test.assert_eq(g.local.num_config, 1)
+    test.assert_eq(g.remote.roles, 3)
+    test.assert_eq(g.cfg.cfg.main_mode, 2)
+    test.assert_eq(g.cfg.cfg.role, 0)
+    test.assert_eq(g.en.state, 1)
+    test.assert_eq(g.selected_tx_power, -2)
+    test.assert_eq(cs_gap.cs_gap_failed(g), false)
+
+@test
+fn test_the_commands_carry_the_roles_and_the_parameters_of_the_host()
+    var g = initiator(true)
+    var seen: [hci_frame.HciCmdMsg] = []
+    for _ in 0..30
+        match cs_gap.cs_gap_next(var g, 0)
+            None => break
+            Some(c) =>
+                list.push(seen, c)
+                for e in reply(both(), c)
+                    cs_gap.cs_gap_event(var g, e)
+    test.assert_eq(list.len(seen), 8)
+    // Set Default Settings: handle, Role_Enable 1 (the initiator), CS_SYNC antenna 1, 0 dBm.
+    test.assert_eq(seen[2].params, [0x41, 0x00, 1, 1, 0])
+    test.assert_eq(seen[3].params, [0x41, 0x00])
+    // Create Config: Config_ID 0, both Controllers, main mode 2, no submode, the role 0 (initiator), access address only, LE 1M.
+    test.assert_eq(seen[5].params[0:13], [0x41, 0x00, 0, 1, 2, 0xFF, 1, 1, 1, 1, 0, 0, 1])
+    // Set Procedure Parameters: 2 procedures of 100 units, subevents of 2500 microseconds.
+    test.assert_eq(seen[6].params[0:11], [0x41, 0x00, 0, 100, 0, 3, 0, 10, 0, 2, 0])
+    test.assert_eq(seen[6].params[11:14], [0xC4, 0x09, 0x00])
+    test.assert_eq(seen[7].params, [0x41, 0x00, 0, 1])
+
+@test
+fn test_a_reflector_that_is_the_peripheral_waits_for_the_events_of_the_peer()
+    var g = reflector(false)
+    let sent = drive(var g, both(), 0)
+    // Capabilities, remote capabilities and the default settings with Role_Enable 2; then the engine waits for the peer's Host.
+    test.assert_eq(sent, [0x2089, 0x208A, 0x208D])
+    test.assert_eq(g.stage, cs_gap.STAGE_SECURITY)
+    cs_gap.cs_gap_event(var g, meta(0x2E, [0, HANDLE, 0]))
+    test.assert_eq(g.stage, cs_gap.STAGE_CONFIG)
+    test.assert_eq(list.len(drive(var g, both(), 10)), 0)
+    // The peer creates the configuration (the reflector's role in it) and enables the procedures.
+    cs_gap.cs_gap_event(var g, config_complete(hci_cs.cs_cmd_params(hci_cs.cs_create_config(cs_gap.cs_gap_config(g.p, 0)))))
+    test.assert_eq(g.stage, cs_gap.STAGE_ENABLE)
+    test.assert_eq(g.cfg.cfg.role, 1)
+    cs_gap.cs_gap_event(var g, enable_complete(1))
+    test.assert_eq(g.stage, cs_gap.STAGE_RUNNING)
+
+@test
+fn test_a_reflector_that_is_the_central_starts_the_security_and_skips_the_fae_table()
+    var g = reflector(true)
+    let sent = drive(var g, both(), 0)
+    test.assert_eq(sent, [0x2089, 0x208A, 0x208D, 0x208C])
+    test.assert_eq(g.stage, cs_gap.STAGE_CONFIG)
+
+@test
+fn test_default_settings_of_a_reflector_enable_the_reflector_role()
+    var g = reflector(false)
+    var seen: [hci_frame.HciCmdMsg] = []
+    for _ in 0..10
+        match cs_gap.cs_gap_next(var g, 0)
+            None => break
+            Some(c) =>
+                list.push(seen, c)
+                for e in reply(both(), c)
+                    cs_gap.cs_gap_event(var g, e)
+    test.assert_eq(seen[2].params, [0x41, 0x00, 2, 1, 0])
+
+@test
+fn test_events_that_come_before_their_stage_are_kept()
+    var g = reflector(false)
+    // The peer's Host is quick: the security, configuration and enable events arrive before this Host has read the capabilities.
+    cs_gap.cs_gap_event(var g, meta(0x2E, [0, HANDLE, 0]))
+    cs_gap.cs_gap_event(var g, config_complete(hci_cs.cs_cmd_params(hci_cs.cs_create_config(cs_gap.cs_gap_config(g.p, 0)))))
+    cs_gap.cs_gap_event(var g, enable_complete(1))
+    test.assert_eq(g.stage, cs_gap.STAGE_READ_LOCAL)
+    let sent = drive(var g, both(), 0)
+    test.assert_eq(sent, [0x2089, 0x208A, 0x208D])
+    test.assert_eq(g.stage, cs_gap.STAGE_RUNNING)
+
+// ── The failures ────────────────────────────────────────────────────
+
+@test
+fn test_a_command_status_other_than_success_fails_the_procedure()
+    var s = both()
+    s.fail_op = 0x208C
+    s.fail_status = 0x2F
+    var g = initiator(true)
+    let sent = drive(var g, s, 0)
+    test.assert_eq(sent, [0x2089, 0x208A, 0x208D, 0x208C])
+    test.assert_eq(cs_gap.cs_gap_failed(g), true)
+    test.assert_eq(cs_gap.cs_gap_status(g), 0x2F)
+    // A failed engine takes no more events and sends no more commands.
+    cs_gap.cs_gap_event(var g, meta(0x2E, [0, HANDLE, 0]))
+    test.assert_eq(cs_gap.cs_gap_failed(g), true)
+    test.assert_eq(list.len(drive(var g, both(), 0)), 0)
+
+@test
+fn test_a_command_complete_with_an_error_fails_the_procedure()
+    var s = both()
+    s.fail_op = 0x208D
+    s.fail_status = 0x0C
+    var g = initiator(true)
+    let _ = drive(var g, s, 0)
+    test.assert_eq(cs_gap.cs_gap_status(g), 0x0C)
+
+@test
+fn test_a_remote_without_an_fae_table_is_not_fatal()
+    // The remote lists No_FAE: the table is not read at all.
+    var g = initiator(true)
+    let sent = drive(var g, scn(caps_bytes(3, 0, false, false), caps_bytes(3, 0, false, true)), 0)
+    test.assert_eq(sent, [0x2089, 0x208A, 0x208D, 0x208C, 0x2090, 0x2093, 0x2094])
+    test.assert_eq(g.stage, cs_gap.STAGE_RUNNING)
+    // The table is read and the Controller answers Unsupported Feature or Parameter Value in the Command Status.
+    var s = both()
+    s.fail_op = 0x208E
+    s.fail_status = 0x11
+    var h = initiator(true)
+    let sent2 = drive(var h, s, 0)
+    test.assert_eq(sent2, [0x2089, 0x208A, 0x208D, 0x208C, 0x208E, 0x2090, 0x2093, 0x2094])
+    test.assert_eq(h.fae_status, 0x11)
+    test.assert_eq(h.stage, cs_gap.STAGE_RUNNING)
+    // The Complete event carries the failure (0x0D, as the SoftDevice Controller answered).
+    var s3 = both()
+    s3.event_status = 0x0D
+    var k = initiator(true)
+    let _ = drive(var k, s3, 0)
+    test.assert_eq(k.fae_status, 0x0D)
+    test.assert_eq(k.stage, cs_gap.STAGE_RUNNING)
+
+@test
+fn test_a_controller_without_the_role_ends_the_procedure()
+    var g = initiator(true)
+    let sent = drive(var g, scn(caps_bytes(2, 0, false, false), caps_bytes(3, 0, false, false)), 0)
+    test.assert_eq(sent, [0x2089])
+    test.assert_eq(cs_gap.cs_gap_status(g), cs_gap.GAP_ROLE_UNSUPPORTED)
+
+@test
+fn test_a_wait_that_passes_the_timeout_fails_the_procedure()
+    var g = initiator(true)
+    // The Controller never answers the capabilities command.
+    match cs_gap.cs_gap_next(var g, 1000)
+        None => test.assert_eq(true, false)
+        Some(c) => test.assert_eq(c.opcode, 0x2089)
+    cs_gap.cs_gap_tick(var g, 5000)
+    test.assert_eq(cs_gap.cs_gap_failed(g), false)
+    cs_gap.cs_gap_tick(var g, 11001)
+    test.assert_eq(cs_gap.cs_gap_status(g), cs_gap.GAP_TIMEOUT)
+
+@test
+fn test_a_wait_for_an_event_of_the_peer_has_a_timeout_too()
+    var g = reflector(false)
+    let _ = drive(var g, both(), 2000)
+    test.assert_eq(g.stage, cs_gap.STAGE_SECURITY)
+    cs_gap.cs_gap_tick(var g, 11000)
+    test.assert_eq(cs_gap.cs_gap_failed(g), false)
+    cs_gap.cs_gap_tick(var g, 12001)
+    test.assert_eq(cs_gap.cs_gap_status(g), cs_gap.GAP_TIMEOUT)
+
+@test
+fn test_a_malformed_capability_event_fails_the_procedure()
+    var g = initiator(true)
+    match cs_gap.cs_gap_next(var g, 0)
+        None => test.assert_eq(true, false)
+        Some(c) => test.assert_eq(c.opcode, 0x2089)
+    // A Command Complete that holds fewer octets than the record.
+    cs_gap.cs_gap_event(var g, cc(0x2089, 0, zeros(10)))
+    test.assert_eq(cs_gap.cs_gap_status(g), cs_gap.GAP_MALFORMED)
+
+@test
+fn test_an_event_of_another_command_is_ignored()
+    var g = initiator(true)
+    match cs_gap.cs_gap_next(var g, 0)
+        None => test.assert_eq(true, false)
+        Some(c) => test.assert_eq(c.opcode, 0x2089)
+    cs_gap.cs_gap_event(var g, cc(0x208D, 0, [HANDLE, 0]))
+    cs_gap.cs_gap_event(var g, u8s([0x05, 4, 0, 0x41, 0, 0x13]))
+    cs_gap.cs_gap_event(var g, u8s([0x13, 5, 1, 0x41, 0, 1, 0]))
+    test.assert_eq(g.stage, cs_gap.STAGE_READ_LOCAL)
+    test.assert_eq(g.acked, false)
+
+// ── The security levels ─────────────────────────────────────────────
+
+@test
+fn test_the_requirements_of_each_level()
+    test.assert_eq(cs_gap.cs_level_requirements(1), 0)
+    test.assert_eq(cs_gap.cs_level_requirements(2), 0x03)
+    test.assert_eq(cs_gap.cs_level_requirements(3), 0x05)
+    test.assert_eq(cs_gap.cs_level_requirements(4), 0x1D)
+
+@test
+fn test_a_level_the_controllers_do_not_meet_ends_the_procedure_before_the_configuration()
+    var p = cs_gap.cs_gap_params(HANDLE, hci_cs.CS_ROLE_INITIATOR, true, 1, 100, 2500)
+    cs_gap.cs_gap_set_level(var p, 2, false)
+    // Level 2 needs main mode 3 in both.
+    var g = cs_gap.cs_gap_new(p)
+    let sent = drive(var g, both(), 0)
+    test.assert_eq(sent, [0x2089, 0x208A])
+    test.assert_eq(cs_gap.cs_gap_status(g), cs_gap.GAP_LEVEL_NOT_MET)
+
+@test
+fn test_level_2_creates_a_mode_3_configuration_and_sets_the_requirements()
+    var p = cs_gap.cs_gap_params(HANDLE, hci_cs.CS_ROLE_INITIATOR, true, 1, 100, 2500)
+    cs_gap.cs_gap_set_level(var p, 2, true)
+    var g = cs_gap.cs_gap_new(p)
+    var seen: [hci_frame.HciCmdMsg] = []
+    let caps = caps_bytes(3, 1, false, false)
+    for _ in 0..30
+        match cs_gap.cs_gap_next(var g, 0)
+            None => break
+            Some(c) =>
+                list.push(seen, c)
+                for e in reply(scn(caps, caps), c)
+                    cs_gap.cs_gap_event(var g, e)
+    var ops: [Int] = []
+    for c in seen
+        list.push(ops, c.opcode)
+    test.assert_eq(ops, [0x2089, 0x208A, 0x208D, 0x208C, 0x20A7, 0x208E, 0x2090, 0x2093, 0x2094])
+    test.assert_eq(seen[4].params, [0x41, 0x00, 0x03, 0, 0, 0, 0, 0, 0, 0])
+    // Create Config: main mode 3, access address only.
+    test.assert_eq(seen[6].params[4], 3)
+    test.assert_eq(seen[6].params[11], 0)
+    test.assert_eq(g.stage, cs_gap.STAGE_RUNNING)
+
+@test
+fn test_levels_are_met_by_the_capability_records()
+    var a = hci_cs.cs_caps_none()
+    var b = hci_cs.cs_caps_none()
+    // Records read from bytes: mode 3, the access address RTT, the 10 ns class, a random sequence and the NADM.
+    var out = hci_cs.HciCsRemoteCapabilities { status: 0, handle: 0, caps: a }
+    let strong = caps_bytes(3, 1, true, false)
+    let e = meta(0x2C, cat([0, HANDLE, 0], strong))
+    test.assert_eq(hci_cs.cs_read_remote_capabilities(e, var out), true)
+    a = out.caps
+    b = out.caps
+    test.assert_eq(cs_gap.cs_level_met(1, a, b), true)
+    test.assert_eq(cs_gap.cs_level_met(2, a, b), true)
+    test.assert_eq(cs_gap.cs_level_met(3, a, b), true)
+    test.assert_eq(cs_gap.cs_level_met(4, a, b), true)
+    // Without the attack detector metric (NADM_Random_Capability 0) level 4 is not met.
+    var plain = caps_bytes(3, 1, true, false)
+    plain[13] = 0
+    test.assert_eq(hci_cs.cs_read_remote_capabilities(meta(0x2C, cat([0, HANDLE, 0], plain)), var out), true)
+    test.assert_eq(cs_gap.cs_level_met(3, out.caps, out.caps), true)
+    test.assert_eq(cs_gap.cs_level_met(4, out.caps, out.caps), false)
+    // Without the 10 ns class level 3 fails, and without mode 3 level 2 does.
+    let lower = caps_bytes(3, 1, false, false)
+    test.assert_eq(hci_cs.cs_read_remote_capabilities(meta(0x2C, cat([0, HANDLE, 0], lower)), var out), true)
+    test.assert_eq(cs_gap.cs_level_met(3, out.caps, out.caps), false)
+    test.assert_eq(cs_gap.cs_level_met(2, out.caps, out.caps), true)
+    let no_mode3 = caps_bytes(3, 0, false, false)
+    test.assert_eq(hci_cs.cs_read_remote_capabilities(meta(0x2C, cat([0, HANDLE, 0], no_mode3)), var out), true)
+    test.assert_eq(cs_gap.cs_level_met(2, out.caps, out.caps), false)
+
+@test
+fn test_the_configuration_of_level_4_uses_a_random_sequence()
+    var p = cs_gap.cs_gap_params(HANDLE, hci_cs.CS_ROLE_INITIATOR, true, 1, 100, 2500)
+    cs_gap.cs_gap_set_level(var p, 4, false)
+    let cfg = cs_gap.cs_gap_config(p, 1)
+    test.assert_eq(cfg.main_mode, 3)
+    test.assert_eq(cfg.rtt_type, hci_cs.CS_RTT_RANDOM_32)
+    test.assert_eq(cfg.config_id, 1)
+    cs_gap.cs_gap_set_level(var p, 1, false)
+    cs_gap.cs_gap_set_rtt_type(var p, 0)
+    test.assert_eq(cs_gap.cs_gap_config(p, 0).main_mode, 2)
+
+// ── The prelude ─────────────────────────────────────────────────────
+
+@test
+fn test_the_prelude_sets_host_feature_47_and_the_event_mask()
+    let c = cs_gap.cs_gap_prelude(0x1F, false)
+    test.assert_eq(list.len(c), 2)
+    test.assert_eq(c[0].opcode, 0x2074)
+    test.assert_eq(c[0].params, [47, 1])
+    test.assert_eq(c[1].opcode, 0x2001)
+    // 0x1F plus bits 43 to 50.
+    test.assert_eq(c[1].params, [0x1F, 0x00, 0x00, 0x00, 0x00, 0xF8, 0x07, 0x00])
+    let c2 = cs_gap.cs_gap_prelude(0x1F, true)
+    test.assert_eq(c2[1].params, [0x1F, 0x00, 0x00, 0x00, 0x00, 0xF8, 0x87, 0x00])
+
+// ── The results ─────────────────────────────────────────────────────
+
+@test
+fn test_the_results_of_each_procedure_are_joined_and_handed_out()
+    var g = initiator(true)
+    let _ = drive(var g, both(), 0)
+    var out = hci_cs.cs_proc_result_new()
+    test.assert_eq(cs_gap.cs_gap_take_result(var g, var out), false)
+    // The first procedure: two subevents, the first with more procedures to follow.
+    cs_gap.cs_gap_event(var g, result(7, 1, 0))
+    test.assert_eq(g.have_result, false)
+    cs_gap.cs_gap_event(var g, result(7, 0, 0))
+    test.assert_eq(g.have_result, true)
+    test.assert_eq(cs_gap.cs_gap_take_result(var g, var out), true)
+    test.assert_eq(out.procedure_counter, 7)
+    test.assert_eq(out.complete, true)
+    test.assert_eq(out.n_sub, 2)
+    test.assert_eq(out.n_steps, 4)
+    test.assert_eq(out.steps[1].mode, 2)
+    test.assert_eq(out.steps[1].channel, 12)
+    test.assert_eq(cs_gap.cs_gap_take_result(var g, var out), false)
+    test.assert_eq(g.stage, cs_gap.STAGE_RUNNING)
+    // The second procedure ends the engine: two were asked for.
+    cs_gap.cs_gap_event(var g, result(8, 0, 0))
+    test.assert_eq(g.results, 2)
+    test.assert_eq(cs_gap.cs_gap_done(g), true)
+    test.assert_eq(cs_gap.cs_gap_take_result(var g, var out), true)
+    test.assert_eq(out.procedure_counter, 8)
+
+@test
+fn test_a_result_the_program_did_not_take_is_counted_as_lost()
+    var p = cs_gap.cs_gap_params(HANDLE, hci_cs.CS_ROLE_INITIATOR, true, 0, 100, 2500)
+    cs_gap.cs_gap_set_procedures(var p, 0)
+    var g = cs_gap.cs_gap_new(p)
+    let _ = drive(var g, both(), 0)
+    cs_gap.cs_gap_event(var g, result(1, 0, 0))
+    cs_gap.cs_gap_event(var g, result(2, 0, 0))
+    test.assert_eq(g.lost, 1)
+    test.assert_eq(g.results, 2)
+    var out = hci_cs.cs_proc_result_new()
+    test.assert_eq(cs_gap.cs_gap_take_result(var g, var out), true)
+    test.assert_eq(out.procedure_counter, 2)
+    // With no count the engine runs until the program stops it.
+    test.assert_eq(cs_gap.cs_gap_done(g), false)
+    let stop = cs_gap.cs_gap_stop_command(g)
+    test.assert_eq(stop.opcode, 0x2094)
+    test.assert_eq(stop.params, [0x41, 0x00, 0, 0])
+    cs_gap.cs_gap_event(var g, enable_complete(0))
+    test.assert_eq(cs_gap.cs_gap_done(g), true)
+
+@test
+fn test_a_procedure_the_controller_aborted_ends_the_engine()
+    var g = initiator(true)
+    let _ = drive(var g, both(), 0)
+    cs_gap.cs_gap_event(var g, meta(0x31, [HANDLE, 0, 0, 0x34, 0x12, 3, 0x00, 0xF0, 0x2E, 0xE2, 0xF, 0xF, 0x32, 1, 0]))
+    test.assert_eq(cs_gap.cs_gap_done(g), true)
+    var out = hci_cs.cs_proc_result_new()
+    test.assert_eq(cs_gap.cs_gap_take_result(var g, var out), true)
+    test.assert_eq(out.aborted, true)
+    test.assert_eq(out.subs[0].abort_subevent, 3)
+
+@test
+fn test_a_malformed_result_event_fails_the_engine()
+    var g = initiator(true)
+    let _ = drive(var g, both(), 0)
+    cs_gap.cs_gap_event(var g, meta(0x31, [HANDLE, 0, 0, 0x34, 0x12, 3, 0x00, 0xF0, 0x2E, 0xE2, 0x0, 0x1, 0, 1, 2]))
+    test.assert_eq(cs_gap.cs_gap_status(g), cs_gap.GAP_MALFORMED)

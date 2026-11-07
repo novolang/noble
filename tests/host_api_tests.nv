@@ -17,9 +17,11 @@ use hci_codec
 use hci_commands
 use host.{ Host, host_blank, host_config }
 use host_api
+use hci_transport
+use gatt_server
 use le_link
 use noble
-use noble.{ Action, Addr, Bond, BondStore, ConnId, ConnParams, DefaultPolicy, Event, HostPolicy, IoCap, RamBonds, Request, Role, Security, Status }
+use noble.{ Action, Adapter, Addr, Bond, BondStore, ConnId, ConnParams, DefaultPolicy, Event, HostPolicy, IoCap, RamBonds, Request, Role, Security, Status }
 use noble_config
 use profile_builder
 use smp
@@ -42,9 +44,18 @@ struct ScriptLink
     var cmdlog: [[u8]]
     var seed: Int
     var addr: Int
+    var serve: Bool
+    var credit: Bool
+    var srv: gatt_server.GattServer
+    var confirm: Bool
+    var sync: Int
 
+// `credit` makes the Controller return the buffer of each ACL packet it is given.  `serve` makes the Controller carry the ATT requests the Host writes to a GATT server of its own (`srv`) and bring the answers
+// back, as the peer of a Central would; `confirm` makes it confirm each indication it is given; `sync` is the status of the LE
+// Periodic Advertising Sync Established event that answers a Create Sync (-1 for none).
 fn script_link() -> ScriptLink
-    ScriptLink { inbox: [], sent: [], now: 0, handle: 0x40, connect_status: 0, mute: false, commands: [], acl: [], cmdlog: [], seed: 1, addr: 0xA1 }
+    ScriptLink { inbox: [], sent: [], now: 0, handle: 0x40, connect_status: 0, mute: false, commands: [], acl: [], cmdlog: [], seed: 1, addr: 0xA1,
+        serve: false, credit: false, srv: gatt_server.new_server([], 247), confirm: false, sync: -1 }
 
 // An HCI event packet, H4 indicator first.
 fn event_packet(code: Int, params: [u8]) -> [u8]
@@ -128,6 +139,10 @@ fn answer(var l: ScriptLink, opcode: Int, params: [u8])
         list.push(l.inbox, status_event(opcode, ok_status))
         // The peer address is at octets 6 to 11 of the command.
         list.push(l.inbox, connection_complete_kind(l.connect_status, l.handle, 0, params[5] as Int, params[6:12]))
+    else if opcode == hci_commands.opcode_le_periodic_advertising_create_sync()
+        list.push(l.inbox, complete(opcode, ok_status, []))
+        if l.sync >= 0
+            list.push(l.inbox, le_meta(0x0E, [l.sync as u8, 0x10, 0x00, 1, 0, params[3], params[4], params[5], params[6], params[7], params[8], 1, 0x20, 0x00, 0]))
     else if opcode == hci_commands.opcode_le_create_connection_cancel()
         list.push(l.inbox, complete(opcode, ok_status, []))
     else if opcode == hci_commands.opcode_le_start_encryption()
@@ -146,6 +161,14 @@ impl HciLink[mutate] for ScriptLink
     fn send_packet(var self, pkt: [u8]) -> Bool
         if list.len(pkt) >= 1 and (pkt[0] as Int) == 2
             list.push(self.acl, pkt[:])
+            if self.credit and not self.serve
+                // The Controller returns the buffer.
+                let handle = ((pkt[1] as Int) | ((pkt[2] as Int) << 8)) & 0x0FFF
+                list.push(self.inbox, event_packet(0x13, [1, (handle & 0xFF) as u8, (handle >> 8) as u8, 1, 0]))
+            if self.serve and list.len(pkt) > 9
+                serve_att(var self, pkt)
+            if self.confirm and list.len(pkt) > 9 and (pkt[9] as Int) == 0x1D
+                list.push(self.inbox, att_packet(((pkt[1] as Int) | ((pkt[2] as Int) << 8)) & 0x0FFF, [0x1E]))
             return true
         list.push(self.sent, pkt[:])
         if list.len(pkt) >= 4 and (pkt[0] as Int) == 1
@@ -167,6 +190,13 @@ impl HciLink[mutate] for ScriptLink
 
     fn park(var self, ms: Int) [mutate, async]
         self.now = self.now + ms
+
+// The ATT request in the ACL packet `pkt` is answered by the server of the link, and the Controller returns the buffer.
+fn serve_att(var l: ScriptLink, pkt: [u8])
+    let handle = ((pkt[1] as Int) | ((pkt[2] as Int) << 8)) & 0x0FFF
+    for out in gatt_server.receive(var l.srv.db, var l.srv.link, pkt[9:], l.now)
+        list.push(l.inbox, att_packet(handle, out))
+    list.push(l.inbox, event_packet(0x13, [1, (handle & 0xFF) as u8, (handle >> 8) as u8, 1, 0]))
 
 // ── Drivers ─────────────────────────────────────────────────────────
 
@@ -255,6 +285,14 @@ struct TestPolicy
     var done_bonded: Bool
     var adverts: Int
     var keep_adverts: Bool
+    var read_code: Int
+    var read_byte: Int
+    var reads: Int
+    var read_svc: Int
+    var write_code: Int
+    var wrote: Int
+    var writes: Int
+    var write_svc: Int
 
 fn test_policy() -> TestPolicy
     TestPolicy {
@@ -262,7 +300,7 @@ fn test_policy() -> TestPolicy
         on_disc: 0, on_conn: 0, connect_asked: 0, connect_role_central: false, params_asked: 0, pairing_asked: 0,
         pairing_level: 0, pairing_bonding: false, shown: -1, compared: -1, disconnected: 0, disc_attempts: -1,
         disc_reason: 0, connected: 0, connected_links: 0, done: 0, done_ok: false, done_bonded: false, adverts: 0,
-        keep_adverts: true }
+        keep_adverts: true, read_code: 0, read_byte: 0, reads: 0, read_svc: -1, write_code: 0, wrote: -1, writes: 0, write_svc: -1 }
 
 fn role_is_central(r: Role) -> Bool
     match r
@@ -334,6 +372,20 @@ impl HostPolicy[] for TestPolicy
         self.done = self.done + 1
         self.done_ok = st.is_ok()
         self.done_bonded = bonded
+
+    fn on_read(var self, conn: ConnId, attr: u16, svc: Int, var out: noble.Value) -> Int
+        self.reads = self.reads + 1
+        self.read_svc = svc
+        if self.read_code == 0
+            let _ = out.push(self.read_byte as u8)
+        self.read_code
+
+    fn on_write(var self, conn: ConnId, attr: u16, svc: Int, var value: noble.Value) -> Int
+        self.writes = self.writes + 1
+        self.write_svc = svc
+        if value.len() > 0
+            self.wrote = value[0] as Int
+        self.write_code
 
 fn new_store() -> RamBonds
     RamBonds { rows: Vec.new() }
@@ -718,9 +770,10 @@ fn test_a_second_call_while_one_is_in_flight_answers_busy_and_a_call_before_star
     // Giving the call up frees the Host for the next one.
     host_api.abandon(var h)
     test.assert(host_api.begin(var h, Request.ConnectCancel).is_ok())
-    // The requests of advertising, scanning and the GATT client are not served by Layer A.
+    // Extended scanning is not served: the Host reads the legacy report only.
     host_api.abandon(var h)
-    test.assert(host_api.begin(var h, Request.ScanStop).is(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
+    let extended = noble.ScanParams { active: false, extended: true, interval_ms: 100, window_ms: 50, duration_ms: 0 }
+    test.assert(host_api.begin(var h, Request.ScanStart(extended, noble.scan_all())).is(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
 
 @when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
 @test
@@ -1390,3 +1443,801 @@ fn test_the_host_answers_the_att_requests_of_a_client_through_the_link()
     test.assert_eq(list.len(l.acl), 2)
     test.assert_eq(l.acl[1][9] as Int, 0x13)
     test.assert_eq(next_kind(var h), -1)
+
+// ═══════════════════════════════════════════════════════════════════
+// Layer B: the Adapter, advertising and scanning, the GATT client and server, the services
+// ═══════════════════════════════════════════════════════════════════
+
+fn new_ble() -> Adapter<ScriptLink, TestPolicy, RamBonds>
+    var l = script_link()
+    l.credit = true
+    noble.adapter(l, test_policy(), new_store())
+
+fn kind_of(e: Event) -> Int
+    match e
+        Ready => 0
+        Advert(_) => 1
+        Connected(_, _, _, _) => 2
+        Disconnected(_, _) => 3
+        ParamsUpdated(_, _) => 4
+        SecurityChanged(_, _, _) => 5
+        PasskeyRequested(_) => 6
+        NumericRequested(_, _) => 7
+        Notification(_, _, _, _) => 8
+        Written(_, _) => 9
+        AttrRead(_, _, _) => 10
+        AttrWrite(_, _, _, _) => 11
+        Subscribed(_, _, _) => 12
+        CocOpened(_, _, _) => 13
+        CocData(_, _, _) => 14
+        CocClosed(_, _, _) => 15
+        DatabaseChanged(_) => 16
+        Dropped(_) => 17
+
+const EV_NOTIFICATION = 8
+const EV_WRITTEN = 9
+const EV_ATTR_READ = 10
+const EV_ATTR_WRITE = 11
+const EV_SUBSCRIBED = 12
+
+// The kind of the next event of the Adapter within `ms`, -1 for none.
+fn wait_kind(var ble: Adapter<ScriptLink, TestPolicy, RamBonds>, ms: Int) -> Int
+    match ble.wait_event(ms)
+        Some(e) => kind_of(e)
+        None => -1
+
+fn value_of_byte(b: Int) -> noble.Value
+    var v: noble.Value = Vec.new()
+    let _ = v.push(b as u8)
+    v
+
+// An LE Advertising Report event of `peer` with the advertising data `ad`.
+fn report_ad(peer: [u8], rssi: Int, ad: [u8]) -> [u8]
+    var params: [u8] = [1, 0, 1]
+    list.append(params, peer)
+    list.push(params, list.len(ad) as u8)
+    list.append(params, ad)
+    list.push(params, rssi as u8)
+    le_meta(0x02, params)
+
+// An Adapter that has started and has a link as the Peripheral; the name of the link.
+fn peripheral_up(var ble: Adapter<ScriptLink, TestPolicy, RamBonds>) -> ConnId
+    test.assert(ble.start().is_ok())
+    test.assert_eq(wait_kind(var ble, 0), 0)
+    list.push(ble.io.inbox, connection_complete(0, 0x41, 1, peer_octets(0x31)))
+    match ble.wait_event(100)
+        Some(e) =>
+            match e
+                Connected(c, _, _, _) => return c
+                _ => test.fail("the Peripheral is told of the link")
+        None => test.fail("the Peripheral is told of the link")
+    noble.no_conn()
+
+// Give the Adapter the ATT request `att` as the Central's, and let the Host answer.
+fn central_sends(var ble: Adapter<ScriptLink, TestPolicy, RamBonds>, att: [u8])
+    list.push(ble.io.inbox, att_packet(0x41, att))
+    ble.step()
+    ble.step()
+
+// The ATT PDU of the ACL packet `n` the Host wrote.
+fn acl_att(l: ScriptLink, n: Int) -> [u8]
+    l.acl[n][9:]
+
+// ── The Adapter ─────────────────────────────────────────────────────
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_start_waits_for_the_controller_and_a_silent_controller_ends_the_call_with_a_timeout()
+    var ble = new_ble()
+    test.assert(ble.start().is_ok())
+    test.assert_eq(wait_kind(var ble, 0), 0)
+    test.assert_eq(wait_kind(var ble, 200), -1)
+    test.assert(ble.io.now >= 200)
+    var quiet = new_ble()
+    quiet.io.mute = true
+    let st = quiet.start()
+    test.assert(st.is(noble.LAYER_LOCAL, noble.E_TIMEOUT))
+    test.assert(quiet.io.now >= 5000)
+    // The call was given up: the Host takes the next.
+    test.assert(host_api.begin(var quiet.host, Request.Start).is_ok())
+
+// ── GAP: advertising ────────────────────────────────────────────────
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_adv_start_sends_the_legacy_commands_a_link_is_an_event_and_the_policy_readvertises_after_it()
+    var ble = new_ble()
+    test.assert(ble.start().is_ok())
+    test.assert_eq(wait_kind(var ble, 0), 0)
+    var data: noble.AdData = Vec.new()
+    test.assert(noble.ad_flags(var data, 0x06))
+    test.assert(noble.ad_uuid16(var data, 0x180D))
+    var name: noble.Name = String.new()
+    let _ = name.push_str("hr")
+    test.assert(noble.ad_name(var data, name))
+    let rsp: noble.AdData = Vec.new()
+    let first = list.len(ble.io.commands)
+    test.assert(ble.adv_start(0, noble.adv_legacy(), data, rsp).is_ok())
+    test.assert_eq(list.len(ble.io.commands), first + 5)
+    test.assert_eq(ble.io.commands[first], hci_commands.opcode_le_set_advertising_enable())
+    test.assert_eq(ble.io.commands[first + 1], hci_commands.opcode_le_set_advertising_parameters())
+    test.assert_eq(ble.io.commands[first + 2], hci_commands.opcode_le_set_advertising_data())
+    test.assert_eq(ble.io.commands[first + 3], hci_commands.opcode_le_set_scan_response_data())
+    test.assert_eq(ble.io.commands[first + 4], hci_commands.opcode_le_set_advertising_enable())
+    // The data block: its length (3 + 4 + 4), then the Flags record.
+    test.assert_eq(ble.io.cmdlog[first + 2][4] as Int, 11)
+    test.assert_eq(ble.io.cmdlog[first + 2][6] as Int, 0x01)
+    test.assert_eq(ble.io.cmdlog[first + 2][7] as Int, 0x06)
+    test.assert(ble.host.api.adv_on)
+    // A link a Central made ends the advertising; the policy asks for it again after the link.
+    ble.policy.on_disc = -1
+    list.push(ble.io.inbox, connection_complete(0, 0x41, 1, peer_octets(0x31)))
+    test.assert_eq(wait_kind(var ble, 100), EV_CONNECTED)
+    test.assert(not ble.host.api.adv_on)
+    test.assert_eq(ble.link_count(), 1)
+    let enables = times_sent(ble.io, hci_commands.opcode_le_set_advertising_enable())
+    list.push(ble.io.inbox, disconnection_complete(0x41, 0x13))
+    test.assert_eq(wait_kind(var ble, 100), EV_DISCONNECTED)
+    test.assert_eq(wait_kind(var ble, 300), -1)
+    test.assert_eq(times_sent(ble.io, hci_commands.opcode_le_set_advertising_enable()), enables + 2)
+    test.assert(ble.host.api.adv_on)
+    // Stopping turns it off once; stopping again sends nothing.
+    test.assert(ble.adv_stop(0).is_ok())
+    test.assert(not ble.host.api.adv_on)
+    let sent = list.len(ble.io.commands)
+    test.assert(ble.adv_stop(0).is_ok())
+    test.assert_eq(list.len(ble.io.commands), sent)
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_extended_and_periodic_advertising_send_the_extended_commands_and_refuse_what_the_specification_refuses()
+    var ble = new_ble()
+    test.assert(ble.start().is_ok())
+    let data: noble.AdData = Vec.new()
+    let rsp: noble.AdData = Vec.new()
+    let ext = noble.AdvParams { extended: true, connectable: false, scannable: true, interval_min_ms: 100, interval_max_ms: 100, duration_ms: 0 }
+    let first = list.len(ble.io.commands)
+    test.assert(ble.adv_start(2, ext, data, rsp).is_ok())
+    test.assert_eq(ble.io.commands[first], hci_commands.opcode_le_set_extended_advertising_parameters())
+    test.assert_eq(ble.io.commands[first + 1], hci_commands.opcode_le_set_extended_advertising_data())
+    test.assert_eq(ble.io.commands[first + 2], hci_commands.opcode_le_set_extended_advertising_enable())
+    test.assert_eq(list.len(ble.io.commands), first + 3)
+    // The set runs, so a new start disables it first.
+    let second = list.len(ble.io.commands)
+    test.assert(ble.adv_start(2, ext, data, rsp).is_ok())
+    test.assert_eq(ble.io.commands[second], hci_commands.opcode_le_set_extended_advertising_enable())
+    test.assert(ble.adv_stop(2).is_ok())
+    test.assert(not ble.host.api.adv_on)
+    // A train rides on a set that does not connect or scan.
+    let third = list.len(ble.io.commands)
+    var d: noble.AdData = Vec.new()
+    test.assert(noble.ad_flags(var d, 0x06))
+    test.assert(ble.periodic_start(1, 100, d).is_ok())
+    test.assert_eq(ble.io.commands[third], hci_commands.opcode_le_set_extended_advertising_parameters())
+    test.assert_eq(ble.io.commands[third + 1], hci_commands.opcode_le_set_periodic_advertising_parameters())
+    test.assert_eq(ble.io.commands[third + 2], hci_commands.opcode_le_set_periodic_advertising_data())
+    test.assert_eq(ble.io.commands[third + 3], hci_commands.opcode_le_set_extended_advertising_enable())
+    test.assert_eq(ble.io.commands[third + 4], hci_commands.opcode_le_set_periodic_advertising_enable())
+    test.assert(ble.host.api.adv_periodic)
+    test.assert(ble.adv_stop(1).is_ok())
+    test.assert_eq(ble.io.commands[list.len(ble.io.commands) - 2], hci_commands.opcode_le_set_periodic_advertising_enable())
+    // Legacy data is 31 octets at most, set 0 only; an interval outside the range is refused.
+    var big: noble.AdData = Vec.new()
+    for _ in 0..31
+        let _ = big.push(1)
+    test.assert(ble.adv_start(0, noble.adv_legacy(), big, rsp).is_ok())
+    test.assert(ble.adv_start(1, noble.adv_legacy(), data, rsp).is(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
+    let slow = noble.AdvParams { extended: false, connectable: true, scannable: true, interval_min_ms: 5, interval_max_ms: 5, duration_ms: 0 }
+    test.assert(ble.adv_start(0, slow, data, rsp).is(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
+    test.assert(ble.periodic_start(0, 1, data).is(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
+    test.assert(ble.adv_stop(3).is(noble.LAYER_LOCAL, noble.E_NOT_FOUND))
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_connectable_advertising_at_the_limit_of_links_answers_no_room_and_a_nonconnectable_one_goes_on()
+    var ble = new_ble()
+    let _ = peripheral_up(var ble)
+    host_api.host_set_max_links(var ble.host, 1)
+    let data: noble.AdData = Vec.new()
+    let rsp: noble.AdData = Vec.new()
+    test.assert(ble.adv_start(0, noble.adv_legacy(), data, rsp).is(noble.LAYER_LOCAL, noble.E_NO_ROOM))
+    let beacon = noble.AdvParams { extended: false, connectable: false, scannable: false, interval_min_ms: 100, interval_max_ms: 150, duration_ms: 0 }
+    let before = list.len(ble.io.commands)
+    test.assert(ble.adv_start(0, beacon, data, rsp).is_ok())
+    // ADV_NONCONN_IND, byte 4 of the parameters.
+    test.assert_eq(ble.io.cmdlog[before + 1][8] as Int, hci_commands.ADV_TYPE_ADV_NONCONN_IND)
+
+// ── GAP: scanning ───────────────────────────────────────────────────
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_find_scans_until_a_report_matches_the_filter_and_stops_and_times_out_when_none_does()
+    var ble = new_ble()
+    test.assert(ble.start().is_ok())
+    test.assert_eq(wait_kind(var ble, 0), 0)
+    // A device of another service, a device of the Battery Service that is too weak, and the one that is wanted.
+    list.push(ble.io.inbox, report_ad(peer_octets(0x61), -40, [3, 3, 0x34, 0x12]))
+    list.push(ble.io.inbox, report_ad(peer_octets(0x63), -90, [3, 3, 0x0F, 0x18]))
+    list.push(ble.io.inbox, report_ad(peer_octets(0x62), -50, [3, 3, 0x0F, 0x18]))
+    var found = noble.blank_report()
+    var want = noble.scan_service(0x180F)
+    want = noble.ScanFilter { uuid16: want.uuid16, name_prefix: want.name_prefix, rssi_min: -60, duplicates: false }
+    let st = ble.find(want, 5000, var found)
+    test.assert(st.is_ok())
+    test.assert_eq(found.addr.octets[0] as Int, 0x62)
+    test.assert_eq(found.rssi as Int, -50)
+    // Only the report that passed the filter reached the policy.
+    test.assert_eq(ble.policy.adverts, 1)
+    test.assert_eq(times_sent(ble.io, hci_commands.opcode_le_set_scan_parameters()), 1)
+    test.assert_eq(times_sent(ble.io, hci_commands.opcode_le_set_scan_enable()), 2)
+    test.assert(not ble.host.api.scan_on)
+    let missed = ble.find(noble.scan_service(0x180A), 300, var found)
+    test.assert(missed.is(noble.LAYER_LOCAL, noble.E_TIMEOUT))
+    test.assert(not ble.host.api.scan_on)
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_scan_start_reports_as_events_a_name_filter_applies_and_extended_scanning_is_refused()
+    var ble = new_ble()
+    test.assert(ble.start().is_ok())
+    test.assert_eq(wait_kind(var ble, 0), 0)
+    var prefix: String[16] = String.new()
+    let _ = prefix.push_str("hr")
+    let by_name = noble.ScanFilter { uuid16: 0, name_prefix: prefix, rssi_min: -127, duplicates: true }
+    test.assert(ble.scan_start(noble.scan_passive(), by_name).is_ok())
+    test.assert(ble.host.api.scan_on)
+    list.push(ble.io.inbox, report_ad(peer_octets(0x61), -40, [3, 9, 0x6E, 0x6F]))
+    list.push(ble.io.inbox, report_ad(peer_octets(0x62), -40, [3, 9, 0x68, 0x72]))
+    test.assert_eq(wait_kind(var ble, 100), 1)
+    test.assert_eq(wait_kind(var ble, 100), -1)
+    // A second start disables the scan that runs first.
+    let before = times_sent(ble.io, hci_commands.opcode_le_set_scan_enable())
+    test.assert(ble.scan_start(noble.scan_passive(), noble.scan_all()).is_ok())
+    test.assert_eq(times_sent(ble.io, hci_commands.opcode_le_set_scan_enable()), before + 2)
+    test.assert(ble.scan_stop().is_ok())
+    test.assert(ble.scan_stop().is_ok())
+    let wide = noble.ScanParams { active: true, extended: true, interval_ms: 100, window_ms: 50, duration_ms: 0 }
+    test.assert(ble.scan_start(wide, noble.scan_all()).is(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
+    let backwards = noble.ScanParams { active: true, extended: false, interval_ms: 50, window_ms: 100, duration_ms: 0 }
+    test.assert(ble.scan_start(backwards, noble.scan_all()).is(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_sync_create_ends_with_the_established_event_and_sync_stop_forgets_the_train()
+    var ble = new_ble()
+    test.assert(ble.start().is_ok())
+    ble.io.sync = 0
+    test.assert(ble.sync_create(peer_addr(0x71), 3, 0, 100).is_ok())
+    test.assert_eq(ble.host.api.sync_handle, 0x10)
+    test.assert(ble.sync_stop().is_ok())
+    test.assert_eq(ble.host.api.sync_handle, -1)
+    test.assert(ble.sync_stop().is(noble.LAYER_LOCAL, noble.E_NOT_FOUND))
+    ble.io.sync = noble.HCI_CONNECTION_FAILED_TO_ESTABLISH
+    test.assert(ble.sync_create(peer_addr(0x71), 3, 0, 100).is(noble.LAYER_HCI, noble.HCI_CONNECTION_FAILED_TO_ESTABLISH))
+    // The Controller reports the train gone, and the Host forgets it.
+    ble.io.sync = 0
+    test.assert(ble.sync_create(peer_addr(0x71), 3, 0, 100).is_ok())
+    list.push(ble.io.inbox, le_meta(0x10, [0x10, 0x00]))
+    ble.step()
+    test.assert_eq(ble.host.api.sync_handle, -1)
+    test.assert(ble.sync_create(peer_addr(0x71), 16, 0, 100).is(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
+    // No established event within the call: it ends with a timeout.
+    ble.io.sync = -1
+    test.assert(ble.sync_create(peer_addr(0x71), 3, 0, 100).is(noble.LAYER_LOCAL, noble.E_TIMEOUT))
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_accept_list_from_bonds_writes_the_accept_list_and_the_resolving_list_of_the_bonds_with_a_key()
+    let plain = bond_for(peer_addr(0x81), Security.Encrypted)
+    var known = bond_for(peer_addr(0x82), Security.Authenticated)
+    known = Bond { peer: known.peer, irk: [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9], has_irk: true, ltk: known.ltk, ediv: 0, rand: known.rand, key_size: 16, level: known.level }
+    var store = new_store()
+    test.assert(store.save(plain).is_ok())
+    test.assert(store.save(known).is_ok())
+    var ble = noble.adapter(script_link(), test_policy(), store)
+    test.assert(ble.start().is_ok())
+    let first = list.len(ble.io.commands)
+    test.assert(ble.accept_list_from_bonds().is_ok())
+    test.assert_eq(ble.io.commands[first], hci_commands.opcode_le_clear_filter_accept_list())
+    test.assert_eq(ble.io.commands[first + 1], hci_commands.opcode_le_add_device_to_filter_accept_list())
+    test.assert_eq(ble.io.commands[first + 2], hci_commands.opcode_le_add_device_to_filter_accept_list())
+    test.assert_eq(ble.io.commands[first + 3], hci_commands.opcode_le_clear_resolving_list())
+    test.assert_eq(ble.io.commands[first + 4], hci_commands.opcode_le_add_device_to_resolving_list())
+    test.assert_eq(list.len(ble.io.commands), first + 5)
+    // Without a key in the store only the accept list is written.
+    var only = new_store()
+    test.assert(only.save(plain).is_ok())
+    var bare = noble.adapter(script_link(), test_policy(), only)
+    test.assert(bare.start().is_ok())
+    let mark = list.len(bare.io.commands)
+    test.assert(bare.accept_list_from_bonds().is_ok())
+    test.assert_eq(list.len(bare.io.commands), mark + 2)
+
+// ── The GATT server ─────────────────────────────────────────────────
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_stored_characteristic_answers_a_read_and_a_write_is_an_event_and_the_database_has_room_for_what_the_key_says()
+    var ble = new_ble()
+    test.assert(ble.add_service(noble.uuid16(0x180F)).svc == 0)
+    let level = ble.add_char(noble.uuid16(0x2A19), noble.PROP_READ | noble.PROP_WRITE, noble.open_perms(), noble.Access.Open, 4)
+    test.assert(level.status.is_ok())
+    var t1 = value_of_byte(87)
+    test.assert(ble.set_value(level.attr, var t1).is_ok())
+    // A characteristic before a service, and an attribute that is no characteristic.
+    var fresh = new_ble()
+    let orphan = fresh.add_char(noble.uuid16(0x2A19), noble.PROP_READ, noble.open_perms(), noble.Access.Open, 1)
+    test.assert(orphan.status.is(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
+    test.assert(fresh.bind_event(level.attr).is(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
+    var t2 = value_of_byte(1)
+    test.assert(ble.set_value(noble.Attr { handle: 900, props: 0, cccd: 0 }, var t2).is(noble.LAYER_LOCAL, noble.E_NOT_FOUND))
+    test.assert(ble.bind_function(noble.Attr { handle: 900, props: 0, cccd: 0 }).is(noble.LAYER_LOCAL, noble.E_NOT_FOUND))
+    let conn = peripheral_up(var ble)
+    central_sends(var ble, [0x0A, (level.attr.handle & 255) as u8, (level.attr.handle >> 8) as u8])
+    test.assert_eq(list.len(ble.io.acl), 1)
+    test.assert_eq(acl_att(ble.io, 0)[0] as Int, 0x0B)
+    test.assert_eq(acl_att(ble.io, 0)[1] as Int, 87)
+    // A write is stored and the application hears of it; the longest write is what `add_char` said.
+    central_sends(var ble, [0x12, (level.attr.handle & 255) as u8, (level.attr.handle >> 8) as u8, 5, 6])
+    test.assert_eq(acl_att(ble.io, 1)[0] as Int, 0x13)
+    test.assert_eq(wait_kind(var ble, 10), EV_WRITTEN)
+    central_sends(var ble, [0x12, (level.attr.handle & 255) as u8, (level.attr.handle >> 8) as u8, 1, 2, 3, 4, 5])
+    test.assert_eq(acl_att(ble.io, 2)[0] as Int, 0x01)
+    test.assert_eq(acl_att(ble.io, 2)[4] as Int, noble.ATT_INVALID_ATTRIBUTE_VALUE_LENGTH)
+    test.assert(conn.slot < 255)
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_function_valued_characteristic_asks_the_policy_with_the_index_of_its_service()
+    var ble = new_ble()
+    test.assert(ble.add_service(noble.uuid16(0x180F)).svc == 0)
+    test.assert(ble.add_service(noble.uuid16(0xFFF0)).svc == 1)
+    let cp = ble.add_char(noble.uuid16(0xFFF1), noble.PROP_READ | noble.PROP_WRITE, noble.open_perms(), noble.Access.Open, 4)
+    test.assert(ble.bind_function(cp.attr).is_ok())
+    let h0 = (cp.attr.handle & 255) as u8
+    let h1 = (cp.attr.handle >> 8) as u8
+    let _ = peripheral_up(var ble)
+    ble.policy.read_byte = 42
+    central_sends(var ble, [0x0A, h0, h1])
+    test.assert_eq(acl_att(ble.io, 0)[0] as Int, 0x0B)
+    test.assert_eq(acl_att(ble.io, 0)[1] as Int, 42)
+    test.assert_eq(ble.policy.read_svc, 1)
+    // A read at an offset takes the part after it; an offset past the end is refused.
+    central_sends(var ble, [0x0C, h0, h1, 0, 0])
+    test.assert_eq(acl_att(ble.io, 1)[0] as Int, 0x0D)
+    central_sends(var ble, [0x0C, h0, h1, 9, 0])
+    test.assert_eq(acl_att(ble.io, 2)[0] as Int, 0x01)
+    test.assert_eq(acl_att(ble.io, 2)[4] as Int, noble.ATT_INVALID_OFFSET)
+    // A policy that leaves the read alone answers Read Not Permitted; one that gives a code sends it.
+    ble.policy.read_code = noble.NOT_HANDLED
+    central_sends(var ble, [0x0A, h0, h1])
+    test.assert_eq(acl_att(ble.io, 3)[4] as Int, noble.ATT_READ_NOT_PERMITTED)
+    ble.policy.read_code = 0x80
+    central_sends(var ble, [0x0A, h0, h1])
+    test.assert_eq(acl_att(ble.io, 4)[4] as Int, 0x80)
+    // A write reaches the policy, which accepts or refuses it; a command is not answered.
+    central_sends(var ble, [0x12, h0, h1, 0x7F])
+    test.assert_eq(acl_att(ble.io, 5)[0] as Int, 0x13)
+    test.assert_eq(ble.policy.wrote, 0x7F)
+    test.assert_eq(ble.policy.write_svc, 1)
+    ble.policy.write_code = noble.ATT_VALUE_NOT_ALLOWED
+    central_sends(var ble, [0x12, h0, h1, 0x01])
+    test.assert_eq(acl_att(ble.io, 6)[4] as Int, noble.ATT_VALUE_NOT_ALLOWED)
+    ble.policy.write_code = 0
+    central_sends(var ble, [0x52, h0, h1, 0x33])
+    test.assert_eq(list.len(ble.io.acl), 7)
+    test.assert_eq(ble.policy.wrote, 0x33)
+    test.assert_eq(ble.policy.writes, 3)
+    // A value longer than the characteristic accepts is refused before the policy is asked.
+    var long: [u8] = [0x12, h0, h1]
+    for _ in 0..80
+        list.push(long, 1)
+    central_sends(var ble, long)
+    test.assert_eq(acl_att(ble.io, 7)[0] as Int, 0x01)
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_an_event_bound_characteristic_queues_the_request_and_respond_answers_it()
+    var ble = new_ble()
+    test.assert(ble.add_service(noble.uuid16(0x180F)).svc == 0)
+    test.assert(ble.add_service(noble.uuid16(0xFFF0)).svc == 1)
+    let c = ble.add_char(noble.uuid16(0xFFF1), noble.PROP_READ | noble.PROP_WRITE, noble.open_perms(), noble.Access.Open, 4)
+    test.assert(ble.bind_event(c.attr).is_ok())
+    let h0 = (c.attr.handle & 255) as u8
+    let h1 = (c.attr.handle >> 8) as u8
+    let conn = peripheral_up(var ble)
+    // No request pending: nothing to answer.
+    var t3 = value_of_byte(1)
+    test.assert(ble.respond(conn, c.attr.handle, 0, var t3).is(noble.LAYER_LOCAL, noble.E_BUSY))
+    list.push(ble.io.inbox, att_packet(0x41, [0x0A, h0, h1]))
+    match ble.wait_event(50)
+        Some(e) =>
+            match e
+                AttrRead(k, attr, svc) =>
+                    test.assert_eq(k.slot as Int, conn.slot as Int)
+                    test.assert_eq(attr as Int, c.attr.handle as Int)
+                    test.assert_eq(svc, 1)
+                _ => test.fail("a read of an event-bound attribute is queued")
+        None => test.fail("a read of an event-bound attribute is queued")
+    // The client waits: nothing was answered, and the policy was not asked.
+    test.assert_eq(list.len(ble.io.acl), 0)
+    test.assert_eq(ble.policy.reads, 0)
+    var t4 = value_of_byte(77)
+    test.assert(ble.respond(conn, c.attr.handle, 0, var t4).is_ok())
+    ble.step()
+    test.assert_eq(acl_att(ble.io, 0)[0] as Int, 0x0B)
+    test.assert_eq(acl_att(ble.io, 0)[1] as Int, 77)
+    var t5 = value_of_byte(1)
+    test.assert(ble.respond(conn, c.attr.handle, 0, var t5).is(noble.LAYER_LOCAL, noble.E_BUSY))
+    // A write carries its value, and the answer can be an error.
+    list.push(ble.io.inbox, att_packet(0x41, [0x12, h0, h1, 5, 6]))
+    match ble.wait_event(50)
+        Some(e) =>
+            match e
+                AttrWrite(_, attr, svc, value) =>
+                    test.assert_eq(value.len(), 2)
+                    test.assert_eq(value[1] as Int, 6)
+                _ => test.fail("a write of an event-bound attribute is queued")
+        None => test.fail("a write of an event-bound attribute is queued")
+    var nothing: noble.Value = Vec.new()
+    test.assert(ble.respond(conn, c.attr.handle, noble.ATT_VALUE_NOT_ALLOWED, var nothing).is_ok())
+    ble.step()
+    test.assert_eq(acl_att(ble.io, 1)[0] as Int, 0x01)
+    test.assert_eq(acl_att(ble.io, 1)[4] as Int, noble.ATT_VALUE_NOT_ALLOWED)
+    // A second request while one waits is refused at once; a command is queued and needs no answer.
+    list.push(ble.io.inbox, att_packet(0x41, [0x0A, h0, h1]))
+    ble.step()
+    list.push(ble.io.inbox, att_packet(0x41, [0x0A, h0, h1]))
+    ble.step()
+    test.assert_eq(acl_att(ble.io, 2)[0] as Int, 0x01)
+    test.assert_eq(acl_att(ble.io, 2)[4] as Int, noble.ATT_UNLIKELY_ERROR)
+    test.assert_eq(wait_kind(var ble, 10), EV_ATTR_READ)
+    list.push(ble.io.inbox, att_packet(0x41, [0x52, h0, h1, 9]))
+    ble.step()
+    test.assert_eq(wait_kind(var ble, 10), EV_ATTR_WRITE)
+    // The client gave up: the held request ends with the ATT timeout.
+    var t6 = value_of_byte(1)
+    test.assert(ble.respond(conn, c.attr.handle, 0, var t6).is_ok())
+    list.push(ble.io.inbox, att_packet(0x41, [0x0A, h0, h1]))
+    test.assert_eq(wait_kind(var ble, 50), EV_ATTR_READ)
+    test.assert_eq(wait_kind(var ble, 31000), -1)
+    var t7 = value_of_byte(1)
+    test.assert(ble.respond(conn, c.attr.handle, 0, var t7).is(noble.LAYER_LOCAL, noble.E_BUSY))
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_client_that_subscribes_is_an_event_and_notify_reaches_it_only_then_and_at_the_security_asked()
+    var ble = new_ble()
+    test.assert(ble.add_service(noble.uuid16(0x180D)).svc == 0)
+    let hrm = ble.add_char(noble.uuid16(0x2A37), noble.PROP_NOTIFY, noble.Permissions { read: noble.Access.Denied, write: noble.Access.Denied }, noble.Access.Open, 2)
+    let ind = ble.add_char(noble.uuid16(0x2A38), noble.PROP_INDICATE, noble.Permissions { read: noble.Access.Denied, write: noble.Access.Denied }, noble.Access.Open, 2)
+    test.assert(hrm.attr.cccd != 0 and ind.attr.cccd != 0)
+    let conn = peripheral_up(var ble)
+    var t8 = value_of_byte(60)
+    test.assert(ble.notify(conn, hrm.attr, noble.Security.Open, var t8).is(noble.LAYER_LOCAL, noble.E_NOT_SUBSCRIBED))
+    var t9 = value_of_byte(60)
+    test.assert_eq(ble.notify_all(hrm.attr, noble.Security.Open, var t9), 0)
+    // The Client Characteristic Configuration descriptor is written: Subscribed, with the handle of the value.
+    central_sends(var ble, [0x12, (hrm.attr.cccd & 255) as u8, (hrm.attr.cccd >> 8) as u8, 1, 0])
+    test.assert_eq(acl_att(ble.io, 0)[0] as Int, 0x13)
+    match ble.wait_event(10)
+        Some(e) =>
+            match e
+                Subscribed(k, attr, mode) =>
+                    test.assert_eq(k.slot as Int, conn.slot as Int)
+                    test.assert_eq(attr as Int, hrm.attr.handle as Int)
+                    test.assert_eq(mode as Int, 1)
+                _ => test.fail("Subscribed is queued")
+        None => test.fail("Subscribed is queued")
+    var t10 = value_of_byte(60)
+    test.assert(ble.notify(conn, hrm.attr, noble.Security.Encrypted, var t10).is(noble.LAYER_LOCAL, noble.E_SECURITY_LOW))
+    var t11 = value_of_byte(61)
+    test.assert(ble.notify(conn, hrm.attr, noble.Security.Open, var t11).is_ok())
+    ble.step()
+    test.assert_eq(acl_att(ble.io, 1)[0] as Int, 0x1B)
+    test.assert_eq(acl_att(ble.io, 1)[3] as Int, 61)
+    var t12 = value_of_byte(62)
+    test.assert_eq(ble.notify_all(hrm.attr, noble.Security.Open, var t12), 1)
+    ble.step()
+    test.assert_eq(acl_att(ble.io, 2)[3] as Int, 62)
+    // Writing zero is a Subscribed with mode 0, and notify is refused again.
+    central_sends(var ble, [0x12, (hrm.attr.cccd & 255) as u8, (hrm.attr.cccd >> 8) as u8, 0, 0])
+    match ble.wait_event(10)
+        Some(e) =>
+            match e
+                Subscribed(_, _, mode) => test.assert_eq(mode as Int, 0)
+                _ => test.fail("Subscribed is queued when the client unsubscribes")
+        None => test.fail("Subscribed is queued when the client unsubscribes")
+    var t13 = value_of_byte(63)
+    test.assert(ble.notify(conn, hrm.attr, noble.Security.Open, var t13).is(noble.LAYER_LOCAL, noble.E_NOT_SUBSCRIBED))
+    // A characteristic that indicates: the call ends with the client's confirmation.
+    var t14 = value_of_byte(7)
+    test.assert(ble.indicate(conn, ind.attr, var t14).is(noble.LAYER_LOCAL, noble.E_NOT_SUBSCRIBED))
+    central_sends(var ble, [0x12, (ind.attr.cccd & 255) as u8, (ind.attr.cccd >> 8) as u8, 2, 0])
+    test.assert_eq(wait_kind(var ble, 10), EV_SUBSCRIBED)
+    ble.io.confirm = true
+    var t15 = value_of_byte(7)
+    test.assert(ble.indicate(conn, ind.attr, var t15).is_ok())
+    var sent_indication = false
+    for k in 0..list.len(ble.io.acl)
+        if (acl_att(ble.io, k)[0] as Int) == 0x1D
+            sent_indication = true
+    test.assert(sent_indication)
+    // A client that never confirms ends the call with a timeout.
+    ble.io.confirm = false
+    var t16 = value_of_byte(8)
+    test.assert(ble.indicate(conn, ind.attr, var t16).is(noble.LAYER_LOCAL, noble.E_TIMEOUT))
+    // A name that is stale is refused.
+    test.assert(ble.disconnect(conn, noble.HCI_REMOTE_USER_TERMINATED).is_ok())
+    var t17 = value_of_byte(1)
+    test.assert(ble.notify(conn, hrm.attr, noble.Security.Open, var t17).is(noble.LAYER_LOCAL, noble.E_STALE))
+
+// ── Services behind the pump ────────────────────────────────────────
+
+// A service that keeps a switch: a write of 0 or 1 is taken, anything else is refused.
+struct Switch
+    var svc: Int
+    var attr: noble.Attr
+    var seen: Int
+    var ticks: Int
+    var events: Int
+
+impl noble.Service[] for Switch
+    fn attach(var self, var h: Host) -> Status
+        let s = h.add_service(noble.uuid16(0xFFF0))
+        if not s.status.is_ok()
+            return s.status
+        self.svc = s.svc
+        let c = h.add_char(noble.uuid16(0xFFF1), noble.PROP_WRITE, noble.Permissions { read: noble.Access.Denied, write: noble.Access.Open }, noble.Access.Denied, 1)
+        if not c.status.is_ok()
+            return c.status
+        self.attr = c.attr
+        h.bind_event(c.attr)
+
+    fn on_event(var self, ev: Event, var out: noble.Outbox) -> Bool
+        self.events = self.events + 1
+        match ev
+            AttrWrite(conn, attr, svc, value) =>
+                if svc != self.svc
+                    return false
+                let empty: noble.Value = Vec.new()
+                if value.len() != 1 or value[0] > 1
+                    let _ = out.push(noble.Out.Respond(conn, attr, noble.ATT_VALUE_NOT_ALLOWED, empty))
+                    return true
+                self.seen = value[0] as Int
+                let _ = out.push(noble.Out.Respond(conn, attr, 0, empty))
+                true
+            _ => false
+
+    fn tick(var self, now_ms: Int, var out: noble.Outbox)
+        self.ticks = self.ticks + 1
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_plug_attaches_a_service_and_the_pump_gives_it_the_events_and_answers_for_it()
+    var ble = new_ble()
+    var sw = Switch { svc: -1, attr: noble.Attr { handle: 0, props: 0, cccd: 0 }, seen: -1, ticks: 0, events: 0 }
+    test.assert(ble.plug(var sw).is_ok())
+    test.assert_eq(sw.svc, 0)
+    // A characteristic of the product's own, in a service of its own, that no service module takes.
+    test.assert_eq(ble.add_service(noble.uuid16(0xFFF3)).svc, 1)
+    let own = ble.add_char(noble.uuid16(0xFFF2), noble.PROP_READ | noble.PROP_WRITE, noble.open_perms(), noble.Access.Open, 1)
+    test.assert(own.status.is_ok())
+    test.assert(ble.bind_event(own.attr).is_ok())
+    let _ = peripheral_up(var ble)
+    let sw0 = (sw.attr.handle & 255) as u8
+    let sw1 = (sw.attr.handle >> 8) as u8
+    list.push(ble.io.inbox, att_packet(0x41, [0x12, sw0, sw1, 1]))
+    noble.pump(var ble, var sw, 50)
+    test.assert_eq(sw.seen, 1)
+    test.assert(sw.ticks >= 1)
+    ble.step()
+    test.assert_eq(acl_att(ble.io, 0)[0] as Int, 0x13)
+    list.push(ble.io.inbox, att_packet(0x41, [0x12, sw0, sw1, 7]))
+    noble.pump(var ble, var sw, 50)
+    ble.step()
+    test.assert_eq(sw.seen, 1)
+    test.assert_eq(acl_att(ble.io, 1)[4] as Int, noble.ATT_VALUE_NOT_ALLOWED)
+    // A request for an attribute no service owns is refused at once, whatever the service sees of it.
+    let own0 = (own.attr.handle & 255) as u8
+    let own1 = (own.attr.handle >> 8) as u8
+    list.push(ble.io.inbox, att_packet(0x41, [0x12, own0, own1, 1]))
+    noble.pump(var ble, var sw, 50)
+    ble.step()
+    test.assert_eq(acl_att(ble.io, 2)[4] as Int, noble.ATT_WRITE_NOT_PERMITTED)
+    list.push(ble.io.inbox, att_packet(0x41, [0x0A, own0, own1]))
+    noble.pump(var ble, var sw, 50)
+    ble.step()
+    test.assert_eq(acl_att(ble.io, 3)[4] as Int, noble.ATT_READ_NOT_PERMITTED)
+
+// ── The GATT client over a server of the link ───────────────────────
+
+// The database of the server the link plays: a Battery Service with a level (read, notify, a configuration descriptor), a control
+// point (write) and a secret (nothing can be read).  The handles of the three values.
+fn fake_battery(var l: ScriptLink) -> [Int]
+    var out: [Int] = []
+    match profile_builder.start_service(var l.srv.db, [0x0F, 0x18])
+        Ok(_) => ()
+        Err(_) => test.fail("the service is added")
+    match profile_builder.add_value(var l.srv.db, 0x12, profile_builder.read_only(gatt_server.Access.Open), [0x19, 0x2A], [87])
+        Ok(h) => list.push(out, h)
+        Err(_) => test.fail("the level is added")
+    match profile_builder.add_cccd(var l.srv.db, gatt_server.open_permissions())
+        Ok(h) => list.push(out, h)
+        Err(_) => test.fail("the descriptor is added")
+    match profile_builder.add_value(var l.srv.db, 0x08, profile_builder.write_only(gatt_server.Access.Open), [0x1A, 0x2A], [0])
+        Ok(h) => list.push(out, h)
+        Err(_) => test.fail("the control point is added")
+    match profile_builder.add_value(var l.srv.db, 0x02, profile_builder.write_only(gatt_server.Access.Open), [0x1B, 0x2A], [1])
+        Ok(h) => list.push(out, h)
+        Err(_) => test.fail("the secret is added")
+    out
+
+// Push the notification of the server's value `handle` to the Host.
+fn server_notifies(var l: ScriptLink, handle: Int)
+    for pdu in gatt_server.send_value(var l.srv.db, var l.srv.link, handle, l.now)
+        list.push(l.inbox, att_packet(l.handle, pdu))
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_the_adapter_discovers_reads_writes_and_subscribes_over_a_link_and_a_notification_is_an_event()
+    var ble = new_ble()
+    ble.io.serve = true
+    let handles = fake_battery(var ble.io)
+    test.assert(ble.start().is_ok())
+    test.assert_eq(wait_kind(var ble, 0), 0)
+    let up = ble.connect(peer_addr(0x55), noble.conn_params_default(), 5000)
+    test.assert(up.status.is_ok())
+    test.assert_eq(wait_kind(var ble, 0), EV_CONNECTED)
+    test.assert(ble.exchange_mtu(up.conn).is_ok())
+    match ble.conn_info(up.conn)
+        Some(info) => test.assert((info.mtu as Int) > 23)
+        None => test.fail("the link has a name")
+    let battery = noble.uuid16(0x180F)
+    test.assert(ble.discover(up.conn, noble.uuid16(0x1234)).is(noble.LAYER_LOCAL, noble.E_NOT_FOUND))
+    test.assert(ble.discover(up.conn, battery).is_ok())
+    match ble.find_char(up.conn, battery, noble.uuid16(0x2A19))
+        None => test.fail("the level is in the cache")
+        Some(level) =>
+            test.assert_eq(level.handle as Int, handles[0])
+            test.assert(level.cccd != 0)
+            test.assert_eq((level.props as Int) & noble.PROP_NOTIFY, noble.PROP_NOTIFY)
+            var v: noble.Value = Vec.new()
+            test.assert(ble.read(up.conn, level, noble.Security.Open, var v).is_ok())
+            test.assert_eq(v.len(), 1)
+            test.assert_eq(v[0] as Int, 87)
+            // A link below the security asked sends nothing.
+            let sent = list.len(ble.io.acl)
+            test.assert(ble.read(up.conn, level, noble.Security.Authenticated, var v).is(noble.LAYER_LOCAL, noble.E_SECURITY_LOW))
+            test.assert_eq(list.len(ble.io.acl), sent)
+            test.assert(ble.subscribe(up.conn, level, noble.NOTIFY, noble.Security.Open).is_ok())
+            test.assert_eq(gatt_server.configuration(ble.io.srv.link, level.cccd as Int), 1)
+            server_notifies(var ble.io, handles[0])
+            match ble.wait_event(100)
+                Some(e) =>
+                    match e
+                        Notification(k, attr, indication, value) =>
+                            test.assert_eq(k.slot as Int, up.conn.slot as Int)
+                            test.assert_eq(attr as Int, handles[0])
+                            test.assert(not indication)
+                            test.assert_eq(value[0] as Int, 87)
+                        _ => test.fail("a notification is an event")
+                None => test.fail("a notification is an event")
+            // Three notifications at once: two fit, and the rest are counted.
+            server_notifies(var ble.io, handles[0])
+            server_notifies(var ble.io, handles[0])
+            server_notifies(var ble.io, handles[0])
+            test.assert_eq(wait_kind(var ble, 50), EV_NOTIFICATION)
+            test.assert_eq(wait_kind(var ble, 50), EV_NOTIFICATION)
+            match ble.wait_event(50)
+                Some(e) =>
+                    match e
+                        Dropped(k) => test.assert_eq(k as Int, 1)
+                        _ => test.fail("the notifications that did not fit are counted")
+                None => test.fail("the notifications that did not fit are counted")
+            test.assert(ble.unsubscribe(up.conn, level, noble.Security.Open).is_ok())
+            test.assert_eq(gatt_server.configuration(ble.io.srv.link, level.cccd as Int), 0)
+    match ble.find_char(up.conn, battery, noble.uuid16(0x2A1A))
+        None => test.fail("the control point is in the cache")
+        Some(control) =>
+            var t18 = value_of_byte(9)
+            test.assert(ble.write(up.conn, control, noble.Security.Open, var t18).is_ok())
+            test.assert_eq(ble.io.srv.db.attributes[gatt_server.index_of(ble.io.srv.db, control.handle as Int)].value[0] as Int, 9)
+            var t19 = value_of_byte(10)
+            test.assert(ble.write_no_response(up.conn, control, noble.Security.Open, var t19).is_ok())
+            test.assert_eq(ble.io.srv.db.attributes[gatt_server.index_of(ble.io.srv.db, control.handle as Int)].value[0] as Int, 10)
+            // The control point cannot be read: the refusal keeps the number of ATT.
+            var v: noble.Value = Vec.new()
+            test.assert(ble.read(up.conn, control, noble.Security.Open, var v).is(noble.LAYER_ATT, noble.ATT_READ_NOT_PERMITTED))
+            test.assert(ble.subscribe(up.conn, control, noble.NOTIFY, noble.Security.Open).is(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
+    test.assert(ble.find_char(up.conn, battery, noble.uuid16(0x2A99)) == None)
+    test.assert(ble.find_char(up.conn, noble.uuid16(0x1800), noble.uuid16(0x2A19)) == None)
+
+// ── Two Hosts: the GATT client and server end to end ────────────────
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_two_hosts_discover_read_write_subscribe_and_notify_through_the_requests_of_layer_a()
+    var x = pair_up()
+    let battery = noble.uuid16(0x180F)
+    test.assert(x.b.add_service(battery).svc == 0)
+    let level = x.b.add_char(noble.uuid16(0x2A19), noble.PROP_READ | noble.PROP_WRITE | noble.PROP_NOTIFY, noble.open_perms(), noble.Access.Open, 4)
+    let computed = x.b.add_char(noble.uuid16(0x2A1A), noble.PROP_READ, noble.Permissions { read: noble.Access.Open, write: noble.Access.Denied }, noble.Access.Open, 1)
+    test.assert(level.status.is_ok() and computed.status.is_ok())
+    test.assert(x.b.set_value(level.attr, value_of_byte(87)).is_ok())
+    test.assert(x.b.bind_function(computed.attr).is_ok())
+    x.pb.read_byte = 0x2B
+    // Discovery fills the cache of the Central; the cache is not radio traffic.
+    test.assert(call_a(var x, Request.Discover(x.ca, battery)).is_ok())
+    match host_api.find_char(x.a, x.ca, battery, noble.uuid16(0x2A19))
+        None => test.fail("the level is in the cache")
+        Some(found) =>
+            test.assert_eq(found.handle as Int, level.attr.handle as Int)
+            test.assert_eq(found.cccd as Int, level.attr.cccd as Int)
+            test.assert(call_a(var x, Request.Read(x.ca, found, Security.Open)).is_ok())
+            test.assert_eq(x.a.api.op.value[0] as Int, 87)
+            // A write with a response is stored and reaches the application of the server as Written.
+            test.assert(call_a(var x, Request.Write(x.ca, found, Security.Open, value_of_byte(66), true)).is_ok())
+            test.assert_eq(next_kind(var x.b), EV_WRITTEN)
+            test.assert(call_a(var x, Request.Read(x.ca, found, Security.Open)).is_ok())
+            test.assert_eq(x.a.api.op.value[0] as Int, 66)
+            // A subscription is an event of the server, and a notification one of the client.
+            test.assert(call_a(var x, Request.Subscribe(x.ca, found, 1, Security.Encrypted)).is(noble.LAYER_LOCAL, noble.E_SECURITY_LOW))
+            test.assert(call_a(var x, Request.Subscribe(x.ca, found, 1, Security.Open)).is_ok())
+            test.assert_eq(next_kind(var x.b), EV_SUBSCRIBED)
+            test.assert(host_api.notify(var x.b, x.cb, level.attr, Security.Open, value_of_byte(70)).is_ok())
+            pump(var x, 4)
+            match host_api.next_event(var x.a)
+                Some(e) =>
+                    match e
+                        Notification(k, attr, indication, value) =>
+                            test.assert_eq(attr as Int, level.attr.handle as Int)
+                            test.assert_eq(value[0] as Int, 70)
+                        _ => test.fail("a notification is an event")
+                None => test.fail("a notification is an event")
+            // The queue of four holds two notifications beside the slots kept for the state events; the others are counted.
+            for k in 0..4
+                test.assert(host_api.notify(var x.b, x.cb, level.attr, Security.Open, value_of_byte(80 + k)).is_ok())
+            pump(var x, 6)
+            test.assert_eq(next_kind(var x.a), EV_NOTIFICATION)
+            test.assert_eq(next_kind(var x.a), EV_NOTIFICATION)
+            test.assert_eq(next_kind(var x.a), EV_DROPPED)
+            test.assert_eq(next_kind(var x.a), -1)
+            // And a Central unsubscribes with mode 0.
+            test.assert(call_a(var x, Request.Subscribe(x.ca, found, 0, Security.Open)).is_ok())
+            test.assert(host_api.notify(var x.b, x.cb, level.attr, Security.Open, value_of_byte(71)).is(noble.LAYER_LOCAL, noble.E_NOT_SUBSCRIBED))
+    match host_api.find_char(x.a, x.ca, battery, noble.uuid16(0x2A1A))
+        None => test.fail("the computed value is in the cache")
+        Some(found) =>
+            test.assert(call_a(var x, Request.Read(x.ca, found, Security.Open)).is_ok())
+            test.assert_eq(x.a.api.op.value[0] as Int, 0x2B)
+            test.assert_eq(x.pb.read_svc, 0)
+            // A write to a value that does not accept one keeps the code of ATT.
+            test.assert(call_a(var x, Request.Write(x.ca, found, Security.Open, value_of_byte(1), true)).is(noble.LAYER_ATT, noble.ATT_WRITE_NOT_PERMITTED))
+    test.assert(call_a(var x, Request.ExchangeMtu(x.ca)).is_ok())
+    // The server indicates, and the Central confirms it.
+    match host_api.find_char(x.a, x.ca, battery, noble.uuid16(0x2A19))
+        None => test.fail("the level is in the cache")
+        Some(found) =>
+            test.assert(call_a(var x, Request.Subscribe(x.ca, found, 2, Security.Open)).is_ok())
+            test.assert_eq(next_kind(var x.b), EV_SUBSCRIBED)
+            let begun = host_api.begin(var x.b, Request.Indicate(x.cb, level.attr, value_of_byte(5)))
+            test.assert(begun.is_ok())
+            var done = false
+            for _ in 0..40
+                pump(var x, 1)
+                match host_api.result(var x.b)
+                    Some(st) =>
+                        test.assert(st.is_ok())
+                        done = true
+                        break
+                    None => ()
+            test.assert(done)
+            match host_api.next_event(var x.a)
+                Some(e) =>
+                    match e
+                        Notification(_, _, indication, value) =>
+                            test.assert(indication)
+                            test.assert_eq(value[0] as Int, 5)
+                        _ => test.fail("an indication is an event")
+                None => test.fail("an indication is an event")

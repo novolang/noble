@@ -178,6 +178,22 @@ max     = 255
 unit    = "bytes"
 doc     = "octets of advertising data in one report or one advertising set of the Host API (Layer A, src/noble.nv)"
 
+[config.max_name]
+type    = "int"
+default = 24
+min     = 1
+max     = 31
+unit    = "bytes"
+doc     = "octets of a device name that `ad_name` writes into advertising data (Layer B, src/noble.nv); the type `Name` of a value on the caller's stack, not storage of the Host"
+
+[config.outbox]
+type    = "int"
+default = 4
+min     = 1
+max     = 16
+unit    = "commands"
+doc     = "commands a service queues in one turn of `pump` (Layer B, src/noble.nv); the `Outbox` is a value on the caller's stack, not storage of the Host"
+
 [config.max_pairing]
 type    = "int"
 default = 1

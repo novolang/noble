@@ -20,26 +20,41 @@
 // specification leaves to the product are asked of `p`, and the keys are kept in `b`.
 //
 // The events the engine queues: `Ready`, `Advert`, `Connected`, `Disconnected`, `ParamsUpdated`,
-// `SecurityChanged`, `PasskeyRequested`, `NumericRequested`, `CocOpened`, `CocData`, `CocClosed`
-// and `Dropped`, and `Written` for the attributes whose writes the GATT server tracks
-// (`gatt_server.take_changed`).  `Notification`, `Subscribed`, `AttrRead`, `AttrWrite` and
-// `DatabaseChanged` belong to the GATT wrappers of Layer B and are NOT IMPLEMENTED here.
+// `SecurityChanged`, `PasskeyRequested`, `NumericRequested`, `CocOpened`, `CocData`, `CocClosed`,
+// `Notification`, `Subscribed`, `AttrRead`, `AttrWrite`, `DatabaseChanged` and `Dropped`, and `Written` for
+// the attributes whose writes the GATT server tracks (`gatt_server.take_changed`: every characteristic
+// `Host.add_char` adds).
 //
-// What the engine serves: Start, Connect, ConnectListed, ConnectCancel, Disconnect,
-// UpdateParams, Secure, CocOpen and CocClose.  The requests of advertising, scanning,
-// synchronisation, the accept list and the GATT client (`Request.AdvStart` to
-// `Request.Indicate`) are NOT IMPLEMENTED here: `begin` answers them E_BAD_ARGUMENT.  The
-// advertising code of Layer B reads `Api.advertise`, the answer of `on_connected` and
-// `on_disconnected` that concerns advertising.
+// What the engine serves: Start, Connect, ConnectListed, ConnectCancel, Disconnect, UpdateParams, Secure,
+// CocOpen and CocClose (Layer A), and for Layer B AdvStart, PeriodicStart, AdvStop, ScanStart, ScanStop,
+// SyncCreate, SyncStop, AcceptListFromBonds, ExchangeMtu, Discover, Read, Write, Subscribe and Indicate.  A
+// request that is a run of HCI commands (advertising, scanning, synchronisation, the accept list) sends
+// them one at a time, each when the Controller has answered the one before; a request of the GATT client
+// runs on the client engine of the Host (`gatt_client`), which holds the discovery cache of each link.
+// The advertising the policy asked for with `Action.Readvertise` is started by the Host itself at the first
+// turn after the link ended in which no call is in flight (`Api.advertise`).
+//
+// NOT IMPLEMENTED: `HostPolicy.authorize_write` is never called; a request for an attribute bound to the
+// application (`bind_function`, `bind_event`) is held on the unenhanced ATT bearer only; extended scan
+// reports (`ScanParams.extended` answers E_BAD_ARGUMENT) and periodic advertising reports are not read.
+//
+// A note for the next reader of this file.  `h.link` is the `LeLink` of the active slot (`host_activate`),
+// and a read of `h.le.slots[slot]` that is bound to a local, as in `let after = h.le.slots[slot].att.cccd`, made
+// `h.link` and the slot two values and broke the pairing tests.  The Layer B code therefore activates the slot
+// and reads `h.link`, and passes `h.link.att` and the like as arguments without keeping them.
 //
 // Most tables the engine reaches are lists (the package builds with sibling_check = "warn" for
 // that reason), so the Host does not yet keep the promise of no allocation after start; the
 // storage of Layer A itself (the queue, the connection table, the registers) is fixed.
 // planning/NOBLE-HOST-API-SKETCH.md sections 3.3, 3.4, 3.7, 3.8 and 3.11 are the design.
 
+use att
+use gatt_client
 use hci_codec
 use hci_commands
 use hci_frame
+use hci_init
+use periodic_sync
 use hci_frame.{ HciCmdMsg }
 use gatt_server
 use hci_transport
@@ -337,10 +352,16 @@ fn finish(var h: Host, st: Status)
     h.api.op.status = st
     h.api.kind = noble.R_NONE
     h.api.step = 0
+    if h.api.internal
+        // A call the Host started for itself has no caller to read it.
+        h.api.internal = false
+        h.api.op.busy = false
+        h.api.op.done = false
 
 // Give up the call in flight.  The Controller may still answer the command that was sent for it;
 // the answer is taken and dropped.
 pub fn abandon(var h: Host)
+    h.api.internal = false
     h.api.op.busy = false
     h.api.op.done = false
     h.api.kind = noble.R_NONE
@@ -452,7 +473,84 @@ pub fn begin(var h: Host, req: Request) -> Status
                     h.api.r_conn = conn
                     h.api.r_chan = chan as Int
                     kind = noble.R_COC_CLOSE
-                _ => return noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT)
+                Request.AdvStart(set, p, data, rsp) =>
+                    let st = begin_adv(var h, set as Int, p, data, rsp)
+                    if not st.is_ok()
+                        return st
+                    kind = noble.R_ADV_START
+                Request.PeriodicStart(set, interval_ms, data) =>
+                    let st = begin_periodic(var h, set as Int, interval_ms as Int, data)
+                    if not st.is_ok()
+                        return st
+                    kind = noble.R_PERIODIC_START
+                Request.AdvStop(set) =>
+                    if (set as Int) != h.api.adv_set
+                        return noble.failed(noble.LAYER_LOCAL, noble.E_NOT_FOUND)
+                    kind = noble.R_ADV_STOP
+                Request.ScanStart(p, f) =>
+                    // Extended scanning reports are NOT IMPLEMENTED: the Host reads the legacy report only.
+                    if p.extended or not scan_params_ok(p)
+                        return noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT)
+                    h.api.scan_p = p
+                    h.api.scan_f = f
+                    kind = noble.R_SCAN_START
+                Request.ScanStop => kind = noble.R_SCAN_STOP
+                Request.SyncCreate(adv, sid, skip, timeout) =>
+                    if (sid as Int) > 15 or (timeout as Int) < hci_commands.PERIODIC_SYNC_TIMEOUT_RANGE_MIN or (timeout as Int) > hci_commands.PERIODIC_SYNC_TIMEOUT_RANGE_MAX
+                        return noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT)
+                    h.api.r_peer = adv
+                    h.api.r_sid = sid as Int
+                    h.api.r_skip = skip as Int
+                    h.api.r_timeout = timeout as Int
+                    kind = noble.R_SYNC_CREATE
+                Request.SyncStop => kind = noble.R_SYNC_STOP
+                Request.AcceptListFromBonds => kind = noble.R_ACCEPT_LIST
+                Request.ExchangeMtu(conn) =>
+                    if slot_of(h, conn) < 0
+                        return noble.failed(noble.LAYER_LOCAL, noble.E_STALE)
+                    h.api.r_conn = conn
+                    kind = noble.R_MTU
+                Request.Discover(conn, svc) =>
+                    if slot_of(h, conn) < 0
+                        return noble.failed(noble.LAYER_LOCAL, noble.E_STALE)
+                    h.api.r_conn = conn
+                    h.api.r_svc = svc
+                    kind = noble.R_DISCOVER
+                Request.Read(conn, a, need) =>
+                    if slot_of(h, conn) < 0
+                        return noble.failed(noble.LAYER_LOCAL, noble.E_STALE)
+                    h.api.r_conn = conn
+                    h.api.r_attr = a
+                    h.api.r_need = need
+                    h.api.op.value = Vec.new()
+                    kind = noble.R_READ
+                Request.Write(conn, a, need, data, response) =>
+                    if slot_of(h, conn) < 0
+                        return noble.failed(noble.LAYER_LOCAL, noble.E_STALE)
+                    h.api.r_conn = conn
+                    h.api.r_attr = a
+                    h.api.r_need = need
+                    h.api.r_data = data
+                    h.api.r_response = response
+                    kind = noble.R_WRITE
+                Request.Subscribe(conn, a, mode, need) =>
+                    if slot_of(h, conn) < 0
+                        return noble.failed(noble.LAYER_LOCAL, noble.E_STALE)
+                    if (mode as Int) > 3
+                        return noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT)
+                    h.api.r_conn = conn
+                    h.api.r_attr = a
+                    h.api.r_need = need
+                    h.api.r_mode = mode as Int
+                    kind = noble.R_SUBSCRIBE
+                Request.Indicate(conn, a, data) =>
+                    if slot_of(h, conn) < 0
+                        return noble.failed(noble.LAYER_LOCAL, noble.E_STALE)
+                    h.api.r_conn = conn
+                    h.api.r_attr = a
+                    h.api.r_data = data
+                    kind = noble.R_INDICATE
+                Request.Start => ()
     h.api.op.busy = true
     h.api.op.done = false
     h.api.op.status = noble.ok()
@@ -572,6 +670,12 @@ fn kick<P: HostPolicy[f], B: BondStore[g]>(var h: Host, var p: P, var b: B) [f, 
         start_coc_open(var h)
     else if kind == noble.R_COC_CLOSE
         start_coc_close(var h)
+    else if is_script(kind)
+        start_script(var h, var b)
+    else if is_client(kind)
+        start_client(var h, kind)
+    else if kind == noble.R_INDICATE
+        start_indicate(var h)
 
 // The scan and connection intervals of a connection the Host creates, in 0.625 ms units: scan
 // 60 ms with a 30 ms window.
@@ -582,7 +686,7 @@ const SCAN_WINDOW = 48
 fn send_create_connection(var h: Host, peer: Addr, q: ConnParams, listed: Bool)
     let policy = if listed then hci_commands.INITIATOR_FILTER_ACCEPT_LIST else hci_commands.SCAN_FILTER_BASIC_UNFILTERED
     let own = if h.api.own_kind == 0 then hci_commands.OWN_ADDR_TYPE_PUBLIC else hci_commands.OWN_ADDR_TYPE_RANDOM
-    let octets = if listed then [0, 0, 0, 0, 0, 0] else octets_of(peer)
+    let octets: [u8] = if listed then [0, 0, 0, 0, 0, 0] else octets_of(peer)
     let params = hci_commands.build_le_create_connection(SCAN_INTERVAL, SCAN_WINDOW, policy, (peer.kind & 1) as Int, octets, own, q.interval_min as Int, q.interval_max as Int, q.latency as Int, q.timeout as Int, 0, 0)
     send_cmd(var h, hci_commands.opcode_le_create_connection(), params)
 
@@ -642,6 +746,7 @@ fn timers<P: HostPolicy[f], B: BondStore[g]>(var h: Host, var p: P, var b: B) [f
             h.api.attempts = h.api.attempts + 1
             h.api.reconnecting = true
             send_create_connection(var h, h.api.last_peer, h.api.last_params, h.api.last_listed)
+    layer_b_timers(var h, var p, var b)
 
 // The answers the application gave to a passkey or a numeric comparison.
 fn answers<P: HostPolicy[f], B: BondStore[g]>(var h: Host, var p: P, var b: B) [f, g, mutate]
@@ -706,6 +811,16 @@ fn on_event<P: HostPolicy[f], B: BondStore[g]>(var h: Host, evt: [u8], var p: P,
     if hci_codec.is_encryption_event(evt)
         on_encryption(var h, evt, var p, var b)
         return
+    match hci_codec.le_periodic_sync_established(evt)
+        Some(e) =>
+            on_sync_established(var h, e)
+            return
+        None => ()
+    match hci_codec.le_periodic_sync_lost(evt)
+        Some(_) =>
+            h.api.sync_handle = -1
+            return
+        None => ()
     match hci_codec.le_advertising_reports(evt)
         Some(reports) => on_reports(var h, reports, var p)
         None => ()
@@ -718,7 +833,7 @@ fn on_reports<P: HostPolicy[f]>(var h: Host, reports: [hci_codec.AdvertisingRepo
         for i in 0..list.len(r.data)
             let _ = data.push(r.data[i])
         let rep = noble.AdvReport { addr: address_of(r.address_type, r.address), rssi: r.rssi as i8, flags: r.event_type as u8, data: data }
-        if p.on_advert(rep)
+        if passes_filter(h.api.scan_f, rep) and p.on_advert(rep)
             emit(var h, Event.Advert(rep))
 
 // The answer to the command in flight.  A command the engine sent for the call in flight
@@ -757,6 +872,8 @@ fn command_answered<P: HostPolicy[f], B: BondStore[g]>(var h: Host, opcode: Int,
     else if kind == noble.R_SECURE
         if opcode == hci_commands.opcode_le_start_encryption() and status != 0
             finish(var h, noble.failed(noble.LAYER_HCI, status))
+    else if is_script(kind)
+        script_answered(var h, opcode, status, var b)
 
 // ── Start: bring the Controller up ──────────────────────────────────
 //
@@ -773,7 +890,7 @@ fn start_answered(var h: Host, opcode: Int, status: Int, rp: [u8])
         let mask = hci_commands.EVENT_MASK_DEFAULT | hci_commands.EVENT_MASK_ENCRYPTION_KEY_REFRESH_COMPLETE | hci_commands.EVENT_MASK_LE_META
         send_cmd(var h, hci_commands.opcode_hci_set_event_mask(), hci_commands.build_set_event_mask(mask))
     else if step == 2
-        let le_mask = hci_commands.LE_EVENT_MASK_DEFAULT | hci_commands.LE_EVENT_MASK_REMOTE_CONNECTION_PARAMETER_REQUEST
+        let le_mask = hci_commands.LE_EVENT_MASK_DEFAULT | hci_commands.LE_EVENT_MASK_REMOTE_CONNECTION_PARAMETER_REQUEST | hci_commands.LE_EVENT_MASK_PERIODIC_ADVERTISING
         send_cmd(var h, hci_commands.opcode_le_set_event_mask(), hci_commands.build_set_event_mask(le_mask))
     else if step == 3
         send_cmd(var h, hci_commands.opcode_le_read_buffer_size(), [])
@@ -823,10 +940,15 @@ fn on_acl<P: HostPolicy[f], B: BondStore[g]>(var h: Host, pkt: [u8], var p: P, v
                 send_acl(var h, le_link.host_completed(var h.le.credits, pkt))
                 return
             host_activate(var h, slot)
+            let subscribed = h.link.att.cccd[:]
             send_acl(var h, le_link.receive_acl(var h.link, pkt, h.clock_ms))
             let conn = h.api.conns[slot].id
             for handle in gatt_server.take_changed(var h.link.att)
                 emit(var h, Event.Written(conn, handle as u16))
+            subscription_events(var h, slot, subscribed)
+            serve_held(var h, slot, var p)
+            for pdu in gatt_server.take_client_pdus(var h.link.att)
+                client_pdu(var h, slot, pdu)
             for pdu in le_link.take_smp_pdus(var h.link)
                 sec_pdu(var h, slot, pdu, var p, var b)
             coc_events(var h, slot)
@@ -925,6 +1047,9 @@ fn on_connection_complete<P: HostPolicy[f], B: BondStore[g]>(var h: Host, c: hci
     let slot = id.slot
     host_activate(var h, slot)
     h.ll_update = []
+    let _ = gatt_client.open(var h.client, id)
+    if not central and h.api.adv_on and h.api.adv_p.connectable
+        h.api.adv_on = false
     // The Security Manager follows the link: both halves are told of the connection, with the
     // addresses of the connection and the bond of the peer, if the store has one.
     let own = if list.len(h.own_address) == 6 then h.own_address[:] else [0, 0, 0, 0, 0, 0]
@@ -980,11 +1105,13 @@ fn on_disconnection<P: HostPolicy[f], B: BondStore[g]>(var h: Host, d: hci_codec
     h.ll_update = []
     set_ask(var h, slot, 0)
     set_ans(var h, slot, noble.NO_ANSWER)
+    set_pend(var h, slot, 0, 0, 0)
+    gatt_client.close(var h.client, link_id(h, slot))
     send_acl(var h, le_link.le_links_close(var h.le, links.links_id(h.le.registry, slot)))
     set_conn(var h, slot, noble.Conn { live: false, id: conn, info: info })
     let reason = noble.failed(noble.LAYER_HCI, d.reason)
     // The call in flight on this link ends with it.
-    if h.api.kind != noble.R_NONE and h.api.kind != noble.R_START and h.api.kind != noble.R_CONNECT and h.api.kind != noble.R_CANCEL and slot_of_name(h, h.api.r_conn) == slot
+    if uses_conn(h.api.kind) and slot_of_name(h, h.api.r_conn) == slot
         if h.api.kind == noble.R_DISCONNECT
             finish(var h, noble.ok())
         else
@@ -1363,3 +1490,863 @@ pub fn coc_send(var h: Host, conn: ConnId, chan: Int, sdu: Value) -> Status
             send_acl(var h, out)
             noble.ok()
         None => noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT)
+
+// ═══════════════════════════════════════════════════════════════════
+// Layer B requests: advertising, scanning, synchronisation, the accept list, the GATT client and the bound attributes
+// ═══════════════════════════════════════════════════════════════════
+
+fn bytes_of(v: Value) -> [u8]
+    var out: [u8] = []
+    for i in 0..v.len()
+        list.push(out, v[i])
+    out
+
+fn ad_bytes(d: noble.AdData) -> [u8]
+    var out: [u8] = []
+    for i in 0..d.len()
+        list.push(out, d[i])
+    out
+
+fn link_id(h: Host, slot: Int) -> links.LinkId
+    links.links_id(h.le.registry, slot)
+
+fn le16_of(pdu: [u8], at: Int) -> Int
+    (pdu[at] as Int) | ((pdu[at + 1] as Int) << 8)
+
+// Whether a request is one that names a connection in `Api.r_conn`.
+fn uses_conn(kind: Int) -> Bool
+    kind == noble.R_DISCONNECT or kind == noble.R_UPDATE or kind == noble.R_SECURE or kind == noble.R_COC_OPEN
+        or kind == noble.R_COC_CLOSE or kind == noble.R_MTU or kind == noble.R_DISCOVER or kind == noble.R_READ
+        or kind == noble.R_WRITE or kind == noble.R_SUBSCRIBE or kind == noble.R_INDICATE
+
+// Whether a request is a sequence of HCI commands, each sent when the one before it has been answered.
+fn is_script(kind: Int) -> Bool
+    kind == noble.R_ADV_START or kind == noble.R_PERIODIC_START or kind == noble.R_ADV_STOP or kind == noble.R_SCAN_START
+        or kind == noble.R_SCAN_STOP or kind == noble.R_SYNC_CREATE or kind == noble.R_SYNC_STOP or kind == noble.R_ACCEPT_LIST
+
+// A request that runs on the GATT client engine.
+fn is_client(kind: Int) -> Bool
+    kind == noble.R_MTU or kind == noble.R_DISCOVER or kind == noble.R_READ or kind == noble.R_WRITE or kind == noble.R_SUBSCRIBE
+
+// ── Arguments ───────────────────────────────────────────────────────
+
+// An interval or a window in milliseconds as the 0.625 ms units of the commands.
+fn units_of(ms: Int) -> Int
+    ms * 8 / 5
+
+fn adv_interval_ok(p: noble.AdvParams) -> Bool
+    let lo = units_of(p.interval_min_ms as Int)
+    let hi = units_of(p.interval_max_ms as Int)
+    lo >= hci_commands.ADV_INTERVAL_RANGE_MIN and hi <= hci_commands.ADV_INTERVAL_RANGE_MAX and lo <= hi
+
+fn scan_params_ok(p: noble.ScanParams) -> Bool
+    let interval = units_of(p.interval_ms as Int)
+    let window = units_of(p.window_ms as Int)
+    interval >= 4 and interval <= 0x4000 and window >= 4 and window <= interval
+
+// Check the arguments of `AdvStart` and keep them as the last advertising the Host started.
+fn begin_adv(var h: Host, set: Int, p: noble.AdvParams, data: noble.AdData, rsp: noble.AdData) -> Status
+    if not p.extended and (set != 0 or data.len() > hci_commands.ADV_DATA_MAX_LEN or rsp.len() > hci_commands.ADV_DATA_MAX_LEN)
+        return noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT)
+    if not adv_interval_ok(p) or set > 0xEF
+        return noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT)
+    if p.connectable and link_count(h) >= h.api.max_links
+        return noble.failed(noble.LAYER_LOCAL, noble.E_NO_ROOM)
+    h.api.adv_set = set
+    h.api.adv_p = p
+    h.api.adv_data = data
+    h.api.adv_rsp = rsp
+    h.api.adv_ext = p.extended
+    h.api.adv_periodic = false
+    h.api.adv_valid = true
+    noble.ok()
+
+fn begin_periodic(var h: Host, set: Int, interval_ms: Int, data: noble.AdData) -> Status
+    let units = interval_ms * 4 / 5
+    if set > 0xEF or units < hci_commands.PERIODIC_INTERVAL_RANGE_MIN or units > hci_commands.PERIODIC_INTERVAL_RANGE_MAX
+        return noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT)
+    h.api.adv_set = set
+    h.api.adv_p = noble.AdvParams { extended: true, connectable: false, scannable: false, interval_min_ms: 100, interval_max_ms: 100, duration_ms: 0 }
+    h.api.adv_data = data
+    h.api.adv_rsp = Vec.new()
+    h.api.adv_interval = units
+    h.api.adv_ext = true
+    h.api.adv_periodic = true
+    h.api.adv_valid = true
+    noble.ok()
+
+// ── The scripts ─────────────────────────────────────────────────────
+//
+// A request that is a run of HCI commands keeps the number of the command in flight in `Api.r_cursor` and its opcode in
+// `Api.r_phase`.  The next command is built when the answer to the last one arrives, so a failure ends the run and the commands
+// after it are never sent.
+
+// One command of a script, and whether a failure of it is passed over.
+struct Cmd
+    var opcode: Int
+    var params: [u8]
+    var lenient: Bool
+
+fn cmd_of(opcode: Int, params: [u8], lenient: Bool) -> Cmd
+    Cmd { opcode: opcode, params: params[:], lenient: lenient }
+
+fn own_type(h: Host) -> Int
+    if h.api.own_kind == 0
+        hci_commands.OWN_ADDR_TYPE_PUBLIC
+    else
+        hci_commands.OWN_ADDR_TYPE_RANDOM
+
+// The advertising data block of the legacy commands, 32 octets.
+fn adv_block(d: noble.AdData) -> [u8]
+    match hci_commands.build_le_adv_data_block(ad_bytes(d))
+        Some(block) => block
+        None => []
+
+// The legacy script: disable, the random address when the Host uses one, the parameters, the two data blocks, enable.
+fn legacy_cmd(h: Host, n: Int) -> ?Cmd
+    var i = n
+    if i == 0
+        return Some(cmd_of(hci_commands.opcode_le_set_advertising_enable(), hci_commands.build_le_set_advertising_enable(false), true))
+    i = i - 1
+    if h.api.own_kind == 1
+        if i == 0
+            return Some(cmd_of(hci_commands.opcode_le_set_random_address(), hci_commands.build_le_set_random_address(h.own_address), false))
+        i = i - 1
+    let p = h.api.adv_p
+    let kind = if p.connectable then hci_commands.ADV_TYPE_ADV_IND else if p.scannable or h.api.adv_rsp.len() > 0 then hci_commands.ADV_TYPE_ADV_SCAN_IND else hci_commands.ADV_TYPE_ADV_NONCONN_IND
+    if i == 0
+        return Some(cmd_of(hci_commands.opcode_le_set_advertising_parameters(), hci_init.build_le_set_advertising_parameters_for(units_of(p.interval_min_ms as Int), units_of(p.interval_max_ms as Int), kind, own_type(h)), false))
+    if i == 1
+        return Some(cmd_of(hci_commands.opcode_le_set_advertising_data(), adv_block(h.api.adv_data), false))
+    if i == 2
+        return Some(cmd_of(hci_commands.opcode_le_set_scan_response_data(), adv_block(h.api.adv_rsp), false))
+    if i == 3
+        return Some(cmd_of(hci_commands.opcode_le_set_advertising_enable(), hci_commands.build_le_set_advertising_enable(true), false))
+    None
+
+fn ext_enable(h: Host, on: Bool) -> Cmd
+    let duration = h.api.adv_p.duration_ms as Int / 10
+    cmd_of(hci_commands.opcode_le_set_extended_advertising_enable(), hci_commands.build_le_set_extended_advertising_enable(on, h.api.adv_set, if on then duration else 0, 0), not on)
+
+fn ext_params(h: Host, properties: Int, phy2: Int) -> Cmd
+    let p = h.api.adv_p
+    let own = if h.api.own_kind == 0 then hci_commands.OWN_ADDR_TYPE_PUBLIC else hci_commands.OWN_ADDR_TYPE_RANDOM
+    cmd_of(hci_commands.opcode_le_set_extended_advertising_parameters(),
+        hci_commands.build_le_set_extended_advertising_parameters(h.api.adv_set, properties, units_of(p.interval_min_ms as Int), units_of(p.interval_max_ms as Int),
+            hci_commands.ADV_CHANNEL_MAP_ALL, own, 0x00, [0, 0, 0, 0, 0, 0], hci_commands.ADV_FILTER_NONE, hci_commands.ADV_TX_POWER_NO_PREFERENCE,
+            hci_commands.LE_PHY_1M, 0x00, phy2, h.api.adv_set & 0x0F, 0x00), false)
+
+fn ext_data_cmd(opcode: Int, set: Int, d: noble.AdData) -> Cmd
+    match hci_commands.build_le_set_extended_data(set, hci_commands.EXT_ADV_DATA_COMPLETE, hci_commands.EXT_ADV_FRAGMENT_ANY, ad_bytes(d))
+        Some(params) => cmd_of(opcode, params, false)
+        None => cmd_of(opcode, [], false)
+
+// The extended script: disable the set when it runs, the set's random address when the Host uses one, the parameters, the data, the
+// scan response data when the set is scannable, enable.
+fn extended_cmd(h: Host, n: Int) -> ?Cmd
+    var i = n
+    if h.api.adv_on and h.api.adv_ext
+        if i == 0
+            return Some(ext_enable(h, false))
+        i = i - 1
+    if h.api.own_kind == 1
+        if i == 0
+            return Some(cmd_of(hci_commands.opcode_le_set_advertising_set_random_address(), hci_commands.build_le_set_advertising_set_random_address(h.api.adv_set, h.own_address), false))
+        i = i - 1
+    let p = h.api.adv_p
+    var properties = 0
+    if p.connectable
+        properties = hci_commands.ADV_EVENT_PROP_CONNECTABLE
+    else if p.scannable
+        properties = hci_commands.ADV_EVENT_PROP_SCANNABLE
+    if i == 0
+        return Some(ext_params(h, properties, hci_commands.LE_PHY_1M))
+    i = i - 1
+    if i == 0
+        return Some(ext_data_cmd(hci_commands.opcode_le_set_extended_advertising_data(), h.api.adv_set, h.api.adv_data))
+    i = i - 1
+    if p.scannable and h.api.adv_rsp.len() > 0
+        if i == 0
+            return Some(ext_data_cmd(hci_commands.opcode_le_set_extended_scan_response_data(), h.api.adv_set, h.api.adv_rsp))
+        i = i - 1
+    if i == 0
+        return Some(ext_enable(h, true))
+    None
+
+// The periodic script: the set's own address, the extended parameters of a set that neither connects nor scans, the periodic
+// parameters and data, then the set and the train enabled.
+fn periodic_cmd(h: Host, n: Int) -> ?Cmd
+    var i = n
+    if h.api.adv_on and h.api.adv_ext
+        if i == 0
+            return Some(ext_enable(h, false))
+        i = i - 1
+    if i == 0
+        return Some(ext_params(h, 0, hci_commands.LE_PHY_2M))
+    i = i - 1
+    if h.api.own_kind == 1
+        if i == 0
+            return Some(cmd_of(hci_commands.opcode_le_set_advertising_set_random_address(), hci_commands.build_le_set_advertising_set_random_address(h.api.adv_set, h.own_address), false))
+        i = i - 1
+    if i == 0
+        return Some(cmd_of(hci_commands.opcode_le_set_periodic_advertising_parameters(),
+            hci_commands.build_le_set_periodic_advertising_parameters(h.api.adv_set, h.api.adv_interval, h.api.adv_interval, 0), false))
+    i = i - 1
+    if h.api.adv_data.len() > 0
+        if i == 0
+            match hci_commands.build_le_set_periodic_advertising_data(h.api.adv_set, hci_commands.EXT_ADV_DATA_COMPLETE, ad_bytes(h.api.adv_data))
+                Some(params) => return Some(cmd_of(hci_commands.opcode_le_set_periodic_advertising_data(), params, false))
+                None => return Some(cmd_of(hci_commands.opcode_le_set_periodic_advertising_data(), [], false))
+        i = i - 1
+    if i == 0
+        return Some(ext_enable(h, true))
+    i = i - 1
+    if i == 0
+        return Some(cmd_of(hci_commands.opcode_le_set_periodic_advertising_enable(), hci_commands.build_le_set_periodic_advertising_enable(true, h.api.adv_set), false))
+    None
+
+fn stop_cmd(h: Host, n: Int) -> ?Cmd
+    if not h.api.adv_ext
+        if n == 0
+            return Some(cmd_of(hci_commands.opcode_le_set_advertising_enable(), hci_commands.build_le_set_advertising_enable(false), false))
+        return None
+    var i = n
+    if h.api.adv_periodic
+        if i == 0
+            return Some(cmd_of(hci_commands.opcode_le_set_periodic_advertising_enable(), hci_commands.build_le_set_periodic_advertising_enable(false, h.api.adv_set), false))
+        i = i - 1
+    if i == 0
+        return Some(ext_enable(h, false))
+    None
+
+fn scan_cmd(h: Host, n: Int) -> ?Cmd
+    var i = n
+    if h.api.scan_on
+        if i == 0
+            return Some(cmd_of(hci_commands.opcode_le_set_scan_enable(), hci_commands.build_le_set_scan_enable(false, false), true))
+        i = i - 1
+    let p = h.api.scan_p
+    if i == 0
+        let kind = if p.active then hci_commands.LE_SCAN_TYPE_ACTIVE else hci_commands.LE_SCAN_TYPE_PASSIVE
+        return Some(cmd_of(hci_commands.opcode_le_set_scan_parameters(), hci_commands.build_le_set_scan_parameters(kind, units_of(p.interval_ms as Int), units_of(p.window_ms as Int), own_type(h), hci_commands.SCAN_FILTER_BASIC_UNFILTERED), false))
+    i = i - 1
+    if i == 0
+        return Some(cmd_of(hci_commands.opcode_le_set_scan_enable(), hci_commands.build_le_set_scan_enable(true, not h.api.scan_f.duplicates), false))
+    None
+
+fn sync_cmd(h: Host, n: Int) -> ?Cmd
+    if n != 0
+        return None
+    match periodic_sync.make_periodic_sync(false, h.api.r_sid, h.api.r_peer.kind as Int, octets_of(h.api.r_peer), h.api.r_skip, h.api.r_timeout)
+        Ok(s) =>
+            match periodic_sync.create_sync_command(s)
+                Some(c) => Some(cmd_of(c.opcode, c.params, false))
+                None => None
+        Err(_) => None
+
+fn sync_stop_cmd(h: Host, n: Int) -> ?Cmd
+    if n != 0
+        return None
+    let c = periodic_sync.terminate_sync_command(h.api.sync_handle)
+    Some(cmd_of(c.opcode, c.params, false))
+
+// The `j`-th bond that has an identity resolving key, for the resolving list.
+fn nth_identity<B: BondStore[g]>(var b: B, j: Int) -> ?Bond [g]
+    var seen = 0
+    for i in 0..b.count()
+        match b.at(i)
+            Some(x) =>
+                if x.has_irk
+                    if seen == j
+                        return Some(x)
+                    seen = seen + 1
+            None => ()
+    None
+
+fn identity_count<B: BondStore[g]>(var b: B) -> Int [g]
+    var n = 0
+    for i in 0..b.count()
+        match b.at(i)
+            Some(x) =>
+                if x.has_irk
+                    n = n + 1
+            None => ()
+    n
+
+// The accept list script: clear the list, add each bond; and when a bond has an identity key, clear the resolving list and add each
+// of those.  The resolving list commands are passed over when the Controller refuses them (it has no privacy).
+fn accept_cmd<B: BondStore[g]>(var b: B, n: Int) -> ?Cmd [g]
+    let bonds = b.count()
+    if n == 0
+        return Some(cmd_of(hci_commands.opcode_le_clear_filter_accept_list(), [], false))
+    if n <= bonds
+        match b.at(n - 1)
+            Some(x) => return Some(cmd_of(hci_commands.opcode_le_add_device_to_filter_accept_list(), hci_commands.build_le_add_device_to_filter_accept_list((x.peer.kind & 1) as Int, octets_of(x.peer)), false))
+            None => return None
+    let m = identity_count(var b)
+    if m == 0
+        return None
+    if n == bonds + 1
+        return Some(cmd_of(hci_commands.opcode_le_clear_resolving_list(), [], true))
+    if n <= bonds + 1 + m
+        match nth_identity(var b, n - bonds - 2)
+            Some(x) => return Some(cmd_of(hci_commands.opcode_le_add_device_to_resolving_list(), hci_commands.build_le_add_device_to_resolving_list((x.peer.kind & 1) as Int, octets_of(x.peer), irk_list(x), [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), true))
+            None => return None
+    None
+
+// The command number `n` of the script of the request `kind`, None after the last.
+fn script_cmd<B: BondStore[g]>(h: Host, kind: Int, n: Int, var b: B) -> ?Cmd [g]
+    if kind == noble.R_ADV_START
+        if h.api.adv_ext
+            extended_cmd(h, n)
+        else
+            legacy_cmd(h, n)
+    else if kind == noble.R_PERIODIC_START
+        periodic_cmd(h, n)
+    else if kind == noble.R_ADV_STOP
+        stop_cmd(h, n)
+    else if kind == noble.R_SCAN_START
+        scan_cmd(h, n)
+    else if kind == noble.R_SCAN_STOP
+        if n == 0
+            Some(cmd_of(hci_commands.opcode_le_set_scan_enable(), hci_commands.build_le_set_scan_enable(false, false), false))
+        else
+            None
+    else if kind == noble.R_SYNC_CREATE
+        sync_cmd(h, n)
+    else if kind == noble.R_SYNC_STOP
+        sync_stop_cmd(h, n)
+    else if kind == noble.R_ACCEPT_LIST
+        accept_cmd(var b, n)
+    else
+        None
+
+// Send the command `c` as number `n` of the script in flight.
+fn send_script(var h: Host, c: Cmd, n: Int)
+    h.api.r_cursor = n
+    h.api.r_phase = c.opcode
+    h.api.r_response = c.lenient
+    send_cmd(var h, c.opcode, c.params)
+
+// Start the script of the request in flight.  A request with nothing to do ends at once.
+fn start_script<B: BondStore[g]>(var h: Host, var b: B) [g, mutate]
+    let kind = h.api.kind
+    if kind == noble.R_ADV_STOP and not h.api.adv_on
+        finish(var h, noble.ok())
+        return
+    if kind == noble.R_SCAN_STOP and not h.api.scan_on
+        finish(var h, noble.ok())
+        return
+    if kind == noble.R_SYNC_STOP and h.api.sync_handle < 0
+        finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_NOT_FOUND))
+        return
+    match script_cmd(h, kind, 0, var b)
+        Some(c) => send_script(var h, c, 0)
+        None => finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
+
+// What a script that ran to the end leaves in the Host.
+fn script_done(var h: Host)
+    let kind = h.api.kind
+    if kind == noble.R_ADV_START
+        h.api.adv_on = true
+    else if kind == noble.R_PERIODIC_START
+        h.api.adv_on = true
+    else if kind == noble.R_ADV_STOP
+        h.api.adv_on = false
+    else if kind == noble.R_SCAN_START
+        h.api.scan_on = true
+    else if kind == noble.R_SCAN_STOP
+        h.api.scan_on = false
+    else if kind == noble.R_SYNC_STOP
+        h.api.sync_handle = -1
+    else if kind == noble.R_SYNC_CREATE
+        // The Controller has the command; the train is found when it reports LE Periodic Advertising Sync Established.
+        h.api.r_cursor = -1
+        return
+    finish(var h, noble.ok())
+
+// The answer to the command in flight of a script.
+fn script_answered<B: BondStore[g]>(var h: Host, opcode: Int, status: Int, var b: B) [g, mutate]
+    if opcode != h.api.r_phase or h.api.r_cursor < 0
+        return
+    if status != 0 and not h.api.r_response
+        finish(var h, noble.failed(noble.LAYER_HCI, status))
+        return
+    let n = h.api.r_cursor + 1
+    match script_cmd(h, h.api.kind, n, var b)
+        Some(c) => send_script(var h, c, n)
+        None => script_done(var h)
+
+// LE Periodic Advertising Sync Established ends a SyncCreate; Sync Lost forgets the train.
+fn on_sync_established(var h: Host, e: hci_codec.PeriodicSyncEstablished)
+    if h.api.kind == noble.R_SYNC_CREATE and h.api.r_cursor < 0
+        if e.status == 0
+            h.api.sync_handle = e.sync_handle
+            finish(var h, noble.ok())
+        else
+            finish(var h, noble.failed(noble.LAYER_HCI, e.status))
+
+// The Host starts advertising again by itself when the policy asked for it (`Action.Readvertise`) and no call is in flight.
+fn restart_advertising(var h: Host)
+    let how = h.api.advertise
+    h.api.advertise = 0
+    if h.api.adv_periodic
+        return
+    let p = h.api.adv_p
+    if how == noble.ADVERTISE_NON_CONNECTABLE or link_count(h) >= h.api.max_links
+        h.api.adv_p = noble.AdvParams { extended: p.extended, connectable: false, scannable: p.scannable, interval_min_ms: p.interval_min_ms, interval_max_ms: p.interval_max_ms, duration_ms: p.duration_ms }
+    h.api.op.busy = true
+    h.api.op.done = false
+    h.api.op.status = noble.ok()
+    h.api.kind = noble.R_ADV_START
+    h.api.step = 0
+    h.api.internal = true
+
+// ── Scan filter ─────────────────────────────────────────────────────
+
+// Whether the advertising data lists the 16-bit service `uuid`: a list of 16-bit UUIDs (AD types 0x02 and 0x03) or service data
+// (0x16).
+fn ad_has_service(d: noble.AdData, uuid: Int) -> Bool
+    var at = 0
+    while at + 1 < d.len()
+        let n = d[at] as Int
+        if n == 0 or at + 1 + n > d.len()
+            return false
+        let t = d[at + 1] as Int
+        if t == 0x02 or t == 0x03
+            var k = at + 2
+            while k + 1 <= at + n
+                if ((d[k] as Int) | ((d[k + 1] as Int) << 8)) == uuid
+                    return true
+                k = k + 2
+        else if t == 0x16 and n >= 3
+            if ((d[at + 2] as Int) | ((d[at + 3] as Int) << 8)) == uuid
+                return true
+        at = at + 1 + n
+    false
+
+// Whether the advertising data carries a name (AD types 0x08 and 0x09) that starts with `prefix`.
+fn ad_name_starts(d: noble.AdData, prefix: String[16]) -> Bool
+    var at = 0
+    while at + 1 < d.len()
+        let n = d[at] as Int
+        if n == 0 or at + 1 + n > d.len()
+            return false
+        let t = d[at + 1] as Int
+        if t == 0x08 or t == 0x09
+            if n - 1 < prefix.len()
+                return false
+            var same = true
+            var j = 0
+            for c in prefix
+                if d[at + 2 + j] != c
+                    same = false
+                j = j + 1
+            return same
+        at = at + 1 + n
+    false
+
+fn passes_filter(f: noble.ScanFilter, r: noble.AdvReport) -> Bool
+    if (r.rssi as Int) < (f.rssi_min as Int)
+        return false
+    if (f.uuid16 as Int) != 0 and not ad_has_service(r.data, f.uuid16 as Int)
+        return false
+    if f.name_prefix.len() > 0 and not ad_name_starts(r.data, f.name_prefix)
+        return false
+    true
+
+// ── The GATT client ─────────────────────────────────────────────────
+
+// The Rx MTU of the link as the client engine shapes its requests after it.
+fn sync_client_mtu(var h: Host, slot: Int)
+    host_activate(var h, slot)
+    let _ = gatt_client.set_mtu(var h.client, link_id(h, slot), 0, le_link.client_mtu(h.link))
+
+// Hand the PDUs the client engine has ready for `slot` to the link.
+fn client_pump(var h: Host, slot: Int)
+    host_activate(var h, slot)
+    let id = link_id(h, slot)
+    for _ in 0..8
+        var buf: gatt_client.ClientPdu = Vec.new()
+        let kind = gatt_client.take_tx(var h.client, id, 0, h.clock_ms, var buf)
+        if kind == gatt_client.TX_NONE
+            break
+        var pdu: [u8] = []
+        for i in 0..buf.len()
+            list.push(pdu, buf[i])
+        send_acl(var h, le_link.send_client_att(var h.link, [pdu]))
+        // A command has no answer: the engine ended its request when it handed the PDU out.
+        if kind == gatt_client.TX_COMMAND
+            client_done(var h, slot)
+
+fn client_pdu_of(data: [u8]) -> gatt_client.ClientPdu
+    var p: gatt_client.ClientPdu = Vec.new()
+    for x in data
+        let _ = p.push(x)
+    p
+
+fn client_error(h: Host, code: Int) -> Status
+    if code == gatt_client.ERR_NO_LINK
+        noble.failed(noble.LAYER_LOCAL, noble.E_NO_ROOM)
+    else
+        noble.from_client_error(code)
+
+// Queue the GATT client request in flight on the engine.
+fn start_client(var h: Host, kind: Int)
+    let slot = slot_of(h, h.api.r_conn)
+    if slot < 0
+        finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_STALE))
+        return
+    if kind != noble.R_MTU and kind != noble.R_DISCOVER and level_int(h.api.conns[slot].info.level) < level_int(h.api.r_need)
+        finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_SECURITY_LOW))
+        return
+    host_activate(var h, slot)
+    let id = link_id(h, slot)
+    sync_client_mtu(var h, slot)
+    let mtu = le_link.client_mtu(h.link)
+    let handle = h.api.r_attr.handle as Int
+    var ticket = -1
+    if kind == noble.R_MTU
+        ticket = gatt_client.begin_exchange_mtu(var h.client, id, 0)
+    else if kind == noble.R_DISCOVER
+        gatt_client.cache_clear(var h.client, id)
+        h.api.r_phase = 1
+        ticket = gatt_client.begin_discover_services_by_uuid(var h.client, id, 0, 1, 0xFFFF, noble.to_client_uuid(h.api.r_svc))
+    else if kind == noble.R_READ
+        ticket = gatt_client.begin_read_long(var h.client, id, 0, handle)
+    else if kind == noble.R_SUBSCRIBE
+        if h.api.r_attr.cccd == 0
+            finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
+            return
+        ticket = gatt_client.begin_subscribe(var h.client, id, 0, h.api.r_attr.cccd as Int, h.api.r_mode)
+    else
+        var data: gatt_client.ClientPayload = Vec.new()
+        let n = h.api.r_data.len()
+        for i in 0..n
+            match data.push(h.api.r_data[i])
+                Ok(_) => ()
+                Err(_) =>
+                    finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_NO_ROOM))
+                    return
+        if not h.api.r_response
+            ticket = gatt_client.begin_write_command(var h.client, id, 0, handle, data, n)
+        else if n > mtu - 3
+            ticket = gatt_client.begin_write_long(var h.client, id, 0, handle, data, n)
+        else
+            ticket = gatt_client.begin_write(var h.client, id, 0, handle, data, n)
+    if ticket < 0
+        finish(var h, client_error(h, ticket))
+        return
+    client_pump(var h, slot)
+
+// The value the engine's last read left, as a `Value`; `E_NO_ROOM` when it did not fit.
+fn take_read_value(var h: Host, id: links.LinkId) -> Status
+    let n = gatt_client.value_len(var h.client, id, 0)
+    var v: Value = Vec.new()
+    var fits = true
+    for i in 0..n
+        match v.push(gatt_client.value_at(var h.client, id, 0, i) as u8)
+            Ok(_) => ()
+            Err(_) => fits = false
+    h.api.op.value = v
+    if fits
+        noble.ok()
+    else
+        noble.failed(noble.LAYER_LOCAL, noble.E_NO_ROOM)
+
+// The first handle at or after which the descriptors of the characteristic record `index` end, within the service's last handle.
+fn descriptors_end(var h: Host, id: links.LinkId, value_handle: Int, last: Int) -> Int
+    let bound = gatt_client.boundary_after(var h.client, id.slot, value_handle) - 1
+    if bound < last
+        bound
+    else
+        last
+
+// Queue the descriptor discovery of the next characteristic, from record `r_cursor`, that notifies or indicates.  False when there
+// is none.
+fn next_descriptors(var h: Host, slot: Int) -> Bool
+    let id = link_id(h, slot)
+    let count = gatt_client.cache_count(var h.client, id)
+    for j in h.api.r_cursor..count
+        if gatt_client.cache_kind_at(var h.client, id, j) == gatt_client.KIND_CHAR and (gatt_client.cache_b_at(var h.client, id, j) & (noble.PROP_NOTIFY | noble.PROP_INDICATE)) != 0
+            let value = gatt_client.cache_a_at(var h.client, id, j)
+            let stop = descriptors_end(var h, id, value, h.api.r_mode)
+            if value + 1 <= stop
+                h.api.r_cursor = j + 1
+                if gatt_client.begin_discover_descriptors(var h.client, id, 0, value + 1, stop) >= 0
+                    return true
+    false
+
+// A discovery step ended: the service, then its characteristics, then the descriptors of those that notify or indicate.
+fn discover_step(var h: Host, slot: Int, raw: Int)
+    let id = link_id(h, slot)
+    if h.api.r_phase == 1
+        if raw == noble.ATT_ATTRIBUTE_NOT_FOUND
+            finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_NOT_FOUND))
+            return
+        if raw != gatt_client.STATUS_OK
+            finish(var h, noble.from_client_status(raw))
+            return
+        let at = gatt_client.cache_find(var h.client, id, gatt_client.KIND_SERVICE, noble.to_client_uuid(h.api.r_svc), 0)
+        if at < 0
+            finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_NOT_FOUND))
+            return
+        let first = gatt_client.cache_handle_at(var h.client, id, at)
+        h.api.r_mode = gatt_client.cache_a_at(var h.client, id, at)
+        h.api.r_cursor = 0
+        h.api.r_phase = 2
+        let t = gatt_client.begin_discover_characteristics(var h.client, id, 0, first, h.api.r_mode)
+        if t < 0
+            finish(var h, client_error(h, t))
+        return
+    if raw != gatt_client.STATUS_OK and raw != noble.ATT_ATTRIBUTE_NOT_FOUND
+        finish(var h, noble.from_client_status(raw))
+        return
+    h.api.r_phase = 3
+    if not next_descriptors(var h, slot)
+        finish(var h, noble.ok())
+
+// The request in flight on the client engine ended for `slot`.
+fn client_done(var h: Host, slot: Int)
+    host_activate(var h, slot)
+    let kind = h.api.kind
+    if not is_client(kind) or slot_of_name(h, h.api.r_conn) != slot
+        return
+    let id = link_id(h, slot)
+    let raw = gatt_client.result_status(var h.client, id, 0)
+    if kind == noble.R_DISCOVER
+        discover_step(var h, slot, raw)
+    else if kind == noble.R_MTU
+        if raw == gatt_client.STATUS_OK
+            let mtu = gatt_client.mtu(var h.client, id, 0)
+            if mtu > gatt_server.mtu_of(h.link.att, 0)
+                gatt_server.set_mtu(var h.link.att, 0, mtu)
+        finish(var h, noble.from_client_status(raw))
+    else if kind == noble.R_READ
+        if raw == gatt_client.STATUS_OK or raw == gatt_client.STATUS_TRUNCATED
+            finish(var h, take_read_value(var h, id))
+        else
+            finish(var h, noble.from_client_status(raw))
+    else
+        finish(var h, noble.from_client_status(raw))
+
+// A PDU for the client role arrived on `slot`: an answer, a notification or an indication.
+fn client_pdu(var h: Host, slot: Int, pdu: [u8])
+    host_activate(var h, slot)
+    let id = link_id(h, slot)
+    sync_client_mtu(var h, slot)
+    var buf = client_pdu_of(pdu)
+    let ev = gatt_client.on_pdu(var h.client, id, 0, var buf, list.len(pdu))
+    let conn = h.api.conns[slot].id
+    if (ev == gatt_client.EV_NOTIFICATION or ev == gatt_client.EV_INDICATION) and list.len(pdu) >= 3
+        emit(var h, Event.Notification(conn, le16_of(pdu, 1) as u16, ev == gatt_client.EV_INDICATION, value_of(pdu[3:])))
+    else if ev == gatt_client.EV_SERVICE_CHANGED
+        emit(var h, Event.DatabaseChanged(conn))
+    else if ev == gatt_client.EV_DONE
+        client_done(var h, slot)
+    client_pump(var h, slot)
+
+// Look a characteristic up in the cache of `conn`.
+pub fn find_char(h: Host, conn: ConnId, svc: noble.Uuid, chr: noble.Uuid) -> ?noble.Attr
+    let slot = slot_of(h, conn)
+    if slot < 0
+        return None
+    var t = h.client
+    let id = link_id(h, slot)
+    let s = gatt_client.cache_find(var t, id, gatt_client.KIND_SERVICE, noble.to_client_uuid(svc), 0)
+    if s < 0
+        return None
+    let first = gatt_client.cache_handle_at(var t, id, s)
+    let last = gatt_client.cache_a_at(var t, id, s)
+    let want = noble.to_client_uuid(chr)
+    var at = gatt_client.cache_find(var t, id, gatt_client.KIND_CHAR, want, s)
+    while at >= 0
+        let declaration = gatt_client.cache_handle_at(var t, id, at)
+        if declaration >= first and declaration <= last
+            return Some(noble.Attr { handle: gatt_client.cache_a_at(var t, id, at) as u16, props: gatt_client.cache_b_at(var t, id, at) as u8, cccd: gatt_client.cccd_of(var t, id, at) as u16 })
+        at = gatt_client.cache_find(var t, id, gatt_client.KIND_CHAR, want, at + 1)
+    None
+
+// ── The GATT server ─────────────────────────────────────────────────
+
+// The Error Code a policy or an application answer stands for: 0 for success, the code itself when it is one, and for NOT_HANDLED
+// the code of an access the attribute does not grant.
+fn att_code_of(code: Int, write: Bool) -> Int
+    if code == 0
+        0
+    else if code == noble.NOT_HANDLED
+        if write then noble.ATT_WRITE_NOT_PERMITTED else noble.ATT_READ_NOT_PERMITTED
+    else if code < 0 or code > 255
+        noble.ATT_UNLIKELY_ERROR
+    else
+        code
+
+// The ATT PDU that answers a request for a bound attribute: the Error Response for `code` not 0, else the value (`op` 0x0A or
+// 0x0C) or the Write Response.
+fn held_answer(h: Host, slot: Int, op: Int, handle: Int, offset: Int, code: Int, value: Value) -> [[u8]]
+    if code != 0
+        return gatt_server.error(op, handle, code)
+    if op == 0x12
+        return [att.build_write_rsp()]
+    let v = bytes_of(value)
+    let cap = gatt_server.mtu_of(h.link.att, 0) - 1
+    if offset > list.len(v)
+        return gatt_server.error(op, handle, noble.ATT_INVALID_OFFSET)
+    var stop = list.len(v)
+    if stop - offset > cap
+        stop = offset + cap
+    if op == 0x0C
+        [att.build_read_blob_rsp(v[offset:stop])]
+    else
+        [att.build_read_rsp(v[offset:stop])]
+
+fn set_pend(var h: Host, slot: Int, kind: Int, handle: Int, offset: Int)
+    var p = h.api.pend
+    p[slot] = kind
+    h.api.pend = p
+    var a = h.api.pend_attr
+    a[slot] = handle
+    h.api.pend_attr = a
+    var o = h.api.pend_off
+    o[slot] = offset
+    h.api.pend_off = o
+    var m = h.api.pend_ms
+    m[slot] = h.clock_ms
+    h.api.pend_ms = m
+
+// The requests for bound attributes that the server held for the application: those bound to a function are answered with the
+// policy's answer at once, those bound to an event are queued and wait for `respond`.
+fn serve_held<P: HostPolicy[f]>(var h: Host, slot: Int, var p: P) [f, mutate]
+    host_activate(var h, slot)
+    let conn = h.api.conns[slot].id
+    for pdu in gatt_server.take_held(var h.link.att)
+        let op = pdu[0] as Int
+        let handle = le16_of(pdu, 1)
+        let mode = gatt_server.bound_mode(h.link.db, handle)
+        let svc = gatt_server.bound_service(h.link.db, handle)
+        let write = op == 0x12 or op == att.ATT_OP_WRITE_CMD
+        let offset = if op == 0x0C then le16_of(pdu, 3) else 0
+        if mode == gatt_server.BOUND_FUNCTION
+            var v: Value = Vec.new()
+            var code = 0
+            if write
+                if list.len(pdu) - 3 > noble_config.ATT_VALUE_BYTES
+                    code = noble.ATT_INVALID_ATTRIBUTE_VALUE_LENGTH
+                else
+                    v = value_of(pdu[3:])
+                    code = att_code_of(p.on_write(conn, handle as u16, svc, var v), true)
+            else
+                code = att_code_of(p.on_read(conn, handle as u16, svc, var v), false)
+            if op != att.ATT_OP_WRITE_CMD
+                send_acl(var h, le_link.send_att(var h.link, held_answer(h, slot, op, handle, offset, code, v)))
+        else if h.api.pend[slot] != 0 and op != att.ATT_OP_WRITE_CMD
+            // The client has one request outstanding: a second is its error.
+            send_acl(var h, le_link.send_att(var h.link, gatt_server.error(op, handle, noble.ATT_UNLIKELY_ERROR)))
+        else
+            var queued = false
+            if write
+                if list.len(pdu) - 3 <= noble_config.ATT_VALUE_BYTES
+                    queued = noble.queue_event(var h.api, Event.AttrWrite(conn, handle as u16, svc, value_of(pdu[3:])))
+            else
+                queued = noble.queue_event(var h.api, Event.AttrRead(conn, handle as u16, svc))
+            if queued
+                if op != att.ATT_OP_WRITE_CMD
+                    set_pend(var h, slot, if op == 0x12 then 2 else if op == 0x0C then 4 else 1, handle, offset)
+            else if op != att.ATT_OP_WRITE_CMD
+                send_acl(var h, le_link.send_att(var h.link, gatt_server.error(op, handle, noble.ATT_INSUFFICIENT_RESOURCES)))
+
+// Answer the request that `Event.AttrRead` or `Event.AttrWrite` reported: `code` 0 with `v` as the value of a read, or the ATT
+// error code.  E_BUSY when no request is pending on `conn` for `attr`.
+pub fn respond(var h: Host, conn: ConnId, attr_handle: u16, code: Int, v: Value) -> Status
+    let slot = slot_of(h, conn)
+    if slot < 0
+        return noble.failed(noble.LAYER_LOCAL, noble.E_STALE)
+    let attr = attr_handle as Int
+    if h.api.pend[slot] == 0 or h.api.pend_attr[slot] != attr
+        return noble.failed(noble.LAYER_LOCAL, noble.E_BUSY)
+    host_activate(var h, slot)
+    let kind = h.api.pend[slot]
+    let offset = h.api.pend_off[slot]
+    set_pend(var h, slot, 0, 0, 0)
+    let op = if kind == 2 then 0x12 else if kind == 4 then 0x0C else 0x0A
+    send_acl(var h, le_link.send_att(var h.link, held_answer(h, slot, op, attr, offset, att_code_of(code, kind == 2), v)))
+    noble.ok()
+
+// Send `v` as a notification to the client on `conn`.
+pub fn notify(var h: Host, conn: ConnId, a: noble.Attr, need: Security, v: Value) -> Status
+    let slot = slot_of(h, conn)
+    if slot < 0
+        return noble.failed(noble.LAYER_LOCAL, noble.E_STALE)
+    if level_int(h.api.conns[slot].info.level) < level_int(need)
+        return noble.failed(noble.LAYER_LOCAL, noble.E_SECURITY_LOW)
+    host_activate(var h, slot)
+    if a.cccd == 0 or (gatt_server.configuration(h.link.att, a.cccd as Int) & gatt_server.CCC_NOTIFICATION) == 0
+        return noble.failed(noble.LAYER_LOCAL, noble.E_NOT_SUBSCRIBED)
+    if not gatt_server.set_value(var h.link.db, a.handle as Int, bytes_of(v))
+        return noble.failed(noble.LAYER_LOCAL, noble.E_NOT_FOUND)
+    let pdus = gatt_server.send_value(var h.link.db, var h.link.att, a.handle as Int, h.clock_ms)
+    send_acl(var h, le_link.send_att(var h.link, pdus))
+    noble.ok()
+
+// Send the value as an indication; the call ends with the client's confirmation.
+fn start_indicate(var h: Host)
+    let slot = slot_of(h, h.api.r_conn)
+    let a = h.api.r_attr
+    if slot < 0
+        finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_STALE))
+        return
+    host_activate(var h, slot)
+    if a.cccd == 0 or (gatt_server.configuration(h.link.att, a.cccd as Int) & gatt_server.CCC_INDICATION) == 0
+        finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_NOT_SUBSCRIBED))
+        return
+    if not gatt_server.set_value(var h.link.db, a.handle as Int, bytes_of(h.api.r_data))
+        finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_NOT_FOUND))
+        return
+    let pdus = gatt_server.send_value(var h.link.db, var h.link.att, a.handle as Int, h.clock_ms)
+    send_acl(var h, le_link.send_att(var h.link, pdus))
+    if not gatt_server.indication_pending(h.link.att, a.handle as Int)
+        finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_SECURITY_LOW))
+
+// The Client Characteristic Configuration values that changed in `before` against the link now: one `Subscribed` for each.
+fn subscription_events(var h: Host, slot: Int, before: [Int])
+    let after = h.link.att.cccd
+    let conn = h.api.conns[slot].id
+    for k in 0..list.len(after) / 2
+        let handle = after[2 * k]
+        let now = after[2 * k + 1]
+        var was = 0
+        for j in 0..list.len(before) / 2
+            if before[2 * j] == handle
+                was = before[2 * j + 1]
+        if now != was
+            emit(var h, Event.Subscribed(conn, gatt_server.value_of_configuration(h.link.db, handle) as u16, (now & 3) as u8))
+    for j in 0..list.len(before) / 2
+        var still = false
+        for k in 0..list.len(after) / 2
+            if after[2 * k] == before[2 * j]
+                still = true
+        if not still and before[2 * j + 1] != 0
+            emit(var h, Event.Subscribed(conn, gatt_server.value_of_configuration(h.link.db, before[2 * j]) as u16, 0))
+
+// ── Timers of Layer B ───────────────────────────────────────────────
+
+// The ATT transaction timeout of a request held for the application, in milliseconds.
+const HELD_TIMEOUT_MS = 30000
+
+fn layer_b_timers<P: HostPolicy[f], B: BondStore[g]>(var h: Host, var p: P, var b: B) [f, g, mutate]
+    for slot in 0..le_link.le_links_slots(h.le)
+        if h.api.conns[slot].live
+            host_activate(var h, slot)
+            let id = link_id(h, slot)
+            if gatt_client.tick(var h.client, id, 0, h.clock_ms) == gatt_client.EV_DONE
+                client_done(var h, slot)
+            client_pump(var h, slot)
+            if h.api.pend[slot] != 0 and h.clock_ms - h.api.pend_ms[slot] >= HELD_TIMEOUT_MS
+                set_pend(var h, slot, 0, 0, 0)
+            if h.api.kind == noble.R_INDICATE and slot_of_name(h, h.api.r_conn) == slot
+                if h.link.att.bearers[0].timed_out
+                    finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_TIMEOUT))
+                else if not gatt_server.indication_pending(h.link.att, h.api.r_attr.handle as Int)
+                    finish(var h, noble.ok())
+    if h.api.advertise != 0 and h.api.adv_valid and not h.api.op.busy and h.api.ready
+        restart_advertising(var h)

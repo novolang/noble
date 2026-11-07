@@ -382,7 +382,11 @@ struct SavedConfiguration
 // `restrict_first_octet`; `value_rules` the format rules of
 // `require_value_format`.  The database is stored once however many
 // connections the Host holds: every `AttLink` is paired with it by the
-// caller of each handler.
+// caller of each handler.  `bound` lists, three entries each, the attributes
+// the Host API binds to the application (`bind`): the handle, the mode
+// (`BOUND_FUNCTION` or `BOUND_EVENT`) and the index of the service that owns
+// the handle.  A read or write request for one is not answered here: after the
+// security and format checks it is held in `AttLink.held` for the caller.
 pub struct GattDb
     var attributes: [GattAttribute]
     rx_mtu: Int
@@ -393,6 +397,7 @@ pub struct GattDb
     var value_rules: [ValueRule]
     var guards: [WriteGuard]
     var long_reads: [Int]
+    var bound: [Int]
 
 // The value of a per-connection attribute (`make_per_link`) for the client
 // of one connection.
@@ -459,6 +464,9 @@ pub struct AttLink
     // The Read Long rule (`add_read_long_rule`): for each guarded attribute the
     // handle and a stamp of the value this client read last at offset 0.
     var read_stamps: [Int]
+    // The read and write requests for bound attributes (`GattDb.bound`) that passed the checks and wait for the caller
+    // (`take_held`), in the order they arrived.
+    var held: [[u8]]
 
 // A database and the state of one connection to it: what a program with a
 // single client holds, and what the tests of one connection build.  A
@@ -483,7 +491,7 @@ pub fn no_security() -> LinkSecurity
 pub fn new_db(records: [u8], rx_mtu: Int) -> GattDb
     var db = GattDb {
         attributes: from_records(records), rx_mtu: rx_mtu, saved: [], generation: 0,
-        indication_rules: [], octet_rules: [], value_rules: [], guards: [], long_reads: [] }
+        indication_rules: [], octet_rules: [], value_rules: [], guards: [], long_reads: [], bound: [] }
     refresh_hash(var db)
     db
 
@@ -495,7 +503,7 @@ pub fn new_att_link(db: GattDb) -> AttLink
         bearers: [], cccd: [], prepare_queue: [], security: no_security(), changed: [], client_rx: [],
         link_values: [], csf: 0, peer_csrk: [], sign_counter: -1, client_csrk: [], client_sign_counter: -1,
         prepare_generation: -1, aware_generation: 0, seen_generation: 0, change_unaware: false,
-        hash_read: false, robust_error_sent: false, identity: 0, read_stamps: [] }
+        hash_read: false, robust_error_sent: false, identity: 0, read_stamps: [], held: [] }
     reset_bearer(db, var link)
     link
 
@@ -1634,6 +1642,8 @@ fn receive_on(var db: GattDb, var link: AttLink, index: Int, pdu: [u8], now_ms: 
         return []
     if admitted != 0
         return error(op, refused_handle(pdu), admitted)
+    if index == 0 and is_bound_request(db, pdu)
+        return hold(db, var link, pdu)
     if op == att.ATT_OP_WRITE_CMD
         let _ = write(var db, var link, pdu, false)
         return []
@@ -2205,6 +2215,100 @@ pub fn take_changed(var link: AttLink) -> [Int]
     let out = link.changed[:]
     link.changed = []
     out
+
+// ── Attributes bound to the application ────────────────────────────
+
+// How a bound attribute is answered: `BOUND_FUNCTION` asks the application inside the Host's turn and `BOUND_EVENT` queues
+// an event and waits for the application's answer.
+pub const BOUND_FUNCTION = 1
+pub const BOUND_EVENT = 2
+
+// Bind the attribute `handle` to the application in `mode`, as the service with index `svc` owns it.  False when there is no
+// such attribute, or it is a declaration.  A second call replaces the first.
+pub fn bind(var db: GattDb, handle: Int, mode: Int, svc: Int) -> Bool
+    let i = index_of(db, handle)
+    if i < 0 or mode < BOUND_FUNCTION or mode > BOUND_EVENT
+        return false
+    let a = db.attributes[i]
+    if is_service(a) or is_type(a, UUID_CHARACTERISTIC) or is_type(a, UUID_INCLUDE)
+        return false
+    var out: [Int] = []
+    for k in 0..list.len(db.bound) / 3
+        if db.bound[3 * k] != handle
+            list.push(out, db.bound[3 * k])
+            list.push(out, db.bound[3 * k + 1])
+            list.push(out, db.bound[3 * k + 2])
+    list.push(out, handle)
+    list.push(out, mode)
+    list.push(out, svc)
+    db.bound = out
+    true
+
+// The mode `handle` is bound in, 0 when it is not bound.
+pub fn bound_mode(db: GattDb, handle: Int) -> Int
+    for k in 0..list.len(db.bound) / 3
+        if db.bound[3 * k] == handle
+            return db.bound[3 * k + 1]
+    0
+
+// The index of the service that owns the bound attribute `handle`, -1 when it is not bound.
+pub fn bound_service(db: GattDb, handle: Int) -> Int
+    for k in 0..list.len(db.bound) / 3
+        if db.bound[3 * k] == handle
+            return db.bound[3 * k + 2]
+    -1
+
+// Whether `pdu` is a request the application answers: a Read Request, Read Blob Request, Write Request or Write Command for a
+// bound attribute.
+fn is_bound_request(db: GattDb, pdu: [u8]) -> Bool
+    if list.len(db.bound) == 0 or list.len(pdu) < 3
+        return false
+    let op = pdu[0] as Int
+    if op != 0x0A and op != 0x0C and op != 0x12 and op != att.ATT_OP_WRITE_CMD
+        return false
+    bound_mode(db, read_le16(pdu, 1)) != 0
+
+// Check a request for a bound attribute as the server checks one for any other (the handle, the access the attribute grants the
+// link, the format rules of a write) and, when it passes, keep it in `AttLink.held` for the caller.  The answer is the Error
+// Response of a request that failed, and nothing for a command or a request that is held.
+fn hold(db: GattDb, var link: AttLink, pdu: [u8]) -> [[u8]]
+    let op = pdu[0] as Int
+    let handle = read_le16(pdu, 1)
+    let write = op == 0x12 or op == att.ATT_OP_WRITE_CMD
+    let i = index_of(db, handle)
+    var code = if i < 0
+        att.ATT_ERR_INVALID_HANDLE
+    else
+        access_error(db, link, i, write)
+    if code == 0 and write
+        code = value_error(db, link, i, value_at(db, link, i), 0, pdu[3:], true)
+    if code == 0 and op == 0x0C and list.len(pdu) != 5
+        code = att.ATT_ERR_INVALID_PDU
+    if code != 0
+        return if op == att.ATT_OP_WRITE_CMD then [] else error(op, handle, code)
+    list.push(link.held, pdu[:])
+    []
+
+// The requests held for the caller since the last call.
+pub fn take_held(var link: AttLink) -> [[u8]]
+    let out = link.held[:]
+    link.held = []
+    out
+
+// The handle of the characteristic value whose Client Characteristic Configuration descriptor is `cccd`: the handle after the
+// nearest characteristic declaration before it, 0 when there is none.
+pub fn value_of_configuration(db: GattDb, cccd: Int) -> Int
+    let i = index_of(db, cccd)
+    if i < 0
+        return 0
+    for k in 0..i
+        let j = i - 1 - k
+        let a = db.attributes[j]
+        if is_service(a)
+            return 0
+        if is_type(a, UUID_CHARACTERISTIC)
+            return a.handle + 1
+    0
 
 // The PDUs for the client role received since the last call.
 pub fn take_client_pdus(var link: AttLink) -> [[u8]]

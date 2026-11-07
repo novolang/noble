@@ -20,7 +20,7 @@ they import its modules by name.
 | Module | Holds |
 |---|---|
 | `host` | the Host as one value (`Host`, made by `host_blank` from a `HostConfig`): the links of both roles, the GATT database and client table, both Security Manager halves, the bonds, the pairing settings and the queue of HCI commands owed to the Controller; two Hosts in one program share no table.  The BTP session of `orbit/ble` holds a `Host` beside the states of its test services |
-| `noble`, `host_api` | the Host API, Layer A: the values an application holds (`Status`, `ConnId`, `Event`, `Request`, `ConnInfo`), the policy trait `HostPolicy` and the bond store `BondStore` with `RamBonds`, and the calls that drive a `Host` without waiting (`begin`, `poll`, `result`, `next_event`) |
+| `noble`, `host_api` | the Host API: the values an application holds (`Status`, `ConnId`, `Event`, `Request`, `ConnInfo`), the policy trait `HostPolicy` and the bond store `BondStore` with `RamBonds`, the calls that drive a `Host` without waiting (Layer A: `begin`, `poll`, `result`, `next_event`), and over them the `Adapter` that waits, the GAP and GATT calls, the trait `Service`, `plug` and `pump` (Layer B) |
 | `links`, `le_link` | the registry of connection slots, the credit pool of the Controller's ACL buffers, and one LE link: its HCI events, its ACL data, and the dispatch of its L2CAP PDUs to ATT, SMP and the credit based channels |
 | `hci_session`, `hci_deframer`, `hci_transport`, `hci_uart`, `hci_usb_cdc`, `hci_init` | the pairing of a command with its answer, the H4 byte stream cut into packets, the `HciTransport` trait and its UART and USB CDC-ACM transports, and the builders of the start-up commands |
 | `att`, `att_server`, `att_scratch`, `att_server_scratch` | the ATT PDU codec, the ATT server, and the fixed-RAM scratch buffer and response builders the device images use |
@@ -98,11 +98,76 @@ fn connect_to<T: HciLink[e]>(var h: host.Host, var t: T, var p: noble.DefaultPol
     noble.failed(noble.LAYER_LOCAL, noble.E_TIMEOUT)
 ```
 
-This layer serves `Start`, `Connect`, `ConnectListed`, `ConnectCancel`, `Disconnect`, `UpdateParams`, `Secure`, `CocOpen` and
-`CocClose`, the replies `passkey_reply`, `numeric_reply`, `unbond` and `coc_send`, and `coc_listen`.  Advertising, scanning,
-synchronization, the accept list, the GATT client and server calls, the `Adapter` that waits, and the service modules are NOT
-IMPLEMENTED here; `begin` answers their requests `E_BAD_ARGUMENT`.  The `Host` still carries the Bluetooth Test Protocol
-session of `orbit/ble`, which does not use these calls.
+Layer A serves `Start`, `Connect`, `ConnectListed`, `ConnectCancel`, `Disconnect`, `UpdateParams`, `Secure`, `CocOpen` and
+`CocClose`, the replies `passkey_reply`, `numeric_reply`, `unbond` and `coc_send`, and `coc_listen`; Layer B (next section) adds
+advertising, scanning, synchronisation, the accept list and the GATT client and server.  The `Host` still carries the Bluetooth Test
+Protocol session of `orbit/ble`, which does not use these calls.
+
+## Layer B: the Adapter, GAP, GATT and the services
+
+An `Adapter` holds a `Host`, a transport, the product's policy and its bond store, so that a program does not thread four values through
+every call: `var ble = noble.adapter(link, policy, bonds)`.  Its methods start a call with `begin`, run the Host until the call ends or
+its timeout passes, and answer the `Status`; a method that can wait carries `[async]` and parks in `HciLink.park` between two turns of
+the Host.  `step`, `run`, `start` and `wait_event(timeout_ms)` are the loop; `now_ms` is the clock of the transport.
+
+| Area | Methods |
+|---|---|
+| Advertising | `adv_start(set, params, data, scan_rsp)` (legacy or extended, by `AdvParams.extended`), `periodic_start`, `adv_stop`; `ad_flags`, `ad_uuid16`, `ad_name` and `adv_legacy()` make the payload and the parameters; `Action.Readvertise` of the policy restarts the last advertising |
+| Scanning | `scan_start(params, filter)`, `scan_stop`, `find(filter, timeout_ms, var report)`; the `ScanFilter` (a service, a name prefix, a signal floor) is applied by the Host before `HostPolicy.on_advert` |
+| Synchronising | `sync_create`, `sync_stop`, `accept_list_from_bonds` |
+| Connections | `connect`, `connect_listed`, `connect_cancel`, `disconnect`, `update_params`, `secure`, `conn_info`, `link_count`, and the channels `coc_listen`, `coc_open`, `coc_send`, `coc_close` |
+| GATT client | `exchange_mtu`, `discover(conn, service)`, `find_char`, `read`, `write`, `write_no_response`, `subscribe`, `unsubscribe`; `need` is the least security the link must have before a request is sent |
+| GATT server | `add_service`, `add_char`, `set_value`, `bind_function`, `bind_event`, `respond`, `notify`, `notify_all`, `indicate` |
+| Services | the trait `Service`, `ble.plug(var module)`, `pump(var ble, var services, wait_ms)` |
+
+Events: `Advert`, `Connected`, `Disconnected`, `Written` (a stored characteristic was written), `Subscribed(conn, attr, mode)` (a client
+wrote the configuration of a value), `Notification` (a notification or an indication of a peer, with a flag), `AttrRead` and `AttrWrite`
+(an attribute bound with `bind_event`), `DatabaseChanged` (a Service Changed indication dropped part of the discovery cache) and `Dropped`.
+
+A characteristic is stored (the Host holds the bytes), bound to a function (`bind_function`: a read or write asks `HostPolicy.on_read` or
+`on_write` inside the Host's turn, with the index of the service that owns the attribute as `svc`, and the answer is the ATT error code, 0
+or `NOT_HANDLED`), or bound to an event (`bind_event`: the request is queued as `AttrRead` or `AttrWrite`, the Host holds it, and
+`respond` answers it within the ATT timeout of 30 seconds).  The security of the attribute is checked before either hook is called.
+
+A service is a module: a value that implements `Service` (`attach(var h: host.Host)` adds its attributes and keeps its handles;
+`on_event`, `tick`, `on_read` and `on_write` are optional).  `ble.plug(var module)` attaches one.  A program with a pump gives every
+event to `pump`, which offers it to the services, refuses an attribute request no service took, runs their `tick` and applies what they
+queued (`Out.Notify`, `NotifyAll`, `Respond`).  **Question 29 of planning/NOBLE-HOST-API-SKETCH.md (attribute requests as events and the
+product's own composite, section 3.17, against the library combinators of section 3.16) is not answered by the owner.  Layer B builds the
+form the sketch recommends, `bind_event`, the product's composite and no combinator; the combinators are NOT BUILT.**
+
+```novo
+use noble
+
+// Scan for a device that offers the Battery Service, connect, discover it and read the level.
+fn battery_level<T: HciLink[e]>(var ble: noble.Adapter<T, noble.DefaultPolicy, noble.RamBonds>) -> Int [e, async, time, mutate]
+    var found = noble.blank_report()
+    if not ble.find(noble.scan_service(0x180F), 5000, var found).is_ok()
+        return -1
+    let up = ble.connect(found.addr, noble.conn_params_default(), 5000)
+    if not up.status.is_ok() or not ble.discover(up.conn, noble.uuid16(0x180F)).is_ok()
+        return -1
+    match ble.find_char(up.conn, noble.uuid16(0x180F), noble.uuid16(0x2A19))
+        None => -1
+        Some(level) =>
+            var v: noble.Value = Vec.new()
+            if ble.read(up.conn, level, noble.Security.Open, var v).is_ok() then v[0] as Int else -1
+```
+
+`orbit/noble-examples` holds the eight example programs of the sketch (the hello-world, a scan, a read with every failure reported, a
+heart-rate Peripheral, a bonded Central, a credit based channel Central and its Peripheral, and a Battery Service module) as Host
+programs for a PC over the socket of a bridge; the three Peripheral programs also build for the nRF54LM20 DK over `UartHci`.
+
+What Layer B does not do (NOT IMPLEMENTED): `HostPolicy.authorize_write` is not called, so an `Access.Authorized` attribute answers
+Insufficient Authorization; an attribute request on an Enhanced ATT bearer reaches the server's stored value, not the function or the
+event (a request for a bound attribute is held on the unenhanced bearer only); a Prepare Write of a bound attribute is stored, not
+held; extended scanning (`ScanParams.extended`) is refused with `E_BAD_ARGUMENT`, because the Host reads the legacy report only;
+periodic advertising reports are not delivered; the GATT state of a bond (`BondStore.load_server`, `load_cache`) is not used, so a
+discovery cache and a client's subscriptions do not outlive the link; the descriptors a discovery finds are those of the characteristics
+that notify or indicate.  The transports `UartHci` (H4 over `hal.uart`) and the PC socket of `noble-examples` carry `now_ms` and
+`park`; the USB CDC-ACM and in-RAM transports keep the defaults (the system tick and a yield).  The sketch's `uart_adapter()` is not in
+the package (a build bug, `bugs/codegen-llvm/a-generic-struct-made-by-a-plain-function-never-used-calls-a-generic-of-another-module-that-has-no-specialisation.md`);
+a program writes `noble.adapter(noble.uart_hci(), ...)`.
 
 The sizes of the tables are keys of the package configuration.  A consumer
 writes a `[noble]` section in its config file (`max_connections`,
@@ -133,8 +198,8 @@ novo test
 `novo build` type-checks and effect-checks every module under `src/`; the package is a library and writes no binary.
 `novo test` runs the suites under `tests/`: one suite for each module, `tests/<module>_tests.nv`, and three that drive
 several modules together (`gatt_client_engine_tests.nv`, `integration_gatt_tests.nv` and `two_centrals_tests.nv`).
-`host_api_tests.nv` drives a Host through `begin`, `poll` and `next_event` over a scripted Controller, and two Hosts through a
-pairing; its cases that need an event queue run with `--config configs/layer_a.toml`.
+`host_api_tests.nv` drives a Host through `begin`, `poll` and `next_event` over a scripted Controller, two Hosts through a
+pairing and through a GATT round trip, and the `Adapter` over a Controller that plays a GATT server; its cases that need an event queue run with `--config configs/layer_a.toml`.
 `novo test tests/<module>_tests.nv` runs one of them.  A suite takes a profile with `--config configs/pc.toml`;
 `novo config ci` runs every suite under the smallest and the largest configuration the schema allows and under each file
 of `configs/`.  The tests are not part of the published package.

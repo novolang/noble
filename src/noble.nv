@@ -6,9 +6,17 @@
 // reads a clock or sleeps; the time is an argument and the wire is the `HciLink` the caller passes.
 // This module holds the values of that surface (`Status`, `ConnId`, `Event`, `Request`, ...), the
 // policy trait `HostPolicy` and the bond store `BondStore`; `host_api.nv` holds the engine.
+// Layer B, at the end of this module, is the `Adapter` that waits over those four calls, the GAP and GATT
+// methods that start requests, the trait `Service` with `plug` and `pump`, and the payload builders.
 // planning/NOBLE-HOST-API-SKETCH.md sections 3.3 and 3.4 are the design.
 
 use gatt_client
+use gatt_server
+use hci_deframer
+use hci_transport
+use host
+use host.{ Host, host_blank, host_config }
+use host_api
 use limits
 use profile_builder
 use smp
@@ -594,7 +602,9 @@ enum Event
     Written(conn: ConnId, attr: u16)
     // A read or write of an attribute bound with `bind_event` (section
     // 3.17): the client waits for `Out.Respond` from the service that owns
-    // `svc`.  Never dropped: the ATT request is already held by the Host.
+    // `svc`.  Counted with the state events: it keeps a slot of the queue from the adverts and
+    // notifications.  When the queue has no slot at all, the Host answers the client
+    // ATT_INSUFFICIENT_RESOURCES and queues nothing.
     AttrRead(conn: ConnId, attr: u16, svc: Int)
     AttrWrite(conn: ConnId, attr: u16, svc: Int, value: Value)
     Subscribed(conn: ConnId, attr: u16, mode: u8)
@@ -678,6 +688,29 @@ pub @tier(embedded)
 fn blank_report() -> AdvReport
     AdvReport { addr: Addr { kind: 0, octets: [0, 0, 0, 0, 0, 0] }, rssi: 0, flags: 0, data: Vec.new() }
 
+// The octets of `u` as they are on the air: two for a 16-bit UUID, sixteen for a 128-bit one, least significant first.
+pub @tier(embedded)
+fn uuid_octets(u: Uuid) -> [u8]
+    var out: [u8] = []
+    if not u.wide
+        list.push(out, (u.lo & 255) as u8)
+        list.push(out, ((u.lo >>> 8) & 255) as u8)
+        return out
+    for i in 0..8
+        list.push(out, ((u.lo >>> (8 * i)) & 255) as u8)
+    for i in 0..8
+        list.push(out, ((u.hi >>> (8 * i)) & 255) as u8)
+    out
+
+// The UUID as the GATT client engine names it (`gatt_client.Uuid` has the same three fields).
+pub @tier(embedded)
+fn to_client_uuid(u: Uuid) -> gatt_client.Uuid
+    gatt_client.Uuid { wide: u.wide, lo: u.lo, hi: u.hi }
+
+pub @tier(embedded)
+fn from_client_uuid(u: gatt_client.Uuid) -> Uuid
+    Uuid { wide: u.wide, lo: u.lo, hi: u.hi }
+
 // The record of no call.  `Op` is a plain struct, made once with the `Host`.
 fn idle_op() -> Op
     Op { busy: false, done: false, status: ok(), conn: no_conn(), chan: 0, value: Vec.new() }
@@ -728,6 +761,20 @@ const R_UPDATE = 5
 const R_SECURE = 6
 const R_COC_OPEN = 7
 const R_COC_CLOSE = 8
+const R_ADV_START = 9
+const R_PERIODIC_START = 10
+const R_ADV_STOP = 11
+const R_SCAN_START = 12
+const R_SCAN_STOP = 13
+const R_SYNC_CREATE = 14
+const R_SYNC_STOP = 15
+const R_ACCEPT_LIST = 16
+const R_MTU = 17
+const R_DISCOVER = 18
+const R_READ = 19
+const R_WRITE = 20
+const R_SUBSCRIBE = 21
+const R_INDICATE = 22
 
 // The value of an answer that was not given.
 const NO_ANSWER = -1000
@@ -782,6 +829,47 @@ pub struct Api
     // 2 a numeric comparison; and the answer given, -1000 for none.
     var ask: Vec[Int; limits.LINK_SLOTS]
     var ans: Vec[Int; limits.LINK_SLOTS]
+    // Layer B.  The advertising set the last `AdvStart` or `PeriodicStart` started, with its arguments, for `Action.Readvertise`
+    // and for `AdvStop`: whether it is on, whether it used the extended commands, whether a periodic train rides on it.
+    var adv_valid: Bool
+    var adv_on: Bool
+    var adv_ext: Bool
+    var adv_periodic: Bool
+    var adv_set: Int
+    var adv_p: AdvParams
+    var adv_data: AdData
+    var adv_rsp: AdData
+    var adv_interval: Int
+    // The advertising the Host restarts by itself (`ADVERTISE_*`, the same as `advertise` but kept until the restart runs).
+    var adv_again: Int
+    // A call the Host started for itself (the restart above): it holds `op.busy` but no application waits for it.
+    var internal: Bool
+    // Scanning: the filter the Host applies to each report, and whether the Controller scans.
+    var scan_f: ScanFilter
+    var scan_p: ScanParams
+    var scan_on: Bool
+    // Periodic advertising synchronisation: the Sync_Handle the Controller gave, -1 for none, and the arguments of the call.
+    var sync_handle: Int
+    var r_sid: Int
+    var r_skip: Int
+    var r_timeout: Int
+    // The registers of a GATT request: the attribute, the data to write or the service to find, the mode of a subscription,
+    // whether a write expects a response, and the step of a discovery.
+    var r_attr: Attr
+    var r_data: Value
+    var r_svc: Uuid
+    var r_mode: Int
+    var r_response: Bool
+    var r_cursor: Int
+    var r_phase: Int
+    // The GATT server: the services added, so the index of the next one.
+    var svc_count: Int
+    // The request a bound attribute is held for, for each connection: 0 none, 1 Read Request, 2 Write Request, 3 Write
+    // Command, 4 Read Blob Request; the handle, the offset of a Read Blob, and the time it was queued.
+    var pend: Vec[Int; limits.LINK_SLOTS]
+    var pend_attr: Vec[Int; limits.LINK_SLOTS]
+    var pend_off: Vec[Int; limits.LINK_SLOTS]
+    var pend_ms: Vec[Int; limits.LINK_SLOTS]
 
 pub @tier(embedded)
 fn blank_addr() -> Addr
@@ -796,17 +884,30 @@ pub fn api_new(max_links: Int) -> Api
     var conns: Vec[Conn; limits.LINK_SLOTS] = Vec.new()
     var ask: Vec[Int; limits.LINK_SLOTS] = Vec.new()
     var ans: Vec[Int; limits.LINK_SLOTS] = Vec.new()
+    var pend: Vec[Int; limits.LINK_SLOTS] = Vec.new()
+    var pend_attr: Vec[Int; limits.LINK_SLOTS] = Vec.new()
+    var pend_off: Vec[Int; limits.LINK_SLOTS] = Vec.new()
+    var pend_ms: Vec[Int; limits.LINK_SLOTS] = Vec.new()
     for _ in 0..limits.LINK_SLOTS
         let _ = conns.push(Conn { live: false, id: no_conn(), info: blank_info() })
         let _ = ask.push(0)
         let _ = ans.push(NO_ANSWER)
+        let _ = pend.push(0)
+        let _ = pend_attr.push(0)
+        let _ = pend_off.push(0)
+        let _ = pend_ms.push(0)
     Api {
         ready: false, events: Deque.new(), held: 0, dropped: 0, conns: conns, op: idle_op(), max_links: max_links,
         kind: 0, step: 0, r_conn: no_conn(), r_params: conn_params_default(), r_need: Security.Open, r_peer: blank_addr(),
         r_psm: 0, r_mtu: 0, r_chan: 0, r_reason: 0,
         last_peer: blank_addr(), last_params: conn_params_default(), last_listed: false, last_valid: false,
         attempts: 0, due_ms: -1, reconnecting: false, advertise: 0, coc_psm: 0, coc_need: Security.Open,
-        bondable: true, sc_only: false, min_key_size: 7, seed: Vec.new(), own_kind: 0, ask: ask, ans: ans }
+        bondable: true, sc_only: false, min_key_size: 7, seed: Vec.new(), own_kind: 0, ask: ask, ans: ans,
+        adv_valid: false, adv_on: false, adv_ext: false, adv_periodic: false, adv_set: 0, adv_p: adv_legacy(),
+        adv_data: Vec.new(), adv_rsp: Vec.new(), adv_interval: 0, adv_again: 0, internal: false,
+        scan_f: scan_all(), scan_p: scan_passive(), scan_on: false, sync_handle: -1, r_sid: 0, r_skip: 0, r_timeout: 0,
+        r_attr: Attr { handle: 0, props: 0, cccd: 0 }, r_data: Vec.new(), r_svc: uuid16(0), r_mode: 0, r_response: true,
+        r_cursor: 0, r_phase: 0, svc_count: 0, pend: pend, pend_attr: pend_attr, pend_off: pend_off, pend_ms: pend_ms }
 
 // Whether `ev` reports the state of a connection or a pairing: such an event is
 // never dropped, because one slot per connection is kept for it.
@@ -819,6 +920,8 @@ fn is_state_event(ev: Event) -> Bool
         SecurityChanged(_, _, _) => true
         PasskeyRequested(_) => true
         NumericRequested(_, _) => true
+        AttrRead(_, _, _) => true
+        AttrWrite(_, _, _, _) => true
         _ => false
 
 // Whether `ev` arrives with no flow control the Host can apply, so that a full
@@ -932,6 +1035,587 @@ fn from_profile_error(e: profile_builder.ProfileError) -> Status
         NoRoom => failed(LAYER_LOCAL, E_NO_ROOM)
         InvalidValue => failed(LAYER_LOCAL, E_BAD_ARGUMENT)
         NotPermitted => failed(LAYER_LOCAL, E_REFUSED)
+
+// ═══════════════════════════════════════════════════════════════════
+// Layer B: the Adapter, GAP, GATT and the services
+// ═══════════════════════════════════════════════════════════════════
+//
+// An `Adapter` holds a Host, the transport, the product's policy and its bond store, so a program does not thread four values
+// through every call.  Its methods start a call with `begin`, run the Host until the call ends or the timeout passes, and answer
+// the `Status`.  A method that can wait carries `[async]`: the task parks in the transport's `park` (by default
+// `core.rt.yield_now`) between two turns of the Host.  Nothing in this layer reads a clock but through the transport's `now_ms`.
+// planning/NOBLE-HOST-API-SKETCH.md sections 3.5, 3.6, 3.10 and 3.13 are the design.
+
+// The longest a turn of the Adapter parks, in milliseconds: the timers of the Host (the ATT transaction timeout, the supervision
+// of a pairing, a reconnection that is due) advance at the turns, so a transport that returns from `park` only when a packet
+// arrives still turns the Host at least this often.
+const PARK_SLICE_MS = 50
+
+// What `connect` and `connect_listed` answer: the outcome, and the name of the link they made.
+pub @value
+struct ConnResult
+    status: Status
+    conn: ConnId
+
+// What `coc_open` answers: the outcome, and the channel it opened.
+pub @value
+struct CocResult
+    status: Status
+    chan: u8
+
+// What `add_char` answers: the outcome, and the attribute as discovery would give it (the value handle, the properties, the handle
+// of the Client Characteristic Configuration descriptor, 0 for none).
+pub @value
+struct AttrResult
+    status: Status
+    attr: Attr
+
+// What `add_service` answers: the outcome, and the index of the new service, which the Host passes to `HostPolicy.on_read` and
+// `on_write` as `svc` and to `Event.AttrRead` and `AttrWrite` for every attribute of the service.
+pub @value
+struct ServiceResult
+    status: Status
+    svc: Int
+
+pub alias Name = String[noble_config.MAX_NAME]
+
+pub struct Adapter<T: HciLink[e], P: HostPolicy[f], B: BondStore[g]>
+    var io: T
+    var policy: P
+    var bonds: B
+    var host: Host
+
+// The Adapter of a transport, a policy and a bond store, with a Host that serves `MAX_CONNECTIONS` links and the Device Name
+// "noble".
+pub @tier(embedded)
+fn adapter<T: HciLink[e], P: HostPolicy[f], B: BondStore[g]>(io: T, policy: P, bonds: B) -> Adapter<T, P, B>
+    Adapter { io: io, policy: policy, bonds: bonds, host: host_blank(host_config(noble_config.MAX_CONNECTIONS, ['n', 'o', 'b', 'l', 'e'])) }
+
+impl Adapter
+    // One turn of the Host at the current clock.
+    @tier(embedded)
+    fn step(var self) [e, f, g, time, mutate]
+        let now = self.io.now_ms()
+        host_api.poll(var self.host, var self.io, var self.policy, var self.bonds, now)
+
+    // The transport's clock, in milliseconds.
+    @tier(embedded)
+    fn now_ms(var self) -> Int [e, time]
+        self.io.now_ms()
+
+    // Start `req` and run the Host until it ends.
+    @tier(embedded)
+    fn run(var self, req: Request, timeout_ms: Int) -> Status [e, f, g, async, time, mutate]
+        let started = host_api.begin(var self.host, req)
+        if not started.is_ok()
+            return started
+        let t0 = self.io.now_ms()
+        while true
+            self.step()
+            match host_api.result(var self.host)
+                Some(done) => return done
+                None => ()
+            let waited = self.io.now_ms() - t0
+            if waited >= timeout_ms
+                host_api.abandon(var self.host)
+                return failed(LAYER_LOCAL, E_TIMEOUT)
+            self.io.park(park_for(timeout_ms - waited))
+        ok()
+
+    // Bring the Controller up: reset, the event masks, the buffer sizes, the random seed and the address.  `Event.Ready` is queued
+    // when it has.
+    @tier(embedded)
+    fn start(var self) -> Status [e, f, g, async, time, mutate]
+        self.run(Request.Start, 5000)
+
+    // The next event, waiting up to `timeout_ms` for one.
+    @tier(embedded)
+    fn wait_event(var self, timeout_ms: Int) -> ?Event [e, f, g, async, time, mutate]
+        let t0 = self.io.now_ms()
+        while true
+            self.step()
+            match host_api.next_event(var self.host)
+                Some(ev) => return Some(ev)
+                None => ()
+            let waited = self.io.now_ms() - t0
+            if waited >= timeout_ms
+                return None
+            self.io.park(park_for(timeout_ms - waited))
+        None
+
+// Empty values of the two types, made where the capacity of the type is known (see the workaround above `impl Adapter`).
+@tier(embedded)
+fn new_value() -> Value
+    Vec.new()
+
+@tier(embedded)
+fn new_ad() -> AdData
+    Vec.new()
+
+@tier(embedded)
+fn park_for(remaining_ms: Int) -> Int
+    if remaining_ms > PARK_SLICE_MS
+        PARK_SLICE_MS
+    else if remaining_ms < 1
+        1
+    else
+        remaining_ms
+
+// ── GAP: advertising data ───────────────────────────────────────────
+
+@tier(embedded)
+fn ad_put(var d: AdData, b: Int) -> Bool
+    match d.push(b as u8)
+        Ok(_) => true
+        Err(_) => false
+
+// The Flags record.
+pub @tier(embedded)
+fn ad_flags(var d: AdData, flags: Int) -> Bool
+    ad_put(var d, 2) and ad_put(var d, 0x01) and ad_put(var d, flags)
+
+// The Complete List of 16-bit Service Class UUIDs with one entry.
+pub @tier(embedded)
+fn ad_uuid16(var d: AdData, uuid: Int) -> Bool
+    ad_put(var d, 3) and ad_put(var d, 0x03) and ad_put(var d, uuid & 255) and ad_put(var d, uuid >> 8)
+
+// The Complete Local Name record.
+pub @tier(embedded)
+fn ad_name(var d: AdData, name: Name) -> Bool
+    if not ad_put(var d, name.len() + 1) or not ad_put(var d, 0x09)
+        return false
+    for b in name
+        if not ad_put(var d, b as Int)
+            return false
+    true
+
+// Legacy advertising, connectable and scannable, every 100 ms to 150 ms, with no limit of time.
+pub @tier(embedded)
+fn adv_legacy() -> AdvParams
+    AdvParams { extended: false, connectable: true, scannable: true, interval_min_ms: 100, interval_max_ms: 150, duration_ms: 0 }
+
+// ── GAP: scanning ───────────────────────────────────────────────────
+
+// Report every device.
+pub @tier(embedded)
+fn scan_all() -> ScanFilter
+    ScanFilter { uuid16: 0, name_prefix: String.new(), rssi_min: -127, duplicates: false }
+
+// Report the devices that advertise the 16-bit service `uuid`.
+pub @tier(embedded)
+fn scan_service(uuid: Int) -> ScanFilter
+    ScanFilter { uuid16: uuid as u16, name_prefix: String.new(), rssi_min: -127, duplicates: false }
+
+// Passive scanning, 50 ms in every 100 ms, with no limit of time.
+pub @tier(embedded)
+fn scan_passive() -> ScanParams
+    ScanParams { active: false, extended: false, interval_ms: 100, window_ms: 50, duration_ms: 0 }
+
+// workaround(a-module-qualified-capacity-of-a-vec-is-unknown-in-a-method-of-a-generic-impl): inside a method of the generic
+// `impl Adapter`, a type whose capacity is a key of the configuration (`AdData`, `Value`: `Vec[u8; noble_config.X]`) has a capacity
+// the compiler does not know, and E2001 refuses to hand a value of it to `Request.AdvStart` or to a function of host_api, or to
+// index it.  The methods of this impl that take such a value are generic in its type (`data: V`; a call site passes an `AdData`
+// or a `Value` as before) and copy it into a value made by `new_ad` or `new_value`, free functions, where the capacity is known.
+impl Adapter
+    // Start advertising set `set` (0 for the legacy set).  Legacy and extended advertising are one call: `p.extended` picks the
+    // commands, and the Host never mixes the two.  A connection ends the advertising of a set; the policy decides whether it starts
+    // again (`Action.Readvertise`).
+    @tier(embedded)
+    fn adv_start<D>(var self, set: Int, p: AdvParams, data: D, scan_rsp: D) -> Status [e, f, g, async, time, mutate]
+        var d = new_ad()
+        for i in 0..data.len()
+            let _ = d.push(data[i])
+        var r = new_ad()
+        for i in 0..scan_rsp.len()
+            let _ = r.push(scan_rsp[i])
+        self.run(Request.AdvStart(set as u8, p, d, r), 2000)
+
+    // Put a periodic advertising train on set `set`, with `data` as its data.
+    @tier(embedded)
+    fn periodic_start<D>(var self, set: Int, interval_ms: Int, data: D) -> Status [e, f, g, async, time, mutate]
+        var d = new_ad()
+        for i in 0..data.len()
+            let _ = d.push(data[i])
+        self.run(Request.PeriodicStart(set as u8, interval_ms as u16, d), 2000)
+
+    @tier(embedded)
+    fn adv_stop(var self, set: Int) -> Status [e, f, g, async, time, mutate]
+        self.run(Request.AdvStop(set as u8), 2000)
+
+    // Reports arrive as `Event.Advert`.  The Host applies `f` to each report, then asks `HostPolicy.on_advert`.
+    @tier(embedded)
+    fn scan_start(var self, p: ScanParams, f: ScanFilter) -> Status [e, f, g, async, time, mutate]
+        self.run(Request.ScanStart(p, f), 2000)
+
+    @tier(embedded)
+    fn scan_stop(var self) -> Status [e, f, g, async, time, mutate]
+        self.run(Request.ScanStop, 2000)
+
+    // Synchronise to a periodic advertising train.  The call ends when the Controller has the train.
+    @tier(embedded)
+    fn sync_create(var self, adv: Addr, sid: Int, skip: Int, timeout: Int) -> Status [e, f, g, async, time, mutate]
+        self.run(Request.SyncCreate(adv, sid as u8, skip as u16, timeout as u16), 30000)
+
+    @tier(embedded)
+    fn sync_stop(var self) -> Status [e, f, g, async, time, mutate]
+        self.run(Request.SyncStop, 2000)
+
+    // Scan until one report matches `want`, then stop.  A convenience over `scan_start` and `wait_event`.
+    @tier(embedded)
+    fn find(var self, want: ScanFilter, timeout_ms: Int, var out: AdvReport) -> Status [e, f, g, async, time, mutate]
+        let s = self.scan_start(scan_passive(), want)
+        if not s.is_ok()
+            return s
+        let t0 = self.io.now_ms()
+        while true
+            match self.wait_event(100)
+                Some(ev) =>
+                    match ev
+                        Advert(r) =>
+                            out = r
+                            return self.scan_stop()
+                        _ => ()
+                None => ()
+            if self.io.now_ms() - t0 >= timeout_ms
+                let _ = self.scan_stop()
+                return failed(LAYER_LOCAL, E_TIMEOUT)
+        ok()
+
+// ── GAP: connections, in either role ────────────────────────────────
+
+impl Adapter
+    // Connect to `peer` as the Central.  The same `ConnId` names the link for the whole connection, whichever role set it up.
+    @tier(embedded)
+    fn connect(var self, peer: Addr, p: ConnParams, timeout_ms: Int) -> ConnResult [e, f, g, async, time, mutate]
+        let s = self.run(Request.Connect(peer, p), timeout_ms)
+        ConnResult { status: s, conn: host_api.op_conn(self.host) }
+
+    // Connect to whichever bonded device is in range (the accept list).
+    @tier(embedded)
+    fn connect_listed(var self, p: ConnParams, timeout_ms: Int) -> ConnResult [e, f, g, async, time, mutate]
+        let s = self.run(Request.ConnectListed(p), timeout_ms)
+        ConnResult { status: s, conn: host_api.op_conn(self.host) }
+
+    // Write the bonds into the Controller's accept list and resolving list.
+    @tier(embedded)
+    fn accept_list_from_bonds(var self) -> Status [e, f, g, async, time, mutate]
+        self.run(Request.AcceptListFromBonds, 5000)
+
+    @tier(embedded)
+    fn connect_cancel(var self) -> Status [e, f, g, async, time, mutate]
+        self.run(Request.ConnectCancel, 2000)
+
+    @tier(embedded)
+    fn disconnect(var self, conn: ConnId, reason: Int) -> Status [e, f, g, async, time, mutate]
+        self.run(Request.Disconnect(conn, reason as u8), 5000)
+
+    @tier(embedded)
+    fn update_params(var self, conn: ConnId, p: ConnParams) -> Status [e, f, g, async, time, mutate]
+        self.run(Request.UpdateParams(conn, p), 5000)
+
+    // What the Host knows of a connection; None for a name that is stale.
+    @tier(embedded)
+    fn conn_info(self, conn: ConnId) -> ?ConnInfo
+        host_api.conn_info(self.host, conn)
+
+    // How many connections are live, in either role.
+    @tier(embedded)
+    fn link_count(self) -> Int
+        host_api.link_count(self.host)
+
+// ── GATT client ─────────────────────────────────────────────────────
+
+// The values of a subscription: notifications or indications.
+pub const NOTIFY = 1
+pub const INDICATE = 2
+
+impl Adapter
+    @tier(embedded)
+    fn exchange_mtu(var self, conn: ConnId) -> Status [e, f, g, async, time, mutate]
+        self.run(Request.ExchangeMtu(conn), 30000)
+
+    // Discover the service `svc` with its characteristics and the descriptors of those that notify or indicate, into the Host's
+    // cache for `conn` (`CLIENT_CACHE_RECORDS` records for a link).
+    @tier(embedded)
+    fn discover(var self, conn: ConnId, svc: Uuid) -> Status [e, f, g, async, time, mutate]
+        self.run(Request.Discover(conn, svc), 30000)
+
+    // Look a characteristic up in the cache; no radio traffic.
+    @tier(embedded)
+    fn find_char(self, conn: ConnId, svc: Uuid, chr: Uuid) -> ?Attr
+        host_api.find_char(self.host, conn, svc, chr)
+
+    // Read a value.  `need` is the least security the link must have before the request is sent: below it the call fails with
+    // E_SECURITY_LOW and nothing leaves the device.  `Open` accepts any link.
+    @tier(embedded)
+    fn read<V>(var self, conn: ConnId, a: Attr, need: Security, var out: V) -> Status [e, f, g, async, time, mutate]
+        let s = self.run(Request.Read(conn, a, need), 30000)
+        out.clear()
+        let src = self.host.api.op.value
+        for i in 0..src.len()
+            let _ = out.push(src[i])
+        s
+
+    @tier(embedded)
+    fn write<V>(var self, conn: ConnId, a: Attr, need: Security, var data: V) -> Status [e, f, g, async, time, mutate]
+        var d = new_value()
+        for i in 0..data.len()
+            let _ = d.push(data[i])
+        self.run(Request.Write(conn, a, need, d, true), 30000)
+
+    @tier(embedded)
+    fn write_no_response<V>(var self, conn: ConnId, a: Attr, need: Security, var data: V) -> Status [e, f, g, async, time, mutate]
+        var d = new_value()
+        for i in 0..data.len()
+            let _ = d.push(data[i])
+        self.run(Request.Write(conn, a, need, d, false), 30000)
+
+    // Write the characteristic's configuration descriptor.  Values arrive as `Event.Notification`.
+    @tier(embedded)
+    fn subscribe(var self, conn: ConnId, a: Attr, mode: Int, need: Security) -> Status [e, f, g, async, time, mutate]
+        self.run(Request.Subscribe(conn, a, mode as u8, need), 30000)
+
+    @tier(embedded)
+    fn unsubscribe(var self, conn: ConnId, a: Attr, need: Security) -> Status [e, f, g, async, time, mutate]
+        self.run(Request.Subscribe(conn, a, 0, need), 30000)
+
+// ── GATT server ─────────────────────────────────────────────────────
+
+pub const PROP_READ = 0x02
+pub const PROP_WRITE_NO_RESPONSE = 0x04
+pub const PROP_WRITE = 0x08
+pub const PROP_NOTIFY = 0x10
+pub const PROP_INDICATE = 0x20
+
+pub @tier(embedded)
+fn open_perms() -> Permissions
+    Permissions { read: Access.Open, write: Access.Open }
+
+impl Adapter
+    // The same calls as on the Host, for a program that holds an Adapter.
+    @tier(embedded)
+    fn add_service(var self, uuid: Uuid) -> ServiceResult [e, f, g, mutate]
+        self.host.add_service(uuid)
+
+    @tier(embedded)
+    fn add_char(var self, uuid: Uuid, props: Int, perm: Permissions, cccd: Access, max_len: Int) -> AttrResult [e, f, g, mutate]
+        self.host.add_char(uuid, props, perm, cccd, max_len)
+
+    @tier(embedded)
+    fn bind_function(var self, a: Attr) -> Status [e, f, g, mutate]
+        self.host.bind_function(a)
+
+    @tier(embedded)
+    fn bind_event(var self, a: Attr) -> Status [e, f, g, mutate]
+        self.host.bind_event(a)
+
+    // Answer the ATT request that `Event.AttrRead` or `AttrWrite` reported: `code` 0 with `v` as the value of a read, or the ATT
+    // error code.  E_BUSY when no request is pending on `conn` for `attr`.
+    @tier(embedded)
+    fn respond<V>(var self, conn: ConnId, attr: u16, code: Int, var v: V) -> Status [e, f, g, mutate]
+        var d = new_value()
+        for i in 0..v.len()
+            let _ = d.push(v[i])
+        host_api.respond(var self.host, conn, attr, code, d)
+
+    // Set the value a read returns.
+    @tier(embedded)
+    fn set_value<V>(var self, a: Attr, var v: V) -> Status [e, f, g, mutate]
+        var d = new_value()
+        for i in 0..v.len()
+            let _ = d.push(v[i])
+        self.host.set_value(a, d)
+
+    // Send `v` as a notification to the client on `conn` if it subscribed; E_NOT_SUBSCRIBED if it did not, E_SECURITY_LOW if the
+    // link is below `need`.
+    @tier(embedded)
+    fn notify<V>(var self, conn: ConnId, a: Attr, need: Security, var v: V) -> Status [e, f, g, mutate]
+        var d = new_value()
+        for i in 0..v.len()
+            let _ = d.push(v[i])
+        host_api.notify(var self.host, conn, a, need, d)
+
+    // Send `v` to every connected client that subscribed to `a` and whose link is at `need` or above: the usual case for a sensor.
+    // Answers how many were sent; a client below `need` is skipped and counted in neither.
+    @tier(embedded)
+    fn notify_all<V>(var self, a: Attr, need: Security, var v: V) -> Int [e, f, g, mutate]
+        var d = new_value()
+        for i in 0..v.len()
+            let _ = d.push(v[i])
+        var n = 0
+        for i in 0..self.host.api.conns.len()
+            let k = self.host.api.conns[i]
+            if k.live
+                if host_api.notify(var self.host, k.id, a, need, d).is_ok()
+                    n = n + 1
+        n
+
+    // Send `v` as an indication and wait for the client's confirmation.
+    @tier(embedded)
+    fn indicate<V>(var self, conn: ConnId, a: Attr, var v: V) -> Status [e, f, g, async, time, mutate]
+        var d = new_value()
+        for i in 0..v.len()
+            let _ = d.push(v[i])
+        self.run(Request.Indicate(conn, a, d), 30000)
+
+// ── Pairing, bonding and credit based channels ──────────────────────
+
+impl Adapter
+    // Raise the link to `need`.  With a bond that is strong enough the Host encrypts the link and no pairing runs.  Otherwise it
+    // asks `policy.accept_pairing` and pairs, calling the hooks for the passkey or the numeric comparison.  It fails with
+    // E_SECURITY_LOW when the peer or the policy cannot reach `need`, and with the SMP reason when the pairing fails.  Nothing in
+    // the Host raises security on its own.
+    @tier(embedded)
+    fn secure(var self, conn: ConnId, need: Security) -> Status [e, f, g, async, time, mutate]
+        self.run(Request.Secure(conn, need), 60000)
+
+    // The answers to `Event.PasskeyRequested` and `Event.NumericRequested`.
+    @tier(embedded)
+    fn passkey_reply(var self, conn: ConnId, passkey: Int) -> Status [e, f, g, mutate]
+        host_api.passkey_reply(var self.host, conn, passkey)
+
+    @tier(embedded)
+    fn numeric_reply(var self, conn: ConnId, accepted: Bool) -> Status [e, f, g, mutate]
+        host_api.numeric_reply(var self.host, conn, accepted)
+
+    // Delete the bond and drop the keys of the peer.
+    @tier(embedded)
+    fn unbond(var self, peer: Addr) [e, f, g, mutate]
+        host_api.unbond(var self.host, var self.bonds, peer)
+
+    // Accept channels on `psm`, if the link has at least `need`.
+    @tier(embedded)
+    fn coc_listen(var self, psm: Int, mtu: Int, need: Security) -> Status [e, f, g, mutate]
+        host_api.coc_listen(var self.host, psm, mtu, need)
+
+    @tier(embedded)
+    fn coc_open(var self, conn: ConnId, psm: Int, mtu: Int, need: Security) -> CocResult [e, f, g, async, time, mutate]
+        let s = self.run(Request.CocOpen(conn, psm as u16, mtu as u16, need), 30000)
+        CocResult { status: s, chan: host_api.op_chan(self.host) as u8 }
+
+    // Queue one SDU; E_NO_ROOM while the peer's credits are used up.
+    @tier(embedded)
+    fn coc_send<V>(var self, conn: ConnId, chan: Int, var sdu: V) -> Status [e, f, g, mutate]
+        var d = new_value()
+        for i in 0..sdu.len()
+            let _ = d.push(sdu[i])
+        host_api.coc_send(var self.host, conn, chan, d)
+
+    @tier(embedded)
+    fn coc_close(var self, conn: ConnId, chan: Int) -> Status [e, f, g, async, time, mutate]
+        self.run(Request.CocClose(conn, chan as u8), 5000)
+
+// ── Services ────────────────────────────────────────────────────────
+
+// What a service asks the pump to do: the pump applies it to the Adapter, so a service never holds the Adapter.
+pub @value
+enum Out
+    Notify(conn: ConnId, attr: Attr, value: Value)
+    NotifyAll(attr: Attr, value: Value)
+    // The answer to `Event.AttrRead` or `AttrWrite`.
+    Respond(conn: ConnId, attr: u16, code: Int, value: Value)
+
+pub alias Outbox = Vec[Out; noble_config.OUTBOX]
+
+// Every service module implements this trait and exports a value that does.  `attach` adds the service to the Host's database and
+// keeps the handles and the service index in the value; `on_event` offers the service each event the Host queued, and answers
+// true when it took the event; `tick` runs once a turn of the pump; `on_read` and `on_write` serve the attributes bound with
+// `bind_function`, which the product's policy gives to the service whose index the Host passed, and answer NOT_HANDLED for an
+// attribute the service leaves to the product.
+pub trait Service[e]
+    fn attach(var self, var h: host.Host) -> Status [e, mutate]
+
+    fn on_event(var self, ev: Event, var out: Outbox) -> Bool [e, mutate]
+        false
+
+    fn tick(var self, now_ms: Int, var out: Outbox) [e, mutate]
+        let _ = now_ms
+
+    fn on_read(var self, conn: ConnId, attr: u16, var out: Value) -> Int [e, mutate]
+        NOT_HANDLED
+
+    fn on_write(var self, conn: ConnId, attr: u16, var value: Value) -> Int [e, mutate]
+        NOT_HANDLED
+
+impl Adapter
+    // Install a service module: one call, whatever the module is.
+    @tier(embedded)
+    fn plug<S: Service[h]>(var self, var s: S) -> Status [h, mutate]
+        s.attach(var self.host)
+
+// One turn of a program whose services are behind a pump: wait up to `wait_ms` for an event, offer it to the services (an
+// attribute request that no service took is refused at once, so a client never waits for the ATT timeout), run their `tick`, and
+// apply what they queued.
+pub @tier(embedded)
+fn pump<T: HciLink[e], P: HostPolicy[f], B: BondStore[g], S: Service[h]>(var ble: Adapter<T, P, B>, var svcs: S, wait_ms: Int) [e, f, g, h, async, time, mutate]
+    var out: Outbox = Vec.new()
+    match ble.wait_event(wait_ms)
+        Some(ev) =>
+            if not svcs.on_event(ev, var out)
+                refuse(ev, var out)
+        None => ()
+    svcs.tick(ble.now_ms(), var out)
+    for i in 0..out.len()
+        match out[i]
+            Out.Notify(conn, a, v) =>
+                let _ = ble.notify(conn, a, Security.Open, v)
+            Out.NotifyAll(a, v) =>
+                let _ = ble.notify_all(a, Security.Open, v)
+            Out.Respond(conn, attr, code, v) =>
+                let _ = ble.respond(conn, attr, code, v)
+
+// The refusal of an attribute request that no service took.
+@tier(embedded)
+fn refuse(ev: Event, var out: Outbox)
+    let empty: Value = Vec.new()
+    match ev
+        Event.AttrRead(conn, attr, svc) =>
+            let _ = out.push(Out.Respond(conn, attr, ATT_READ_NOT_PERMITTED, empty))
+        Event.AttrWrite(conn, attr, svc, value) =>
+            let _ = out.push(Out.Respond(conn, attr, ATT_WRITE_NOT_PERMITTED, empty))
+        _ => ()
+
+// ── A transport: H4 over a UART ─────────────────────────────────────
+
+// The HCI UART Transport Layer on the board's UART, to a Controller on the other side of it: each HCI packet follows its packet
+// indicator ([Vol 4] Part A, Section 2).  The bytes that have not yet made a packet are kept in `rx`.
+pub struct UartHci
+    var rx: [u8]
+
+pub @tier(embedded)
+fn uart_hci() -> UartHci
+    UartHci { rx: [] }
+
+// How many octets one `recv_packet` takes from the UART before it cuts a packet.
+const UART_READ_MAX = 255
+
+impl HciLink[hw, mutate] for UartHci
+    @tier(embedded)
+    fn send_packet(var self, pkt: [u8]) -> Bool [hw]
+        for i in 0..list.len(pkt)
+            hal.uart.write_byte(pkt[i] as Int)
+        true
+
+    @tier(embedded)
+    fn recv_packet(var self, timeout_ms: Int) -> ?[u8] [hw, mutate]
+        let _ = timeout_ms
+        for _ in 0..UART_READ_MAX
+            let b = hal.uart.try_read_byte()
+            if b < 0
+                break
+            list.push(self.rx, b as u8)
+        let r = hci_deframer.next_packet(self.rx)
+        self.rx = r.new_buf[:]
+        match r.packet
+            Some(pkt) => Some(pkt[:])
+            None => None
+
+// workaround(a-generic-struct-made-by-a-plain-function-never-used-calls-a-generic-of-another-module-that-has-no-specialisation): the
+// sketch's `uart_adapter()`, the Adapter over `UartHci` with the default policy and RAM bonds, is a plain function that builds an
+// `Adapter<UartHci, DefaultPolicy, RamBonds>`.  In a package no program calls it from, the build stops with "use of undefined value
+// '@novo_user_host_api.poll'", because the `step` of that instantiation calls the generic `host_api.poll` and no specialisation of it
+// is emitted.  A program writes `adapter(uart_hci(), DefaultPolicy { placeholder: 0 }, RamBonds { rows: Vec.new() })`, as the
+// programs of orbit/noble-examples/device do.
 
 // workaround(a-type-alias-with-the-name-of-the-module-qualified-type-it-names-is-a-cycle): the sketch spells the Host
 // `noble.Host`, and `pub alias Host = host.Host` here is refused as a cycle (E2025).  A program or a service module

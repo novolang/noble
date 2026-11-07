@@ -44,6 +44,8 @@ use smp_keys
 use smp_keys.{ KeyPair, PublicKey }
 use smp_responder
 use hci_frame
+use gatt_server
+use noble_config
 use noble
 
 // The Appearance characteristic value of the GAP server: 0x0000, Unknown.
@@ -301,3 +303,97 @@ pub fn host_seed(var host: Host, seed: [u8], irk: [u8])
                 smp_responder.new_state(smp_responder.default_config(), pair, a.value),
                 smp_initiator.new_state(smp_initiator.default_config(), pair, b.value))
     host.rand = rng
+
+// ── The GATT database the application declares ──────────────────────
+//
+// The database is the Host's, shared by every connection, so the calls that declare it belong to the Host and need no transport:
+// a service module takes a `Host` (planning/NOBLE-HOST-API-SKETCH.md, section 3.13).  Declare it before the first connection:
+// every change of the definitions makes a connected client change-unaware of the database.
+
+// The `gatt_server.Access` of an `Access` of the API.
+fn gatt_access(a: noble.Access) -> gatt_server.Access
+    if a == noble.Access.Open
+        return gatt_server.Access.Open
+    if a == noble.Access.Authorized
+        return gatt_server.Access.Authorized
+    if a == noble.Access.Encrypted
+        return gatt_server.Access.Encrypted
+    if a == noble.Access.Authenticated
+        return gatt_server.Access.Authenticated
+    if a == noble.Access.SecureConnections
+        return gatt_server.Access.SecureConnections
+    gatt_server.Access.Denied
+
+// Whether the database has room for `n` more attributes.
+fn database_room(host: Host, n: Int) -> Bool
+    list.len(host.link.db.attributes) + n <= noble_config.MAX_ATTRIBUTES
+
+impl Host
+    // Start a primary service.  Services are numbered from 0 in the order they are added.  Answers E_NO_ROOM when the database is
+    // full.
+    fn add_service(var self, uuid: noble.Uuid) -> noble.ServiceResult
+        if not database_room(self, 1)
+            return noble.ServiceResult { status: noble.failed(noble.LAYER_LOCAL, noble.E_NO_ROOM), svc: -1 }
+        let handle = gatt_server.add_service(var self.link.db, false, noble.uuid_octets(uuid))
+        if handle < 0
+            return noble.ServiceResult { status: noble.failed(noble.LAYER_LOCAL, noble.E_NO_ROOM), svc: -1 }
+        let index = self.api.svc_count
+        self.api.svc_count = index + 1
+        noble.ServiceResult { status: noble.ok(), svc: index }
+
+    // Add a characteristic to the last service.  `perm` is what a client needs to read and to write the value; `cccd` is what it
+    // needs to subscribe, and a Client Characteristic Configuration descriptor is added when `props` has Notify or Indicate.
+    // `max_len` is the longest value a client may write.
+    fn add_char(var self, uuid: noble.Uuid, props: Int, perm: noble.Permissions, cccd: noble.Access, max_len: Int) -> noble.AttrResult
+        let blank = noble.Attr { handle: 0, props: props as u8, cccd: 0 }
+        let wants_cccd = (props & (gatt_server.PROP_NOTIFY | gatt_server.PROP_INDICATE)) != 0
+        if self.api.svc_count == 0
+            return noble.AttrResult { status: noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT), attr: blank }
+        if not database_room(self, if wants_cccd then 3 else 2)
+            return noble.AttrResult { status: noble.failed(noble.LAYER_LOCAL, noble.E_NO_ROOM), attr: blank }
+        let permission = gatt_server.permission_bits(gatt_server.Permissions { read: gatt_access(perm.read), write: gatt_access(perm.write) })
+        let declaration = gatt_server.add_characteristic(var self.link.db, props, permission, noble.uuid_octets(uuid))
+        if declaration < 0
+            return noble.AttrResult { status: noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT), attr: blank }
+        let value = declaration + 1
+        if max_len > 0
+            let _ = gatt_server.set_max_length(var self.link.db, value, max_len)
+        var descriptor = 0
+        if wants_cccd
+            descriptor = gatt_server.add_configuration(var self.link.db, gatt_server.Permissions { read: gatt_server.Access.Open, write: gatt_access(cccd) })
+            if descriptor < 0
+                return noble.AttrResult { status: noble.failed(noble.LAYER_LOCAL, noble.E_NO_ROOM), attr: blank }
+        noble.AttrResult { status: noble.ok(), attr: noble.Attr { handle: value as u16, props: props as u8, cccd: descriptor as u16 } }
+
+    // Make the attribute `a`, added with `add_char`, function-valued: a read or write calls `HostPolicy.on_read` or `on_write`
+    // inside the Host's turn.
+    fn bind_function(var self, a: noble.Attr) -> noble.Status
+        self.bind_as(a, gatt_server.BOUND_FUNCTION)
+
+    // The other binding: a read or write of `a` is queued as `Event.AttrRead` or `AttrWrite`, the Host holds the ATT request, and
+    // the application answers with `respond` within the ATT timeout of 30 seconds.  No policy is involved.
+    fn bind_event(var self, a: noble.Attr) -> noble.Status
+        self.bind_as(a, gatt_server.BOUND_EVENT)
+
+    fn bind_as(var self, a: noble.Attr, mode: Int) -> noble.Status
+        if self.api.svc_count == 0
+            return noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT)
+        if gatt_server.bind(var self.link.db, a.handle as Int, mode, self.api.svc_count - 1)
+            noble.ok()
+        else
+            noble.failed(noble.LAYER_LOCAL, noble.E_NOT_FOUND)
+
+    // Set the value a read of `a` returns.  The longest value a client may write stays what `add_char` gave.
+    fn set_value(var self, a: noble.Attr, v: noble.Value) -> noble.Status
+        let handle = a.handle as Int
+        let i = gatt_server.index_of(self.link.db, handle)
+        if i < 0
+            return noble.failed(noble.LAYER_LOCAL, noble.E_NOT_FOUND)
+        let longest = self.link.db.attributes[i].max_len
+        var data: [u8] = []
+        for k in 0..v.len()
+            list.push(data, v[k])
+        if not gatt_server.set_value(var self.link.db, handle, data)
+            return noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT)
+        let _ = gatt_server.set_max_length(var self.link.db, handle, longest)
+        noble.ok()

@@ -6,6 +6,8 @@ consumer deciding whether to upgrade can read.
 
 ## Unreleased
 
+`host`: the Host as one value.  `Host` holds the 29 fields of the Bluetooth Test Protocol session of `orbit/ble` that are Host state and not the state of a test service (the link registry and active `LeLink`, the parked per-connection state, the Security Manager halves, the bonds, the pairing settings, the GATT client table, the queue of commands owed to the Controller and the rest), `host_blank(host_config(slots, name))` makes one, and `host_activate` switches the connection the per-connection fields describe.  Two Hosts in one program share no table.  `SecuritySettings`, `LinkSession` and the Appearance, Peripheral Preferred Connection Parameters and bond-capacity constants moved here from `orbit/ble/src/btp/btp_session.nv` with no change.
+
 `cs_gap`: the Channel Sounding GAP procedures of Core Vol 3 Part C, Sections 9.7 and 10.11.1, as an engine that a program drives with `cs_gap_next`, `cs_gap_event`, `cs_gap_tick` and `cs_gap_take_result`: the capabilities of both Controllers, the default settings, the security start, the remote FAE table, the configuration, the procedure parameters and Procedure Enable, then the result events of each procedure joined into one `HciCsProcResult`.  Either ACL role and either CS role; the security levels 1 to 4 choose the configuration and the requirements.
 
 ## 0.1.0

@@ -54,6 +54,15 @@ this package imports a module of the Controller or of `orbit/ble`.
    broadcast isochronous tables, `iso_host` routes an HCI event to them, `iso_flow`
    counts the Controller's ISO buffers, `iso_setup` brings the feature up, and
    `isoal` and `isoal_timing` are the Isochronous Adaptation Layer.
+9. **The Host.**  `host` holds the state of one Host in one value: `Host`, made
+   by `host_blank(host_config(slots, name))`.  It owns the link registry and
+   the `LeLink` of the active connection with the state parked for the others,
+   the GATT database each link serves, the client table, both Security Manager
+   halves, the bonds, the pairing settings and the queue of HCI commands the
+   Host owes the Controller.  A front end holds a `Host` beside its own state:
+   the BTP session of `orbit/ble` does.  The four fixed-RAM buffers of
+   `att_scratch` and `smp_ctx` (module-level statics) belong to the co-resident
+   image, which has no `Host` value; no `Host` function reaches them.
 
 `profile_builder`, `notify`, `wire` and `control_common` are what the modules
 that add a service to a `GattServer` share.  The audio roles are the package
@@ -98,13 +107,14 @@ the script `tests/orbit/test_ble_config_equals_limits.sh` checks the two.
 
 ## The public surface
 
-An extension module, a chip image and a PC Host name 591 items of the package;
+An extension module, a chip image and a PC Host name 600 items of the package;
 they are `pub`, each with a doc comment, and every other item is private.
 `novo doc` prints them.
 
 | Layer | Modules and public items |
 |---|---|
 | ATT and GATT | `gatt_server` (89), `gatt_client` (78), `att` (36), `att_scratch` (11), `gatt_db` (8), `att_server` (3), `att_server_scratch` (2) |
+| Host | `host` (9) |
 | Links and HCI | `le_link` (38), `links` (16), `hci_session` (4), `hci_init` (3), `hci_deframer` (1) |
 | Channels | `l2cap_coc` (17), `l2cap` (7) |
 | Security | `smp` (26), `smp_ctx` (23), `smp_keys` (18), `smp_bond` (7), `smp_initiator` (7), `smp_responder` (6), `smp_fsm` (4), `smp_core` (2), `smp_handler` (1) |

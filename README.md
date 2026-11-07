@@ -19,6 +19,7 @@ they import its modules by name.
 
 | Module | Holds |
 |---|---|
+| `host` | the Host as one value (`Host`, made by `host_blank` from a `HostConfig`): the links of both roles, the GATT database and client table, both Security Manager halves, the bonds, the pairing settings and the queue of HCI commands owed to the Controller; two Hosts in one program share no table.  The BTP session of `orbit/ble` holds a `Host` beside the states of its test services |
 | `links`, `le_link` | the registry of connection slots, the credit pool of the Controller's ACL buffers, and one LE link: its HCI events, its ACL data, and the dispatch of its L2CAP PDUs to ATT, SMP and the credit based channels |
 | `hci_session`, `hci_deframer`, `hci_transport`, `hci_uart`, `hci_usb_cdc`, `hci_init` | the pairing of a command with its answer, the H4 byte stream cut into packets, the `HciTransport` trait and its UART and USB CDC-ACM transports, and the builders of the start-up commands |
 | `att`, `att_server`, `att_scratch`, `att_server_scratch` | the ATT PDU codec, the ATT server, and the fixed-RAM scratch buffer and response builders the device images use |

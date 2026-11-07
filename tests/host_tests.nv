@@ -1,0 +1,94 @@
+// tests/host_tests.nv — the unit tests of src/host.nv.
+//
+//   novo test tests/host_tests.nv
+
+use std.test
+use host.{ BOND_CAPACITY, Host, host_activate, host_blank, host_config }
+use le_link
+use gatt_client
+use links
+
+fn name_of(text: Str) -> [u8]
+    var out: [u8] = []
+    for i in 0..str.len(text)
+        list.push(out, str.byte_at_or(text, i, 0) as u8)
+    out
+
+@test
+fn test_a_blank_host_has_every_slot_free_and_nothing_pending()
+    let h = host_blank(host_config(2, name_of("noble")))
+    test.assert_eq(le_link.le_links_slots(h.le), 2)
+    test.assert_eq(list.len(h.parked), 2)
+    test.assert_eq(h.active, 0)
+    test.assert_eq(h.clock_ms, 0)
+    test.assert_eq(list.len(h.queued), 0)
+    test.assert_eq(list.len(h.refused), 0)
+    test.assert_eq(list.len(h.events), 0)
+    test.assert_eq(list.len(h.local_features), 0)
+    test.assert_eq(list.len(h.supported_commands), 0)
+    test.assert(not h.car_wanted)
+    test.assert(not h.security.ready)
+
+@test
+fn test_a_blank_host_keeps_the_name_and_the_bond_capacity_of_its_configuration()
+    let h = host_blank(host_config(1, name_of("earbud")))
+    test.assert_eq(list.len(h.device_name), 6)
+    test.assert_eq(h.device_name[0] as Int, 0x65)
+    test.assert_eq(h.bonds.capacity, BOND_CAPACITY)
+    test.assert_eq(list.len(h.bonds.bonds), 0)
+
+@test
+fn test_the_pairing_settings_of_a_blank_host_are_the_defaults()
+    let h = host_blank(host_config(1, name_of("noble")))
+    test.assert(h.security.mitm)
+    test.assert_eq(h.security.mode, 1)
+    test.assert_eq(h.security.level, 2)
+    test.assert(not h.security.sc_only)
+    test.assert(not h.security.configured)
+    test.assert_eq(h.security.client_level, 0)
+    test.assert_eq(list.len(h.security.irk), 0)
+
+@test
+fn test_two_hosts_share_no_table()
+    var a = host_blank(host_config(1, name_of("a")))
+    let b = host_blank(host_config(1, name_of("b")))
+    a.clock_ms = 77
+    list.push(a.refused, 5)
+    test.assert_eq(b.clock_ms, 0)
+    test.assert_eq(list.len(b.refused), 0)
+    test.assert_eq(a.device_name[0] as Int, 0x61)
+    test.assert_eq(b.device_name[0] as Int, 0x62)
+
+@test
+fn test_activating_a_slot_parks_the_fields_of_the_connection_that_was_active()
+    var h = host_blank(host_config(2, name_of("noble")))
+    h.ll_update = [1, 2, 3, 4]
+    h.car_wanted = true
+    host_activate(var h, 1)
+    test.assert_eq(h.active, 1)
+    test.assert_eq(list.len(h.ll_update), 0)
+    test.assert(not h.car_wanted)
+    test.assert_eq(list.len(h.parked[0].ll_update), 4)
+    test.assert(h.parked[0].car_wanted)
+    host_activate(var h, 0)
+    test.assert_eq(h.active, 0)
+    test.assert_eq(list.len(h.ll_update), 4)
+    test.assert(h.car_wanted)
+
+@test
+fn test_activating_the_active_slot_or_a_slot_that_does_not_exist_changes_nothing()
+    var h = host_blank(host_config(2, name_of("noble")))
+    h.ll_update = [9]
+    host_activate(var h, 0)
+    host_activate(var h, 2)
+    host_activate(var h, -1)
+    test.assert_eq(h.active, 0)
+    test.assert_eq(list.len(h.ll_update), 1)
+
+@test
+fn test_the_client_table_of_a_blank_host_has_no_link_open()
+    var h = host_blank(host_config(1, name_of("noble")))
+    let id = links.link_id(0, 0)
+    test.assert_eq(gatt_client.cache_count(var h.client, id), 0)
+    test.assert(gatt_client.open(var h.client, id))
+    test.assert_eq(gatt_client.cache_count(var h.client, id), 0)

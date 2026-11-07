@@ -1,0 +1,255 @@
+// host.nv — the Host: the state a Bluetooth Low Energy Host keeps, in one value.
+//
+// A `Host` owns the tables of one Host and nothing outside itself: the LE
+// links of both roles (`le`, `link`, `parked`), the GATT database that each
+// link serves (`link.db`), the state of the GATT client of every link
+// (`client`), both halves of the Security Manager (`smp`, `smp_central`),
+// the bonds (`bonds`), the settings of the pairing (`security`), the queue
+// of HCI commands the Host owes the Controller (`queued`) and the Controller's
+// feature set.  Two Hosts in one program share no table.  The four fixed-RAM
+// buffers of `att_scratch.nv` and `smp_ctx.nv` (module-level statics, addressed
+// with `hw.mem_*`) are the state of the co-resident image, which has no `Host`
+// value and drives the ATT server and the pairing over them; no function of
+// this module reaches them, so a Host does not share them with another.
+//
+// The Host takes no part in a front end.  The Bluetooth Test Protocol session
+// of orbit/ble (`btp_session.nv`) holds a `Host` beside the states of its test
+// services and drives it; a program that has no use for the protocol builds a
+// `Host` with `host_blank` and calls the same functions of this package.
+//
+// The Host works on one link at a time, the `active` slot, and `link` is that
+// slot's `LeLink`.  The fields that belong to the connection (`ll_update`,
+// `smp`, `smp_central`, `car_wanted` and `car_records`) hold the active
+// slot's state; `parked` holds the same fields for every slot, and
+// `host_activate` writes the active slot's into `parked` and reads the next
+// one's out, so an event for another connection finds the state of that
+// connection and leaves this one's alone.
+//
+// `host_blank(config)` is the constructor: it makes every table of the Host
+// from `config`, once, at the start.  Most tables are lists today (the
+// package builds with `sibling_check = "warn"` for that reason), so the
+// Host does not yet keep the promise of no allocation after start; the
+// tables that are fixed-capacity storage (`client`, the link registry and the
+// isochronous tables) take their capacities from the package configuration
+// (`noble_config`).  `host_activate` is the one function here that changes
+// which connection the per-connection fields describe.
+
+use gatt_db
+use gatt_client
+use le_link
+use smp
+use smp_bond
+use smp_initiator
+use smp_keys
+use smp_keys.{ KeyPair, PublicKey }
+use smp_responder
+use hci_frame
+
+// The Appearance characteristic value of the GAP server: 0x0000, Unknown.
+const APPEARANCE_UNKNOWN = 0x0000
+
+// The Peripheral Preferred Connection Parameters of the GAP server: a
+// connection interval of 30 ms to 50 ms, no Peripheral latency, a 5 s
+// supervision timeout.
+const PPCP_INTERVAL_MIN = 0x0018
+const PPCP_INTERVAL_MAX = 0x0028
+const PPCP_LATENCY = 0x0000
+const PPCP_TIMEOUT = 0x01F4
+
+// The number of bonds the Host keeps; a new bond with no room left replaces
+// the oldest (`smp_bond.SmpBondTable`).
+pub const BOND_CAPACITY = 4
+
+// What a program chooses when it makes a Host: `slots` is the number of
+// connections the Host serves at once, at most `links.LINK_SLOTS`;
+// `device_name` is the Device Name characteristic of the GAP server;
+// `bond_capacity` is the number of bonds kept.
+pub struct HostConfig
+    slots: Int
+    device_name: [u8]
+    bond_capacity: Int
+
+// The configuration of a Host that serves `slots` connections with the
+// Device Name `device_name` and the default number of bonds.
+pub fn host_config(slots: Int, device_name: [u8]) -> HostConfig
+    HostConfig { slots: slots, device_name: device_name[:], bond_capacity: BOND_CAPACITY }
+
+// What a program has set for pairing: the IO Capability ([Vol 3] Part H,
+// Table 3.4), whether the MITM flag asks for MITM protection (on until the
+// program turns it off), and the minimum encryption key size (Section
+// 2.3.4).  `irk` is the local Identity Resolving Key the Host distributes
+// with IdKey, empty for none.  `ready` is set once the program has given the
+// Host a seed for the random numbers and the key pair; until then the Host
+// answers every Security Manager command with Pairing Not Supported (Section
+// 3.3).  `mode` and `level` are the LE security mode and level the program
+// set, `sc_only` the LE Secure Connections Only flag, `configured` whether
+// the program set a mode and level at all, which is what the client security
+// check of `client_level` comes from, and `client_level` the level that check
+// holds a link to, 0 for none ([Vol 3] Part C, Section 10.2).
+pub struct SecuritySettings
+    var io_capability: Int
+    var mitm: Bool
+    var min_key_size: Int
+    var irk: [u8]
+    var ready: Bool
+    var mode: Int
+    var level: Int
+    var sc_only: Bool
+    var configured: Bool
+    var client_level: Int
+
+// The state of one connection that the Host keeps while another is active:
+// the fields of the host that belong to the connection.
+pub struct LinkSession
+    var ll_update: [Int]
+    var smp: smp_responder.SmpState
+    var smp_central: smp_initiator.SmpInitState
+    var car_wanted: Bool
+    var car_records: [[u8]]
+
+// The Host.
+//
+// `le` holds every LE link and the registry that says which slot holds which
+// connection (`le_link.LeLinks`).  `key_pair` and `rand` are what the Security
+// Manager halves of a slot are made from, `refused` the handles of
+// connections the registry had no slot for.
+//
+// `clock_ms` is the clock reading of the last tick, which times the signaling
+// procedures; `queued` the batches of HCI commands the Host owes the
+// Controller, oldest first; `device_name` the Device Name; and `ll_update` the
+// connection parameters of an LE Connection Update command the Controller took,
+// kept until its LE Connection Update Complete event in case the Host must ask
+// again over L2CAP (Interval Min, Interval Max, Latency, Timeout; empty for
+// none).
+//
+// `local_features` is the Controller's feature set, the LE Read Local
+// Supported Features answer the program took at bring-up, empty until it did;
+// bit 1 of the first octet is the Connection Parameters Request Procedure.
+// `supported_commands` is the Controller's Supported_Commands, the 64 octets of
+// the Read Local Supported Commands answer, empty until the program took them;
+// octet 37 bit 7 is LE Extended Create Connection.
+//
+// The Security Manager's part: `smp` is the responder of `smp_responder.nv` for
+// the connection and `smp_central` the initiator of `smp_initiator.nv`, which
+// runs the pairing when the Host holds the Central role; `bonds` is the
+// security database both halves read and write, `security` the settings the
+// program gives them, and `events` the front end's events they have for the
+// program, which the next step's output carries.  `own_address` is the random
+// address the Controller uses, which the pairing's confirm values and keys
+// depend on (the Identity Address until the program reports a private one),
+// and `resolved` the peer's Identity Address Information (address type, then
+// the address) once a pairing reports one the connection did not use, for the
+// session to take over into the connection record.  `oob_local` is the local
+// r and C of LE Secure Connections Out of Band data (32 octets), made at the
+// first request and answered again at every later one, because the two values
+// must be of the same pair ([Vol 3] Part H, Section 2.3.5.6.4).  The out of
+// band data a program gives before a connection waits in `oob_tk` (the TK of LE
+// legacy pairing, 16 octets) and `oob_peer` (the peer's r and C of LE Secure
+// Connections, 32 octets), each with a `waiting` flag that says a value is held
+// even when it clears the value.
+//
+// `client` is the state of the GATT client role of every connection
+// (`gatt_client.nv`).  Each Host owns its table: a Host that is made new has an
+// empty one, and two Hosts in one process share none of it.  `car_wanted` and
+// `car_records` are the Host's own read of the peer's Central Address
+// Resolution characteristic, and `changed_range` the handle range of a database
+// change not yet indicated, empty for none.
+pub struct Host
+    var le: le_link.LeLinks
+    var link: le_link.LeLink
+    var active: Int
+    var parked: [LinkSession]
+    var refused: [Int]
+    var key_pair: KeyPair
+    var rand: smp_keys.SmpRandom
+    var clock_ms: Int
+    var queued: [[HciCmdMsg]]
+    var device_name: [u8]
+    var local_features: [u8]
+    var supported_commands: [u8]
+    var ll_update: [Int]
+    var smp: smp_responder.SmpState
+    var smp_central: smp_initiator.SmpInitState
+    var bonds: smp_bond.SmpBondTable
+    var security: SecuritySettings
+    var events: [u8]
+    var own_address: [u8]
+    var resolved: [u8]
+    var oob_local: [u8]
+    var oob_tk: [u8]
+    var oob_tk_waiting: Bool
+    var oob_peer: [u8]
+    var oob_peer_waiting: Bool
+    var client: gatt_client.ClientTable
+    var car_wanted: Bool
+    var car_records: [[u8]]
+    var changed_range: [Int]
+
+// The GAP server's database for `device_name` ([Vol 3] Part C, Section 12;
+// `gatt_db.nv`).  The Device Name and the Appearance are writable, which the
+// Generic Access Profile test cases ask for; no program that does not run
+// them needs it.
+fn gap_database(device_name: [u8]) -> [u8]
+    let appearance: [u8] = [(APPEARANCE_UNKNOWN & 0xFF) as u8, ((APPEARANCE_UNKNOWN >>> 8) & 0xFF) as u8]
+    gatt_db.build_gap_server(device_name, appearance, gatt_db.ppcp_value(PPCP_INTERVAL_MIN, PPCP_INTERVAL_MAX, PPCP_LATENCY, PPCP_TIMEOUT), true)
+
+// The state of a connection that has not begun: the Security Manager halves
+// `smp_state` and `smp_central` and nothing in progress.
+pub fn fresh_link_session(smp_state: smp_responder.SmpState, smp_central: smp_initiator.SmpInitState) -> LinkSession
+    LinkSession { ll_update: [], smp: smp_state, smp_central: smp_central, car_wanted: false, car_records: [] }
+
+// The per-connection fields of `host`, as they stand.
+fn capture_link_session(var host: Host) -> LinkSession
+    LinkSession { ll_update: host.ll_update, smp: host.smp, smp_central: host.smp_central, car_wanted: host.car_wanted, car_records: host.car_records }
+
+// Make `p` the per-connection fields of `host`.
+fn load_link_session(var host: Host, var p: LinkSession)
+    host.ll_update = p.ll_update
+    host.smp = p.smp
+    host.smp_central = p.smp_central
+    host.car_wanted = p.car_wanted
+    host.car_records = p.car_records
+
+// A Host with nothing connected, made from `config`: every link slot free,
+// the GAP server's database built for the Device Name, the Security
+// Manager halves in their first state with no keys and the pairing settings
+// at their defaults (the program gives the seed and the key pair later), an
+// empty bond table of `config.bond_capacity` entries, and the GATT client
+// table opened empty.
+pub fn host_blank(config: HostConfig) -> Host
+    let security = SecuritySettings { io_capability: smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT, mitm: true, min_key_size: smp.SMP_MIN_ENC_KEY_SIZE, irk: [], ready: false, mode: 1, level: 2, sc_only: false, configured: false, client_level: 0 }
+    let no_keys = KeyPair { private_key: [], public_key: PublicKey { x: [], y: [] } }
+    let smp_state = smp_responder.new_state(smp_responder.default_config(), no_keys, smp_keys.zeros(16))
+    let smp_central = smp_initiator.new_state(smp_initiator.default_config(), no_keys, smp_keys.zeros(16))
+    let le = le_link.new_le_links(gap_database(config.device_name), config.slots)
+    var parked: [LinkSession] = []
+    for _ in 0..le_link.le_links_slots(le)
+        list.push(parked, fresh_link_session(
+            smp_responder.new_state(smp_responder.default_config(), no_keys, smp_keys.zeros(16)),
+            smp_initiator.new_state(smp_initiator.default_config(), no_keys, smp_keys.zeros(16))))
+    var host = Host {
+        le: le, link: le.slots[0], active: 0, parked: parked, refused: [], key_pair: no_keys, rand: smp_keys.random_from_seed(smp_keys.zeros(16)),
+        clock_ms: 0, queued: [], device_name: config.device_name[:], local_features: [], supported_commands: [], ll_update: [],
+        smp: smp_state, smp_central: smp_central, bonds: smp_bond.new_bond_table(config.bond_capacity), security: security, events: [],
+        own_address: [], resolved: [], oob_local: [], oob_tk: [], oob_tk_waiting: false,
+        oob_peer: [], oob_peer_waiting: false,
+        client: gatt_client.ClientTable {
+            generation: Vec.new(), opened: Vec.new(), flags: Vec.new(), sc_handle: Vec.new(), cache_n: Vec.new(),
+            hash: Vec.new(), c_kind: Vec.new(), c_flags: Vec.new(), c_handle: Vec.new(), c_a: Vec.new(),
+            c_b: Vec.new(), c_lo: Vec.new(), c_hi: Vec.new(), regs: Vec.new(), queue: Vec.new(),
+            value: Vec.new(), payload: Vec.new(), tx: Vec.new() },
+        car_wanted: false, car_records: [], changed_range: [] }
+    gatt_client.init_table(var host.client)
+    host
+
+// Work on the connection in `slot` from now on: the state of the one that
+// was active is parked and the state of `slot` is read out.  A slot that is
+// the active one, or that does not exist, changes nothing.
+pub fn host_activate(var host: Host, slot: Int)
+    if slot == host.active or slot < 0 or slot >= le_link.le_links_slots(host.le)
+        return
+    host.parked[host.active] = capture_link_session(var host)
+    var next = host.parked[slot]
+    load_link_session(var host, var next)
+    host.active = slot
+    host.link = host.le.slots[slot]

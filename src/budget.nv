@@ -111,6 +111,10 @@ const HAP_RECORD_FIELDS = 3
 const HAP_NAME_OCTETS = 40
 const HAP_BTP_STATE = 640
 
+// The scalars of one event of the Host API queue (the connection name, the attribute handle,
+// the flags and the tag), beside the largest payload.
+const EVENT_FIXED = 48
+
 // The larger of `n` and 1: a table of an absent feature keeps one record.
 @tier(embedded)
 const fn max1(n: Int) -> Int
@@ -320,6 +324,13 @@ const fn hap_bytes() -> Int
             + vec_bytes(HAP_LINK_REGS, 8) + vec_bytes(noble_config.MAX_HAS_CACHE * HAP_RECORD_FIELDS, 8)
             + vec_bytes(noble_config.MAX_HAS_CACHE * HAP_NAME_OCTETS, 1) + slot(HAP_NAME_OCTETS)) + HAP_BTP_STATE
 
+// The Host API's event queue (noble.nv, Layer A): `EVENT_QUEUE` slots, each holding the largest
+// event, which is a value of `ATT_VALUE_BYTES` octets or a report of `MAX_ADV_DATA` octets
+// beside the scalars of the event.  Zero without a queue.
+@tier(embedded)
+const fn event_queue_bytes() -> Int
+    noble_config.EVENT_QUEUE * (noble_config.ATT_VALUE_BYTES + noble_config.MAX_ADV_DATA + EVENT_FIXED)
+
 // The Host core's storage, in bytes.
 @tier(embedded)
 const fn total_bytes() -> Int
@@ -328,7 +339,7 @@ const fn total_bytes() -> Int
         + noble_config.MAX_PAIRING * PAIRING_CONTEXT + bond_bytes() + channel_bytes() + iso_bytes()
         + ase_bytes() + control_bytes() + 2 * slot(noble_config.HCI_BUFFER_OCTETS) + TRANSPORT_RINGS + client_bytes() + bridge_bytes()
         + broadcast_bytes() + bap_bytes() + unicast_bytes() + sink_bytes() + control_client_bytes()
-        + profile_link_bytes() + hap_bytes()
+        + profile_link_bytes() + hap_bytes() + event_queue_bytes()
 
 // The checks of the limits, made when the build is compiled: a profile that
 // breaks one stops `novo build` and `novo test` with the message, before the

@@ -1,0 +1,9 @@
+# The Host API (Layer A, src/noble.nv and src/host_api.nv) with an event queue, for the tests of this package:
+# `novo test --config configs/layer_a.toml tests/host_api_tests.nv`.  The default configuration has no queue
+# (`event_queue` 0, because a Host that does not use the API pays for none), so the cases of that file that need
+# one guard themselves and return there; this profile gives them four events and two connections.  It has no
+# counterpart in orbit/ble/configs, which holds the profiles of the images.
+
+[noble]
+max_connections = 2
+event_queue = 4

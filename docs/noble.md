@@ -63,6 +63,22 @@ this package imports a module of the Controller or of `orbit/ble`.
    the BTP session of `orbit/ble` does.  The four fixed-RAM buffers of
    `att_scratch` and `smp_ctx` (module-level statics) belong to the co-resident
    image, which has no `Host` value; no `Host` function reaches them.
+10. **The Host API, Layer A.**  `noble` holds the values an application sees
+   (`Status` with the named codes of ATT, HCI and SMP and the Host's own, `ConnId`,
+   `Addr`, `Security`, `ConnParams`, `ConnInfo`, `AdvReport`, `Event`, `Request`), the
+   trait `HostPolicy` with a default for each decision, the trait `BondStore` with
+   `Bond` and `RamBonds`, and `Api`, the fixed storage of the layer (the event queue,
+   the connection table, the call in flight) that a `Host` carries.  `host_api` holds
+   the engine: `begin` takes a request, `poll` reads the transport, the Security
+   Manager, the links and the channels and calls the hooks, `result` and
+   `next_event` hand the outcome and the events to the application.  The
+   adapters `from_client_status`, `from_client_error`, `from_advertiser_error`,
+   `from_smp_reason` and `from_profile_error` read the older error forms of the
+   package as a `Status`.  `hci_transport` gives `HciLink` the clock (`now_ms`) and
+   the wait (`park`), both with a default; the layer itself calls neither.  The Host
+   API serves the requests of connecting, disconnecting, updating the parameters,
+   securing a link and the credit based channels; the requests of advertising,
+   scanning and the GATT client are NOT IMPLEMENTED in it.
 
 `profile_builder`, `notify`, `wire` and `control_common` are what the modules
 that add a service to a `GattServer` share.  The audio roles are the package
@@ -72,13 +88,15 @@ module of this package.
 
 ## Configuration
 
-The schema is the `[config.<key>]` tables of `novo.toml`: 38 keys (`max_connections`,
+The schema is the `[config.<key>]` tables of `novo.toml`: 41 keys (`max_connections`,
 `max_att_mtu`, `acl_octets`, `acl_buffers`, `max_attributes`, `max_value_bytes`,
 `max_uuid128`, `max_cccd`, `max_bearers`, `max_coc_channels`, `max_bonds`,
 `max_pairing`, `max_cis`, `max_big`, `max_bis`, `iso_sdu_octets`, `iso_buffers`,
 `sequenced_slots`, `hci_buffer_octets`, `hci_rx_flow_control` and the GATT client
 engine's `max_client_links`, `client_bearers`, `client_cache_records`,
-`client_queue` and `client_value_bytes`).  The ranges are the bounds of the
+`client_queue` and `client_value_bytes`) and the three of the Host API (`event_queue`, the events the queue holds, 0 in the
+default so that a Host that does not use the API pays for none; `att_value_bytes`, the octets of one value or SDU a call or an
+event carries; `max_adv_data`, the octets of the advertising data of a report).  The ranges are the bounds of the
 Core Specification where it states one, and a relation between keys is a field
 of the schema, which `novo config check` refuses a file to break.
 
@@ -103,7 +121,8 @@ this package.
 
 `configs/<profile>.toml` are the profiles the package's tests run under.  The
 same names exist in `orbit/ble/configs/`, whose `[noble]` sections equal these;
-the script `tests/orbit/test_ble_config_equals_limits.sh` checks the two.
+the script `tests/orbit/test_ble_config_equals_limits.sh` checks the two.  `layer_a.toml` has no
+counterpart there: it gives the tests of the Host API their event queue (`event_queue = 4`).
 
 ## The public surface
 
@@ -114,7 +133,8 @@ they are `pub`, each with a doc comment, and every other item is private.
 | Layer | Modules and public items |
 |---|---|
 | ATT and GATT | `gatt_server` (89), `gatt_client` (78), `att` (36), `att_scratch` (11), `gatt_db` (8), `att_server` (3), `att_server_scratch` (2) |
-| Host | `host` (9) |
+| Host | `host` (10) |
+| Host API | `noble` (about 50 values, constants and functions), `host_api` (16) |
 | Links and HCI | `le_link` (38), `links` (16), `hci_session` (4), `hci_init` (3), `hci_deframer` (1) |
 | Channels | `l2cap_coc` (17), `l2cap` (7) |
 | Security | `smp` (26), `smp_ctx` (23), `smp_keys` (18), `smp_bond` (7), `smp_initiator` (7), `smp_responder` (6), `smp_fsm` (4), `smp_core` (2), `smp_handler` (1) |

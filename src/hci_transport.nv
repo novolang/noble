@@ -91,6 +91,23 @@ trait HciTransport
 // for a socket, `[hw]` for a UART.  A byte-stream transport implements
 // both traits, the `HciTransport` methods on top of these two.
 
+//
+// The Host API (noble.nv, host_api.nv) reads the time and waits through the
+// same link, because the link is where the Host meets the outside world: it is
+// the one thing that already waits with a deadline.  `now_ms` is the clock in
+// milliseconds and `park` gives up the processor until a packet may have
+// arrived or `ms` have passed.  Both have a default, so an impl that has
+// nothing better keeps the system tick and a yield; a link with an interrupt on
+// receive parks the task on a wake cell in `park`, and a simulated link
+// answers `now_ms` with a virtual clock that its test advances.
+
 trait HciLink[e]
-    fn send_packet(self, pkt: [u8]) -> Bool [e]
+    fn send_packet(var self, pkt: [u8]) -> Bool [e]
     fn recv_packet(var self, timeout_ms: Int) -> ?[u8] [e]
+
+    fn now_ms(var self) -> Int [e, time]
+        core.rt.tick_ms()
+
+    fn park(var self, ms: Int) [e, async]
+        let _ = ms
+        core.rt.yield_now()

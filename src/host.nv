@@ -44,6 +44,7 @@ use smp_keys
 use smp_keys.{ KeyPair, PublicKey }
 use smp_responder
 use hci_frame
+use noble
 
 // The Appearance characteristic value of the GAP server: 0x0000, Unknown.
 const APPEARANCE_UNKNOWN = 0x0000
@@ -148,6 +149,12 @@ pub struct LinkSession
 // Connections, 32 octets), each with a `waiting` flag that says a value is held
 // even when it clears the value.
 //
+// `api` is the fixed storage of the Host API (noble.nv, host_api.nv): the event queue, the connection
+// table, the call in flight and the registers of the request that serves it.  `acl_out` holds the
+// HCI ACL Data packets the links owe the Controller until the next `poll` writes them, and
+// `cmd_wait` the opcode of the command the Controller has not answered, -1 for none.  The Bluetooth
+// Test Protocol session of orbit/ble does not use the three.
+//
 // `client` is the state of the GATT client role of every connection
 // (`gatt_client.nv`).  Each Host owns its table: a Host that is made new has an
 // empty one, and two Hosts in one process share none of it.  `car_wanted` and
@@ -184,6 +191,9 @@ pub struct Host
     var car_wanted: Bool
     var car_records: [[u8]]
     var changed_range: [Int]
+    var api: noble.Api
+    var acl_out: [[u8]]
+    var cmd_wait: Int
 
 // The GAP server's database for `device_name` ([Vol 3] Part C, Section 12;
 // `gatt_db.nv`).  The Device Name and the Appearance are writable, which the
@@ -238,7 +248,8 @@ pub fn host_blank(config: HostConfig) -> Host
             hash: Vec.new(), c_kind: Vec.new(), c_flags: Vec.new(), c_handle: Vec.new(), c_a: Vec.new(),
             c_b: Vec.new(), c_lo: Vec.new(), c_hi: Vec.new(), regs: Vec.new(), queue: Vec.new(),
             value: Vec.new(), payload: Vec.new(), tx: Vec.new() },
-        car_wanted: false, car_records: [], changed_range: [] }
+        car_wanted: false, car_records: [], changed_range: [],
+        api: noble.api_new(config.slots), acl_out: [], cmd_wait: -1 }
     gatt_client.init_table(var host.client)
     host
 
@@ -253,3 +264,40 @@ pub fn host_activate(var host: Host, slot: Int)
     load_link_session(var host, var next)
     host.active = slot
     host.link = host.le.slots[slot]
+
+// Give the Host what pairing needs: at least 16 octets of `seed` from an entropy source of the
+// program's (the operating system on a PC, the Controller's LE Rand command on a device), and the
+// local Identity Resolving Key `irk`, least significant octet first, empty for none.  The P-256
+// private key of the public key exchange ([Vol 3] Part H, Section 2.3.5.6.1) and the random number
+// generator of the Security Manager are drawn from the seed, so every run of a program has a key
+// pair of its own; Section 2.3.6 recommends when to replace it.  The Central half and the
+// Peripheral half of each slot get a generator of their own, from different draws of the seed, so
+// the nonces and passkeys of the two, and of two connections, never repeat one another.  The
+// private key is 32 random octets with the most significant bit cleared, which keeps it below the
+// order of the curve's base point.
+pub fn host_seed(var host: Host, seed: [u8], irk: [u8])
+    let first = smp_keys.random_draw(smp_keys.random_from_seed(seed))
+    let second = smp_keys.random_draw(first.random)
+    let third = smp_keys.random_draw(second.random)
+    let fourth = smp_keys.random_draw(third.random)
+    var private_key = first.value[:]
+    list.append(private_key, second.value)
+    private_key[31] = ((private_key[31] as Int) & 0x7F) as u8
+    var sec = host.security
+    sec.irk = irk[:]
+    sec.ready = true
+    host.security = sec
+    let pair = smp_keys.key_pair_from_private(private_key)
+    host.smp = smp_responder.new_state(smp_responder.default_config(), pair, third.value)
+    host.smp_central = smp_initiator.new_state(smp_initiator.default_config(), pair, fourth.value)
+    host.key_pair = pair
+    var rng = fourth.random
+    for slot in 0..le_link.le_links_slots(host.le)
+        if slot != host.active
+            let a = smp_keys.random_draw(rng)
+            let b = smp_keys.random_draw(a.random)
+            rng = b.random
+            host.parked[slot] = fresh_link_session(
+                smp_responder.new_state(smp_responder.default_config(), pair, a.value),
+                smp_initiator.new_state(smp_initiator.default_config(), pair, b.value))
+    host.rand = rng

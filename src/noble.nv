@@ -1,0 +1,938 @@
+// noble.nv -- the Host API, Layer A: the values an application holds and the decisions it makes.
+//
+// Layer A is the request-and-poll core of the Host: `begin` takes a request and answers at once
+// whether it was accepted, `poll` runs the Host once, `result` reads the outcome of the call in
+// flight and `next_event` the next event the application did not ask about.  Nothing in it waits,
+// reads a clock or sleeps; the time is an argument and the wire is the `HciLink` the caller passes.
+// This module holds the values of that surface (`Status`, `ConnId`, `Event`, `Request`, ...), the
+// policy trait `HostPolicy` and the bond store `BondStore`; `host_api.nv` holds the engine.
+// planning/NOBLE-HOST-API-SKETCH.md sections 3.3 and 3.4 are the design.
+
+use gatt_client
+use limits
+use profile_builder
+use smp
+use noble_config
+
+// ── Status: the error value ─────────────────────────────────────────
+// A failure keeps the number its layer gave it.  `layer` says which
+// specification the number belongs to; `code` is that layer's value, so
+// an ATT error "insufficient authentication" is
+// `Status { layer: LAYER_ATT, code: ATT_INSUFFICIENT_AUTHENTICATION }` and
+// an HCI "connection failed to be established" is
+// `Status { layer: LAYER_HCI, code: HCI_CONNECTION_FAILED_TO_ESTABLISH }`.
+pub const LAYER_LOCAL = 0
+pub const LAYER_HCI = 1
+pub const LAYER_ATT = 2
+pub const LAYER_SMP = 3
+pub const LAYER_L2CAP = 4
+
+// Local codes: failures the Host itself reports.
+pub const E_NOT_READY = 1
+pub const E_BUSY = 2
+pub const E_NO_ROOM = 3
+pub const E_STALE = 4
+pub const E_TIMEOUT = 5
+pub const E_SECURITY_LOW = 6
+pub const E_NOT_SUBSCRIBED = 7
+pub const E_CANCELLED = 8
+pub const E_BAD_ARGUMENT = 9
+pub const E_NOT_FOUND = 10
+pub const E_LINK_LOST = 11
+pub const E_REFUSED = 12
+
+// The numbers of the other layers, by the name their specification gives
+// them (Core 6.3: ATT Part F 3.4.1.1, HCI Vol 1 Part F, SMP Part H 3.5.5).
+// No example or comment on this page uses the bare number.
+pub const ATT_INVALID_HANDLE = 1
+pub const ATT_READ_NOT_PERMITTED = 2
+pub const ATT_WRITE_NOT_PERMITTED = 3
+pub const ATT_INVALID_PDU = 4
+pub const ATT_INSUFFICIENT_AUTHENTICATION = 5
+pub const ATT_REQUEST_NOT_SUPPORTED = 6
+pub const ATT_INVALID_OFFSET = 7
+pub const ATT_INSUFFICIENT_AUTHORIZATION = 8
+pub const ATT_PREPARE_QUEUE_FULL = 9
+pub const ATT_ATTRIBUTE_NOT_FOUND = 10
+pub const ATT_ATTRIBUTE_NOT_LONG = 11
+pub const ATT_INSUFFICIENT_ENCRYPTION_KEY_SIZE = 12
+pub const ATT_INVALID_ATTRIBUTE_VALUE_LENGTH = 13
+pub const ATT_UNLIKELY_ERROR = 14
+pub const ATT_INSUFFICIENT_ENCRYPTION = 15
+pub const ATT_UNSUPPORTED_GROUP_TYPE = 16
+pub const ATT_INSUFFICIENT_RESOURCES = 17
+pub const ATT_DATABASE_OUT_OF_SYNC = 18
+pub const ATT_VALUE_NOT_ALLOWED = 19
+
+pub const HCI_AUTHENTICATION_FAILURE = 0x5
+pub const HCI_PIN_OR_KEY_MISSING = 0x6
+pub const HCI_CONNECTION_TIMEOUT = 0x8
+pub const HCI_REMOTE_USER_TERMINATED = 0x13
+pub const HCI_REMOTE_LOW_RESOURCES = 0x14
+pub const HCI_REMOTE_POWER_OFF = 0x15
+pub const HCI_CONNECTION_TERMINATED_BY_LOCAL_HOST = 0x16
+pub const HCI_UNSUPPORTED_REMOTE_FEATURE = 0x1a
+pub const HCI_MIC_FAILURE = 0x3d
+pub const HCI_UNACCEPTABLE_CONNECTION_PARAMETERS = 0x3b
+pub const HCI_CONNECTION_FAILED_TO_ESTABLISH = 0x3e
+
+pub const SMP_PASSKEY_ENTRY_FAILED = 1
+pub const SMP_OOB_NOT_AVAILABLE = 2
+pub const SMP_AUTHENTICATION_REQUIREMENTS = 3
+pub const SMP_CONFIRM_VALUE_FAILED = 4
+pub const SMP_PAIRING_NOT_SUPPORTED = 5
+pub const SMP_ENCRYPTION_KEY_SIZE = 6
+pub const SMP_COMMAND_NOT_SUPPORTED = 7
+pub const SMP_UNSPECIFIED_REASON = 8
+pub const SMP_REPEATED_ATTEMPTS = 9
+pub const SMP_INVALID_PARAMETERS = 10
+pub const SMP_DHKEY_CHECK_FAILED = 11
+pub const SMP_NUMERIC_COMPARISON_FAILED = 12
+pub const SMP_BR_EDR_PAIRING_IN_PROGRESS = 13
+pub const SMP_CROSS_TRANSPORT_KEY_NOT_ALLOWED = 14
+
+pub @value
+struct Status
+    layer: u8
+    code: u16
+
+impl Status
+    @tier(embedded)
+    fn is_ok(self) -> Bool
+        (self.layer as Int) == LAYER_LOCAL and (self.code as Int) == 0
+
+    @tier(embedded)
+    fn is(self, layer: Int, code: Int) -> Bool
+        (self.layer as Int) == layer and (self.code as Int) == code
+
+    // The name of the failure, for a log line: "insufficient authentication"
+    // for `Status { layer: LAYER_ATT, code: ATT_INSUFFICIENT_AUTHENTICATION }`.
+    @tier(embedded)
+    fn name(self) -> Str
+        if self.layer == LAYER_ATT
+            return att_name(self.code as Int)
+        if self.layer == LAYER_HCI
+            return hci_name(self.code as Int)
+        if self.layer == LAYER_SMP
+            return smp_name(self.code as Int)
+        "unknown"
+
+pub @tier(embedded)
+fn ok() -> Status
+    Status { layer: 0, code: 0 }
+
+pub @tier(embedded)
+fn failed(layer: Int, code: Int) -> Status
+    Status { layer: layer as u8, code: code as u16 }
+
+// A name for a log line.  Only the codes this page names have one; any other
+// code answers "unknown", and the log line adds the number.
+pub @tier(embedded)
+fn att_name(code: Int) -> Str
+    if code == ATT_INVALID_HANDLE
+        return "invalid handle"
+    if code == ATT_READ_NOT_PERMITTED
+        return "read not permitted"
+    if code == ATT_WRITE_NOT_PERMITTED
+        return "write not permitted"
+    if code == ATT_INVALID_PDU
+        return "invalid pdu"
+    if code == ATT_INSUFFICIENT_AUTHENTICATION
+        return "insufficient authentication"
+    if code == ATT_REQUEST_NOT_SUPPORTED
+        return "request not supported"
+    if code == ATT_INVALID_OFFSET
+        return "invalid offset"
+    if code == ATT_INSUFFICIENT_AUTHORIZATION
+        return "insufficient authorization"
+    if code == ATT_PREPARE_QUEUE_FULL
+        return "prepare queue full"
+    if code == ATT_ATTRIBUTE_NOT_FOUND
+        return "attribute not found"
+    if code == ATT_ATTRIBUTE_NOT_LONG
+        return "attribute not long"
+    if code == ATT_INSUFFICIENT_ENCRYPTION_KEY_SIZE
+        return "insufficient encryption key size"
+    if code == ATT_INVALID_ATTRIBUTE_VALUE_LENGTH
+        return "invalid attribute value length"
+    if code == ATT_UNLIKELY_ERROR
+        return "unlikely error"
+    if code == ATT_INSUFFICIENT_ENCRYPTION
+        return "insufficient encryption"
+    if code == ATT_UNSUPPORTED_GROUP_TYPE
+        return "unsupported group type"
+    if code == ATT_INSUFFICIENT_RESOURCES
+        return "insufficient resources"
+    if code == ATT_DATABASE_OUT_OF_SYNC
+        return "database out of sync"
+    if code == ATT_VALUE_NOT_ALLOWED
+        return "value not allowed"
+    "unknown"
+
+pub @tier(embedded)
+fn hci_name(code: Int) -> Str
+    if code == HCI_AUTHENTICATION_FAILURE
+        return "authentication failure"
+    if code == HCI_PIN_OR_KEY_MISSING
+        return "pin or key missing"
+    if code == HCI_CONNECTION_TIMEOUT
+        return "connection timeout"
+    if code == HCI_REMOTE_USER_TERMINATED
+        return "remote user terminated"
+    if code == HCI_REMOTE_LOW_RESOURCES
+        return "remote low resources"
+    if code == HCI_REMOTE_POWER_OFF
+        return "remote power off"
+    if code == HCI_CONNECTION_TERMINATED_BY_LOCAL_HOST
+        return "connection terminated by local host"
+    if code == HCI_UNSUPPORTED_REMOTE_FEATURE
+        return "unsupported remote feature"
+    if code == HCI_MIC_FAILURE
+        return "mic failure"
+    if code == HCI_UNACCEPTABLE_CONNECTION_PARAMETERS
+        return "unacceptable connection parameters"
+    if code == HCI_CONNECTION_FAILED_TO_ESTABLISH
+        return "connection failed to establish"
+    "unknown"
+
+pub @tier(embedded)
+fn smp_name(code: Int) -> Str
+    if code == SMP_PASSKEY_ENTRY_FAILED
+        return "passkey entry failed"
+    if code == SMP_OOB_NOT_AVAILABLE
+        return "oob not available"
+    if code == SMP_AUTHENTICATION_REQUIREMENTS
+        return "authentication requirements"
+    if code == SMP_CONFIRM_VALUE_FAILED
+        return "confirm value failed"
+    if code == SMP_PAIRING_NOT_SUPPORTED
+        return "pairing not supported"
+    if code == SMP_ENCRYPTION_KEY_SIZE
+        return "encryption key size"
+    if code == SMP_COMMAND_NOT_SUPPORTED
+        return "command not supported"
+    if code == SMP_UNSPECIFIED_REASON
+        return "unspecified reason"
+    if code == SMP_REPEATED_ATTEMPTS
+        return "repeated attempts"
+    if code == SMP_INVALID_PARAMETERS
+        return "invalid parameters"
+    if code == SMP_DHKEY_CHECK_FAILED
+        return "dhkey check failed"
+    if code == SMP_NUMERIC_COMPARISON_FAILED
+        return "numeric comparison failed"
+    if code == SMP_BR_EDR_PAIRING_IN_PROGRESS
+        return "br edr pairing in progress"
+    if code == SMP_CROSS_TRANSPORT_KEY_NOT_ALLOWED
+        return "cross transport key not allowed"
+    "unknown"
+
+// ── Names ───────────────────────────────────────────────────────────
+// A device address as it is on the air: `kind` 0 public, 1 random;
+// `octets` least significant first.
+pub @value
+struct Addr
+    kind: u8
+    octets: [u8; 6]
+
+// A connection, named by its slot and the slot's generation.  The Host
+// owns the connection; the application holds only the name.  A name kept
+// after the connection ended is refused with E_STALE, not answered for
+// the next occupant of the slot.
+pub @value
+struct ConnId
+    slot: u8
+    generation: u8
+
+pub @value
+struct Uuid
+    wide: Bool
+    lo: Int
+    hi: Int
+
+pub @tier(embedded)
+fn uuid16(v: Int) -> Uuid
+    Uuid { wide: false, lo: v & 0xFFFF, hi: 0 }
+
+// A characteristic as discovery found it: its value handle, its
+// properties and the handle of its Client Characteristic Configuration
+// descriptor (0 for none).
+pub @value
+struct Attr
+    handle: u16
+    props: u8
+    cccd: u16
+
+// The security a call needs, named by the LE security mode 1 level.
+pub @value
+enum Security
+    Open
+    Encrypted
+    Authenticated
+    SecureConnections
+
+// What a GATT server demands of a client for one direction of one
+// attribute: the four levels above, plus Denied and Authorized.
+pub @value
+enum Access
+    Denied
+    Open
+    Authorized
+    Encrypted
+    Authenticated
+    SecureConnections
+
+pub @value
+struct Permissions
+    read: Access
+    write: Access
+
+pub @value
+enum Role
+    Central
+    Peripheral
+
+pub @value
+enum IoCap
+    DisplayOnly
+    DisplayYesNo
+    KeyboardOnly
+    NoInputNoOutput
+    KeyboardDisplay
+
+// Connection parameters in the units of the specification: intervals
+// in 1.25 ms, the supervision timeout in 10 ms.
+pub @value
+struct ConnParams
+    interval_min: u16
+    interval_max: u16
+    latency: u16
+    timeout: u16
+
+pub @tier(embedded)
+fn conn_params_default() -> ConnParams
+    ConnParams { interval_min: 24, interval_max: 40, latency: 0, timeout: 400 }
+
+pub alias Value = Vec[u8; noble_config.ATT_VALUE_BYTES]
+
+// ── Policy hooks: the decisions the specification leaves to the product ──
+// Every method has a default, so a product writes the ones it cares about.
+// `e` is what the product's code costs (a hook that draws on a display
+// declares `[hw]`), and the functions that call a hook carry that effect.
+pub const PENDING = -1
+pub const REFUSE = -2
+// The answer of `on_read` and `on_write` that leaves the decision to the
+// Host, which then answers the client ATT_READ_NOT_PERMITTED or
+// ATT_WRITE_NOT_PERMITTED.  A service module answers it for an attribute it
+// does not serve, so the product's policy can decide instead.
+pub const NOT_HANDLED = -3
+
+// What the Host does after a link was made or ended, as the policy answers.
+// Readvertise repeats the last `adv_start` (Peripheral); Reconnect repeats
+// the last `connect` or `connect_listed` (Central) after `after_ms`, so a
+// product sets the backoff and a peer that is switched off is not asked at
+// once and for ever; Stay does nothing.
+pub @value
+enum Action
+    Stay
+    Readvertise
+    AdvertiseNonConnectable
+    Reconnect(after_ms: Int)
+
+pub trait HostPolicy[e]
+    // The IO capability this device offers in a pairing.
+    fn io_capability(self, conn: ConnId) -> IoCap [e]
+        IoCap.NoInputNoOutput
+
+    // Whether to start or accept a pairing that wants `level`.
+    fn accept_pairing(var self, conn: ConnId, peer: Addr, level: Security, bonding: Bool) -> Bool [e]
+        true
+
+    // Show a passkey the user types on the other device.
+    fn show_passkey(var self, conn: ConnId, passkey: Int) [e]
+        let _ = passkey
+
+    // Ask the user for the passkey the other device shows.  Answer the six
+    // digits (0 to 999999), PENDING to answer later with `passkey_reply`,
+    // or REFUSE to end the pairing.  A hook that waits for the user holds
+    // the Host's turn while it waits: no other link is served and no event
+    // is queued until it returns.  That form is for a program with one link
+    // and nothing else to serve (example 4).  Every other program answers
+    // PENDING, takes `Event.PasskeyRequested` in its loop, asks the user
+    // there, and calls `passkey_reply`.
+    fn ask_passkey(var self, conn: ConnId) -> Int [e]
+        PENDING
+
+    // Show a six-digit value and ask whether it matches the other device's.
+    // Answer 1 for yes, 0 for no, or PENDING to answer with `numeric_reply`
+    // after `Event.NumericRequested`; the same rule on waiting applies.
+    fn confirm_numeric(var self, conn: ConnId, value: Int) -> Int [e]
+        PENDING
+
+    // Whether to accept the connection parameters the peer asks for.
+    fn accept_params(var self, conn: ConnId, p: ConnParams) -> Bool [e]
+        true
+
+    // The connection flow.  The role says which side this device is, so one
+    // trait serves both.  Every default keeps the behaviour of a Host with
+    // no hook.
+    //
+    // Whether to keep a link with `peer`.  As a Peripheral it is called once
+    // for a link a peer made, after the Controller reports it and before the
+    // application sees `Event.Connected`; false makes the Host disconnect with
+    // reason `HCI_REMOTE_USER_TERMINATED` and queue no `Connected`.  As a
+    // Central it is called before `connect` sends the command; false answers
+    // `E_REFUSED` and nothing is sent.
+    fn accept_connect(var self, peer: Addr, role: Role) -> Bool [e]
+        true
+
+    // Whether a scan report reaches the application.  False drops it before
+    // it takes a place in the event queue.  The `ScanFilter` still applies
+    // first; this is for what a filter cannot say (an address list, the
+    // manufacturer data).
+    fn on_advert(var self, r: AdvReport) -> Bool [e]
+        true
+
+    // A link ended.  The answer is what the Host does next: nothing, advertise
+    // again, or connect again after a delay.  `Readvertise` is valid for a
+    // Peripheral and `Reconnect` for a Central; the other answer is read as
+    // `Stay`.  `attempts` is how many times the Host has reconnected to this
+    // peer since the last link that was made, so the hook can back off and
+    // give up: `Reconnect(1000 * attempts)` up to a count, then `Stay`.
+    fn on_disconnected(var self, conn: ConnId, reason: Status, role: Role, attempts: Int) -> Action [e]
+        let _ = attempts
+        Action.Stay
+
+    // A link was made.  `links` is how many are live now, against
+    // `HostConfig.max_links`.  The answer says what the Host does with the
+    // advertising the connection ended: nothing, advertise again (connectable
+    // while there is room), or advertise non-connectable so the device stays
+    // visible at the limit.  The Host never advertises connectable at the
+    // limit: an answer that asks for it at the limit is read as
+    // `AdvertiseNonConnectable`.
+    fn on_connected(var self, conn: ConnId, role: Role, links: Int) -> Action [e]
+        Action.Stay
+
+    // Decide a write to a characteristic whose permission is Authorized:
+    // 0 accepts, any other value is the ATT error code the client receives.
+    fn authorize_write(var self, conn: ConnId, attr: Int, var value: Value) -> Int [e]
+        0
+
+    // The attributes bound with `bind_function` have no value in the Host:
+    // a read asks the policy to fill `out`, and a write asks it to act on
+    // `value`.  Both answer 0, the ATT error code the client receives
+    // (`ATT_*`, or an application code from 0x80, which a Control Point
+    // uses for "op code not supported"), or NOT_HANDLED.  `svc` is the index
+    // `add_service` answered for the service that owns `attr`, so a product
+    // with several services dispatches on it (one line per service) and no
+    // service is offered an attribute it does not own.  The hooks run inside
+    // the Host's turn and must not wait.
+    fn on_read(var self, conn: ConnId, attr: u16, svc: Int, var out: Value) -> Int [e]
+        NOT_HANDLED
+
+    fn on_write(var self, conn: ConnId, attr: u16, svc: Int, var value: Value) -> Int [e]
+        NOT_HANDLED
+
+    // A pairing ended; `bonded` says the keys were stored.
+    fn pairing_done(var self, conn: ConnId, st: Status, level: Security, bonded: Bool) [e]
+        let _ = st
+
+// ── Bond storage: the security database the product keeps ───────────
+pub @value
+struct Bond
+    peer: Addr
+    irk: [u8; 16]
+    has_irk: Bool
+    ltk: [u8; 16]
+    ediv: u16
+    rand: [u8; 8]
+    key_size: u8
+    level: Security
+
+// What the GATT server keeps for a bonded client (Core Vol 3 Part G 7.2
+// and 2.5.2.1: persistent across connections for a trusted client): the
+// Client Characteristic Configuration values, the Client Supported
+// Features value and the database generation the client last saw.
+pub @value
+struct ServerState
+    peer: Addr
+    csf: u8
+    generation: u16
+    ccc: Vec[u16; noble_config.MAX_CCCD]
+
+// The Database Hash of a peer's GATT database (Vol 3 Part G 7.3).
+pub alias DbHash = [u8; 16]
+
+// A peer's discovered database as the Host serialised it.  The store keeps
+// the octets and does not interpret them.
+pub alias CacheImage = Vec[u8; cache_image_bytes()]
+
+pub trait BondStore[g]
+    fn find(self, peer: Addr) -> ?Bond [g]
+    fn save(var self, bond: Bond) -> Status [g]
+    fn forget(var self, peer: Addr) [g]
+    fn count(self) -> Int [g]
+    fn at(self, index: Int) -> ?Bond [g]
+
+    // GATT state kept with the bond.  Every default stores nothing, so a
+    // store that only holds bonds is complete, and a product that wants
+    // robust caching across a reset writes these four over flash.
+    fn load_server(self, peer: Addr) -> ?ServerState [g]
+        None
+
+    fn save_server(var self, st: ServerState) [g]
+        let _ = st
+
+    // The discovered database of `peer` whose Database Hash was `hash`.
+    // False when none is stored for that hash.
+    fn load_cache(self, peer: Addr, hash: DbHash, var img: CacheImage) -> Bool [g]
+        false
+
+    fn save_cache(var self, peer: Addr, hash: DbHash, img: CacheImage) [g]
+        let _ = peer
+
+// Bonds in RAM, `MAX_BONDS` of them.  A product that keeps bonds across
+// a reset writes its own store over flash.
+pub @value
+struct RamBonds
+    rows: Vec[Bond; noble_config.MAX_BONDS]
+
+pub @tier(embedded)
+fn same_addr(a: Addr, b: Addr) -> Bool
+    if a.kind != b.kind
+        return false
+    for i in 0..6
+        if a.octets[i] != b.octets[i]
+            return false
+    true
+
+impl BondStore[] for RamBonds
+    @tier(embedded)
+    fn find(self, peer: Addr) -> ?Bond
+        for i in 0..self.rows.len()
+            if same_addr(self.rows[i].peer, peer)
+                return Some(self.rows[i])
+        None
+
+    // A bond for a peer that has one replaces it; a full table answers
+    // E_NO_ROOM and keeps what it has, and the Host reports the pairing as not
+    // bonded.
+    @tier(embedded)
+    fn save(var self, bond: Bond) -> Status
+        for i in 0..self.rows.len()
+            if same_addr(self.rows[i].peer, bond.peer)
+                self.rows[i] = bond
+                return ok()
+        match self.rows.push(bond)
+            Ok(_) => ok()
+            Err(_) => failed(LAYER_LOCAL, E_NO_ROOM)
+
+    // Remove the bond of `peer` by moving the last bond into its place.
+    @tier(embedded)
+    fn forget(var self, peer: Addr)
+        for i in 0..self.rows.len()
+            if same_addr(self.rows[i].peer, peer)
+                let last = self.rows.len() - 1
+                self.rows[i] = self.rows[last]
+                let _ = self.rows.pop()
+                return
+
+    @tier(embedded)
+    fn count(self) -> Int
+        self.rows.len()
+
+    @tier(embedded)
+    fn at(self, index: Int) -> ?Bond
+        self.rows.get(index)
+
+// The policy of a device with no product code.
+pub @value
+struct DefaultPolicy
+    placeholder: Int
+
+impl HostPolicy[] for DefaultPolicy
+
+// ── Data the Host reports ───────────────────────────────────────────
+pub alias AdData = Vec[u8; noble_config.MAX_ADV_DATA]
+
+pub @value
+struct AdvReport
+    addr: Addr
+    rssi: i8
+    flags: u8
+    data: AdData
+
+pub @value
+struct ConnInfo
+    role: Role
+    peer: Addr
+    params: ConnParams
+    mtu: u16
+    level: Security
+    bonded: Bool
+
+// What happened that the application did not ask about.  The Host queues
+// at most `EVENT_QUEUE` of them.  An `Advert` or a `Notification` that does
+// not fit is dropped and counted in `Dropped`; the events of a connection's
+// state (`Connected`, `Disconnected`, `ParamsUpdated`, `SecurityChanged`,
+// and the two pairing requests) are never dropped, because one slot of the
+// queue is reserved for each connection.  An answer to a call is never an
+// event: it is the call's result.  `PasskeyRequested` and `NumericRequested`
+// are queued when the policy's hook answered PENDING; the application asks
+// the user and calls `passkey_reply` or `numeric_reply`.
+pub @value
+enum Event
+    Ready
+    Advert(report: AdvReport)
+    Connected(conn: ConnId, role: Role, peer: Addr, params: ConnParams)
+    Disconnected(conn: ConnId, reason: Status)
+    ParamsUpdated(conn: ConnId, params: ConnParams)
+    SecurityChanged(conn: ConnId, level: Security, bonded: Bool)
+    PasskeyRequested(conn: ConnId)
+    NumericRequested(conn: ConnId, value: Int)
+    Notification(conn: ConnId, attr: u16, indication: Bool, value: Value)
+    Written(conn: ConnId, attr: u16)
+    // A read or write of an attribute bound with `bind_event` (section
+    // 3.17): the client waits for `Out.Respond` from the service that owns
+    // `svc`.  Never dropped: the ATT request is already held by the Host.
+    AttrRead(conn: ConnId, attr: u16, svc: Int)
+    AttrWrite(conn: ConnId, attr: u16, svc: Int, value: Value)
+    Subscribed(conn: ConnId, attr: u16, mode: u8)
+    CocOpened(conn: ConnId, chan: u8, psm: u16)
+    CocData(conn: ConnId, chan: u8, sdu: Value)
+    CocClosed(conn: ConnId, chan: u8, reason: Status)
+    DatabaseChanged(conn: ConnId)
+    Dropped(count: u16)
+
+// ── The requests: Layer A's one entry for starting a call ───────────
+pub @value
+struct AdvParams
+    extended: Bool
+    connectable: Bool
+    scannable: Bool
+    interval_min_ms: u16
+    interval_max_ms: u16
+    duration_ms: u32
+
+pub @value
+struct ScanParams
+    active: Bool
+    extended: Bool
+    interval_ms: u16
+    window_ms: u16
+    duration_ms: u32
+
+pub @value
+struct ScanFilter
+    uuid16: u16
+    name_prefix: String[16]
+    rssi_min: i8
+    duplicates: Bool
+
+pub @value
+enum Request
+    Start
+    AdvStart(set: u8, p: AdvParams, data: AdData, scan_rsp: AdData)
+    PeriodicStart(set: u8, interval_ms: u16, data: AdData)
+    AdvStop(set: u8)
+    ScanStart(p: ScanParams, f: ScanFilter)
+    ScanStop
+    SyncCreate(adv: Addr, sid: u8, skip: u16, timeout: u16)
+    SyncStop
+    AcceptListFromBonds
+    Connect(peer: Addr, p: ConnParams)
+    ConnectListed(p: ConnParams)
+    ConnectCancel
+    Disconnect(conn: ConnId, reason: u8)
+    UpdateParams(conn: ConnId, p: ConnParams)
+    ExchangeMtu(conn: ConnId)
+    Discover(conn: ConnId, svc: Uuid)
+    Read(conn: ConnId, attr: Attr, need: Security)
+    Write(conn: ConnId, attr: Attr, need: Security, data: Value, response: Bool)
+    Subscribe(conn: ConnId, attr: Attr, mode: u8, need: Security)
+    Indicate(conn: ConnId, attr: Attr, data: Value)
+    Secure(conn: ConnId, need: Security)
+    CocOpen(conn: ConnId, psm: u16, mtu: u16, need: Security)
+    CocClose(conn: ConnId, chan: u8)
+
+// ── The call in flight ──────────────────────────────────────────────
+// HCI allows one command at a time and the GATT client one ATT transaction per
+// bearer, so the Host takes one call at a time and answers a second with
+// E_BUSY.  `Op` is the record of that call: `begin` sets `busy`, the engine
+// sets `done` and `status` when the call ends, and `result` reads them and
+// clears the record.  `conn` and `chan` are what a call that makes a link or a
+// channel answers.
+pub struct Op
+    var busy: Bool
+    var done: Bool
+    var status: Status
+    var conn: ConnId
+    var chan: u8
+    var value: Value
+
+pub @tier(embedded)
+fn no_conn() -> ConnId
+    ConnId { slot: 255, generation: 0 }
+
+pub @tier(embedded)
+fn blank_report() -> AdvReport
+    AdvReport { addr: Addr { kind: 0, octets: [0, 0, 0, 0, 0, 0] }, rssi: 0, flags: 0, data: Vec.new() }
+
+// The record of no call.  `Op` is a plain struct, made once with the `Host`.
+fn idle_op() -> Op
+    Op { busy: false, done: false, status: ok(), conn: no_conn(), chan: 0, value: Vec.new() }
+
+// The larger of `n` and 1: a table whose key is 0 keeps one record.
+@tier(embedded)
+const fn max1(n: Int) -> Int
+    if n > 1
+        n
+    else
+        1
+
+// The octets of a serialised discovery cache: 32 for each record the client
+// engine keeps for a link.
+@tier(embedded)
+const fn cache_image_bytes() -> Int
+    max1(noble_config.CLIENT_CACHE_RECORDS) * 32
+
+// ── The state of Layer A ────────────────────────────────────────────
+// Everything the request engine (host_api.nv) keeps beside the tables of `Host`
+// (host.nv), as one value of fixed size: the event queue, the connection table,
+// the call in flight and the registers of the request that serves it.  It holds
+// no list, so a `Host` that never calls `begin` pays for the queue and the
+// table only, and a profile with `event_queue = 0` pays for one slot.
+//
+// `held` counts the connection-state events in the queue, and `dropped` the
+// events lost since the application last read `Event.Dropped`.  The queue
+// keeps `reserve` slots for the events of a connection's state: an `Advert` or a
+// `Notification` is admitted only while at least that many slots, less the
+// state events already queued, stay free.
+
+// One connection of the Host as the application sees it.  The slot is the one
+// of the Host's link registry (`le_link.LeLinks`); `id` carries the slot and its
+// generation, `info` what `conn_info` answers.
+pub @value
+struct Conn
+    live: Bool
+    id: ConnId
+    info: ConnInfo
+
+// The kinds of request the engine serves, held in `Api.kind`.
+const R_NONE = 0
+const R_START = 1
+const R_CONNECT = 2
+const R_CANCEL = 3
+const R_DISCONNECT = 4
+const R_UPDATE = 5
+const R_SECURE = 6
+const R_COC_OPEN = 7
+const R_COC_CLOSE = 8
+
+// The value of an answer that was not given.
+const NO_ANSWER = -1000
+
+// The answers of `HostPolicy.on_connected` and `on_disconnected` that concern
+// advertising, held in `Api.advertise` for the advertising code of Layer B.
+const ADVERTISE_NONE = 0
+const ADVERTISE_CONNECTABLE = 1
+const ADVERTISE_NON_CONNECTABLE = 2
+
+pub struct Api
+    var ready: Bool
+    var events: Deque[Event; max1(noble_config.EVENT_QUEUE)]
+    var held: Int
+    var dropped: Int
+    var conns: Vec[Conn; limits.LINK_SLOTS]
+    var op: Op
+    var max_links: Int
+    // The request being served: its kind, its step, and its arguments.
+    var kind: Int
+    var step: Int
+    var r_conn: ConnId
+    var r_params: ConnParams
+    var r_need: Security
+    var r_peer: Addr
+    var r_psm: Int
+    var r_mtu: Int
+    var r_chan: Int
+    var r_reason: Int
+    // The last `connect`, for `Action.Reconnect`: the peer, the parameters, whether
+    // it was `connect_listed`, how many reconnections have been made since the
+    // last link, and the time the next one is due (-1 for none).
+    var last_peer: Addr
+    var last_params: ConnParams
+    var last_listed: Bool
+    var last_valid: Bool
+    var attempts: Int
+    var due_ms: Int
+    var reconnecting: Bool
+    var advertise: Int
+    // The one PSM `coc_listen` accepts, with the MTU and the security it asked.
+    var coc_psm: Int
+    var coc_need: Security
+    // The settings the pairing reads (HostConfig of the sketch).
+    var bondable: Bool
+    var sc_only: Bool
+    var min_key_size: Int
+    // Bytes of the random seed the Controller gave (LE Rand), 16 of them.
+    var seed: Vec[u8; 16]
+    var own_kind: Int
+    // What each connection waits for from the application: 0 nothing, 1 a passkey,
+    // 2 a numeric comparison; and the answer given, -1000 for none.
+    var ask: Vec[Int; limits.LINK_SLOTS]
+    var ans: Vec[Int; limits.LINK_SLOTS]
+
+pub @tier(embedded)
+fn blank_addr() -> Addr
+    Addr { kind: 0, octets: [0, 0, 0, 0, 0, 0] }
+
+@tier(embedded)
+fn blank_info() -> ConnInfo
+    ConnInfo { role: Role.Peripheral, peer: blank_addr(), params: conn_params_default(), mtu: 23, level: Security.Open, bonded: false }
+
+// The Layer A state of a Host that serves `max_links` connections, made once with the `Host`.
+pub fn api_new(max_links: Int) -> Api
+    var conns: Vec[Conn; limits.LINK_SLOTS] = Vec.new()
+    var ask: Vec[Int; limits.LINK_SLOTS] = Vec.new()
+    var ans: Vec[Int; limits.LINK_SLOTS] = Vec.new()
+    for _ in 0..limits.LINK_SLOTS
+        let _ = conns.push(Conn { live: false, id: no_conn(), info: blank_info() })
+        let _ = ask.push(0)
+        let _ = ans.push(NO_ANSWER)
+    Api {
+        ready: false, events: Deque.new(), held: 0, dropped: 0, conns: conns, op: idle_op(), max_links: max_links,
+        kind: 0, step: 0, r_conn: no_conn(), r_params: conn_params_default(), r_need: Security.Open, r_peer: blank_addr(),
+        r_psm: 0, r_mtu: 0, r_chan: 0, r_reason: 0,
+        last_peer: blank_addr(), last_params: conn_params_default(), last_listed: false, last_valid: false,
+        attempts: 0, due_ms: -1, reconnecting: false, advertise: 0, coc_psm: 0, coc_need: Security.Open,
+        bondable: true, sc_only: false, min_key_size: 7, seed: Vec.new(), own_kind: 0, ask: ask, ans: ans }
+
+// Whether `ev` reports the state of a connection or a pairing: such an event is
+// never dropped, because one slot per connection is kept for it.
+@tier(embedded)
+fn is_state_event(ev: Event) -> Bool
+    match ev
+        Connected(_, _, _, _) => true
+        Disconnected(_, _) => true
+        ParamsUpdated(_, _) => true
+        SecurityChanged(_, _, _) => true
+        PasskeyRequested(_) => true
+        NumericRequested(_, _) => true
+        _ => false
+
+// Whether `ev` arrives with no flow control the Host can apply, so that a full
+// queue drops it and counts the loss.
+@tier(embedded)
+fn is_droppable_event(ev: Event) -> Bool
+    match ev
+        Advert(_) => true
+        Notification(_, _, _, _) => true
+        _ => false
+
+// The slots the queue keeps free for the state events of the connections: the
+// ceiling `max_links` less the state events already queued, and always one slot
+// less than the queue so that a droppable event can be admitted at all.
+@tier(embedded)
+fn reserve_free(a: Api) -> Int
+    var cap = noble_config.EVENT_QUEUE - 1
+    if cap < 0
+        cap = 0
+    var reserve = a.max_links
+    if reserve > cap
+        reserve = cap
+    let free = reserve - a.held
+    if free < 0
+        0
+    else
+        free
+
+// Put `ev` in the queue.  False, with the loss counted in `dropped`, when the
+// queue has no room for it: a droppable event is admitted while the reserve stays
+// free, any other event while the queue has a slot.
+pub @tier(embedded)
+fn queue_event(var a: Api, ev: Event) -> Bool
+    let n = a.events.len()
+    var room = n < noble_config.EVENT_QUEUE
+    if room and is_droppable_event(ev) and n + reserve_free(a) >= noble_config.EVENT_QUEUE
+        room = false
+    if not room
+        a.dropped = a.dropped + 1
+        return false
+    a.events.push_back(ev)
+    if is_state_event(ev)
+        a.held = a.held + 1
+    true
+
+// The oldest event; once the queue is empty, the count of the events that were
+// dropped since the last time, as `Event.Dropped`.
+pub @tier(embedded)
+fn queue_take(var a: Api) -> ?Event
+    match a.events.pop_front()
+        Some(ev) =>
+            if is_state_event(ev)
+                a.held = a.held - 1
+            Some(ev)
+        None =>
+            if a.dropped > 0
+                let n = a.dropped
+                a.dropped = 0
+                Some(Event.Dropped((if n > 65535 then 65535 else n) as u16))
+            else
+                None
+
+// ── Adapters from the five error forms of the existing code ─────────
+// A module that still answers in its own form is read as a `Status` with these, so the
+// application sees one error value (planning/NOBLE-HOST-API-SKETCH.md, section 3.11).
+
+// The result of a GATT client request (`gatt_client.result_status`): 0 is success, 1 to 255 is the
+// Error Code of the peer's Error Response, and the codes from 0x100 are the engine's own.
+pub @tier(embedded)
+fn from_client_status(code: Int) -> Status
+    if code == gatt_client.STATUS_OK
+        return ok()
+    if code > 0 and code < 256
+        return failed(LAYER_ATT, code)
+    if code == gatt_client.STATUS_TIMEOUT
+        return failed(LAYER_LOCAL, E_TIMEOUT)
+    if code == gatt_client.STATUS_CACHE_FULL or code == gatt_client.STATUS_TRUNCATED
+        return failed(LAYER_LOCAL, E_NO_ROOM)
+    failed(LAYER_ATT, ATT_INVALID_PDU)
+
+// The reason the GATT client did not queue a request (`gatt_client.ERR_*`).
+pub @tier(embedded)
+fn from_client_error(code: Int) -> Status
+    if code == gatt_client.ERR_NO_LINK
+        return failed(LAYER_LOCAL, E_STALE)
+    if code == gatt_client.ERR_QUEUE_FULL or code == gatt_client.ERR_REPEAT
+        return failed(LAYER_LOCAL, E_BUSY)
+    if code == gatt_client.ERR_NO_ROOM
+        return failed(LAYER_LOCAL, E_NO_ROOM)
+    if code == gatt_client.ERR_DEAD
+        return failed(LAYER_LOCAL, E_LINK_LOST)
+    if code == gatt_client.ERR_NO_BEARER
+        return failed(LAYER_LOCAL, E_NOT_READY)
+    failed(LAYER_LOCAL, E_BAD_ARGUMENT)
+
+// The text `advertiser.make_advertiser` answers when it refuses its arguments.
+pub @tier(embedded)
+fn from_advertiser_error(text: Str) -> Status
+    let _ = text
+    failed(LAYER_LOCAL, E_BAD_ARGUMENT)
+
+// A Pairing Failed reason of the Security Manager (`smp.Reason`).
+pub @tier(embedded)
+fn from_smp_reason(reason: smp.Reason) -> Status
+    failed(LAYER_SMP, smp.reason_code(reason))
+
+// Why a profile could not be added to the server (`profile_builder.ProfileError`).
+pub @tier(embedded)
+fn from_profile_error(e: profile_builder.ProfileError) -> Status
+    match e
+        NoRoom => failed(LAYER_LOCAL, E_NO_ROOM)
+        InvalidValue => failed(LAYER_LOCAL, E_BAD_ARGUMENT)
+        NotPermitted => failed(LAYER_LOCAL, E_REFUSED)
+
+// workaround(a-type-alias-with-the-name-of-the-module-qualified-type-it-names-is-a-cycle): the sketch spells the Host
+// `noble.Host`, and `pub alias Host = host.Host` here is refused as a cycle (E2025).  A program or a service module
+// that takes the Host names it `host.Host`.

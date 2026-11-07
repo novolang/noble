@@ -1,0 +1,1365 @@
+// host_api.nv -- the Host API, Layer A: the request engine and the poll.
+//
+// An application drives a `Host` (host.nv) with four calls and no wait:
+//
+//   begin(var h, req)                    start one call; answers at once whether it was accepted
+//   poll(var h, var t, var p, var b, ms) run the Host once at the clock `ms`
+//   result(var h)                        the outcome of the call in flight, None until it ended
+//   next_event(var h)                    the next event the application did not ask about
+//
+// `t` is the transport (`HciLink`), `p` the product's decisions (`HostPolicy`) and `b` its
+// security database (`BondStore`).  Nothing here waits, reads a clock or sleeps: the clock is the
+// argument `ms`, the wire is `t.recv_packet(0)` and `t.send_packet`, and a program that wants to
+// wait (Layer B, the Adapter) parks in `t.park` between two polls.  The Host takes one call at a
+// time (`E_BUSY` for a second), because HCI allows one command at a time.
+//
+// The Host consumes every HCI packet itself.  An event of the Controller moves the link
+// registry, the Security Manager, the L2CAP channels and the ATT server (the existing modules
+// `links`, `le_link`, `smp_responder`, `smp_initiator`, `l2cap_coc`, `gatt_server`), and what it
+// leaves for the application becomes an `Event` in the queue of `noble.nv`.  The decisions the
+// specification leaves to the product are asked of `p`, and the keys are kept in `b`.
+//
+// The events the engine queues: `Ready`, `Advert`, `Connected`, `Disconnected`, `ParamsUpdated`,
+// `SecurityChanged`, `PasskeyRequested`, `NumericRequested`, `CocOpened`, `CocData`, `CocClosed`
+// and `Dropped`, and `Written` for the attributes whose writes the GATT server tracks
+// (`gatt_server.take_changed`).  `Notification`, `Subscribed`, `AttrRead`, `AttrWrite` and
+// `DatabaseChanged` belong to the GATT wrappers of Layer B and are NOT IMPLEMENTED here.
+//
+// What the engine serves: Start, Connect, ConnectListed, ConnectCancel, Disconnect,
+// UpdateParams, Secure, CocOpen and CocClose.  The requests of advertising, scanning,
+// synchronisation, the accept list and the GATT client (`Request.AdvStart` to
+// `Request.Indicate`) are NOT IMPLEMENTED here: `begin` answers them E_BAD_ARGUMENT.  The
+// advertising code of Layer B reads `Api.advertise`, the answer of `on_connected` and
+// `on_disconnected` that concerns advertising.
+//
+// Most tables the engine reaches are lists (the package builds with sibling_check = "warn" for
+// that reason), so the Host does not yet keep the promise of no allocation after start; the
+// storage of Layer A itself (the queue, the connection table, the registers) is fixed.
+// planning/NOBLE-HOST-API-SKETCH.md sections 3.3, 3.4, 3.7, 3.8 and 3.11 are the design.
+
+use hci_codec
+use hci_commands
+use hci_frame
+use hci_frame.{ HciCmdMsg }
+use gatt_server
+use hci_transport
+use host.{ Host, host_activate, host_seed }
+use l2cap_coc
+use le_link
+use links
+use noble
+use noble.{ Action, Addr, Bond, BondStore, ConnId, ConnInfo, ConnParams, Event, HostPolicy, IoCap, Request, Role, Security, Status, Value }
+use noble_config
+use smp
+use smp_bond
+use smp_core
+use smp_initiator
+use smp_keys
+use smp_responder
+
+// Packets one `poll` takes from the transport before it returns.
+const RECEIVE_BUDGET = 8
+
+// The default ATT_MTU of an LE bearer ([Vol 3] Part F, Section 3.2.8).
+const DEFAULT_MTU = 23
+
+// The transport value of `coc_listen` for an LE link.
+const TRANSPORT_LE = 0x01
+
+// The HCI status of a command that the peer's Controller does not support.
+const STATUS_UNSUPPORTED_FEATURE = 0x11
+
+// The kinds of a security event, common to the two halves of the Security Manager.
+const SE_NONE = 0
+const SE_DISPLAY = 1
+const SE_PASSKEY = 2
+const SE_NUMERIC = 3
+const SE_REPLY_LTK = 4
+const SE_NEGATIVE_LTK = 5
+const SE_START_ENCRYPTION = 6
+const SE_COMPLETE = 7
+const SE_FAILED = 8
+const SE_TIMEOUT = 9
+const SE_ESTABLISHED = 10
+const SE_BOND_LOST = 11
+
+// One action of either half of the Security Manager, in one shape: the kind, an integer (the
+// passkey, the value to compare, the level or the reason), the key of a Long Term Key reply or an
+// Encryption start, and the result of a pairing.
+struct SecEvent
+    var kind: Int
+    var n: Int
+    var ltk: [u8]
+    var rand: [u8]
+    var ediv: Int
+    var result: ?smp_core.PairingResult
+    var peer_type: Int
+    var peer: [u8]
+
+fn sec_none() -> SecEvent
+    SecEvent { kind: SE_NONE, n: 0, ltk: [], rand: [], ediv: 0, result: None, peer_type: 0, peer: [] }
+
+fn sec_of(kind: Int, n: Int) -> SecEvent
+    SecEvent { kind: kind, n: n, ltk: [], rand: [], ediv: 0, result: None, peer_type: 0, peer: [] }
+
+// The action of the responder as a `SecEvent`.
+fn sec_of_responder(a: smp_responder.SmpAction) -> SecEvent
+    match a
+        smp_responder.DisplayPasskey(passkey) => sec_of(SE_DISPLAY, passkey)
+        smp_responder.RequestPasskey => sec_of(SE_PASSKEY, 0)
+        smp_responder.ConfirmNumericValue(value) => sec_of(SE_NUMERIC, value)
+        smp_responder.ReplyLtk(ltk) =>
+            var e = sec_of(SE_REPLY_LTK, 0)
+            e.ltk = ltk[:]
+            e
+        smp_responder.NegativeReplyLtk => sec_of(SE_NEGATIVE_LTK, 0)
+        smp_responder.PairingComplete(result) =>
+            var e = sec_of(SE_COMPLETE, 0)
+            e.result = Some(result)
+            e
+        smp_responder.PairingFailed(reason, _) => sec_of(SE_FAILED, reason)
+        smp_responder.PairingTimeout => sec_of(SE_TIMEOUT, 0)
+        smp_responder.SecurityEstablished(level) => sec_of(SE_ESTABLISHED, level)
+        smp_responder.LocalOobData(_, _) => sec_none()
+
+// The action of the initiator as a `SecEvent`.
+fn sec_of_initiator(a: smp_initiator.SmpInitAction) -> SecEvent
+    match a
+        smp_initiator.DisplayPasskey(passkey) => sec_of(SE_DISPLAY, passkey)
+        smp_initiator.RequestPasskey => sec_of(SE_PASSKEY, 0)
+        smp_initiator.ConfirmNumericValue(value) => sec_of(SE_NUMERIC, value)
+        smp_initiator.StartEncryption(ltk, ediv, rand_value) =>
+            var e = sec_of(SE_START_ENCRYPTION, 0)
+            e.ltk = ltk[:]
+            e.ediv = ediv
+            e.rand = rand_value[:]
+            e
+        smp_initiator.PairingComplete(result) =>
+            var e = sec_of(SE_COMPLETE, 0)
+            e.result = Some(result)
+            e
+        smp_initiator.PairingFailed(reason, _) => sec_of(SE_FAILED, reason)
+        smp_initiator.PairingTimeout => sec_of(SE_TIMEOUT, 0)
+        smp_initiator.SecurityEstablished(level) => sec_of(SE_ESTABLISHED, level)
+        smp_initiator.BondLost(peer_type, peer) =>
+            var e = sec_of(SE_BOND_LOST, 0)
+            e.peer_type = peer_type
+            e.peer = peer[:]
+            e
+        smp_initiator.LocalOobData(_, _) => sec_none()
+
+// ── Names: slots, levels, addresses ─────────────────────────────────
+
+// The name the application holds for the connection of the link `id`.
+fn conn_id_of(id: links.LinkId) -> ConnId
+    ConnId { slot: id.slot as u8, generation: (id.generation & 255) as u8 }
+
+// The LE security mode 1 level of `s`, 1 to 4.
+fn level_int(s: Security) -> Int
+    match s
+        Security.Open => 1
+        Security.Encrypted => 2
+        Security.Authenticated => 3
+        Security.SecureConnections => 4
+
+// The `Security` of the level `n`.
+fn security_of(n: Int) -> Security
+    if n >= 4
+        Security.SecureConnections
+    else if n == 3
+        Security.Authenticated
+    else if n == 2
+        Security.Encrypted
+    else
+        Security.Open
+
+// The slot `conn` names, or -1 when it names no connection the Host holds: a slot out of range,
+// a connection that ended, or one whose slot was taken by another.
+fn slot_of(h: Host, conn: ConnId) -> Int
+    let s = conn.slot as Int
+    if s >= le_link.le_links_slots(h.le)
+        return -1
+    let c = h.api.conns[s]
+    if c.live and (c.id.generation as Int) == (conn.generation as Int)
+        s
+    else
+        -1
+
+// The slot of the connection with the Connection_Handle `handle`, or -1.
+fn slot_of_handle(h: Host, handle: Int) -> Int
+    let id = le_link.le_links_find_handle(h.le, handle)
+    if not links.is_link(id)
+        return -1
+    if h.api.conns[id.slot].live
+        id.slot
+    else
+        -1
+
+fn handle_of(h: Host, slot: Int) -> Int
+    links.links_handle(h.le.registry, links.links_id(h.le.registry, slot))
+
+// How many connections are live.
+pub fn link_count(h: Host) -> Int
+    var n = 0
+    for i in 0..le_link.le_links_slots(h.le)
+        if h.api.conns[i].live
+            n = n + 1
+    n
+
+fn octet_at(data: [u8], i: Int) -> u8
+    if i < list.len(data)
+        data[i]
+    else
+        0 as u8
+
+fn address_of(kind: Int, octets: [u8]) -> Addr
+    Addr { kind: (kind & 1) as u8, octets: [octet_at(octets, 0), octet_at(octets, 1), octet_at(octets, 2), octet_at(octets, 3), octet_at(octets, 4), octet_at(octets, 5)] }
+
+fn octets_of(a: Addr) -> [u8]
+    var out: [u8] = []
+    for i in 0..6
+        list.push(out, a.octets[i])
+    out
+
+fn same_peer(a: Addr, b: Addr) -> Bool
+    noble.same_addr(a, b)
+
+// Make a `Value` of the first octets of `data`.
+fn value_of(data: [u8]) -> Value
+    var v: Value = Vec.new()
+    for i in 0..list.len(data)
+        match v.push(data[i])
+            Ok(_) => ()
+            Err(_) => return v
+    v
+
+// The octets of the fixed arrays of a `Bond`, as lists.
+fn irk_list(b: Bond) -> [u8]
+    var out: [u8] = []
+    for i in 0..16
+        list.push(out, b.irk[i])
+    out
+
+fn ltk_list(b: Bond) -> [u8]
+    var out: [u8] = []
+    for i in 0..16
+        list.push(out, b.ltk[i])
+    out
+
+fn rand_list(b: Bond) -> [u8]
+    var out: [u8] = []
+    for i in 0..8
+        list.push(out, b.rand[i])
+    out
+
+// The SMP IO Capability of `io` ([Vol 3] Part H, Table 3.4).
+fn io_value(io: IoCap) -> Int
+    match io
+        IoCap.DisplayOnly => 0
+        IoCap.DisplayYesNo => 1
+        IoCap.KeyboardOnly => 2
+        IoCap.NoInputNoOutput => 3
+        IoCap.KeyboardDisplay => 4
+
+// The stored bond as the Security Manager keeps it.  The store keeps the keys of the role the
+// pairing ran in: the LTK, EDIV and Rand the device encrypts with as a Central or answers with as
+// a Peripheral, the peer's IRK and the level.
+fn smp_bond_of(b: Bond) -> smp_bond.SmpBond
+    let level = level_int(b.level)
+    smp_bond.SmpBond {
+        peer_address_type: (b.peer.kind & 1) as Int,
+        peer_address: octets_of(b.peer),
+        peer_irk: if b.has_irk then irk_list(b) else [],
+        peer_csrk: [], peer_sign_counter: -1, peer_ltk: [], peer_ediv: 0, peer_rand: [],
+        ltk: ltk_list(b), ediv: b.ediv as Int, rand: rand_list(b), local_csrk: [],
+        key_size: b.key_size as Int, authenticated: level >= 3, secure_connections: level >= 4 }
+
+// A bond of the Security Manager as the store keeps it.
+fn bond_of_smp(s: smp_bond.SmpBond) -> Bond
+    Bond {
+        peer: address_of(s.peer_address_type, s.peer_address),
+        irk: [octet_at(s.peer_irk, 0), octet_at(s.peer_irk, 1), octet_at(s.peer_irk, 2), octet_at(s.peer_irk, 3), octet_at(s.peer_irk, 4), octet_at(s.peer_irk, 5), octet_at(s.peer_irk, 6), octet_at(s.peer_irk, 7), octet_at(s.peer_irk, 8), octet_at(s.peer_irk, 9), octet_at(s.peer_irk, 10), octet_at(s.peer_irk, 11), octet_at(s.peer_irk, 12), octet_at(s.peer_irk, 13), octet_at(s.peer_irk, 14), octet_at(s.peer_irk, 15)], has_irk: list.len(s.peer_irk) == 16,
+        ltk: [octet_at(s.ltk, 0), octet_at(s.ltk, 1), octet_at(s.ltk, 2), octet_at(s.ltk, 3), octet_at(s.ltk, 4), octet_at(s.ltk, 5), octet_at(s.ltk, 6), octet_at(s.ltk, 7), octet_at(s.ltk, 8), octet_at(s.ltk, 9), octet_at(s.ltk, 10), octet_at(s.ltk, 11), octet_at(s.ltk, 12), octet_at(s.ltk, 13), octet_at(s.ltk, 14), octet_at(s.ltk, 15)], ediv: s.ediv as u16, rand: [octet_at(s.rand, 0), octet_at(s.rand, 1), octet_at(s.rand, 2), octet_at(s.rand, 3), octet_at(s.rand, 4), octet_at(s.rand, 5), octet_at(s.rand, 6), octet_at(s.rand, 7)],
+        key_size: s.key_size as u8, level: security_of(smp_bond.security_level(s)) }
+
+// The bond of `peer` as the Security Manager keeps it, if the store has one.
+fn find_bond<B: BondStore[g]>(var b: B, peer: Addr) -> ?smp_bond.SmpBond [g]
+    match b.find(peer)
+        Some(x) => Some(smp_bond_of(x))
+        None => None
+
+// ── The queue ───────────────────────────────────────────────────────
+
+// A store into an element of a table of `Api` is made on a copy and written back, because the
+// element of a `Vec` read out of a struct is a copy (SPEC § 14.8).
+fn set_conn(var h: Host, slot: Int, c: noble.Conn)
+    var conns = h.api.conns
+    conns[slot] = c
+    h.api.conns = conns
+
+fn set_ask(var h: Host, slot: Int, v: Int)
+    var ask = h.api.ask
+    ask[slot] = v
+    h.api.ask = ask
+
+fn set_ans(var h: Host, slot: Int, v: Int)
+    var ans = h.api.ans
+    ans[slot] = v
+    h.api.ans = ans
+
+fn emit(var h: Host, ev: Event)
+    let _ = noble.queue_event(var h.api, ev)
+
+// The oldest event the application did not ask about, or None.  Taking a `CocData` hands the
+// credits its K-frames spent back to the peer, so a slow application slows the peer down.
+pub fn next_event(var h: Host) -> ?Event
+    let ev = noble.queue_take(var h.api)
+    match ev
+        Some(e) =>
+            match e
+                Event.CocData(conn, chan, _) =>
+                    let s = slot_of(h, conn)
+                    if s >= 0
+                        match le_link.coc_return_credits(var h.le.slots[s], chan as Int)
+                            Some(out) =>
+                                for pkt in out
+                                    list.push(h.acl_out, pkt[:])
+                            None => ()
+                _ => ()
+        None => ()
+    ev
+
+// ── The call in flight ──────────────────────────────────────────────
+
+// End the call in flight with `st`.
+fn finish(var h: Host, st: Status)
+    h.api.op.done = true
+    h.api.op.status = st
+    h.api.kind = noble.R_NONE
+    h.api.step = 0
+
+// Give up the call in flight.  The Controller may still answer the command that was sent for it;
+// the answer is taken and dropped.
+pub fn abandon(var h: Host)
+    h.api.op.busy = false
+    h.api.op.done = false
+    h.api.kind = noble.R_NONE
+    h.api.step = 0
+
+// The outcome of the call in flight: None until it has ended.  Reading it frees the Host for the
+// next call.
+pub fn result(var h: Host) -> ?Status
+    if not h.api.op.done
+        return None
+    let st = h.api.op.status
+    h.api.op.busy = false
+    h.api.op.done = false
+    Some(st)
+
+// The connection a finished `Connect` made, and the channel a finished `CocOpen` opened; they
+// hold their last value until the next call.
+pub fn op_conn(h: Host) -> ConnId
+    h.api.op.conn
+
+pub fn op_chan(h: Host) -> Int
+    h.api.op.chan as Int
+
+// What the Host knows of a connection; None for a name that is stale.
+pub fn conn_info(h: Host, conn: ConnId) -> ?ConnInfo
+    let s = slot_of(h, conn)
+    if s < 0
+        return None
+    let info = h.api.conns[s].info
+    let link = h.le.slots[s]
+    if list.len(link.att.bearers) == 0
+        return Some(info)
+    Some(ConnInfo { role: info.role, peer: info.peer, params: info.params, mtu: link.att.bearers[0].mtu as u16, level: info.level, bonded: info.bonded })
+
+// Start `req`.  The answer says at once whether it was accepted: E_NOT_READY before `Start`
+// ended, E_BUSY while another call is in flight, E_STALE for a connection that is gone,
+// E_BAD_ARGUMENT for an argument the specification refuses or a request Layer A does not serve,
+// E_NO_ROOM when the Host holds `max_links` connections.  An accepted call is carried out by the
+// next `poll`, and its outcome is read with `result`.
+pub fn begin(var h: Host, req: Request) -> Status
+    if h.api.op.busy
+        return noble.failed(noble.LAYER_LOCAL, noble.E_BUSY)
+    var kind = noble.R_NONE
+    match req
+        Request.Start => kind = noble.R_START
+        _ =>
+            if not h.api.ready
+                return noble.failed(noble.LAYER_LOCAL, noble.E_NOT_READY)
+            match req
+                Request.Connect(peer, p) =>
+                    if h.api.reconnecting
+                        return noble.failed(noble.LAYER_LOCAL, noble.E_BUSY)
+                    if link_count(h) >= h.api.max_links
+                        return noble.failed(noble.LAYER_LOCAL, noble.E_NO_ROOM)
+                    if not params_ok(p)
+                        return noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT)
+                    h.api.r_peer = peer
+                    h.api.r_params = p
+                    h.api.r_chan = 0
+                    // A connection the application asks for replaces one the policy scheduled.
+                    h.api.due_ms = -1
+                    kind = noble.R_CONNECT
+                Request.ConnectListed(p) =>
+                    if h.api.reconnecting
+                        return noble.failed(noble.LAYER_LOCAL, noble.E_BUSY)
+                    if link_count(h) >= h.api.max_links
+                        return noble.failed(noble.LAYER_LOCAL, noble.E_NO_ROOM)
+                    if not params_ok(p)
+                        return noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT)
+                    h.api.r_peer = noble.blank_addr()
+                    h.api.r_params = p
+                    h.api.r_chan = 1
+                    h.api.due_ms = -1
+                    kind = noble.R_CONNECT
+                Request.ConnectCancel => kind = noble.R_CANCEL
+                Request.Disconnect(conn, reason) =>
+                    if slot_of(h, conn) < 0
+                        return noble.failed(noble.LAYER_LOCAL, noble.E_STALE)
+                    h.api.r_conn = conn
+                    h.api.r_reason = reason as Int
+                    kind = noble.R_DISCONNECT
+                Request.UpdateParams(conn, p) =>
+                    if slot_of(h, conn) < 0
+                        return noble.failed(noble.LAYER_LOCAL, noble.E_STALE)
+                    if not params_ok(p)
+                        return noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT)
+                    h.api.r_conn = conn
+                    h.api.r_params = p
+                    kind = noble.R_UPDATE
+                Request.Secure(conn, need) =>
+                    if slot_of(h, conn) < 0
+                        return noble.failed(noble.LAYER_LOCAL, noble.E_STALE)
+                    h.api.r_conn = conn
+                    h.api.r_need = need
+                    kind = noble.R_SECURE
+                Request.CocOpen(conn, psm, mtu, need) =>
+                    if slot_of(h, conn) < 0
+                        return noble.failed(noble.LAYER_LOCAL, noble.E_STALE)
+                    if (psm as Int) == 0 or (mtu as Int) < 23
+                        return noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT)
+                    h.api.r_conn = conn
+                    h.api.r_psm = psm as Int
+                    h.api.r_mtu = coc_mtu(mtu as Int)
+                    h.api.r_need = need
+                    kind = noble.R_COC_OPEN
+                Request.CocClose(conn, chan) =>
+                    if slot_of(h, conn) < 0
+                        return noble.failed(noble.LAYER_LOCAL, noble.E_STALE)
+                    h.api.r_conn = conn
+                    h.api.r_chan = chan as Int
+                    kind = noble.R_COC_CLOSE
+                _ => return noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT)
+    h.api.op.busy = true
+    h.api.op.done = false
+    h.api.op.status = noble.ok()
+    h.api.kind = kind
+    h.api.step = 0
+    noble.ok()
+
+// The connection parameters the specification allows ([Vol 4] Part E, Section 7.8.18).
+fn params_ok(p: ConnParams) -> Bool
+    le_link.acceptable_connection_parameters(p.interval_min as Int, p.interval_max as Int, p.latency as Int, p.timeout as Int)
+
+// The MTU a channel is offered: what an event can carry.
+fn coc_mtu(mtu: Int) -> Int
+    if mtu > noble_config.ATT_VALUE_BYTES
+        noble_config.ATT_VALUE_BYTES
+    else
+        mtu
+
+// ── Commands and packets out ────────────────────────────────────────
+
+// Queue the HCI command `opcode` with `params`.  The Host sends one command at a time: the next
+// leaves when the Controller has answered the last.
+fn send_cmd(var h: Host, opcode: Int, params: [u8])
+    list.push(h.queued, [HciCmdMsg { opcode: opcode, params: params }])
+
+// Write what is owed to the Controller: the Host Number Of Completed Packets command, the ACL
+// packets the links produced and, when no command waits for its answer, the next command.
+fn flush<T: HciLink[e]>(var h: Host, var t: T) [e, mutate]
+    for pkt in le_link.le_links_flush_completed(var h.le)
+        let _ = t.send_packet(pkt)
+    let out = h.acl_out
+    h.acl_out = []
+    for pkt in out
+        let _ = t.send_packet(pkt)
+    if h.cmd_wait >= 0 or list.len(h.queued) == 0
+        return
+    var batch = h.queued[0]
+    h.queued = h.queued[1:]
+    if list.len(batch) == 0
+        return
+    let msg = batch[0]
+    if t.send_packet(hci_codec.build_h4_command(msg.opcode, msg.params))
+        h.cmd_wait = msg.opcode
+    else
+        var back: [[HciCmdMsg]] = [batch]
+        list.append(back, h.queued)
+        h.queued = back
+
+// Give the packets of a link to the transport at the next flush.
+fn send_acl(var h: Host, packets: [[u8]])
+    for pkt in packets
+        list.push(h.acl_out, pkt[:])
+
+// ── The Host's own address and the random seed ──────────────────────
+
+// The address the Controller uses: `kind` 0 public or 1 random, `octets` least significant
+// first.  `Start` reads the public address of the Controller; a product whose Controller has
+// none sets a random address with the Controller's command and tells the Host here.
+pub fn host_set_own_address(var h: Host, kind: Int, octets: [u8])
+    h.api.own_kind = kind & 1
+    h.own_address = octets[:]
+
+// The limit of live connections below the compile-time `MAX_CONNECTIONS`.
+pub fn host_set_max_links(var h: Host, n: Int)
+    var m = n
+    if m > le_link.le_links_slots(h.le)
+        m = le_link.le_links_slots(h.le)
+    if m < 1
+        m = 1
+    h.api.max_links = m
+
+// ── poll ────────────────────────────────────────────────────────────
+
+// Run the Host once at the clock `now_ms`: carry out the call that `begin` accepted, read what
+// the Controller sent (at most RECEIVE_BUDGET packets), advance the timers, call the hooks and
+// write what is owed.  The clock is an argument and the Host does no I/O but through `t`.
+pub fn poll<T: HciLink[e], P: HostPolicy[f], B: BondStore[g]>(var h: Host, var t: T, var p: P, var b: B, now_ms: Int) [e, f, g, mutate]
+    h.clock_ms = now_ms
+    kick(var h, var p, var b)
+    answers(var h, var p, var b)
+    flush(var h, var t)
+    for _ in 0..RECEIVE_BUDGET
+        match t.recv_packet(0)
+            Some(pkt) => on_packet(var h, pkt, var p, var b)
+            None => break
+    timers(var h, var p, var b)
+    flush(var h, var t)
+
+// Start the call that `begin` accepted: its first step needs the policy and the store.
+fn kick<P: HostPolicy[f], B: BondStore[g]>(var h: Host, var p: P, var b: B) [f, g, mutate]
+    if h.api.kind == noble.R_NONE or h.api.step != 0
+        return
+    let kind = h.api.kind
+    h.api.step = 1
+    if kind == noble.R_START
+        send_cmd(var h, hci_commands.opcode_hci_reset(), [])
+    else if kind == noble.R_CONNECT
+        start_connect(var h, var p)
+    else if kind == noble.R_CANCEL
+        send_cmd(var h, hci_commands.opcode_le_create_connection_cancel(), [])
+    else if kind == noble.R_DISCONNECT
+        let slot = slot_of(h, h.api.r_conn)
+        if slot < 0
+            finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_STALE))
+        else
+            send_cmd(var h, hci_commands.opcode_hci_disconnect(), hci_commands.build_disconnect(handle_of(h, slot), h.api.r_reason))
+    else if kind == noble.R_UPDATE
+        let slot = slot_of(h, h.api.r_conn)
+        if slot < 0
+            finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_STALE))
+        else
+            let q = h.api.r_params
+            send_cmd(var h, hci_commands.opcode_le_connection_update(), hci_commands.build_connection_parameters(handle_of(h, slot), q.interval_min as Int, q.interval_max as Int, q.latency as Int, q.timeout as Int, 0, 0))
+    else if kind == noble.R_SECURE
+        start_secure(var h, var p, var b)
+    else if kind == noble.R_COC_OPEN
+        start_coc_open(var h)
+    else if kind == noble.R_COC_CLOSE
+        start_coc_close(var h)
+
+// The scan and connection intervals of a connection the Host creates, in 0.625 ms units: scan
+// 60 ms with a 30 ms window.
+const SCAN_INTERVAL = 96
+const SCAN_WINDOW = 48
+
+// Queue LE Create Connection to `peer` (or to the accept list) with `q`.
+fn send_create_connection(var h: Host, peer: Addr, q: ConnParams, listed: Bool)
+    let policy = if listed then hci_commands.INITIATOR_FILTER_ACCEPT_LIST else hci_commands.SCAN_FILTER_BASIC_UNFILTERED
+    let own = if h.api.own_kind == 0 then hci_commands.OWN_ADDR_TYPE_PUBLIC else hci_commands.OWN_ADDR_TYPE_RANDOM
+    let octets = if listed then [0, 0, 0, 0, 0, 0] else octets_of(peer)
+    let params = hci_commands.build_le_create_connection(SCAN_INTERVAL, SCAN_WINDOW, policy, (peer.kind & 1) as Int, octets, own, q.interval_min as Int, q.interval_max as Int, q.latency as Int, q.timeout as Int, 0, 0)
+    send_cmd(var h, hci_commands.opcode_le_create_connection(), params)
+
+fn start_connect<P: HostPolicy[f]>(var h: Host, var p: P) [f, mutate]
+    let listed = h.api.r_chan == 1
+    let peer = h.api.r_peer
+    if not p.accept_connect(peer, Role.Central)
+        finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_REFUSED))
+        return
+    h.api.last_peer = peer
+    h.api.last_params = h.api.r_params
+    h.api.last_listed = listed
+    h.api.last_valid = true
+    send_create_connection(var h, peer, h.api.r_params, listed)
+
+fn start_coc_open(var h: Host)
+    let slot = slot_of(h, h.api.r_conn)
+    if slot < 0
+        finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_STALE))
+        return
+    if level_int(h.api.conns[slot].info.level) < level_int(h.api.r_need)
+        finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_SECURITY_LOW))
+        return
+    match le_link.coc_connect(var h.le.slots[slot], h.api.r_psm, h.api.r_mtu, 1, false, true)
+        None => finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_NO_ROOM))
+        Some(out) =>
+            send_acl(var h, out)
+            let ids = le_link.coc_connecting_ids(h.le.slots[slot])
+            h.api.r_chan = if list.len(ids) > 0 then ids[list.len(ids) - 1] else -1
+
+fn start_coc_close(var h: Host)
+    let slot = slot_of(h, h.api.r_conn)
+    if slot < 0
+        finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_STALE))
+        return
+    match le_link.coc_disconnect(var h.le.slots[slot], h.api.r_chan)
+        None => finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_NOT_FOUND))
+        Some(out) => send_acl(var h, out)
+
+// ── Timers ──────────────────────────────────────────────────────────
+
+fn timers<P: HostPolicy[f], B: BondStore[g]>(var h: Host, var p: P, var b: B) [f, g, mutate]
+    for slot in 0..le_link.le_links_slots(h.le)
+        if h.api.conns[slot].live
+            le_link.tick(var h.le.slots[slot], h.clock_ms)
+            host_activate(var h, slot)
+            if h.link.central
+                if h.smp_central.phase != smp_core.Phase.Idle
+                    feed_initiator(var h, slot, smp_initiator.Tick, var p, var b)
+            else
+                if h.smp.phase != smp_core.Phase.Idle
+                    feed_responder(var h, slot, smp_responder.Tick, var p, var b)
+    // A reconnection the policy asked for and whose time has come.
+    if h.api.due_ms >= 0 and h.clock_ms >= h.api.due_ms
+        h.api.due_ms = -1
+        if h.api.last_valid and not h.api.reconnecting and link_count(h) < h.api.max_links and p.accept_connect(h.api.last_peer, Role.Central)
+            h.api.attempts = h.api.attempts + 1
+            h.api.reconnecting = true
+            send_create_connection(var h, h.api.last_peer, h.api.last_params, h.api.last_listed)
+
+// The answers the application gave to a passkey or a numeric comparison.
+fn answers<P: HostPolicy[f], B: BondStore[g]>(var h: Host, var p: P, var b: B) [f, g, mutate]
+    for slot in 0..le_link.le_links_slots(h.le)
+        let ask = h.api.ask[slot]
+        let ans = h.api.ans[slot]
+        if ask != 0 and ans != noble.NO_ANSWER
+            set_ask(var h, slot, 0)
+            set_ans(var h, slot, noble.NO_ANSWER)
+            if h.api.conns[slot].live
+                host_activate(var h, slot)
+                if ask == 1
+                    answer_passkey(var h, slot, ans, var p, var b)
+                else
+                    answer_numeric(var h, slot, ans == 1, var p, var b)
+
+// ── Packets in ──────────────────────────────────────────────────────
+
+fn on_packet<P: HostPolicy[f], B: BondStore[g]>(var h: Host, pkt: [u8], var p: P, var b: B) [f, g, mutate]
+    if list.len(pkt) < 2
+        return
+    let kind = pkt[0] as Int
+    if kind == hci_frame.H4_PKT_ACL
+        on_acl(var h, pkt, var p, var b)
+    else if kind == hci_frame.H4_PKT_EVENT
+        on_event(var h, pkt[1:], var p, var b)
+
+fn on_event<P: HostPolicy[f], B: BondStore[g]>(var h: Host, evt: [u8], var p: P, var b: B) [f, g, mutate]
+    if hci_codec.is_command_complete(evt) or hci_codec.is_command_status(evt)
+        let opcode = hci_codec.answered_opcode(evt)
+        if opcode == h.cmd_wait
+            h.cmd_wait = -1
+        let rp = if hci_codec.is_command_complete(evt) then hci_codec.command_complete_return_parameters(evt) else []
+        command_answered(var h, opcode, hci_codec.answered_status(evt), rp, var p, var b)
+        return
+    match hci_codec.number_of_completed_packets(evt)
+        Some(pairs) =>
+            for c in pairs
+                send_acl(var h, le_link.le_links_completed(var h.le, c.connection_handle, c.count))
+            return
+        None => ()
+    match hci_codec.disconnection_complete(evt)
+        Some(d) =>
+            on_disconnection(var h, d, var p, var b)
+            return
+        None => ()
+    match hci_codec.le_connection_complete(evt)
+        Some(c) =>
+            on_connection_complete(var h, c, var p, var b)
+            return
+        None => ()
+    match hci_codec.le_connection_update_complete(evt)
+        Some(u) =>
+            on_update_complete(var h, u)
+            return
+        None => ()
+    match hci_codec.le_remote_connection_parameter_request(evt)
+        Some(r) =>
+            on_remote_parameters(var h, r, var p)
+            return
+        None => ()
+    if hci_codec.is_encryption_event(evt)
+        on_encryption(var h, evt, var p, var b)
+        return
+    match hci_codec.le_advertising_reports(evt)
+        Some(reports) => on_reports(var h, reports, var p)
+        None => ()
+
+// An LE Advertising Report event: each report is offered to the policy and, if it takes it,
+// queued as an `Event.Advert`, which a full queue drops and counts.
+fn on_reports<P: HostPolicy[f]>(var h: Host, reports: [hci_codec.AdvertisingReport], var p: P) [f, mutate]
+    for r in reports
+        var data: noble.AdData = Vec.new()
+        for i in 0..list.len(r.data)
+            let _ = data.push(r.data[i])
+        let rep = noble.AdvReport { addr: address_of(r.address_type, r.address), rssi: r.rssi as i8, flags: r.event_type as u8, data: data }
+        if p.on_advert(rep)
+            emit(var h, Event.Advert(rep))
+
+// The answer to the command in flight.  A command the engine sent for the call in flight
+// advances or ends it; the answer to any other command is dropped.
+fn command_answered<P: HostPolicy[f], B: BondStore[g]>(var h: Host, opcode: Int, status: Int, rp: [u8], var p: P, var b: B) [f, g, mutate]
+    let kind = h.api.kind
+    if opcode == hci_commands.opcode_le_create_connection() and status != 0 and h.api.reconnecting
+        h.api.reconnecting = false
+        reconnect_failed(var h, status, var p)
+        return
+    if kind == noble.R_NONE
+        return
+    if kind == noble.R_START
+        start_answered(var h, opcode, status, rp)
+    else if kind == noble.R_CONNECT
+        if opcode == hci_commands.opcode_le_create_connection()
+            if status != 0
+                finish(var h, noble.failed(noble.LAYER_HCI, status))
+            else
+                h.api.step = 2
+    else if kind == noble.R_CANCEL
+        if opcode == hci_commands.opcode_le_create_connection_cancel()
+            finish(var h, if status == 0 then noble.ok() else noble.failed(noble.LAYER_HCI, status))
+    else if kind == noble.R_DISCONNECT
+        if opcode == hci_commands.opcode_hci_disconnect()
+            if status != 0
+                finish(var h, noble.failed(noble.LAYER_HCI, status))
+            else
+                h.api.step = 2
+    else if kind == noble.R_UPDATE
+        if opcode == hci_commands.opcode_le_connection_update()
+            if status != 0
+                finish(var h, noble.failed(noble.LAYER_HCI, status))
+            else
+                h.api.step = 2
+    else if kind == noble.R_SECURE
+        if opcode == hci_commands.opcode_le_start_encryption() and status != 0
+            finish(var h, noble.failed(noble.LAYER_HCI, status))
+
+// ── Start: bring the Controller up ──────────────────────────────────
+//
+// Reset, the event masks, the buffer sizes (LE Read Buffer Size), 16 octets of seed from LE Rand
+// (twice) and the public address (Read BD_ADDR).  The seed makes the key pair and the random
+// numbers of the Security Manager.
+
+fn start_answered(var h: Host, opcode: Int, status: Int, rp: [u8])
+    if status != 0
+        finish(var h, noble.failed(noble.LAYER_HCI, status))
+        return
+    let step = h.api.step
+    if step == 1
+        let mask = hci_commands.EVENT_MASK_DEFAULT | hci_commands.EVENT_MASK_ENCRYPTION_KEY_REFRESH_COMPLETE | hci_commands.EVENT_MASK_LE_META
+        send_cmd(var h, hci_commands.opcode_hci_set_event_mask(), hci_commands.build_set_event_mask(mask))
+    else if step == 2
+        let le_mask = hci_commands.LE_EVENT_MASK_DEFAULT | hci_commands.LE_EVENT_MASK_REMOTE_CONNECTION_PARAMETER_REQUEST
+        send_cmd(var h, hci_commands.opcode_le_set_event_mask(), hci_commands.build_set_event_mask(le_mask))
+    else if step == 3
+        send_cmd(var h, hci_commands.opcode_le_read_buffer_size(), [])
+    else if step == 4
+        match hci_codec.le_buffer_size(rp)
+            Some(s) => le_link.le_links_set_buffers(var h.le, s.acl_data_packet_length, s.total_acl_data_packets)
+            None => ()
+        send_cmd(var h, hci_commands.opcode_le_rand(), [])
+    else if step == 5
+        h.api.seed = Vec.new()
+        take_seed(var h, rp)
+        send_cmd(var h, hci_commands.opcode_le_rand(), [])
+    else if step == 6
+        take_seed(var h, rp)
+        send_cmd(var h, hci_commands.opcode_read_bd_addr(), [])
+    else
+        if list.len(rp) >= 6
+            h.own_address = rp[0:6]
+            h.api.own_kind = 0
+        var seed: [u8] = []
+        for i in 0..h.api.seed.len()
+            list.push(seed, h.api.seed[i])
+        host_seed(var h, seed, [])
+        h.api.ready = true
+        emit(var h, Event.Ready)
+        finish(var h, noble.ok())
+        return
+    h.api.step = step + 1
+
+fn take_seed(var h: Host, rp: [u8])
+    for i in 0..8
+        if i < list.len(rp)
+            let _ = h.api.seed.push(rp[i])
+
+// ── ACL data ────────────────────────────────────────────────────────
+
+// An HCI ACL Data packet: the link of its handle takes it (L2CAP, ATT, the Security Manager and
+// the channels), the packets it owes the peer go out at the next flush, and what it leaves for the
+// application is queued as events.
+fn on_acl<P: HostPolicy[f], B: BondStore[g]>(var h: Host, pkt: [u8], var p: P, var b: B) [f, g, mutate]
+    match hci_codec.acl_data_packet(pkt[1:])
+        None => return
+        Some(a) =>
+            let slot = slot_of_handle(h, a.connection_handle)
+            if slot < 0
+                // A packet for a handle no link holds still held a buffer of the Host.
+                send_acl(var h, le_link.host_completed(var h.le.credits, pkt))
+                return
+            host_activate(var h, slot)
+            send_acl(var h, le_link.receive_acl(var h.link, pkt, h.clock_ms))
+            let conn = h.api.conns[slot].id
+            for handle in gatt_server.take_changed(var h.link.att)
+                emit(var h, Event.Written(conn, handle as u16))
+            for pdu in le_link.take_smp_pdus(var h.link)
+                sec_pdu(var h, slot, pdu, var p, var b)
+            coc_events(var h, slot)
+            central_update(var h, slot, var p)
+
+// The parameters a peer asked for over L2CAP, which the link accepted as in range: the Central
+// owes the Controller the procedure, and the policy decides whether to start it.
+fn central_update<P: HostPolicy[f]>(var h: Host, slot: Int, var p: P) [f, mutate]
+    if not h.le.slots[slot].central or list.len(h.le.slots[slot].accepted_update) != 4
+        return
+    let u = h.le.slots[slot].accepted_update[:]
+    h.le.slots[slot].accepted_update = []
+    let q = ConnParams { interval_min: u[0] as u16, interval_max: u[1] as u16, latency: u[2] as u16, timeout: u[3] as u16 }
+    if p.accept_params(h.api.conns[slot].id, q)
+        send_cmd(var h, hci_commands.opcode_le_connection_update(), hci_commands.build_connection_parameters(handle_of(h, slot), u[0], u[1], u[2], u[3], 0, 0))
+
+// What the channel table of the link reports: a channel is up, a channel is gone, an SDU arrived.
+fn coc_events(var h: Host, slot: Int)
+    let conn = h.api.conns[slot].id
+    for ev in le_link.take_coc_events(var h.le.slots[slot])
+        match ev
+            l2cap_coc.Connected(id, psm) =>
+                if h.api.kind == noble.R_COC_OPEN and slot_of(h, h.api.r_conn) == slot and id == h.api.r_chan
+                    h.api.op.chan = id as u8
+                    finish(var h, noble.ok())
+                else if level_int(h.api.conns[slot].info.level) < level_int(h.api.coc_need)
+                    // The channel is refused after the fact: its link is below the security
+                    // `coc_listen` asked for.
+                    match le_link.coc_disconnect(var h.le.slots[slot], id)
+                        Some(out) => send_acl(var h, out)
+                        None => ()
+                else
+                    emit(var h, Event.CocOpened(conn, id as u8, psm as u16))
+            l2cap_coc.Disconnected(id, psm, result) =>
+                let st = if result == 0 then noble.ok() else noble.failed(noble.LAYER_L2CAP, result)
+                if h.api.kind == noble.R_COC_OPEN and slot_of(h, h.api.r_conn) == slot and id == h.api.r_chan
+                    finish(var h, if result == 0 then noble.failed(noble.LAYER_L2CAP, 0) else st)
+                else if h.api.kind == noble.R_COC_CLOSE and slot_of(h, h.api.r_conn) == slot and id == h.api.r_chan
+                    finish(var h, noble.ok())
+                else
+                    emit(var h, Event.CocClosed(conn, id as u8, st))
+            l2cap_coc.DataReceived(id, sdu) =>
+                emit(var h, Event.CocData(conn, id as u8, value_of(sdu)))
+            l2cap_coc.Reconfigured(_, _, _) => ()
+
+// ── Connections ─────────────────────────────────────────────────────
+
+fn is_central(r: Role) -> Bool
+    match r
+        Role.Central => true
+        Role.Peripheral => false
+
+// What the policy's answer to `on_connected` and `on_disconnected` asks of the Host: the answers
+// that concern advertising are left in `Api.advertise` for the advertising code, a
+// `Reconnect` sets the time of the next attempt, and an answer that is not valid for the role is
+// read as `Stay`.
+fn apply_action(var h: Host, act: Action, role: Role)
+    match act
+        Action.Stay => ()
+        Action.Readvertise =>
+            if not is_central(role)
+                h.api.advertise = if link_count(h) >= h.api.max_links then noble.ADVERTISE_NON_CONNECTABLE else noble.ADVERTISE_CONNECTABLE
+        Action.AdvertiseNonConnectable =>
+            if not is_central(role)
+                h.api.advertise = noble.ADVERTISE_NON_CONNECTABLE
+        Action.Reconnect(after_ms) =>
+            if is_central(role) and h.api.last_valid
+                h.api.due_ms = h.clock_ms + after_ms
+
+// The Host disconnects a link it does not keep.
+fn refuse_link(var h: Host, handle: Int, reason: Int)
+    send_cmd(var h, hci_commands.opcode_hci_disconnect(), hci_commands.build_disconnect(handle, reason))
+
+fn on_connection_complete<P: HostPolicy[f], B: BondStore[g]>(var h: Host, c: hci_codec.LeConnectionComplete, var p: P, var b: B) [f, g, mutate]
+    let central = c.role == hci_codec.CONNECTION_ROLE_CENTRAL
+    let role = if central then Role.Central else Role.Peripheral
+    if c.status != 0
+        if central
+            connection_failed(var h, c.status, var p)
+        return
+    let peer = address_of(c.peer_address_type, c.peer_address)
+    if link_count(h) >= h.api.max_links
+        refuse_link(var h, c.connection_handle, noble.HCI_REMOTE_LOW_RESOURCES)
+        if central and h.api.kind == noble.R_CONNECT
+            finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_NO_ROOM))
+        return
+    if not central and not p.accept_connect(peer, role)
+        refuse_link(var h, c.connection_handle, noble.HCI_REMOTE_USER_TERMINATED)
+        return
+    let id = le_link.le_links_open(var h.le, c.connection_handle, central, c.peer_address_type & 1, c.peer_address)
+    if not links.is_link(id)
+        refuse_link(var h, c.connection_handle, noble.HCI_REMOTE_LOW_RESOURCES)
+        if central and h.api.kind == noble.R_CONNECT
+            finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_NO_ROOM))
+        return
+    let slot = id.slot
+    host_activate(var h, slot)
+    h.ll_update = []
+    // The Security Manager follows the link: both halves are told of the connection, with the
+    // addresses of the connection and the bond of the peer, if the store has one.
+    let own = if list.len(h.own_address) == 6 then h.own_address[:] else [0, 0, 0, 0, 0, 0]
+    let bond = find_bond(var b, peer)
+    let first = smp_responder.handle(h.smp, smp_responder.Connected(h.api.own_kind, own, c.peer_address_type & 1, c.peer_address[:], bond), h.clock_ms)
+    h.smp = first.state
+    let second = smp_initiator.handle(h.smp_central, smp_initiator.Connected(h.api.own_kind, own, c.peer_address_type & 1, c.peer_address[:], bond), h.clock_ms)
+    h.smp_central = second.state
+    let params = ConnParams { interval_min: c.connection_interval as u16, interval_max: c.connection_interval as u16, latency: c.peripheral_latency as u16, timeout: c.supervision_timeout as u16 }
+    let conn = conn_id_of(id)
+    let info = ConnInfo { role: role, peer: peer, params: params, mtu: DEFAULT_MTU as u16, level: Security.Open, bonded: bond != None }
+    set_conn(var h, slot, noble.Conn { live: true, id: conn, info: info })
+    set_link_security(var h, false, 1)
+    h.api.attempts = 0
+    h.api.reconnecting = false
+    h.api.due_ms = -1
+    if central and h.api.kind == noble.R_CONNECT
+        h.api.op.conn = conn
+        finish(var h, noble.ok())
+    emit(var h, Event.Connected(conn, role, peer, params))
+    let act = p.on_connected(conn, role, link_count(h))
+    apply_action(var h, act, role)
+
+// A Create Connection that ended without a link: the call in flight fails with the Controller's
+// status; a reconnection the Host started reports a failed `Disconnected` and calls the hook again.
+fn connection_failed<P: HostPolicy[f]>(var h: Host, status: Int, var p: P) [f, mutate]
+    if h.api.kind == noble.R_CONNECT
+        finish(var h, noble.failed(noble.LAYER_HCI, status))
+    else if h.api.reconnecting
+        h.api.reconnecting = false
+        reconnect_failed(var h, status, var p)
+
+fn reconnect_failed<P: HostPolicy[f]>(var h: Host, status: Int, var p: P) [f, mutate]
+    let reason = noble.failed(noble.LAYER_HCI, status)
+    emit(var h, Event.Disconnected(noble.no_conn(), reason))
+    let act = p.on_disconnected(noble.no_conn(), reason, Role.Central, h.api.attempts)
+    apply_action(var h, act, Role.Central)
+
+fn on_disconnection<P: HostPolicy[f], B: BondStore[g]>(var h: Host, d: hci_codec.DisconnectionComplete, var p: P, var b: B) [f, g, mutate]
+    if d.status != 0
+        if h.api.kind == noble.R_DISCONNECT
+            finish(var h, noble.failed(noble.LAYER_HCI, d.status))
+        return
+    let slot = slot_of_handle(h, d.connection_handle)
+    if slot < 0
+        return
+    host_activate(var h, slot)
+    let conn = h.api.conns[slot].id
+    let info = h.api.conns[slot].info
+    // A pairing in progress ends with the link.
+    h.smp = smp_responder.handle(h.smp, smp_responder.Disconnected, h.clock_ms).state
+    h.smp_central = smp_initiator.handle(h.smp_central, smp_initiator.Disconnected, h.clock_ms).state
+    h.ll_update = []
+    set_ask(var h, slot, 0)
+    set_ans(var h, slot, noble.NO_ANSWER)
+    send_acl(var h, le_link.le_links_close(var h.le, links.links_id(h.le.registry, slot)))
+    set_conn(var h, slot, noble.Conn { live: false, id: conn, info: info })
+    let reason = noble.failed(noble.LAYER_HCI, d.reason)
+    // The call in flight on this link ends with it.
+    if h.api.kind != noble.R_NONE and h.api.kind != noble.R_START and h.api.kind != noble.R_CONNECT and h.api.kind != noble.R_CANCEL and slot_of_name(h, h.api.r_conn) == slot
+        if h.api.kind == noble.R_DISCONNECT
+            finish(var h, noble.ok())
+        else
+            finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_LINK_LOST))
+    emit(var h, Event.Disconnected(conn, reason))
+    let act = p.on_disconnected(conn, reason, info.role, h.api.attempts)
+    apply_action(var h, act, info.role)
+
+// The slot a name belongs to or belonged to, live or not: a call in flight names the link it
+// was started on, and that link may have ended since.
+fn slot_of_name(h: Host, conn: ConnId) -> Int
+    let s = conn.slot as Int
+    if s >= le_link.le_links_slots(h.le)
+        return -1
+    if (h.api.conns[s].id.generation as Int) == (conn.generation as Int)
+        s
+    else
+        -1
+
+fn set_link_security(var h: Host, encrypted: Bool, level: Int)
+    gatt_server.set_security(var h.link.att, gatt_server.link_security(encrypted, level, if encrypted then 16 else 0, h.link.att.security.has_ltk))
+
+fn on_update_complete(var h: Host, u: hci_codec.LeConnectionUpdateComplete)
+    let slot = slot_of_handle(h, u.connection_handle)
+    if slot < 0
+        return
+    let conn = h.api.conns[slot].id
+    let mine = h.api.kind == noble.R_UPDATE and slot_of_name(h, h.api.r_conn) == slot
+    if u.status != 0
+        if not mine
+            return
+        // A peer without the Connection Parameters Request procedure: a Peripheral asks over L2CAP.
+        if (u.status == noble.HCI_UNSUPPORTED_REMOTE_FEATURE or u.status == STATUS_UNSUPPORTED_FEATURE) and not is_central(h.api.conns[slot].info.role)
+            let q = h.api.r_params
+            match le_link.request_connection_parameter_update(var h.le.slots[slot], q.interval_min as Int, q.interval_max as Int, q.latency as Int, q.timeout as Int, h.clock_ms)
+                Some(out) =>
+                    send_acl(var h, out)
+                    return
+                None => ()
+        finish(var h, noble.failed(noble.LAYER_HCI, u.status))
+        return
+    let c = h.api.conns[slot]
+    let q = ConnParams { interval_min: u.connection_interval as u16, interval_max: u.connection_interval as u16, latency: u.peripheral_latency as u16, timeout: u.supervision_timeout as u16 }
+    set_conn(var h, slot, noble.Conn { live: c.live, id: c.id, info: ConnInfo { role: c.info.role, peer: c.info.peer, params: q, mtu: c.info.mtu, level: c.info.level, bonded: c.info.bonded } })
+    emit(var h, Event.ParamsUpdated(conn, q))
+    if mine
+        finish(var h, noble.ok())
+
+// The peer asks for new connection parameters (LE Remote Connection Parameter Request): the policy
+// decides, and the Host answers the Controller with the reply or the negative reply.
+fn on_remote_parameters<P: HostPolicy[f]>(var h: Host, r: hci_codec.LeRemoteConnectionParameterRequest, var p: P) [f, mutate]
+    let slot = slot_of_handle(h, r.connection_handle)
+    if slot < 0
+        return
+    let q = ConnParams { interval_min: r.interval_min as u16, interval_max: r.interval_max as u16, latency: r.max_latency as u16, timeout: r.timeout as u16 }
+    let fits = le_link.acceptable_connection_parameters(r.interval_min, r.interval_max, r.max_latency, r.timeout)
+    if fits and p.accept_params(h.api.conns[slot].id, q)
+        send_cmd(var h, hci_commands.opcode_le_remote_connection_parameter_request_reply(), hci_commands.build_connection_parameters(r.connection_handle, r.interval_min, r.interval_max, r.max_latency, r.timeout, 0, 0))
+    else
+        send_cmd(var h, hci_commands.opcode_le_remote_connection_parameter_request_negative_reply(), hci_commands.build_handle_and_reason(r.connection_handle, hci_commands.REASON_UNACCEPTABLE_CONNECTION_PARAMETERS))
+
+// ── The Security Manager, role-agnostic ─────────────────────────────
+
+// The settings of a pairing as the product chose them: the IO Capability the policy offers, bonding,
+// LE Secure Connections Only and the smallest key size.
+fn config_with(c: smp_core.SmpConfig, io: Int, bondable: Bool, sc_only: Bool, min_key: Int) -> smp_core.SmpConfig
+    smp_core.SmpConfig {
+        io_capability: io, bondable: bondable, secure_connections: c.secure_connections, sc_only: sc_only,
+        required_level: c.required_level, keypress: c.keypress, request_mitm: c.request_mitm, max_key_size: c.max_key_size,
+        min_key_size: min_key, identity_irk: c.identity_irk, identity_address_type: c.identity_address_type,
+        identity_address: c.identity_address, distribute_csrk: c.distribute_csrk, accept_debug_key: c.accept_debug_key,
+        pairing_supported: c.pairing_supported, attempt_min_wait_ms: c.attempt_min_wait_ms, attempt_max_wait_ms: c.attempt_max_wait_ms }
+
+fn sec_prepare<P: HostPolicy[f]>(var h: Host, slot: Int, var p: P) [f, mutate]
+    let io_cap = io_value(p.io_capability(h.api.conns[slot].id))
+    var responder = h.smp
+    responder.config = config_with(responder.config, io_cap, h.api.bondable, h.api.sc_only, h.api.min_key_size)
+    h.smp = responder
+    var initiator = h.smp_central
+    initiator.config = config_with(initiator.config, io_cap, h.api.bondable, h.api.sc_only, h.api.min_key_size)
+    h.smp_central = initiator
+
+// Hand one input to the responder (the Peripheral's half) at the Host's clock, perform what it
+// reports, and queue the SMP commands it sends.  While it waits for a DHKey, the DHKey is
+// computed and handed back at once.
+fn feed_responder<P: HostPolicy[f], B: BondStore[g]>(var h: Host, slot: Int, input: smp_responder.SmpInput, var p: P, var b: B) [f, g, mutate]
+    let step = smp_responder.handle(h.smp, input, h.clock_ms)
+    h.smp = step.state
+    for pdu in step.pdus
+        send_acl(var h, le_link.send_smp(var h.link, pdu))
+    match step.action
+        Some(a) => sec_event(var h, slot, sec_of_responder(a), var p, var b)
+        None => ()
+    match smp_responder.dhkey_request(h.smp)
+        Some(peer) =>
+            let dhkey = smp_keys.dhkey(h.smp.key_pair.private_key, peer)
+            feed_responder(var h, slot, smp_responder.DhKeyComputed(dhkey), var p, var b)
+        None => ()
+
+// The same for the initiator, the Central's half.
+fn feed_initiator<P: HostPolicy[f], B: BondStore[g]>(var h: Host, slot: Int, input: smp_initiator.SmpInitInput, var p: P, var b: B) [f, g, mutate]
+    let step = smp_initiator.handle(h.smp_central, input, h.clock_ms)
+    h.smp_central = step.state
+    for pdu in step.pdus
+        send_acl(var h, le_link.send_smp(var h.link, pdu))
+    match step.action
+        Some(a) => sec_event(var h, slot, sec_of_initiator(a), var p, var b)
+        None => ()
+    match smp_initiator.dhkey_request(h.smp_central)
+        Some(peer) =>
+            let dhkey = smp_keys.dhkey(h.smp_central.key_pair.private_key, peer)
+            feed_initiator(var h, slot, smp_initiator.DhKeyComputed(dhkey), var p, var b)
+        None => ()
+
+fn answer_passkey<P: HostPolicy[f], B: BondStore[g]>(var h: Host, slot: Int, value: Int, var p: P, var b: B) [f, g, mutate]
+    if h.link.central
+        feed_initiator(var h, slot, smp_initiator.PasskeyEntered(value), var p, var b)
+    else
+        feed_responder(var h, slot, smp_responder.PasskeyEntered(value), var p, var b)
+
+fn answer_numeric<P: HostPolicy[f], B: BondStore[g]>(var h: Host, slot: Int, accepted: Bool, var p: P, var b: B) [f, g, mutate]
+    if h.link.central
+        feed_initiator(var h, slot, smp_initiator.NumericConfirmed(accepted), var p, var b)
+    else
+        feed_responder(var h, slot, smp_responder.NumericConfirmed(accepted), var p, var b)
+
+// An SMP command from the peer.  A Pairing Request first goes to the policy, which may refuse it.
+fn sec_pdu<P: HostPolicy[f], B: BondStore[g]>(var h: Host, slot: Int, pdu: [u8], var p: P, var b: B) [f, g, mutate]
+    sec_prepare(var h, slot, var p)
+    if h.link.central
+        feed_initiator(var h, slot, smp_initiator.Pdu(pdu), var p, var b)
+        return
+    if smp.is_pairing_request(pdu) and h.smp.phase == smp_core.Phase.Idle
+        let auth = smp.pairing_auth_req(pdu)
+        let level = if smp.auth_req_sc(auth) and smp.auth_req_mitm(auth) then 4 else if smp.auth_req_mitm(auth) then 3 else 2
+        let conn = h.api.conns[slot].id
+        if not p.accept_pairing(conn, h.api.conns[slot].info.peer, security_of(level), smp.auth_req_bonding(auth))
+            send_acl(var h, le_link.send_smp(var h.link, smp.build_pairing_failed(noble.SMP_PAIRING_NOT_SUPPORTED)))
+            p.pairing_done(conn, noble.failed(noble.LAYER_SMP, noble.SMP_PAIRING_NOT_SUPPORTED), h.api.conns[slot].info.level, false)
+            return
+    feed_responder(var h, slot, smp_responder.Pdu(pdu), var p, var b)
+
+// The call `Secure`: with the link at the level already the call ends at once; otherwise the
+// policy is asked (unless a bond that is strong enough exists) and the half the role names starts the
+// pairing, or the encryption with the bond's key.
+fn start_secure<P: HostPolicy[f], B: BondStore[g]>(var h: Host, var p: P, var b: B) [f, g, mutate]
+    let slot = slot_of(h, h.api.r_conn)
+    if slot < 0
+        finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_STALE))
+        return
+    host_activate(var h, slot)
+    let need = level_int(h.api.r_need)
+    if level_int(h.api.conns[slot].info.level) >= need
+        finish(var h, noble.ok())
+        return
+    sec_prepare(var h, slot, var p)
+    let conn = h.api.conns[slot].id
+    let peer = h.api.conns[slot].info.peer
+    var strong = false
+    match b.find(peer)
+        Some(x) =>
+            if level_int(x.level) >= need
+                strong = true
+        None => ()
+    if not strong and not p.accept_pairing(conn, peer, h.api.r_need, h.api.bondable)
+        finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_SECURITY_LOW))
+        return
+    if h.link.central
+        feed_initiator(var h, slot, smp_initiator.StartPairing(need), var p, var b)
+    else
+        feed_responder(var h, slot, smp_responder.RequestSecurity(need), var p, var b)
+
+// End the `Secure` call in flight on `slot`, if there is one.
+fn secure_done(var h: Host, slot: Int, st: Status)
+    if h.api.kind == noble.R_SECURE and slot_of_name(h, h.api.r_conn) == slot
+        finish(var h, st)
+
+// The level the link reached, as the call that asked for `need` sees it.
+fn secure_reached(var h: Host, slot: Int)
+    if level_int(h.api.conns[slot].info.level) >= level_int(h.api.r_need)
+        secure_done(var h, slot, noble.ok())
+    else
+        secure_done(var h, slot, noble.failed(noble.LAYER_LOCAL, noble.E_SECURITY_LOW))
+
+fn set_level(var h: Host, slot: Int, level: Security, bonded: Bool)
+    let c = h.api.conns[slot]
+    set_conn(var h, slot, noble.Conn { live: c.live, id: c.id, info: ConnInfo { role: c.info.role, peer: c.info.peer, params: c.info.params, mtu: c.info.mtu, level: level, bonded: bonded } })
+
+// What the Security Manager reports, for the application: the hooks of the policy, the bond store,
+// the HCI commands of the encryption and the events of the pairing.
+fn sec_event<P: HostPolicy[f], B: BondStore[g]>(var h: Host, slot: Int, ev: SecEvent, var p: P, var b: B) [f, g, mutate]
+    let conn = h.api.conns[slot].id
+    let kind = ev.kind
+    let handle = handle_of(h, slot)
+    if kind == SE_DISPLAY
+        p.show_passkey(conn, ev.n)
+    else if kind == SE_PASSKEY
+        let r = p.ask_passkey(conn)
+        if r == noble.PENDING
+            set_ask(var h, slot, 1)
+            set_ans(var h, slot, noble.NO_ANSWER)
+            emit(var h, Event.PasskeyRequested(conn))
+        else if r < 0
+            answer_passkey(var h, slot, -1, var p, var b)
+        else
+            answer_passkey(var h, slot, r, var p, var b)
+    else if kind == SE_NUMERIC
+        let r = p.confirm_numeric(conn, ev.n)
+        if r == noble.PENDING
+            set_ask(var h, slot, 2)
+            set_ans(var h, slot, noble.NO_ANSWER)
+            emit(var h, Event.NumericRequested(conn, ev.n))
+        else
+            answer_numeric(var h, slot, r == 1, var p, var b)
+    else if kind == SE_REPLY_LTK
+        send_cmd(var h, hci_commands.opcode_le_long_term_key_request_reply(), hci_commands.build_le_long_term_key_request_reply(handle, ev.ltk))
+    else if kind == SE_NEGATIVE_LTK
+        send_cmd(var h, hci_commands.opcode_le_long_term_key_request_negative_reply(), hci_commands.build_connection_handle(handle))
+    else if kind == SE_START_ENCRYPTION
+        send_cmd(var h, hci_commands.opcode_le_start_encryption(), hci_commands.build_le_start_encryption(handle, ev.rand, ev.ediv, ev.ltk))
+    else if kind == SE_COMPLETE
+        match ev.result
+            Some(r) => pairing_finished(var h, slot, r, var p, var b)
+            None => ()
+    else if kind == SE_ESTABLISHED
+        let level = security_of(ev.n)
+        set_level(var h, slot, level, true)
+        set_link_security(var h, true, ev.n)
+        emit(var h, Event.SecurityChanged(conn, level, true))
+        secure_reached(var h, slot)
+    else if kind == SE_FAILED or kind == SE_TIMEOUT
+        let st = if kind == SE_FAILED then noble.failed(noble.LAYER_SMP, ev.n) else noble.failed(noble.LAYER_LOCAL, noble.E_TIMEOUT)
+        p.pairing_done(conn, st, h.api.conns[slot].info.level, false)
+        secure_done(var h, slot, st)
+    else if kind == SE_BOND_LOST
+        b.forget(address_of(ev.peer_type, ev.peer))
+        set_level(var h, slot, Security.Open, false)
+
+// A pairing ended with keys: the bond is stored when both devices asked for bonding, the level of
+// the link follows, and the application hears of both.
+fn pairing_finished<P: HostPolicy[f], B: BondStore[g]>(var h: Host, slot: Int, r: smp_core.PairingResult, var p: P, var b: B) [f, g, mutate]
+    let conn = h.api.conns[slot].id
+    var bonded = false
+    if r.bonded
+        bonded = b.save(bond_of_smp(r.bond)).is_ok()
+    let level = security_of(r.level)
+    set_level(var h, slot, level, bonded)
+    if h.link.att.security.encrypted
+        gatt_server.set_security(var h.link.att, gatt_server.link_security(true, r.level, r.bond.key_size, true))
+    emit(var h, Event.SecurityChanged(conn, level, bonded))
+    p.pairing_done(conn, noble.ok(), level, bonded)
+    secure_reached(var h, slot)
+
+// Encryption events: the Long Term Key Request goes to the Peripheral's half, the Encryption
+// Change to the half the role names, and the ATT server learns the link's security.
+fn on_encryption<P: HostPolicy[f], B: BondStore[g]>(var h: Host, evt: [u8], var p: P, var b: B) [f, g, mutate]
+    match hci_codec.le_long_term_key_request(evt)
+        Some(r) =>
+            let slot = slot_of_handle(h, r.connection_handle)
+            if slot < 0
+                return
+            host_activate(var h, slot)
+            if h.link.central
+                return
+            sec_prepare(var h, slot, var p)
+            feed_responder(var h, slot, smp_responder.LtkRequest(r.encrypted_diversifier, r.random_number[:]), var p, var b)
+            return
+        None => ()
+    match hci_codec.encryption_change(evt)
+        Some(e) =>
+            let slot = slot_of_handle(h, e.connection_handle)
+            if slot < 0
+                return
+            host_activate(var h, slot)
+            link_encryption(var h, e.enabled)
+            if h.link.central
+                feed_initiator(var h, slot, smp_initiator.EncryptionChanged(e.enabled), var p, var b)
+            else
+                feed_responder(var h, slot, smp_responder.EncryptionChanged(e.enabled), var p, var b)
+        None => ()
+
+// The level and key size of an encrypted link: the bond's when the Controller encrypted with a
+// bond's LTK, else those of the pairing that produced the key ([Vol 3] Part C, Section 10.2.1).
+fn link_encryption(var h: Host, enabled: Bool)
+    if not enabled
+        gatt_server.set_security(var h.link.att, gatt_server.link_security(false, 1, 0, h.link.att.security.has_ltk))
+        return
+    var level = 2
+    var size = 16
+    if h.link.central
+        level = smp_initiator.pairing_level(h.smp_central)
+        size = h.smp_central.key_size
+        match h.smp_central.bond
+            Some(x) =>
+                if h.smp_central.encrypting_with_bond
+                    level = smp_bond.security_level(x)
+                    size = x.key_size
+            None => ()
+    else
+        level = smp_core.level_of(h.smp.method != smp_core.Method.JustWorks, h.smp.sc, h.smp.key_size)
+        size = h.smp.key_size
+        match h.smp.bond
+            Some(x) =>
+                if h.smp.encrypting_with_bond
+                    level = smp_bond.security_level(x)
+                    size = x.key_size
+            None => ()
+    gatt_server.set_security(var h.link.att, gatt_server.link_security(true, level, size, true))
+
+// ── The calls that need no wait ─────────────────────────────────────
+
+// Answer `Event.PasskeyRequested`: the six digits the user typed, 0 to 999999.  The Security
+// Manager takes the answer at the next `poll`.
+pub fn passkey_reply(var h: Host, conn: ConnId, passkey: Int) -> Status
+    let s = slot_of(h, conn)
+    if s < 0
+        return noble.failed(noble.LAYER_LOCAL, noble.E_STALE)
+    if h.api.ask[s] != 1 or passkey < 0 or passkey > 999999
+        return noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT)
+    set_ans(var h, s, passkey)
+    noble.ok()
+
+// Answer `Event.NumericRequested`: whether the value shown matches the other device's.
+pub fn numeric_reply(var h: Host, conn: ConnId, accepted: Bool) -> Status
+    let s = slot_of(h, conn)
+    if s < 0
+        return noble.failed(noble.LAYER_LOCAL, noble.E_STALE)
+    if h.api.ask[s] != 2
+        return noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT)
+    set_ans(var h, s, if accepted then 1 else 0)
+    noble.ok()
+
+// Delete the bond of `peer` from the store and drop the keys of a live link to it.
+pub fn unbond<B: BondStore[g]>(var h: Host, var b: B, peer: Addr) [g, mutate]
+    b.forget(peer)
+    for s in 0..le_link.le_links_slots(h.le)
+        if h.api.conns[s].live and same_peer(h.api.conns[s].info.peer, peer)
+            host_activate(var h, s)
+            var responder = h.smp
+            responder.bond = None
+            h.smp = responder
+            var initiator = h.smp_central
+            initiator.bond = None
+            h.smp_central = initiator
+            let c = h.api.conns[s]
+            set_conn(var h, s, noble.Conn { live: c.live, id: c.id, info: ConnInfo { role: c.info.role, peer: c.info.peer, params: c.info.params, mtu: c.info.mtu, level: c.info.level, bonded: false } })
+
+// Accept channels on `psm` on every link, present and future, if the link has at least `need`
+// when the channel opens.
+pub fn coc_listen(var h: Host, psm: Int, mtu: Int, need: Security) -> Status
+    if psm <= 0 or mtu < 23
+        return noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT)
+    h.api.coc_psm = psm
+    h.api.coc_need = need
+    for s in 0..le_link.le_links_slots(h.le)
+        le_link.coc_listen(var h.le.slots[s], psm, TRANSPORT_LE, coc_mtu(mtu), l2cap_coc.LISTEN_SUCCESS)
+    noble.ok()
+
+// Queue one SDU on the channel `chan` of `conn`.  E_NO_ROOM while the peer's credits are used up,
+// E_NOT_FOUND for a channel the link does not hold, E_BAD_ARGUMENT for an SDU longer than the
+// peer's MTU.
+pub fn coc_send(var h: Host, conn: ConnId, chan: Int, sdu: Value) -> Status
+    let s = slot_of(h, conn)
+    if s < 0
+        return noble.failed(noble.LAYER_LOCAL, noble.E_STALE)
+    match le_link.coc_channel(h.le.slots[s], chan)
+        None => return noble.failed(noble.LAYER_LOCAL, noble.E_NOT_FOUND)
+        Some(c) =>
+            if c.peer_credits == 0
+                return noble.failed(noble.LAYER_LOCAL, noble.E_NO_ROOM)
+    var data: [u8] = []
+    for i in 0..sdu.len()
+        list.push(data, sdu[i])
+    match le_link.coc_send(var h.le.slots[s], chan, data)
+        Some(out) =>
+            send_acl(var h, out)
+            noble.ok()
+        None => noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT)

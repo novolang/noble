@@ -32,7 +32,7 @@ struct ScriptedLink
     var replies: [[u8]]
 
 impl HciLink[mutate] for ScriptedLink
-    fn send_packet(self, pkt: [u8]) -> Bool
+    fn send_packet(var self, pkt: [u8]) -> Bool
         true
 
     fn recv_packet(var self, timeout_ms: Int) -> ?[u8] [mutate]
@@ -191,7 +191,7 @@ struct DeafLink
     var seen: Int
 
 impl HciLink[mutate] for DeafLink
-    fn send_packet(self, pkt: [u8]) -> Bool
+    fn send_packet(var self, pkt: [u8]) -> Bool
         false
 
     fn recv_packet(var self, timeout_ms: Int) -> ?[u8] [mutate]

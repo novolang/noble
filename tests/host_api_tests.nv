@@ -1,0 +1,1392 @@
+// tests/host_api_tests.nv -- the unit tests of src/host_api.nv and src/noble.nv (the Host API, Layer A).
+//
+//   novo test --config configs/layer_a.toml tests/host_api_tests.nv
+//
+// The default configuration has no event queue (`event_queue` is 0, because a Host that does not use the API pays for
+// none), so the cases that need one carry `@when` on that key and run under `configs/layer_a.toml`, which gives four
+// events; the others (the status values, the policy defaults, the bond store) run under every configuration.
+//
+// A `Host` is driven through `begin`, `poll`, `result` and `next_event` over `ScriptLink`, a
+// transport that plays a Controller: it answers each HCI command with the Command Complete or Command
+// Status event the specification gives and, for the commands that start a procedure, with the event
+// that ends it.  The packets the Host writes are kept in `sent`, and a test puts what the peer would
+// send in `inbox`.  Two Hosts with a link between them (`Pair`) run a pairing end to end.
+
+use std.test
+use hci_codec
+use hci_commands
+use host.{ Host, host_blank, host_config }
+use host_api
+use le_link
+use noble
+use noble.{ Action, Addr, Bond, BondStore, ConnId, ConnParams, DefaultPolicy, Event, HostPolicy, IoCap, RamBonds, Request, Role, Security, Status }
+use noble_config
+use profile_builder
+use smp
+
+// ── The Controller ──────────────────────────────────────────────────
+
+// A transport that plays a Controller.  `inbox` holds the packets the Host reads, `sent` the packets it
+// wrote, `now` is the virtual clock, `handle` the Connection_Handle the next link gets, `peer` the
+// address an LE Create Connection is answered for, `connect_status` the status of the connection
+// complete event that answers it (0 for a link), and `mute` makes the Controller answer nothing.
+struct ScriptLink
+    var inbox: [[u8]]
+    var sent: [[u8]]
+    var now: Int
+    var handle: Int
+    var connect_status: Int
+    var mute: Bool
+    var commands: [Int]
+    var acl: [[u8]]
+    var cmdlog: [[u8]]
+    var seed: Int
+    var addr: Int
+
+fn script_link() -> ScriptLink
+    ScriptLink { inbox: [], sent: [], now: 0, handle: 0x40, connect_status: 0, mute: false, commands: [], acl: [], cmdlog: [], seed: 1, addr: 0xA1 }
+
+// An HCI event packet, H4 indicator first.
+fn event_packet(code: Int, params: [u8]) -> [u8]
+    var pkt: [u8] = [0x04, code as u8, list.len(params) as u8]
+    list.append(pkt, params)
+    pkt
+
+fn complete(opcode: Int, status: Int, rp: [u8]) -> [u8]
+    var params: [u8] = [1, (opcode & 0xFF) as u8, ((opcode >>> 8) & 0xFF) as u8, status as u8]
+    list.append(params, rp)
+    event_packet(0x0E, params)
+
+fn status_event(opcode: Int, status: Int) -> [u8]
+    event_packet(0x0F, [status as u8, 1, (opcode & 0xFF) as u8, ((opcode >>> 8) & 0xFF) as u8])
+
+fn le_meta(sub: Int, params: [u8]) -> [u8]
+    var pkt: [u8] = [0x04]
+    list.append(pkt, hci_codec.le_meta_event(sub, params))
+    pkt
+
+fn le16(v: Int) -> [u8]
+    [(v & 0xFF) as u8, ((v >>> 8) & 0xFF) as u8]
+
+fn peer_octets(n: Int) -> [u8]
+    [n as u8, 0x22, 0x33, 0x44, 0x55, 0x66]
+
+// The LE Connection Complete event of a link `handle` with `peer` in `role` (0 Central, 1 Peripheral).
+fn connection_complete(status: Int, handle: Int, role: Int, peer: [u8]) -> [u8]
+    connection_complete_kind(status, handle, role, 1, peer)
+
+fn connection_complete_kind(status: Int, handle: Int, role: Int, kind: Int, peer: [u8]) -> [u8]
+    var params: [u8] = [status as u8]
+    list.append(params, le16(handle))
+    list.push(params, role as u8)
+    list.push(params, kind as u8)
+    list.append(params, peer)
+    list.append(params, le16(24))
+    list.append(params, le16(0))
+    list.append(params, le16(400))
+    list.push(params, 0)
+    le_meta(0x01, params)
+
+fn disconnection_complete(handle: Int, reason: Int) -> [u8]
+    var params: [u8] = [0]
+    list.append(params, le16(handle))
+    list.push(params, reason as u8)
+    event_packet(0x05, params)
+
+fn update_complete(handle: Int, interval: Int, latency: Int, timeout: Int) -> [u8]
+    var params: [u8] = [0]
+    list.append(params, le16(handle))
+    list.append(params, le16(interval))
+    list.append(params, le16(latency))
+    list.append(params, le16(timeout))
+    le_meta(0x03, params)
+
+fn remote_request(handle: Int, lo: Int, hi: Int, latency: Int, timeout: Int) -> [u8]
+    var params: [u8] = []
+    list.append(params, le16(handle))
+    list.append(params, le16(lo))
+    list.append(params, le16(hi))
+    list.append(params, le16(latency))
+    list.append(params, le16(timeout))
+    le_meta(0x06, params)
+
+// The answer of the Controller to the command `opcode` with `params`.
+fn answer(var l: ScriptLink, opcode: Int, params: [u8])
+    if l.mute
+        return
+    let ok_status = 0
+    if opcode == hci_commands.opcode_hci_reset() or opcode == hci_commands.opcode_hci_set_event_mask() or opcode == hci_commands.opcode_le_set_event_mask()
+        list.push(l.inbox, complete(opcode, ok_status, []))
+    else if opcode == hci_commands.opcode_le_read_buffer_size()
+        list.push(l.inbox, complete(opcode, ok_status, [251, 0, 4]))
+    else if opcode == hci_commands.opcode_le_rand()
+        list.push(l.inbox, complete(opcode, ok_status, [l.seed as u8, 2, 3, 4, 5, 6, 7, 8]))
+        l.seed = l.seed + 1
+    else if opcode == hci_commands.opcode_read_bd_addr()
+        list.push(l.inbox, complete(opcode, ok_status, [l.addr as u8, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6]))
+    else if opcode == hci_commands.opcode_le_create_connection()
+        list.push(l.inbox, status_event(opcode, ok_status))
+        // The peer address is at octets 6 to 11 of the command.
+        list.push(l.inbox, connection_complete_kind(l.connect_status, l.handle, 0, params[5] as Int, params[6:12]))
+    else if opcode == hci_commands.opcode_le_create_connection_cancel()
+        list.push(l.inbox, complete(opcode, ok_status, []))
+    else if opcode == hci_commands.opcode_le_start_encryption()
+        list.push(l.inbox, status_event(opcode, ok_status))
+    else if opcode == hci_commands.opcode_hci_disconnect()
+        list.push(l.inbox, status_event(opcode, ok_status))
+        list.push(l.inbox, disconnection_complete((params[0] as Int) | ((params[1] as Int) << 8), 0x16))
+    else if opcode == hci_commands.opcode_le_connection_update()
+        list.push(l.inbox, status_event(opcode, ok_status))
+        let handle = (params[0] as Int) | ((params[1] as Int) << 8)
+        list.push(l.inbox, update_complete(handle, (params[2] as Int) | ((params[3] as Int) << 8), (params[6] as Int) | ((params[7] as Int) << 8), (params[8] as Int) | ((params[9] as Int) << 8)))
+    else
+        list.push(l.inbox, complete(opcode, ok_status, []))
+
+impl HciLink[mutate] for ScriptLink
+    fn send_packet(var self, pkt: [u8]) -> Bool
+        if list.len(pkt) >= 1 and (pkt[0] as Int) == 2
+            list.push(self.acl, pkt[:])
+            return true
+        list.push(self.sent, pkt[:])
+        if list.len(pkt) >= 4 and (pkt[0] as Int) == 1
+            list.push(self.cmdlog, pkt[:])
+            let opcode = (pkt[1] as Int) | ((pkt[2] as Int) << 8)
+            list.push(self.commands, opcode)
+            answer(var self, opcode, pkt[4:])
+        true
+
+    fn recv_packet(var self, timeout_ms: Int) -> ?[u8] [mutate]
+        if list.len(self.inbox) == 0
+            return None
+        let p = self.inbox[0][:]
+        self.inbox = self.inbox[1:]
+        Some(p)
+
+    fn now_ms(var self) -> Int [mutate, time]
+        self.now
+
+    fn park(var self, ms: Int) [mutate, async]
+        self.now = self.now + ms
+
+// ── Drivers ─────────────────────────────────────────────────────────
+
+fn new_host(slots: Int) -> Host
+    host_blank(host_config(slots, ['n', 'o', 'b', 'l', 'e']))
+
+// Run the Host `n` times, advancing the clock by 10 ms each time.
+fn run<P: HostPolicy[f], B: BondStore[g]>(var h: Host, var l: ScriptLink, var p: P, var b: B, n: Int) [f, g, mutate]
+    for _ in 0..n
+        l.now = l.now + 10
+        host_api.poll(var h, var l, var p, var b, l.now)
+
+// Start a call and run the Host until it ends; the answer is the outcome.
+fn call<P: HostPolicy[f], B: BondStore[g]>(var h: Host, var l: ScriptLink, var p: P, var b: B, req: Request) -> Status [f, g, mutate]
+    let st = host_api.begin(var h, req)
+    if not st.is_ok()
+        return st
+    for _ in 0..40
+        l.now = l.now + 10
+        host_api.poll(var h, var l, var p, var b, l.now)
+        match host_api.result(var h)
+            Some(done) => return done
+            None => ()
+    noble.failed(noble.LAYER_LOCAL, noble.E_TIMEOUT)
+
+// A Host that has started: the Controller answered the bring-up commands.
+fn started<P: HostPolicy[f], B: BondStore[g]>(var h: Host, var l: ScriptLink, var p: P, var b: B) [f, g, mutate]
+    let st = call(var h, var l, var p, var b, Request.Start)
+    test.assert(st.is_ok())
+    // workaround(a-variant-pattern-inside-some-does-not-match-an-optional-value-enum): the event is matched
+    // in two levels, `Some(e)` and then `match e`, in every case of this file.
+    match host_api.next_event(var h)
+        Some(e) =>
+            match e
+                Ready => ()
+                _ => test.fail("Ready is queued when the Host has started")
+        None => test.fail("Ready is queued when the Host has started")
+
+fn peer_addr(n: Int) -> Addr
+    Addr { kind: 1, octets: [n as u8, 0x22, 0x33, 0x44, 0x55, 0x66] }
+
+// ── Start ───────────────────────────────────────────────────────────
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_start_brings_the_controller_up_and_queues_ready()
+    var h = new_host(2)
+    var l = script_link()
+    var p = DefaultPolicy { placeholder: 0 }
+    var b = RamBonds { rows: Vec.new() }
+    test.assert(not h.api.ready)
+    started(var h, var l, var p, var b)
+    test.assert(h.api.ready)
+    // Reset first, then the masks, the buffers, two draws of the seed and the address.
+    test.assert_eq(l.commands[0], hci_commands.opcode_hci_reset())
+    test.assert_eq(list.len(l.commands), 7)
+    test.assert(h.security.ready)
+    test.assert_eq(h.own_address[0] as Int, 0xA1)
+
+// ── A policy that records its calls and answers as a test says ──────
+
+struct TestPolicy
+    var allow_connect: Bool
+    var allow_params: Bool
+    var allow_pairing: Bool
+    var io: IoCap
+    var passkey: Int
+    var numeric: Int
+    var on_disc: Int
+    var on_conn: Int
+    var connect_asked: Int
+    var connect_role_central: Bool
+    var params_asked: Int
+    var pairing_asked: Int
+    var pairing_level: Int
+    var pairing_bonding: Bool
+    var shown: Int
+    var compared: Int
+    var disconnected: Int
+    var disc_attempts: Int
+    var disc_reason: Int
+    var connected: Int
+    var connected_links: Int
+    var done: Int
+    var done_ok: Bool
+    var done_bonded: Bool
+    var adverts: Int
+    var keep_adverts: Bool
+
+fn test_policy() -> TestPolicy
+    TestPolicy {
+        allow_connect: true, allow_params: true, allow_pairing: true, io: IoCap.NoInputNoOutput, passkey: 0, numeric: 1,
+        on_disc: 0, on_conn: 0, connect_asked: 0, connect_role_central: false, params_asked: 0, pairing_asked: 0,
+        pairing_level: 0, pairing_bonding: false, shown: -1, compared: -1, disconnected: 0, disc_attempts: -1,
+        disc_reason: 0, connected: 0, connected_links: 0, done: 0, done_ok: false, done_bonded: false, adverts: 0,
+        keep_adverts: true }
+
+fn role_is_central(r: Role) -> Bool
+    match r
+        Role.Central => true
+        Role.Peripheral => false
+
+fn level_number(s: Security) -> Int
+    match s
+        Security.Open => 1
+        Security.Encrypted => 2
+        Security.Authenticated => 3
+        Security.SecureConnections => 4
+
+impl HostPolicy[] for TestPolicy
+    fn io_capability(self, conn: ConnId) -> IoCap
+        self.io
+
+    fn accept_pairing(var self, conn: ConnId, peer: Addr, level: Security, bonding: Bool) -> Bool
+        self.pairing_asked = self.pairing_asked + 1
+        self.pairing_level = level_number(level)
+        self.pairing_bonding = bonding
+        self.allow_pairing
+
+    fn show_passkey(var self, conn: ConnId, passkey: Int)
+        self.shown = passkey
+
+    fn ask_passkey(var self, conn: ConnId) -> Int
+        self.passkey
+
+    fn confirm_numeric(var self, conn: ConnId, value: Int) -> Int
+        self.compared = value
+        self.numeric
+
+    fn accept_params(var self, conn: ConnId, p: ConnParams) -> Bool
+        self.params_asked = self.params_asked + 1
+        self.allow_params
+
+    fn accept_connect(var self, peer: Addr, role: Role) -> Bool
+        self.connect_asked = self.connect_asked + 1
+        self.connect_role_central = role_is_central(role)
+        self.allow_connect
+
+    fn on_advert(var self, r: noble.AdvReport) -> Bool
+        self.adverts = self.adverts + 1
+        self.keep_adverts
+
+    fn on_disconnected(var self, conn: ConnId, reason: Status, role: Role, attempts: Int) -> Action
+        self.disconnected = self.disconnected + 1
+        self.disc_attempts = attempts
+        self.disc_reason = reason.code as Int
+        if self.on_disc > 0
+            Action.Reconnect(self.on_disc)
+        else if self.on_disc < 0
+            Action.Readvertise
+        else
+            Action.Stay
+
+    fn on_connected(var self, conn: ConnId, role: Role, links: Int) -> Action
+        self.connected = self.connected + 1
+        self.connected_links = links
+        if self.on_conn == 1
+            Action.Readvertise
+        else if self.on_conn == 2
+            Action.AdvertiseNonConnectable
+        else
+            Action.Stay
+
+    fn pairing_done(var self, conn: ConnId, st: Status, level: Security, bonded: Bool)
+        self.done = self.done + 1
+        self.done_ok = st.is_ok()
+        self.done_bonded = bonded
+
+fn new_store() -> RamBonds
+    RamBonds { rows: Vec.new() }
+
+// The events in the queue, in order, as a count.
+fn drain(var h: Host) -> Int
+    var n = 0
+    for _ in 0..64
+        match host_api.next_event(var h)
+            Some(_) => n = n + 1
+            None => return n
+    n
+
+// ── A connection as the Central ─────────────────────────────────────
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_connect_as_the_central_makes_a_link_and_queues_connected()
+    var h = new_host(2)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    let st = call(var h, var l, var p, var b, Request.Connect(peer_addr(0x77), noble.conn_params_default()))
+    test.assert(st.is_ok())
+    test.assert_eq(p.connect_asked, 1)
+    test.assert(p.connect_role_central)
+    let conn = host_api.op_conn(h)
+    match host_api.conn_info(h, conn)
+        Some(info) =>
+            test.assert(role_is_central(info.role))
+            test.assert_eq(info.peer.octets[0] as Int, 0x77)
+            test.assert_eq(level_number(info.level), 1)
+            test.assert(not info.bonded)
+        None => test.fail("the link has a name")
+    test.assert_eq(host_api.link_count(h), 1)
+    match host_api.next_event(var h)
+        Some(e) =>
+            match e
+                Connected(c, role, peer, params) =>
+                    test.assert_eq(c.slot as Int, conn.slot as Int)
+                    test.assert(role_is_central(role))
+                    test.assert_eq(peer.octets[0] as Int, 0x77)
+                    test.assert_eq(params.interval_min as Int, 24)
+                _ => test.fail("Connected is queued")
+        None => test.fail("an event is queued")
+    test.assert_eq(p.connected, 1)
+    test.assert_eq(p.connected_links, 1)
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_connect_the_policy_refuses_sends_nothing_and_answers_refused()
+    var h = new_host(2)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    p.allow_connect = false
+    let before = list.len(l.commands)
+    let st = call(var h, var l, var p, var b, Request.Connect(peer_addr(1), noble.conn_params_default()))
+    test.assert(st.is(noble.LAYER_LOCAL, noble.E_REFUSED))
+    test.assert_eq(list.len(l.commands), before)
+    test.assert_eq(host_api.link_count(h), 0)
+
+// The kind of the next event: its position in the list of `Event`, or -1 for none.
+fn next_kind(var h: Host) -> Int
+    match host_api.next_event(var h)
+        Some(e) =>
+            match e
+                Ready => 0
+                Advert(_) => 1
+                Connected(_, _, _, _) => 2
+                Disconnected(_, _) => 3
+                ParamsUpdated(_, _) => 4
+                SecurityChanged(_, _, _) => 5
+                PasskeyRequested(_) => 6
+                NumericRequested(_, _) => 7
+                Notification(_, _, _, _) => 8
+                Written(_, _) => 9
+                AttrRead(_, _, _) => 10
+                AttrWrite(_, _, _, _) => 11
+                Subscribed(_, _, _) => 12
+                CocOpened(_, _, _) => 13
+                CocData(_, _, _) => 14
+                CocClosed(_, _, _) => 15
+                DatabaseChanged(_) => 16
+                Dropped(_) => 17
+        None => -1
+
+const EV_ADVERT = 1
+const EV_CONNECTED = 2
+const EV_DISCONNECTED = 3
+const EV_PARAMS = 4
+const EV_SECURITY = 5
+const EV_PASSKEY = 6
+const EV_NUMERIC = 7
+const EV_COC_OPENED = 13
+const EV_COC_DATA = 14
+const EV_COC_CLOSED = 15
+const EV_DROPPED = 17
+
+// The LE Advertising Report event with one report from `peer`.
+fn report_event(peer: Int, rssi: Int) -> [u8]
+    var params: [u8] = [1, 0, 1]
+    list.append(params, peer_octets(peer))
+    list.push(params, 3)
+    list.append(params, [2, 1, 6])
+    list.push(params, rssi as u8)
+    le_meta(0x02, params)
+
+// The number of times `opcode` was sent to the Controller.
+fn times_sent(l: ScriptLink, opcode: Int) -> Int
+    var n = 0
+    for c in l.commands
+        if c == opcode
+            n = n + 1
+    n
+
+// ── A connection as the Peripheral ──────────────────────────────────
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_link_a_peer_made_is_kept_and_queued_as_connected_in_the_peripheral_role()
+    var h = new_host(2)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    list.push(l.inbox, connection_complete(0, 0x41, 1, peer_octets(0x31)))
+    run(var h, var l, var p, var b, 1)
+    test.assert_eq(p.connect_asked, 1)
+    test.assert(not p.connect_role_central)
+    test.assert_eq(p.connected, 1)
+    test.assert_eq(host_api.link_count(h), 1)
+    match host_api.next_event(var h)
+        Some(e) =>
+            match e
+                Connected(c, role, peer, params) =>
+                    test.assert(not role_is_central(role))
+                    test.assert_eq(peer.octets[0] as Int, 0x31)
+                    match host_api.conn_info(h, c)
+                        Some(info) => test.assert(not role_is_central(info.role))
+                        None => test.fail("the link has a name")
+                _ => test.fail("Connected is queued")
+        None => test.fail("an event is queued")
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_link_the_policy_does_not_accept_is_disconnected_and_makes_no_event()
+    var h = new_host(2)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    p.allow_connect = false
+    list.push(l.inbox, connection_complete(0, 0x41, 1, peer_octets(0x31)))
+    run(var h, var l, var p, var b, 2)
+    test.assert_eq(p.connect_asked, 1)
+    test.assert_eq(host_api.link_count(h), 0)
+    test.assert_eq(times_sent(l, hci_commands.opcode_hci_disconnect()), 1)
+    // The reason of the Disconnect command is the remote user terminated one.
+    let c = l.cmdlog[list.len(l.cmdlog) - 1]
+    test.assert_eq(c[6] as Int, noble.HCI_REMOTE_USER_TERMINATED)
+    test.assert_eq(next_kind(var h), -1)
+    test.assert_eq(p.connected, 0)
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_link_over_max_links_is_disconnected_for_low_resources()
+    var h = new_host(2)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    host_api.host_set_max_links(var h, 1)
+    list.push(l.inbox, connection_complete(0, 0x41, 1, peer_octets(1)))
+    run(var h, var l, var p, var b, 1)
+    list.push(l.inbox, connection_complete(0, 0x42, 1, peer_octets(2)))
+    run(var h, var l, var p, var b, 2)
+    test.assert_eq(host_api.link_count(h), 1)
+    test.assert_eq(times_sent(l, hci_commands.opcode_hci_disconnect()), 1)
+    let c = l.cmdlog[list.len(l.cmdlog) - 1]
+    test.assert_eq(c[6] as Int, noble.HCI_REMOTE_LOW_RESOURCES)
+    // A `connect` at the limit is refused at once.
+    let st = host_api.begin(var h, Request.Connect(peer_addr(9), noble.conn_params_default()))
+    test.assert(st.is(noble.LAYER_LOCAL, noble.E_NO_ROOM))
+
+// ── Disconnect, and what the policy does next ───────────────────────
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_disconnect_ends_the_link_and_queues_disconnected_and_a_stale_name_is_refused()
+    var h = new_host(2)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    let up = call(var h, var l, var p, var b, Request.Connect(peer_addr(0x55), noble.conn_params_default()))
+    test.assert(up.is_ok())
+    let conn = host_api.op_conn(h)
+    test.assert_eq(next_kind(var h), EV_CONNECTED)
+    let st = call(var h, var l, var p, var b, Request.Disconnect(conn, noble.HCI_REMOTE_USER_TERMINATED))
+    test.assert(st.is_ok())
+    test.assert_eq(host_api.link_count(h), 0)
+    match host_api.next_event(var h)
+        Some(e) =>
+            match e
+                Disconnected(c, reason) =>
+                    test.assert_eq(c.slot as Int, conn.slot as Int)
+                    test.assert(reason.is(noble.LAYER_HCI, noble.HCI_CONNECTION_TERMINATED_BY_LOCAL_HOST))
+                    test.assert_eq(reason.name(), "connection terminated by local host")
+                _ => test.fail("Disconnected is queued")
+        None => test.fail("an event is queued")
+    test.assert_eq(p.disconnected, 1)
+    test.assert_eq(p.disc_attempts, 0)
+    // The name of the ended link is stale, and so is the name of a slot that holds no link.
+    test.assert(host_api.begin(var h, Request.Disconnect(conn, 0x13)).is(noble.LAYER_LOCAL, noble.E_STALE))
+    test.assert(host_api.conn_info(h, conn) == None)
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_reconnect_after_a_delay_waits_for_the_time_then_connects_again_and_counts_the_attempt()
+    var h = new_host(2)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    p.on_disc = 500
+    let up = call(var h, var l, var p, var b, Request.Connect(peer_addr(0x55), noble.conn_params_default()))
+    test.assert(up.is_ok())
+    test.assert_eq(times_sent(l, hci_commands.opcode_le_create_connection()), 1)
+    // The peer drops the link: the policy asks for a reconnection in 500 ms.
+    list.push(l.inbox, disconnection_complete(0x40, 0x08))
+    run(var h, var l, var p, var b, 1)
+    test.assert_eq(p.disconnected, 1)
+    test.assert_eq(p.disc_reason, 0x08)
+    run(var h, var l, var p, var b, 20)
+    test.assert_eq(times_sent(l, hci_commands.opcode_le_create_connection()), 1)
+    run(var h, var l, var p, var b, 40)
+    test.assert_eq(times_sent(l, hci_commands.opcode_le_create_connection()), 2)
+    // The link is made again: the attempts count starts over.
+    test.assert_eq(host_api.link_count(h), 1)
+    test.assert_eq(h.api.attempts, 0)
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_reconnection_that_fails_reports_a_disconnected_event_and_calls_the_hook_with_one_attempt_more()
+    var h = new_host(2)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    p.on_disc = 100
+    let up = call(var h, var l, var p, var b, Request.Connect(peer_addr(0x55), noble.conn_params_default()))
+    test.assert(up.is_ok())
+    test.assert_eq(next_kind(var h), EV_CONNECTED)
+    list.push(l.inbox, disconnection_complete(0x40, 0x08))
+    run(var h, var l, var p, var b, 1)
+    test.assert_eq(next_kind(var h), EV_DISCONNECTED)
+    // The reconnection finds nobody: LE Connection Complete with status 0x3E.
+    l.connect_status = noble.HCI_CONNECTION_FAILED_TO_ESTABLISH
+    for _ in 0..40
+        if p.disconnected < 2
+            run(var h, var l, var p, var b, 1)
+    test.assert_eq(times_sent(l, hci_commands.opcode_le_create_connection()), 2)
+    test.assert_eq(p.disconnected, 2)
+    test.assert_eq(p.disc_attempts, 1)
+    test.assert_eq(next_kind(var h), EV_DISCONNECTED)
+    // The hook asks again, and the third attempt is counted two.
+    for _ in 0..40
+        if p.disconnected < 3
+            run(var h, var l, var p, var b, 1)
+    test.assert_eq(p.disc_attempts, 2)
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_stay_does_nothing_after_a_disconnection_however_long_the_wait()
+    var h = new_host(2)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    let up = call(var h, var l, var p, var b, Request.Connect(peer_addr(0x55), noble.conn_params_default()))
+    test.assert(up.is_ok())
+    list.push(l.inbox, disconnection_complete(0x40, 0x08))
+    run(var h, var l, var p, var b, 200)
+    test.assert_eq(times_sent(l, hci_commands.opcode_le_create_connection()), 1)
+    test.assert_eq(host_api.link_count(h), 0)
+    test.assert_eq(h.api.advertise, noble.ADVERTISE_NONE)
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_readvertise_after_a_peripheral_link_ended_is_left_for_the_advertising_code_and_never_connectable_at_the_limit()
+    var h = new_host(1)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    p.on_disc = -1
+    p.on_conn = 1
+    list.push(l.inbox, connection_complete(0, 0x41, 1, peer_octets(1)))
+    run(var h, var l, var p, var b, 1)
+    // At the limit (one link of one) the answer Readvertise is read as non-connectable.
+    test.assert_eq(h.api.advertise, noble.ADVERTISE_NON_CONNECTABLE)
+    list.push(l.inbox, disconnection_complete(0x41, 0x13))
+    run(var h, var l, var p, var b, 1)
+    test.assert_eq(h.api.advertise, noble.ADVERTISE_CONNECTABLE)
+
+// ── Connection parameters ───────────────────────────────────────────
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_parameter_request_of_the_peer_is_accepted_or_refused_by_the_policy()
+    var h = new_host(2)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    list.push(l.inbox, connection_complete(0, 0x41, 1, peer_octets(1)))
+    run(var h, var l, var p, var b, 1)
+    list.push(l.inbox, remote_request(0x41, 24, 40, 0, 400))
+    run(var h, var l, var p, var b, 2)
+    test.assert_eq(p.params_asked, 1)
+    test.assert_eq(times_sent(l, hci_commands.opcode_le_remote_connection_parameter_request_reply()), 1)
+    p.allow_params = false
+    list.push(l.inbox, remote_request(0x41, 24, 40, 0, 400))
+    run(var h, var l, var p, var b, 2)
+    test.assert_eq(p.params_asked, 2)
+    test.assert_eq(times_sent(l, hci_commands.opcode_le_remote_connection_parameter_request_negative_reply()), 1)
+    // Parameters the specification does not allow are refused without asking the policy.
+    p.allow_params = true
+    list.push(l.inbox, remote_request(0x41, 40, 24, 0, 400))
+    run(var h, var l, var p, var b, 2)
+    test.assert_eq(p.params_asked, 2)
+    test.assert_eq(times_sent(l, hci_commands.opcode_le_remote_connection_parameter_request_negative_reply()), 2)
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_update_params_changes_the_connection_and_queues_params_updated()
+    var h = new_host(2)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    let up = call(var h, var l, var p, var b, Request.Connect(peer_addr(0x55), noble.conn_params_default()))
+    test.assert(up.is_ok())
+    let conn = host_api.op_conn(h)
+    test.assert_eq(next_kind(var h), EV_CONNECTED)
+    let want = ConnParams { interval_min: 12, interval_max: 12, latency: 2, timeout: 300 }
+    let st = call(var h, var l, var p, var b, Request.UpdateParams(conn, want))
+    test.assert(st.is_ok())
+    match host_api.conn_info(h, conn)
+        Some(info) =>
+            test.assert_eq(info.params.interval_min as Int, 12)
+            test.assert_eq(info.params.latency as Int, 2)
+            test.assert_eq(info.params.timeout as Int, 300)
+        None => test.fail("the link has a name")
+    match host_api.next_event(var h)
+        Some(e) =>
+            match e
+                ParamsUpdated(c, q) => test.assert_eq(q.timeout as Int, 300)
+                _ => test.fail("ParamsUpdated is queued")
+        None => test.fail("an event is queued")
+    // Parameters the specification refuses are not accepted.
+    let bad = ConnParams { interval_min: 4, interval_max: 2, latency: 0, timeout: 400 }
+    test.assert(host_api.begin(var h, Request.UpdateParams(conn, bad)).is(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
+
+// ── One call at a time ──────────────────────────────────────────────
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_second_call_while_one_is_in_flight_answers_busy_and_a_call_before_start_answers_not_ready()
+    var h = new_host(2)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    test.assert(host_api.begin(var h, Request.Connect(peer_addr(1), noble.conn_params_default())).is(noble.LAYER_LOCAL, noble.E_NOT_READY))
+    started(var h, var l, var p, var b)
+    test.assert(host_api.begin(var h, Request.Connect(peer_addr(1), noble.conn_params_default())).is_ok())
+    test.assert(host_api.begin(var h, Request.ConnectCancel).is(noble.LAYER_LOCAL, noble.E_BUSY))
+    test.assert(host_api.result(var h) == None)
+    // Giving the call up frees the Host for the next one.
+    host_api.abandon(var h)
+    test.assert(host_api.begin(var h, Request.ConnectCancel).is_ok())
+    // The requests of advertising, scanning and the GATT client are not served by Layer A.
+    host_api.abandon(var h)
+    test.assert(host_api.begin(var h, Request.ScanStop).is(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_connect_the_controller_fails_answers_the_hci_status()
+    var h = new_host(2)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    l.connect_status = noble.HCI_CONNECTION_FAILED_TO_ESTABLISH
+    let st = call(var h, var l, var p, var b, Request.Connect(peer_addr(0x55), noble.conn_params_default()))
+    test.assert(st.is(noble.LAYER_HCI, noble.HCI_CONNECTION_FAILED_TO_ESTABLISH))
+    test.assert_eq(st.name(), "connection failed to establish")
+    test.assert_eq(host_api.link_count(h), 0)
+
+// ── The queue ───────────────────────────────────────────────────────
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_full_queue_drops_and_counts_adverts_and_still_delivers_the_state_events_of_a_connection()
+    var h = new_host(2)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    for i in 0..6
+        list.push(l.inbox, report_event(i + 1, -60))
+    run(var h, var l, var p, var b, 2)
+    test.assert_eq(p.adverts, 6)
+    // Four slots, two kept for the two connections: two adverts fit.
+    list.push(l.inbox, connection_complete(0, 0x41, 1, peer_octets(0x31)))
+    run(var h, var l, var p, var b, 1)
+    list.push(l.inbox, disconnection_complete(0x41, 0x13))
+    run(var h, var l, var p, var b, 1)
+    test.assert_eq(next_kind(var h), EV_ADVERT)
+    test.assert_eq(next_kind(var h), EV_ADVERT)
+    test.assert_eq(next_kind(var h), EV_CONNECTED)
+    test.assert_eq(next_kind(var h), EV_DISCONNECTED)
+    match host_api.next_event(var h)
+        Some(e) =>
+            match e
+                Dropped(n) => test.assert_eq(n as Int, 4)
+                _ => test.fail("Dropped is reported once the queue is empty")
+        None => test.fail("Dropped is reported once the queue is empty")
+    test.assert_eq(next_kind(var h), -1)
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_an_advert_the_policy_does_not_want_takes_no_place_in_the_queue_and_is_not_counted_as_dropped()
+    var h = new_host(2)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    p.keep_adverts = false
+    for i in 0..8
+        list.push(l.inbox, report_event(i + 1, -60))
+    run(var h, var l, var p, var b, 3)
+    test.assert_eq(p.adverts, 8)
+    test.assert_eq(next_kind(var h), -1)
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_the_queue_gives_the_oldest_event_first_and_none_when_empty()
+    var q = noble.api_new(2)
+    test.assert(noble.queue_take(var q) == None)
+    test.assert(noble.queue_event(var q, Event.Ready))
+    test.assert(noble.queue_event(var q, Event.DatabaseChanged(noble.no_conn())))
+    match noble.queue_take(var q)
+        Some(e) =>
+            match e
+                Ready => ()
+                _ => test.fail("the first event is Ready")
+        None => test.fail("an event is queued")
+    match noble.queue_take(var q)
+        Some(e) =>
+            match e
+                DatabaseChanged(_) => ()
+                _ => test.fail("the second event is DatabaseChanged")
+        None => test.fail("an event is queued")
+
+// ── Two Hosts with a link between them ──────────────────────────────
+
+// A Central (`a`) and a Peripheral (`b`) joined by a Controller that carries the ACL data of the
+// one to the other and plays the encryption procedure between them.  `seen_a` and `seen_b` count the
+// commands of each Host the link has looked at.
+struct Pair
+    var a: Host
+    var b: Host
+    var la: ScriptLink
+    var lb: ScriptLink
+    var pa: TestPolicy
+    var pb: TestPolicy
+    var sa: RamBonds
+    var sb: RamBonds
+    var ca: ConnId
+    var cb: ConnId
+    var seen_a: Int
+    var seen_b: Int
+    var now: Int
+
+fn result_ok(r: ?Status) -> Bool
+    match r
+        Some(st) => st.is_ok()
+        None => false
+
+// The address of the Peripheral, which the Central connects to.
+fn b_octets() -> [u8]
+    [0xB1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6]
+
+// ACL data written by one Host goes to the other with the handle of the receiver and the flags of
+// a packet that the Controller delivers; the sender gets its buffers back.
+fn carry(var from: ScriptLink, var to: ScriptLink, to_handle: Int, from_handle: Int)
+    let out = from.acl
+    from.acl = []
+    for pkt in out
+        let flags = ((pkt[2] as Int) >> 4) & 3
+        let pb = if flags == 0 then 2 else flags
+        var q = pkt[:]
+        q[1] = (to_handle & 0xFF) as u8
+        q[2] = (((to_handle >> 8) & 0x0F) | (pb << 4)) as u8
+        list.push(to.inbox, q)
+        list.push(from.inbox, event_packet(0x13, [1, (from_handle & 0xFF) as u8, (from_handle >> 8) as u8, 1, 0]))
+
+fn handle_of_command(c: [u8]) -> Int
+    (c[4] as Int) | ((c[5] as Int) << 8)
+
+// The encryption procedure between the two Controllers: LE Start Encryption of the Central makes
+// the Peripheral's Controller ask for the key; the Peripheral's reply switches the encryption on at
+// both ends.
+fn encryption(var x: Pair)
+    for i in x.seen_a..list.len(x.la.cmdlog)
+        let c = x.la.cmdlog[i]
+        let opcode = (c[1] as Int) | ((c[2] as Int) << 8)
+        if opcode == hci_commands.opcode_le_start_encryption()
+            // handle (2), Rand (8), EDIV (2), LTK (16)
+            var params: [u8] = []
+            list.append(params, le16(0x41))
+            list.append(params, c[6:14])
+            list.append(params, c[14:16])
+            list.push(x.lb.inbox, le_meta(0x05, params))
+    x.seen_a = list.len(x.la.cmdlog)
+    for i in x.seen_b..list.len(x.lb.cmdlog)
+        let c = x.lb.cmdlog[i]
+        let opcode = (c[1] as Int) | ((c[2] as Int) << 8)
+        if opcode == hci_commands.opcode_le_long_term_key_request_reply()
+            list.push(x.la.inbox, event_packet(0x08, [0, 0x40, 0, 1]))
+            list.push(x.lb.inbox, event_packet(0x08, [0, 0x41, 0, 1]))
+    x.seen_b = list.len(x.lb.cmdlog)
+
+// Run both Hosts `n` turns, carrying what they write.
+fn pump(var x: Pair, n: Int)
+    for _ in 0..n
+        x.now = x.now + 10
+        x.la.now = x.now
+        x.lb.now = x.now
+        host_api.poll(var x.a, var x.la, var x.pa, var x.sa, x.now)
+        host_api.poll(var x.b, var x.lb, var x.pb, var x.sb, x.now)
+        carry(var x.la, var x.lb, 0x41, 0x40)
+        carry(var x.lb, var x.la, 0x40, 0x41)
+        encryption(var x)
+
+// The call `req` of the Central, run until it ends.
+fn call_a(var x: Pair, req: Request) -> Status
+    let st = host_api.begin(var x.a, req)
+    if not st.is_ok()
+        return st
+    for _ in 0..200
+        pump(var x, 1)
+        match host_api.result(var x.a)
+            Some(done) => return done
+            None => ()
+    noble.failed(noble.LAYER_LOCAL, noble.E_TIMEOUT)
+
+// Two started Hosts with a link: the Central `a` connected to the address `b_octets`, and the
+// Peripheral `b` told of the link.  Both Connected events are taken.
+fn pair_up() -> Pair
+    var x = Pair {
+        a: new_host(2), b: new_host(2), la: script_link(), lb: script_link(), pa: test_policy(), pb: test_policy(),
+        sa: new_store(), sb: new_store(), ca: noble.no_conn(), cb: noble.no_conn(), seen_a: 0, seen_b: 0, now: 0 }
+    x.la.seed = 1
+    x.lb.seed = 40
+    x.la.addr = 0xA1
+    x.lb.addr = 0xB1
+    let sa = host_api.begin(var x.a, Request.Start)
+    let sb = host_api.begin(var x.b, Request.Start)
+    test.assert(sa.is_ok() and sb.is_ok())
+    pump(var x, 12)
+    test.assert(x.a.api.ready and x.b.api.ready)
+    test.assert(result_ok(host_api.result(var x.a)))
+    test.assert(result_ok(host_api.result(var x.b)))
+    test.assert_eq(next_kind(var x.a), 0)
+    test.assert_eq(next_kind(var x.b), 0)
+    // The Peripheral's Controller reports the link of the Central.
+    list.push(x.lb.inbox, connection_complete_kind(0, 0x41, 1, 0, [0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6]))
+    let up = call_a(var x, Request.Connect(Addr { kind: 0, octets: [0xB1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6] }, noble.conn_params_default()))
+    test.assert(up.is_ok())
+    x.ca = host_api.op_conn(x.a)
+    test.assert_eq(next_kind(var x.a), EV_CONNECTED)
+    pump(var x, 2)
+    match host_api.next_event(var x.b)
+        Some(e) =>
+            match e
+                Connected(c, _, _, _) => x.cb = c
+                _ => test.fail("the Peripheral is told of the link")
+        None => test.fail("the Peripheral is told of the link")
+    x
+
+fn level_of_conn(h: Host, conn: ConnId) -> Int
+    match host_api.conn_info(h, conn)
+        Some(info) => level_number(info.level)
+        None => -1
+
+fn bonded_conn(h: Host, conn: ConnId) -> Bool
+    match host_api.conn_info(h, conn)
+        Some(info) => info.bonded
+        None => false
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_two_hosts_join_and_both_see_the_link_in_their_own_role()
+    var x = pair_up()
+    test.assert_eq(host_api.link_count(x.a), 1)
+    test.assert_eq(host_api.link_count(x.b), 1)
+    match host_api.conn_info(x.a, x.ca)
+        Some(info) => test.assert(role_is_central(info.role))
+        None => test.fail("the Central has the link")
+    match host_api.conn_info(x.b, x.cb)
+        Some(info) => test.assert(not role_is_central(info.role))
+        None => test.fail("the Peripheral has the link")
+
+// ── Pairing ─────────────────────────────────────────────────────────
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_secure_pairs_with_just_works_after_the_policies_accept_and_stores_a_bond_on_both_sides()
+    var x = pair_up()
+    let st = call_a(var x, Request.Secure(x.ca, Security.Encrypted))
+    test.assert(st.is_ok())
+    // The Central asked its policy before it started, the Peripheral when the Pairing Request came.
+    test.assert_eq(x.pa.pairing_asked, 1)
+    test.assert_eq(x.pa.pairing_level, 2)
+    test.assert(x.pa.pairing_bonding)
+    test.assert_eq(x.pb.pairing_asked, 1)
+    pump(var x, 10)
+    test.assert_eq(level_of_conn(x.a, x.ca), 2)
+    test.assert_eq(level_of_conn(x.b, x.cb), 2)
+    test.assert(bonded_conn(x.a, x.ca))
+    test.assert(bonded_conn(x.b, x.cb))
+    test.assert_eq(x.pa.done, 1)
+    test.assert(x.pa.done_ok and x.pa.done_bonded)
+    test.assert_eq(x.pb.done, 1)
+    test.assert(x.pb.done_ok and x.pb.done_bonded)
+    test.assert_eq(x.sa.count(), 1)
+    test.assert_eq(x.sb.count(), 1)
+    // Both sides hear SecurityChanged once.
+    test.assert_eq(next_kind(var x.a), EV_SECURITY)
+    test.assert_eq(next_kind(var x.b), EV_SECURITY)
+    // A call for a level the link has answers at once.
+    test.assert(call_a(var x, Request.Secure(x.ca, Security.Encrypted)).is_ok())
+    test.assert_eq(x.pa.pairing_asked, 1)
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_pairing_the_peripherals_policy_refuses_fails_the_call_with_the_smp_reason()
+    var x = pair_up()
+    x.pb.allow_pairing = false
+    let st = call_a(var x, Request.Secure(x.ca, Security.Encrypted))
+    test.assert(st.is(noble.LAYER_SMP, noble.SMP_PAIRING_NOT_SUPPORTED))
+    test.assert_eq(st.name(), "pairing not supported")
+    test.assert_eq(x.pb.pairing_asked, 1)
+    pump(var x, 4)
+    test.assert_eq(x.pb.done, 1)
+    test.assert(not x.pb.done_ok)
+    test.assert_eq(level_of_conn(x.a, x.ca), 1)
+    test.assert_eq(x.sa.count(), 0)
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_pairing_the_centrals_own_policy_refuses_sends_nothing_and_answers_security_low()
+    var x = pair_up()
+    x.pa.allow_pairing = false
+    let before = list.len(x.la.acl) + list.len(x.lb.inbox)
+    let st = call_a(var x, Request.Secure(x.ca, Security.Authenticated))
+    test.assert(st.is(noble.LAYER_LOCAL, noble.E_SECURITY_LOW))
+    test.assert_eq(x.pa.pairing_asked, 1)
+    test.assert_eq(x.pa.pairing_level, 3)
+    test.assert_eq(x.pb.pairing_asked, 0)
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_passkey_the_policy_answers_pending_is_asked_through_an_event_and_given_with_passkey_reply()
+    var x = pair_up()
+    // The Central shows the passkey, the Peripheral types it: Passkey Entry.
+    x.pa.io = IoCap.DisplayOnly
+    x.pb.io = IoCap.KeyboardOnly
+    x.pb.passkey = noble.PENDING
+    let st = host_api.begin(var x.a, Request.Secure(x.ca, Security.Authenticated))
+    test.assert(st.is_ok())
+    for _ in 0..200
+        if x.b.api.ask[0] == 0
+            pump(var x, 1)
+    test.assert_eq(next_kind(var x.b), EV_PASSKEY)
+    pump(var x, 6)
+    // The Central's policy was handed the six digits to show.
+    test.assert(x.pa.shown >= 0 and x.pa.shown <= 999999)
+    test.assert(result_none(host_api.result(var x.a)))
+    // A wrong call is refused and the right one is taken at the next poll.
+    test.assert(host_api.passkey_reply(var x.b, x.cb, 1000000).is(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
+    test.assert(host_api.passkey_reply(var x.b, x.cb, x.pa.shown).is_ok())
+    var done = noble.failed(noble.LAYER_LOCAL, noble.E_TIMEOUT)
+    for _ in 0..200
+        pump(var x, 1)
+        match host_api.result(var x.a)
+            Some(r) =>
+                done = r
+                break
+            None => ()
+    test.assert(done.is_ok())
+    pump(var x, 10)
+    test.assert(level_of_conn(x.a, x.ca) >= 3)
+    test.assert(level_of_conn(x.b, x.cb) >= 3)
+    test.assert(x.pb.done_ok)
+    // A second reply has nothing to answer.
+    test.assert(host_api.passkey_reply(var x.b, x.cb, 5).is(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_wrong_passkey_fails_the_pairing_with_passkey_entry_failed()
+    var x = pair_up()
+    x.pa.io = IoCap.DisplayOnly
+    x.pb.io = IoCap.KeyboardOnly
+    x.pb.passkey = noble.PENDING
+    let st = host_api.begin(var x.a, Request.Secure(x.ca, Security.Authenticated))
+    test.assert(st.is_ok())
+    for _ in 0..200
+        if x.b.api.ask[0] == 0
+            pump(var x, 1)
+    test.assert_eq(next_kind(var x.b), EV_PASSKEY)
+    pump(var x, 6)
+    test.assert(x.pa.shown >= 0)
+    test.assert(host_api.passkey_reply(var x.b, x.cb, (x.pa.shown + 1) % 1000000).is_ok())
+    var done = noble.failed(noble.LAYER_LOCAL, noble.E_TIMEOUT)
+    for _ in 0..200
+        pump(var x, 1)
+        match host_api.result(var x.a)
+            Some(r) =>
+                done = r
+                break
+            None => ()
+    test.assert(done.layer == noble.LAYER_SMP)
+    test.assert_eq(level_of_conn(x.a, x.ca), 1)
+    test.assert_eq(x.sa.count(), 0)
+
+fn result_none(r: ?Status) -> Bool
+    match r
+        Some(_) => false
+        None => true
+
+// ── Bonds ───────────────────────────────────────────────────────────
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_unbond_removes_the_bond_from_the_store_and_the_link()
+    var x = pair_up()
+    test.assert(call_a(var x, Request.Secure(x.ca, Security.Encrypted)).is_ok())
+    pump(var x, 10)
+    test.assert_eq(x.sa.count(), 1)
+    host_api.unbond(var x.a, var x.sa, Addr { kind: 0, octets: [0xB1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6] })
+    test.assert_eq(x.sa.count(), 0)
+    test.assert(not bonded_conn(x.a, x.ca))
+
+@test
+fn test_the_ram_bond_store_replaces_a_peer_it_has_and_reports_a_full_table()
+    var s = new_store()
+    test.assert(s.find(peer_addr(1)) == None)
+    let one = bond_for(peer_addr(1), Security.Encrypted)
+    test.assert(s.save(one).is_ok())
+    test.assert(s.save(bond_for(peer_addr(1), Security.Authenticated)).is_ok())
+    test.assert_eq(s.count(), 1)
+    match s.find(peer_addr(1))
+        Some(b) => test.assert_eq(level_number(b.level), 3)
+        None => test.fail("the bond is there")
+    for i in 2..(noble_config.MAX_BONDS + 1)
+        test.assert(s.save(bond_for(peer_addr(i), Security.Encrypted)).is_ok())
+    test.assert_eq(s.count(), noble_config.MAX_BONDS)
+    test.assert(s.save(bond_for(peer_addr(99), Security.Encrypted)).is(noble.LAYER_LOCAL, noble.E_NO_ROOM))
+    test.assert_eq(s.count(), noble_config.MAX_BONDS)
+    s.forget(peer_addr(1))
+    test.assert_eq(s.count(), noble_config.MAX_BONDS - 1)
+    test.assert(s.find(peer_addr(1)) == None)
+    test.assert(s.find(peer_addr(2)) != None)
+    // Forgetting a peer that is not there changes nothing.
+    s.forget(peer_addr(77))
+    test.assert_eq(s.count(), noble_config.MAX_BONDS - 1)
+    test.assert(s.at(0) != None)
+    test.assert(s.at(noble_config.MAX_BONDS) == None)
+
+fn bond_for(peer: Addr, level: Security) -> Bond
+    Bond {
+        peer: peer, irk: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], has_irk: false,
+        ltk: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16], ediv: 0, rand: [0, 0, 0, 0, 0, 0, 0, 0],
+        key_size: 16, level: level }
+
+// ── L2CAP credit based channels ─────────────────────────────────────
+
+fn sdu_of(a: Int, n: Int) -> noble.Value
+    var v: noble.Value = Vec.new()
+    for i in 0..n
+        let _ = v.push((a + i) as u8)
+    v
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_coc_opens_carries_data_both_ways_and_closes()
+    var x = pair_up()
+    test.assert(host_api.coc_listen(var x.b, 0x0080, 64, Security.Open).is_ok())
+    let st = call_a(var x, Request.CocOpen(x.ca, 0x0080, 64, Security.Open))
+    test.assert(st.is_ok())
+    let chan_a = host_api.op_chan(x.a)
+    pump(var x, 4)
+    // The Peripheral hears the channel open.
+    var chan_b = -1
+    match host_api.next_event(var x.b)
+        Some(e) =>
+            match e
+                CocOpened(c, chan, psm) =>
+                    chan_b = chan as Int
+                    test.assert_eq(psm as Int, 0x0080)
+                _ => test.fail("CocOpened is queued")
+        None => test.fail("CocOpened is queued")
+    // Data from the Central arrives as CocData at the Peripheral.
+    test.assert(host_api.coc_send(var x.a, x.ca, chan_a, sdu_of(10, 20)).is_ok())
+    pump(var x, 4)
+    match host_api.next_event(var x.b)
+        Some(e) =>
+            match e
+                CocData(c, chan, sdu) =>
+                    test.assert_eq(chan as Int, chan_b)
+                    test.assert_eq(sdu.len(), 20)
+                    test.assert_eq(sdu[0] as Int, 10)
+                    test.assert_eq(sdu[19] as Int, 29)
+                _ => test.fail("CocData is queued")
+        None => test.fail("CocData is queued")
+    // And back.
+    test.assert(host_api.coc_send(var x.b, x.cb, chan_b, sdu_of(1, 5)).is_ok())
+    pump(var x, 4)
+    test.assert_eq(next_kind(var x.a), EV_COC_DATA)
+    // A channel that does not exist and a name that is stale are refused.
+    test.assert(host_api.coc_send(var x.a, x.ca, 7, sdu_of(1, 5)).is(noble.LAYER_LOCAL, noble.E_NOT_FOUND))
+    // The Central closes the channel; the Peripheral hears CocClosed.
+    let closed = call_a(var x, Request.CocClose(x.ca, chan_a as u8))
+    test.assert(closed.is_ok())
+    pump(var x, 4)
+    test.assert_eq(next_kind(var x.b), EV_COC_CLOSED)
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_coc_open_to_a_psm_nobody_listens_on_fails_with_the_l2cap_result()
+    var x = pair_up()
+    let st = call_a(var x, Request.CocOpen(x.ca, 0x0081, 64, Security.Open))
+    test.assert(st.layer == noble.LAYER_L2CAP)
+    test.assert(not st.is_ok())
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_numeric_comparison_the_policy_answers_pending_is_asked_through_an_event_and_given_with_numeric_reply()
+    var x = pair_up()
+    x.pa.io = IoCap.DisplayYesNo
+    x.pb.io = IoCap.DisplayYesNo
+    x.pa.numeric = noble.PENDING
+    x.pb.numeric = 1
+    let st = host_api.begin(var x.a, Request.Secure(x.ca, Security.Authenticated))
+    test.assert(st.is_ok())
+    for _ in 0..200
+        if x.a.api.ask[0] == 0
+            pump(var x, 1)
+    test.assert_eq(next_kind(var x.a), EV_NUMERIC)
+    // Both devices were shown the same six digits.
+    test.assert(x.pb.compared >= 0)
+    test.assert(host_api.numeric_reply(var x.a, x.ca, true).is_ok())
+    var done = noble.failed(noble.LAYER_LOCAL, noble.E_TIMEOUT)
+    for _ in 0..200
+        pump(var x, 1)
+        match host_api.result(var x.a)
+            Some(r) =>
+                done = r
+                break
+            None => ()
+    test.assert(done.is_ok())
+    pump(var x, 10)
+    test.assert(level_of_conn(x.a, x.ca) >= 3)
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_numeric_comparison_the_user_rejects_fails_the_pairing()
+    var x = pair_up()
+    x.pa.io = IoCap.DisplayYesNo
+    x.pb.io = IoCap.DisplayYesNo
+    x.pa.numeric = 0
+    x.pb.numeric = 1
+    let st = call_a(var x, Request.Secure(x.ca, Security.Authenticated))
+    test.assert(st.layer == noble.LAYER_SMP)
+    test.assert_eq(level_of_conn(x.a, x.ca), 1)
+    test.assert_eq(x.sa.count(), 0)
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_passkey_hook_that_refuses_ends_the_pairing_with_passkey_entry_failed()
+    var x = pair_up()
+    x.pa.io = IoCap.DisplayOnly
+    x.pb.io = IoCap.KeyboardOnly
+    x.pb.passkey = noble.REFUSE
+    let st = call_a(var x, Request.Secure(x.ca, Security.Authenticated))
+    test.assert(st.layer == noble.LAYER_SMP)
+    test.assert_eq(x.sb.count(), 0)
+
+// ── Names that go stale ─────────────────────────────────────────────
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_the_name_of_an_ended_link_stays_stale_when_a_new_link_takes_its_slot()
+    var h = new_host(2)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    let first = call(var h, var l, var p, var b, Request.Connect(peer_addr(0x55), noble.conn_params_default()))
+    test.assert(first.is_ok())
+    let old = host_api.op_conn(h)
+    test.assert(call(var h, var l, var p, var b, Request.Disconnect(old, 0x13)).is_ok())
+    l.handle = 0x42
+    let second = call(var h, var l, var p, var b, Request.Connect(peer_addr(0x56), noble.conn_params_default()))
+    test.assert(second.is_ok())
+    let fresh = host_api.op_conn(h)
+    // The same slot, the next generation.
+    test.assert_eq(fresh.slot as Int, old.slot as Int)
+    test.assert(fresh.generation != old.generation)
+    test.assert(host_api.conn_info(h, old) == None)
+    test.assert(host_api.conn_info(h, fresh) != None)
+    test.assert(host_api.begin(var h, Request.Disconnect(old, 0x13)).is(noble.LAYER_LOCAL, noble.E_STALE))
+
+// ── Status ──────────────────────────────────────────────────────────
+
+@test
+fn test_status_keeps_the_number_of_its_layer_and_names_the_codes_it_knows()
+    test.assert(noble.ok().is_ok())
+    test.assert(not noble.failed(noble.LAYER_LOCAL, noble.E_BUSY).is_ok())
+    let a = noble.failed(noble.LAYER_ATT, noble.ATT_INSUFFICIENT_AUTHENTICATION)
+    test.assert(a.is(noble.LAYER_ATT, noble.ATT_INSUFFICIENT_AUTHENTICATION))
+    test.assert(not a.is(noble.LAYER_HCI, noble.ATT_INSUFFICIENT_AUTHENTICATION))
+    test.assert_eq(a.name(), "insufficient authentication")
+    test.assert_eq(noble.failed(noble.LAYER_HCI, noble.HCI_CONNECTION_TIMEOUT).name(), "connection timeout")
+    test.assert_eq(noble.failed(noble.LAYER_SMP, noble.SMP_PASSKEY_ENTRY_FAILED).name(), "passkey entry failed")
+    test.assert_eq(noble.failed(noble.LAYER_ATT, 200).name(), "unknown")
+    test.assert_eq(noble.failed(noble.LAYER_L2CAP, 2).name(), "unknown")
+
+@test
+fn test_every_named_code_has_a_name()
+    for code in 1..20
+        test.assert(noble.att_name(code) != "unknown")
+    for code in [5, 6, 8, 19, 20, 21, 22, 26, 61, 59, 62]
+        test.assert(noble.hci_name(code) != "unknown")
+    for code in 1..15
+        test.assert(noble.smp_name(code) != "unknown")
+    test.assert_eq(noble.att_name(0), "unknown")
+    test.assert_eq(noble.hci_name(0), "unknown")
+    test.assert_eq(noble.smp_name(0), "unknown")
+
+@test
+fn test_the_adapters_read_the_five_error_forms_as_one_status()
+    test.assert(noble.from_client_status(0).is_ok())
+    test.assert(noble.from_client_status(0x05).is(noble.LAYER_ATT, noble.ATT_INSUFFICIENT_AUTHENTICATION))
+    test.assert(noble.from_client_status(0x100).is(noble.LAYER_LOCAL, noble.E_TIMEOUT))
+    test.assert(noble.from_client_status(0x102).is(noble.LAYER_LOCAL, noble.E_NO_ROOM))
+    test.assert(noble.from_client_status(0x101).is(noble.LAYER_ATT, noble.ATT_INVALID_PDU))
+    test.assert(noble.from_client_error(-1).is(noble.LAYER_LOCAL, noble.E_STALE))
+    test.assert(noble.from_client_error(-2).is(noble.LAYER_LOCAL, noble.E_BUSY))
+    test.assert(noble.from_client_error(-3).is(noble.LAYER_LOCAL, noble.E_NO_ROOM))
+    test.assert(noble.from_client_error(-4).is(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
+    test.assert(noble.from_client_error(-5).is(noble.LAYER_LOCAL, noble.E_LINK_LOST))
+    test.assert(noble.from_client_error(-6).is(noble.LAYER_LOCAL, noble.E_NOT_READY))
+    test.assert(noble.from_client_error(-7).is(noble.LAYER_LOCAL, noble.E_BUSY))
+    test.assert(noble.from_advertiser_error("the advertising interval is outside 20 to 10240 ms").is(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
+    test.assert(noble.from_smp_reason(smp.Reason.PairingNotSupported).is(noble.LAYER_SMP, noble.SMP_PAIRING_NOT_SUPPORTED))
+    test.assert(noble.from_smp_reason(smp.Reason.ConfirmValueFailed).is(noble.LAYER_SMP, noble.SMP_CONFIRM_VALUE_FAILED))
+    test.assert(noble.from_profile_error(profile_builder.ProfileError.NoRoom).is(noble.LAYER_LOCAL, noble.E_NO_ROOM))
+    test.assert(noble.from_profile_error(profile_builder.ProfileError.InvalidValue).is(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
+    test.assert(noble.from_profile_error(profile_builder.ProfileError.NotPermitted).is(noble.LAYER_LOCAL, noble.E_REFUSED))
+
+@test
+fn test_default_policy_answers_what_a_host_with_no_hook_does()
+    var p = DefaultPolicy { placeholder: 0 }
+    let c = noble.no_conn()
+    let a = peer_addr(1)
+    test.assert(p.accept_pairing(c, a, Security.Encrypted, true))
+    test.assert_eq(p.ask_passkey(c), noble.PENDING)
+    test.assert_eq(p.confirm_numeric(c, 123456), noble.PENDING)
+    test.assert(p.accept_params(c, noble.conn_params_default()))
+    test.assert(p.accept_connect(a, Role.Central))
+    test.assert(p.on_advert(noble.blank_report()))
+    var v: noble.Value = Vec.new()
+    test.assert_eq(p.on_read(c, 3, 0, var v), noble.NOT_HANDLED)
+    test.assert_eq(p.on_write(c, 3, 0, var v), noble.NOT_HANDLED)
+    test.assert_eq(p.authorize_write(c, 3, var v), 0)
+    match p.on_disconnected(c, noble.ok(), Role.Peripheral, 0)
+        Action.Stay => ()
+        _ => test.fail("a default policy stays")
+    match p.on_connected(c, Role.Peripheral, 1)
+        Action.Stay => ()
+        _ => test.fail("a default policy stays")
+    match p.io_capability(c)
+        IoCap.NoInputNoOutput => ()
+        _ => test.fail("a default policy offers no input and no output")
+    let q = noble.conn_params_default()
+    test.assert_eq(q.interval_min as Int, 24)
+    test.assert_eq(q.timeout as Int, 400)
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_host_on_the_default_policy_connects_and_keeps_to_one_link()
+    var h = new_host(1)
+    var l = script_link()
+    var p = DefaultPolicy { placeholder: 0 }
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    let st = call(var h, var l, var p, var b, Request.Connect(peer_addr(0x55), noble.conn_params_default()))
+    test.assert(st.is_ok())
+    test.assert_eq(host_api.link_count(h), 1)
+    // At the limit of one link the next Connect answers E_NO_ROOM.
+    test.assert(host_api.begin(var h, Request.Connect(peer_addr(0x56), noble.conn_params_default())).is(noble.LAYER_LOCAL, noble.E_NO_ROOM))
+
+// ── ATT traffic of a Peripheral ─────────────────────────────────────
+
+// An HCI ACL Data packet from the Controller carrying the ATT PDU `att` on the fixed channel 4.
+fn att_packet(handle: Int, att: [u8]) -> [u8]
+    let l2cap_length = list.len(att)
+    let total = l2cap_length + 4
+    var pkt: [u8] = [0x02, (handle & 0xFF) as u8, (((handle >> 8) & 0x0F) | 0x20) as u8, (total & 0xFF) as u8, ((total >> 8) & 0xFF) as u8]
+    list.append(pkt, le16(l2cap_length))
+    list.append(pkt, le16(4))
+    list.append(pkt, att)
+    pkt
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_the_host_answers_the_att_requests_of_a_client_through_the_link()
+    var h = new_host(2)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    list.push(l.inbox, connection_complete(0, 0x41, 1, peer_octets(0x31)))
+    run(var h, var l, var p, var b, 1)
+    test.assert_eq(next_kind(var h), EV_CONNECTED)
+    // A Read Request of the Device Name, handle 3: the Host answers it with an ACL packet.
+    list.push(l.inbox, att_packet(0x41, [0x0A, 0x03, 0x00]))
+    run(var h, var l, var p, var b, 2)
+    test.assert_eq(list.len(l.acl), 1)
+    test.assert_eq(l.acl[0][0] as Int, 2)
+    test.assert_eq(l.acl[0][9] as Int, 0x0B)
+    // A Write Request of the same handle (the Device Name is writable) is answered too.  The GATT server
+    // reports a write as a change only for the attributes it tracks (`take_changed`), and the Device Name
+    // is not one of them, so no `Written` is queued.
+    list.push(l.inbox, att_packet(0x41, [0x12, 0x03, 0x00, 0x58, 0x59]))
+    run(var h, var l, var p, var b, 2)
+    test.assert_eq(list.len(l.acl), 2)
+    test.assert_eq(l.acl[1][9] as Int, 0x13)
+    test.assert_eq(next_kind(var h), -1)

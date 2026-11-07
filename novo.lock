@@ -9,5 +9,5 @@ source = "path"
 path = "../noble-hci"
 
 [config.main]
-sha256 = "e695ff2ed686e5a02559713eb484d6b370972539d2c21676193c3f578dc5b882"
+sha256 = "2da1bcfe0d731d30caf402c6be2aa47e009d2714f8dff067a3fb26ef9fd2c5f2"
 schemas = "noble 0.1.0"

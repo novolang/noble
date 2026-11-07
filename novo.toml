@@ -153,6 +153,31 @@ max     = 8
 bytes_expr = "8 + max_bonds * (128 + ((max_cccd) * 2 + 15) / 8 * 8)"
 doc     = "bonded peers kept"
 
+[config.event_queue]
+type    = "int"
+default = 0
+min     = 0
+max     = 16
+unit    = "events"
+bytes_expr = "event_queue * (att_value_bytes + max_adv_data + 48)"
+doc     = "events the Host API queues for the application (Layer A, src/noble.nv), 0 for no queue; one slot of them is kept for each connection's state events"
+
+[config.att_value_bytes]
+type    = "int"
+default = 64
+min     = 1
+max     = 512
+unit    = "bytes"
+doc     = "octets of one attribute value or SDU that the Host API carries in a call or an event (Layer A, src/noble.nv)"
+
+[config.max_adv_data]
+type    = "int"
+default = 31
+min     = 31
+max     = 255
+unit    = "bytes"
+doc     = "octets of advertising data in one report or one advertising set of the Host API (Layer A, src/noble.nv)"
+
 [config.max_pairing]
 type    = "int"
 default = 1

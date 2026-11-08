@@ -201,7 +201,7 @@ min     = 1
 max     = 16
 unit    = "services"
 bytes_expr = "16 + 2 * ((8 + max_services * 2 + 7) / 8 * 8)"
-doc     = "services a product's list holds, the size of the owner table that `pump` finds the owner of an attribute handle in (Layer B, src/noble.nv); the table is the record of two lists of `max_services` handles that the Adapter keeps, made once at start-up"
+doc     = "services a product's list holds, the size of the owner table that `pump` finds the owner of an attribute handle in (Layer B, src/noble.nv); the table is the two lists of `max_services` handles (`owner_first`, `owner_last`) that the Adapter keeps"
 
 [config.max_pairing]
 type    = "int"

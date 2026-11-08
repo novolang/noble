@@ -2004,16 +2004,16 @@ fn switch_service(uuid: Int) -> Switch
     Switch { svc: -1, attr: noble.Attr { handle: 0, props: 0, cccd: 0 }, seen: -1, ticks: 0, events: 0, linked: 0, uuid: uuid }
 
 impl noble.Service[] for Switch
-    fn attach(var self, var h: Host) -> Int
+    fn attach(var self, var h: Host) -> Status
         let s = h.add_service(noble.uuid16(self.uuid))
         if not s.status.is_ok()
-            return s.status.code as Int
+            return s.status
         self.svc = s.svc
         let c = h.add_char(noble.uuid16(self.uuid + 1), noble.PROP_WRITE, noble.Permissions { read: noble.Access.Denied, write: noble.Access.Open }, noble.Access.Denied, 1)
         if not c.status.is_ok()
-            return c.status.code as Int
+            return c.status
         self.attr = c.attr
-        h.bind_event(c.attr).code as Int
+        h.bind_event(c.attr)
 
     fn on_event(var self, ev: Event, var out: noble.Outbox) -> Bool
         self.events = self.events + 1
@@ -2056,21 +2056,21 @@ fn test_plug_of_two_services_records_two_ranges_in_list_order()
     let a = switch_service(0xFFA0)
     let b = switch_service(0xFFB0)
     var svcs: [dyn Service] = [a, b]
-    test.assert(noble.plug(var ble, var svcs).is_ok())
+    test.assert(ble.plug(var svcs).is_ok())
     test.assert_eq(a.svc, 0)
     test.assert_eq(b.svc, 1)
-    test.assert_eq(ble.owners.first.len(), 2)
-    test.assert_eq(ble.owners.last.len(), 2)
+    test.assert_eq(ble.owner_first.len(), 2)
+    test.assert_eq(ble.owner_last.len(), 2)
     // A service holds the handles it added: the service declaration, the characteristic declaration and its value.
-    test.assert(ble.owners.first[0] <= a.attr.handle and a.attr.handle <= ble.owners.last[0])
-    test.assert(ble.owners.first[1] <= b.attr.handle and b.attr.handle <= ble.owners.last[1])
-    test.assert(ble.owners.last[0] < ble.owners.first[1])
+    test.assert(ble.owner_first[0] <= a.attr.handle and a.attr.handle <= ble.owner_last[0])
+    test.assert(ble.owner_first[1] <= b.attr.handle and b.attr.handle <= ble.owner_last[1])
+    test.assert(ble.owner_last[0] < ble.owner_first[1])
     // A list longer than `max_services` is refused, and one service that cannot attach stops the plug.
     var many: [dyn Service] = []
     for k in 0..(noble_config.MAX_SERVICES + 1)
         list.push(many, switch_service(0xFE00 + k * 2))
     var ble2 = new_ble()
-    test.assert(noble.plug(var ble2, var many).is(noble.LAYER_LOCAL, noble.E_NO_ROOM))
+    test.assert(ble2.plug(var many).is(noble.LAYER_LOCAL, noble.E_NO_ROOM))
 
 @when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
 @test
@@ -2079,19 +2079,19 @@ fn test_an_attribute_write_reaches_only_its_owner_and_a_link_event_reaches_both(
     let a = switch_service(0xFFA0)
     let b = switch_service(0xFFB0)
     var svcs: [dyn Service] = [a, b]
-    test.assert(noble.plug(var ble, var svcs).is_ok())
+    test.assert(ble.plug(var svcs).is_ok())
     test.assert(ble.start().is_ok())
     test.assert_eq(wait_kind(var ble, 0), 0)
     // The link event: both services see it, in list order.
     list.push(ble.io.inbox, connection_complete(0, 0x41, 1, peer_octets(0x31)))
-    noble.pump(var ble, 50)
+    ble.pump(50)
     test.assert_eq(a.linked, 1)
     test.assert_eq(b.linked, 1)
     test.assert(a.ticks >= 1 and b.ticks >= 1)
     // A write to the first service's attribute: the first sees it, the second sees no attribute event at all.
     let before = b.events
     list.push(ble.io.inbox, att_packet(0x41, write_request(a.attr.handle, 1)))
-    noble.pump(var ble, 50)
+    ble.pump(50)
     test.assert_eq(a.seen, 1)
     test.assert_eq(b.seen, -1)
     test.assert_eq(b.events, before)
@@ -2099,12 +2099,12 @@ fn test_an_attribute_write_reaches_only_its_owner_and_a_link_event_reaches_both(
     test.assert_eq(acl_att(ble.io, 0)[0] as Int, 0x13)
     // A write of 7 is refused by the owner with its own code, and the other service is not asked.
     list.push(ble.io.inbox, att_packet(0x41, write_request(b.attr.handle, 7)))
-    noble.pump(var ble, 50)
+    ble.pump(50)
     test.assert_eq(b.seen, -1)
     ble.step()
     test.assert_eq(acl_att(ble.io, 1)[4] as Int, noble.ATT_VALUE_NOT_ALLOWED)
     list.push(ble.io.inbox, att_packet(0x41, write_request(b.attr.handle, 1)))
-    noble.pump(var ble, 50)
+    ble.pump(50)
     test.assert_eq(b.seen, 1)
     test.assert_eq(a.seen, 1)
 
@@ -2114,7 +2114,7 @@ fn test_an_attribute_nobody_owns_is_refused_at_once()
     var ble = new_ble()
     let a = switch_service(0xFFA0)
     var svcs: [dyn Service] = [a]
-    test.assert(noble.plug(var ble, var svcs).is_ok())
+    test.assert(ble.plug(var svcs).is_ok())
     // A characteristic of the product's own, added after the list, that no service owns.
     test.assert_eq(ble.add_service(noble.uuid16(0xFFF3)).svc, 1)
     let own = ble.add_char(noble.uuid16(0xFFF2), noble.PROP_READ | noble.PROP_WRITE, noble.open_perms(), noble.Access.Open, 1)
@@ -2123,17 +2123,17 @@ fn test_an_attribute_nobody_owns_is_refused_at_once()
     let _ = peripheral_up(var ble)
     let events = a.events
     list.push(ble.io.inbox, att_packet(0x41, write_request(own.attr.handle, 1)))
-    noble.pump(var ble, 50)
+    ble.pump(50)
     ble.step()
     test.assert_eq(acl_att(ble.io, 0)[4] as Int, noble.ATT_WRITE_NOT_PERMITTED)
     test.assert_eq(a.events, events)
     list.push(ble.io.inbox, att_packet(0x41, [0x0A, (own.attr.handle & 255) as u8, (own.attr.handle >> 8) as u8]))
-    noble.pump(var ble, 50)
+    ble.pump(50)
     ble.step()
     test.assert_eq(acl_att(ble.io, 1)[4] as Int, noble.ATT_READ_NOT_PERMITTED)
     // The owner's attribute is still served.
     list.push(ble.io.inbox, att_packet(0x41, write_request(a.attr.handle, 1)))
-    noble.pump(var ble, 50)
+    ble.pump(50)
     test.assert_eq(a.seen, 1)
 
 // A service that stops the policy it shares with the Adapter (a policy is a reference) at its `after`-th tick, and counts them.
@@ -2143,8 +2143,8 @@ struct Stopper
     var ticks: Int
 
 impl noble.Service[] for Stopper
-    fn attach(var self, var h: Host) -> Int
-        0
+    fn attach(var self, var h: Host) -> Status
+        noble.ok()
 
     fn tick(var self, now_ms: Int, var out: noble.Outbox)
         self.ticks = self.ticks + 1
@@ -2164,8 +2164,8 @@ fn test_serve_starts_asks_on_start_and_turns_the_pump_until_the_policy_asks_to_s
     var ble = ble_with(pol)
     let stopper = Stopper { pol: pol, after: 3, ticks: 0 }
     var svcs: [dyn Service] = [stopper]
-    test.assert(noble.plug(var ble, var svcs).is_ok())
-    test.assert(noble.serve(var ble, 50).is_ok())
+    test.assert(ble.plug(var svcs).is_ok())
+    test.assert(ble.serve(50).is_ok())
     // `keep_serving` was read before each turn: three turns ran, the third set the flag.
     test.assert_eq(stopper.ticks, 3)
     test.assert_eq(pol.start_asked, 1)
@@ -2180,8 +2180,8 @@ fn test_on_start_answering_advertise_makes_the_host_send_the_advertising_command
     var ble = ble_with(pol)
     let stopper = Stopper { pol: pol, after: 1, ticks: 0 }
     var svcs: [dyn Service] = [stopper]
-    test.assert(noble.plug(var ble, var svcs).is_ok())
-    test.assert(noble.serve(var ble, 50).is_ok())
+    test.assert(ble.plug(var svcs).is_ok())
+    test.assert(ble.serve(50).is_ok())
     test.assert_eq(pol.start_asked, 1)
     // Disable, parameters, data, scan response, enable; the data block is the Flags record.
     test.assert_eq(times_sent(ble.io, hci_commands.opcode_le_set_advertising_parameters()), 1)
@@ -2203,8 +2203,8 @@ fn test_serve_answers_the_status_of_a_start_that_failed_and_does_not_ask_on_star
     ble.io.mute = true
     let stopper = Stopper { pol: pol, after: 1, ticks: 0 }
     var svcs: [dyn Service] = [stopper]
-    test.assert(noble.plug(var ble, var svcs).is_ok())
-    test.assert(noble.serve(var ble, 50).is(noble.LAYER_LOCAL, noble.E_TIMEOUT))
+    test.assert(ble.plug(var svcs).is_ok())
+    test.assert(ble.serve(50).is(noble.LAYER_LOCAL, noble.E_TIMEOUT))
     test.assert_eq(pol.start_asked, 0)
     test.assert_eq(stopper.ticks, 0)
 

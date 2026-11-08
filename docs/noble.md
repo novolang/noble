@@ -87,8 +87,8 @@ this package imports a module of the Controller or of `orbit/ble`.
    **Layer B** is in `noble` too: the `Adapter` (`adapter(link, policy, bonds)`) that
    holds a `Host`, a transport, a policy and a bond store and whose methods wait
    (`step`, `run`, `start`, `wait_event`, `connect`, `adv_start`, `scan_start`, `find`,
-   `discover`, `read`, `write`, `subscribe`, `notify`, `respond`), the trait `Service`
-   with `plug` (the product's list of services), `Out`, `Outbox`, `pump` and `serve`, the payload builders (`ad_flags`,
+   `discover`, `read`, `write`, `subscribe`, `notify`, `respond`, and `plug` (the product's
+   list of services), `pump` and `serve`), the trait `Service` with `Out` and `Outbox`, the payload builders (`ad_flags`,
    `ad_uuid16`, `ad_name`) and `UartHci`.  `gatt_server` holds the requests for the
    attributes bound to the application (`GattDb.bound`, `AttLink.held`).  NOT
    IMPLEMENTED in it: `HostPolicy.authorize_write`, bound attributes on an Enhanced

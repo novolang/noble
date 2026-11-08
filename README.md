@@ -20,7 +20,7 @@ they import its modules by name.
 | Module | Holds |
 |---|---|
 | `host` | the Host as one value (`Host`, made by `host_blank` from a `HostConfig`): the links of both roles, the GATT database and client table, both Security Manager halves, the bonds, the pairing settings and the queue of HCI commands owed to the Controller; two Hosts in one program share no table.  The BTP session of `orbit/ble` holds a `Host` beside the states of its test services |
-| `noble`, `host_api` | the Host API: the values an application holds (`Status`, `ConnId`, `Event`, `Request`, `ConnInfo`), the policy trait `HostPolicy` and the bond store `BondStore` with `RamBonds`, the calls that drive a `Host` without waiting (Layer A: `begin`, `poll`, `result`, `next_event`), and over them the `Adapter` that waits, the GAP and GATT calls, the trait `Service`, `plug` and `pump` (Layer B) |
+| `noble`, `host_api` | the Host API: the values an application holds (`Status`, `ConnId`, `Event`, `Request`, `ConnInfo`), the policy trait `HostPolicy` and the bond store `BondStore` with `RamBonds`, the calls that drive a `Host` without waiting (Layer A: `begin`, `poll`, `result`, `next_event`), and over them the `Adapter` that waits, the GAP and GATT calls, the trait `Service`, and its methods `plug`, `pump` and `serve` (Layer B) |
 | `links`, `le_link` | the registry of connection slots, the credit pool of the Controller's ACL buffers, and one LE link: its HCI events, its ACL data, and the dispatch of its L2CAP PDUs to ATT, SMP and the credit based channels |
 | `hci_session`, `hci_deframer`, `hci_transport`, `hci_uart`, `hci_usb_cdc`, `hci_init` | the pairing of a command with its answer, the H4 byte stream cut into packets, the `HciTransport` trait and its UART and USB CDC-ACM transports, and the builders of the start-up commands |
 | `att`, `att_server`, `att_scratch`, `att_server_scratch` | the ATT PDU codec, the ATT server, and the fixed-RAM scratch buffer and response builders the device images use |
@@ -118,7 +118,7 @@ the Host.  `step`, `run`, `start` and `wait_event(timeout_ms)` are the loop; `no
 | Connections | `connect`, `connect_listed`, `connect_cancel`, `disconnect`, `update_params`, `secure`, `conn_info`, `link_count`, and the channels `coc_listen`, `coc_open`, `coc_send`, `coc_close` |
 | GATT client | `exchange_mtu`, `discover(conn, service)`, `find_char`, `read`, `write`, `write_no_response`, `subscribe`, `unsubscribe`; `need` is the least security the link must have before a request is sent |
 | GATT server | `add_service`, `add_char`, `set_value`, `bind_function`, `bind_event`, `respond`, `notify`, `notify_all`, `indicate` |
-| Services | the trait `Service`; `plug(var ble, var services)` takes the product's list of `[dyn Service]`, `pump(var ble, wait_ms)` is one turn and `serve(var ble, wait_ms)` is the loop (it starts the Controller, asks `HostPolicy.on_start`, and turns `pump` while `keep_serving` is true); `ble.plug_module(var module)` attaches one service the product holds itself |
+| Services | the trait `Service`; `ble.plug(var services)` takes the product's list of `[dyn Service]`, `ble.pump(wait_ms)` is one turn and `ble.serve(wait_ms)` is the loop (it starts the Controller, asks `HostPolicy.on_start`, and turns `pump` while `keep_serving` is true); `ble.plug_module(var module)` attaches one service the product holds itself |
 
 Events: `Advert`, `Connected`, `Disconnected`, `Written` (a stored characteristic was written), `Subscribed(conn, attr, mode)` (a client
 wrote the configuration of a value), `Notification` (a notification or an indication of a peer, with a flag), `AttrRead` and `AttrWrite`
@@ -129,19 +129,18 @@ A characteristic is stored (the Host holds the bytes), bound to a function (`bin
 or `NOT_HANDLED`), or bound to an event (`bind_event`: the request is queued as `AttrRead` or `AttrWrite`, the Host holds it, and
 `respond` answers it within the ATT timeout of 30 seconds).  The security of the attribute is checked before either hook is called.
 
-A service is a plain struct that implements `Service` (`attach(var h: noble.Host) -> Int` adds its attributes and keeps its handles,
-and answers 0 or the code of the `Status` that stopped it; `on_event`, `tick`, `on_read` and `on_write` are optional).  A product makes
-a list of its services, `[dyn Service]`, once at start-up and gives it to `noble.plug(var ble, var services)`, which attaches each in
-order and records the first and last attribute handle it added (the owner table, `max_services` entries).  `noble.pump(var ble, wait_ms)`
+A service is a plain struct that implements `Service` (`attach(var h: noble.Host) -> noble.Status` adds its attributes and keeps its handles,
+and answers the `Status` that stopped it, or `ok()`; `on_event`, `tick`, `on_read` and `on_write` are optional).  A product makes
+a list of its services, `[dyn Service]`, once at start-up and gives it to `ble.plug(var services)`, which attaches each in
+order and records the first and last attribute handle it added (the owner table, `max_services` entries).  `ble.pump(wait_ms)`
 is one turn: an attribute event (`AttrRead`, `AttrWrite`, `Written`, `Subscribed`) goes to the one service whose handles hold it and is
 refused at once when none does; a link event (`Ready`, `Connected`, `Disconnected`, `ParamsUpdated`, `SecurityChanged`,
 `DatabaseChanged`) goes to every service; any other event goes to the services until one takes it; then every `tick` runs and what the
 services queued (`Out.Notify`, `NotifyAll`, `Respond`) is applied.  The access check has run before an attribute event exists, so a
-service sees only requests the client had the right to make.  `noble.serve(var ble, wait_ms)` does the start as well: it calls `start`,
+service sees only requests the client had the right to make.  `ble.serve(wait_ms)` does the start as well: it calls `start`,
 asks `HostPolicy.on_start` (an `Action.Advertise(...)` starts advertising), turns `pump` while `HostPolicy.keep_serving` answers true
 and answers the `Status` that ended it.  A product that has work of its own between turns calls `start` itself and writes the loop.
-`plug`, `pump` and `serve` are free functions and not methods of the Adapter until the compiler lane's fix for the capacity of a `Vec`
-in a method of a generic `impl` is in; `plug_module` is the method for one service that the product holds itself and routes by
+`plug`, `pump` and `serve` are methods of the Adapter; `plug_module` is the method for one service that the product holds itself and routes by
 `bind_function` (`pc/battery_product.nv`).
 
 ```novo

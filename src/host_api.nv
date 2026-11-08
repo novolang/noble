@@ -1043,7 +1043,7 @@ fn apply_action(var h: Host, act: Action, role: Role)
         Action.Reconnect(after_ms) =>
             if is_central(role) and h.api.last_valid
                 h.api.due_ms = h.clock_ms + after_ms
-        // `Advertise` is the answer of `on_start`, which the Adapter applies (`noble.serve`); at a link it is read as `Stay`.
+        // `Advertise` is the answer of `on_start`, which the Adapter applies (`Adapter.serve`); at a link it is read as `Stay`.
         Action.Advertise(set, params, data, scan_rsp) => ()
 
 // The Host disconnects a link it does not keep.

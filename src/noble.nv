@@ -1168,31 +1168,15 @@ pub struct Adapter<T: HciLink[e], P: HostPolicy[f], B: BondStore[g]>
     // The product's services (`plug`), and the first and last attribute handle each one added to the database: `pump` finds the
     // owner of an attribute event by its handle.  At most `noble_config.MAX_SERVICES` entries (the key `max_services`).
     var services: [dyn Service]
-    var owners: Owners
-
-// The first and last attribute handle each service of the list added.
-// workaround(a-module-qualified-capacity-of-a-vec-is-unknown-in-a-method-of-a-generic-impl): a struct of its own and not two
-// fields of the Adapter.  The capacity of a fixed-capacity `Vec` that a module-qualified constant names is not known in the layout
-// of the generic `Adapter` and in the methods of its `impl`, and the Adapter's cell came out 28 bytes with the two tables inside
-// it.  Once the compiler lane's fix is in, the two tables become fields of the Adapter.
-pub struct Owners
-    var first: Vec[u16; noble_config.MAX_SERVICES]
-    var last: Vec[u16; noble_config.MAX_SERVICES]
+    var owner_first: Vec[u16; noble_config.MAX_SERVICES]
+    var owner_last: Vec[u16; noble_config.MAX_SERVICES]
 
 // The Adapter of a transport, a policy and a bond store, with a Host that serves `MAX_CONNECTIONS` links and the Device Name
 // "noble".
 pub @tier(embedded)
 fn adapter<T: HciLink[e], P: HostPolicy[f], B: BondStore[g]>(io: T, policy: P, bonds: B) -> Adapter<T, P, B>
     Adapter { io: io, policy: policy, bonds: bonds, host: host_blank(host_config(noble_config.MAX_CONNECTIONS, ['n', 'o', 'b', 'l', 'e'])),
-        services: no_services(), owners: Owners { first: Vec.new(), last: Vec.new() } }
-
-// The empty list of services an Adapter starts with.
-// workaround (no filing of its own; the symptom is of the class of the capacity filing named at `Owners`): a plain function and not
-// a literal in the generic `adapter`, since a literal of a `dyn` element type inside a generic function is one more site where the
-// layout of a generic struct came out wrong in the prototype.
-@tier(embedded)
-fn no_services() -> [dyn Service]
-    []
+        services: [], owner_first: Vec.new(), owner_last: Vec.new() }
 
 impl Adapter
     // One turn of the Host at the current clock.
@@ -1245,15 +1229,6 @@ impl Adapter
                 return None
             self.io.park(park_for(timeout_ms - waited))
         None
-
-// Empty values of the two types, made where the capacity of the type is known (see the workaround above `impl Adapter`).
-@tier(embedded)
-fn new_value() -> Value
-    Vec.new()
-
-@tier(embedded)
-fn new_ad() -> AdData
-    Vec.new()
 
 @tier(embedded)
 fn park_for(remaining_ms: Int) -> Int
@@ -1314,32 +1289,18 @@ pub @tier(embedded)
 fn scan_passive() -> ScanParams
     ScanParams { active: false, extended: false, interval_ms: 100, window_ms: 50, duration_ms: 0 }
 
-// workaround(a-module-qualified-capacity-of-a-vec-is-unknown-in-a-method-of-a-generic-impl): inside a method of the generic
-// `impl Adapter`, a type whose capacity is a key of the configuration (`AdData`, `Value`: `Vec[u8; noble_config.X]`) has a capacity
-// the compiler does not know, and E2001 refuses to hand a value of it to `Request.AdvStart` or to a function of host_api, or to
-// index it.  The methods of this impl that take such a value are generic in its type (`data: V`; a call site passes an `AdData`
-// or a `Value` as before) and copy it into a value made by `new_ad` or `new_value`, free functions, where the capacity is known.
 impl Adapter
     // Start advertising set `set` (0 for the legacy set).  Legacy and extended advertising are one call: `p.extended` picks the
     // commands, and the Host never mixes the two.  A connection ends the advertising of a set; the policy decides whether it starts
     // again (`Action.Readvertise`).
     @tier(embedded)
-    fn adv_start<D>(var self, set: Int, p: AdvParams, data: D, scan_rsp: D) -> Status [e, f, g, async, time, mutate]
-        var d = new_ad()
-        for i in 0..data.len()
-            let _ = d.push(data[i])
-        var r = new_ad()
-        for i in 0..scan_rsp.len()
-            let _ = r.push(scan_rsp[i])
-        self.run(Request.AdvStart(set as u8, p, d, r), 2000)
+    fn adv_start(var self, set: Int, p: AdvParams, data: AdData, scan_rsp: AdData) -> Status [e, f, g, async, time, mutate]
+        self.run(Request.AdvStart(set as u8, p, data, scan_rsp), 2000)
 
     // Put a periodic advertising train on set `set`, with `data` as its data.
     @tier(embedded)
-    fn periodic_start<D>(var self, set: Int, interval_ms: Int, data: D) -> Status [e, f, g, async, time, mutate]
-        var d = new_ad()
-        for i in 0..data.len()
-            let _ = d.push(data[i])
-        self.run(Request.PeriodicStart(set as u8, interval_ms as u16, d), 2000)
+    fn periodic_start(var self, set: Int, interval_ms: Int, data: AdData) -> Status [e, f, g, async, time, mutate]
+        self.run(Request.PeriodicStart(set as u8, interval_ms as u16, data), 2000)
 
     @tier(embedded)
     fn adv_stop(var self, set: Int) -> Status [e, f, g, async, time, mutate]
@@ -1449,7 +1410,7 @@ impl Adapter
     // Read a value.  `need` is the least security the link must have before the request is sent: below it the call fails with
     // E_SECURITY_LOW and nothing leaves the device.  `Open` accepts any link.
     @tier(embedded)
-    fn read<V>(var self, conn: ConnId, a: Attr, need: Security, var out: V) -> Status [e, f, g, async, time, mutate]
+    fn read(var self, conn: ConnId, a: Attr, need: Security, var out: Value) -> Status [e, f, g, async, time, mutate]
         let s = self.run(Request.Read(conn, a, need), 30000)
         out.clear()
         let src = self.host.api.op.value
@@ -1458,18 +1419,12 @@ impl Adapter
         s
 
     @tier(embedded)
-    fn write<V>(var self, conn: ConnId, a: Attr, need: Security, var data: V) -> Status [e, f, g, async, time, mutate]
-        var d = new_value()
-        for i in 0..data.len()
-            let _ = d.push(data[i])
-        self.run(Request.Write(conn, a, need, d, true), 30000)
+    fn write(var self, conn: ConnId, a: Attr, need: Security, var data: Value) -> Status [e, f, g, async, time, mutate]
+        self.run(Request.Write(conn, a, need, data, true), 30000)
 
     @tier(embedded)
-    fn write_no_response<V>(var self, conn: ConnId, a: Attr, need: Security, var data: V) -> Status [e, f, g, async, time, mutate]
-        var d = new_value()
-        for i in 0..data.len()
-            let _ = d.push(data[i])
-        self.run(Request.Write(conn, a, need, d, false), 30000)
+    fn write_no_response(var self, conn: ConnId, a: Attr, need: Security, var data: Value) -> Status [e, f, g, async, time, mutate]
+        self.run(Request.Write(conn, a, need, data, false), 30000)
 
     // Write the characteristic's configuration descriptor.  Values arrive as `Event.Notification`.
     @tier(embedded)
@@ -1513,51 +1468,36 @@ impl Adapter
     // Answer the ATT request that `Event.AttrRead` or `AttrWrite` reported: `code` 0 with `v` as the value of a read, or the ATT
     // error code.  E_BUSY when no request is pending on `conn` for `attr`.
     @tier(embedded)
-    fn respond<V>(var self, conn: ConnId, attr: u16, code: Int, var v: V) -> Status [e, f, g, mutate]
-        var d = new_value()
-        for i in 0..v.len()
-            let _ = d.push(v[i])
-        host_api.respond(var self.host, conn, attr, code, d)
+    fn respond(var self, conn: ConnId, attr: u16, code: Int, var v: Value) -> Status [e, f, g, mutate]
+        host_api.respond(var self.host, conn, attr, code, v)
 
     // Set the value a read returns.
     @tier(embedded)
-    fn set_value<V>(var self, a: Attr, var v: V) -> Status [e, f, g, mutate]
-        var d = new_value()
-        for i in 0..v.len()
-            let _ = d.push(v[i])
-        self.host.set_value(a, d)
+    fn set_value(var self, a: Attr, var v: Value) -> Status [e, f, g, mutate]
+        self.host.set_value(a, v)
 
     // Send `v` as a notification to the client on `conn` if it subscribed; E_NOT_SUBSCRIBED if it did not, E_SECURITY_LOW if the
     // link is below `need`.
     @tier(embedded)
-    fn notify<V>(var self, conn: ConnId, a: Attr, need: Security, var v: V) -> Status [e, f, g, mutate]
-        var d = new_value()
-        for i in 0..v.len()
-            let _ = d.push(v[i])
-        host_api.notify(var self.host, conn, a, need, d)
+    fn notify(var self, conn: ConnId, a: Attr, need: Security, var v: Value) -> Status [e, f, g, mutate]
+        host_api.notify(var self.host, conn, a, need, v)
 
     // Send `v` to every connected client that subscribed to `a` and whose link is at `need` or above: the usual case for a sensor.
     // Answers how many were sent; a client below `need` is skipped and counted in neither.
     @tier(embedded)
-    fn notify_all<V>(var self, a: Attr, need: Security, var v: V) -> Int [e, f, g, mutate]
-        var d = new_value()
-        for i in 0..v.len()
-            let _ = d.push(v[i])
+    fn notify_all(var self, a: Attr, need: Security, var v: Value) -> Int [e, f, g, mutate]
         var n = 0
         for i in 0..self.host.api.conns.len()
             let k = self.host.api.conns[i]
             if k.live
-                if host_api.notify(var self.host, k.id, a, need, d).is_ok()
+                if host_api.notify(var self.host, k.id, a, need, v).is_ok()
                     n = n + 1
         n
 
     // Send `v` as an indication and wait for the client's confirmation.
     @tier(embedded)
-    fn indicate<V>(var self, conn: ConnId, a: Attr, var v: V) -> Status [e, f, g, async, time, mutate]
-        var d = new_value()
-        for i in 0..v.len()
-            let _ = d.push(v[i])
-        self.run(Request.Indicate(conn, a, d), 30000)
+    fn indicate(var self, conn: ConnId, a: Attr, var v: Value) -> Status [e, f, g, async, time, mutate]
+        self.run(Request.Indicate(conn, a, v), 30000)
 
 // ── Pairing, bonding and credit based channels ──────────────────────
 
@@ -1596,11 +1536,8 @@ impl Adapter
 
     // Queue one SDU; E_NO_ROOM while the peer's credits are used up.
     @tier(embedded)
-    fn coc_send<V>(var self, conn: ConnId, chan: Int, var sdu: V) -> Status [e, f, g, mutate]
-        var d = new_value()
-        for i in 0..sdu.len()
-            let _ = d.push(sdu[i])
-        host_api.coc_send(var self.host, conn, chan, d)
+    fn coc_send(var self, conn: ConnId, chan: Int, var sdu: Value) -> Status [e, f, g, mutate]
+        host_api.coc_send(var self.host, conn, chan, sdu)
 
     @tier(embedded)
     fn coc_close(var self, conn: ConnId, chan: Int) -> Status [e, f, g, async, time, mutate]
@@ -1624,11 +1561,8 @@ pub alias Outbox = Vec[Out; noble_config.OUTBOX]
 // `bind_function`, which the product's policy gives to the service whose index the Host passed, and answer NOT_HANDLED for an
 // attribute the service leaves to the product.
 pub trait Service[e]
-    // Answers 0, or the code of the `Status` that stopped it (`s.status.code as Int`).
-    // workaround(a-trait-method-that-answers-a-value-struct-crashes-when-called-through-a-trait-object): an `Int` and not a
-    // `Status`.  A trait method that answers a `@value` struct crashes when it is called through `dyn`, so the code travels and
-    // `plug` makes the `Status` again.  Once the compiler lane's fix is in, `attach` answers a `Status`.
-    fn attach(var self, var h: Host) -> Int [e, mutate]
+    // Answers the `Status` of adding the service's attributes to the Host's database; `ble.plug` stops at the first that fails.
+    fn attach(var self, var h: Host) -> Status [e, mutate]
 
     fn on_event(var self, ev: Event, var out: Outbox) -> Bool [e, mutate]
         false
@@ -1664,111 +1598,105 @@ fn reaches_all(ev: Event) -> Bool
         Event.DatabaseChanged(conn) => true
         _ => false
 
-// Install the product's services: `attach` each one in order, and keep the range of attribute handles it added, so that `pump`
-// can give an attribute event to its owner and to no other service.  The list is the product's, made once at start-up (a
-// `system` block in a program at the embedded tier); the Adapter keeps it.  A product writes `noble.plug(var ble, var svcs)`.
-// workaround(a-module-qualified-capacity-of-a-vec-is-unknown-in-a-method-of-a-generic-impl): a free function and not a method
-// `ble.plug(...)`, as `pump` and `serve` are.  In a method of the generic `impl Adapter` the capacity of the owner table is
-// unknown, and the `dyn` call of `attach` crashed.  Once the compiler lane's fix is in, `plug` is a method of the Adapter.
-pub @tier(embedded)
-fn plug<T: HciLink[e], P: HostPolicy[f], B: BondStore[g]>(var ble: Adapter<T, P, B>, var services: [dyn Service]) -> Status [e, f, g, hw, mutate]
-    if services.len() > noble_config.MAX_SERVICES
-        return failed(LAYER_LOCAL, E_NO_ROOM)
-    ble.services = services
-    for i in 0..ble.services.len()
-        let first = gatt_server.last_handle(ble.host.link.db) + 1
-        var svc = ble.services[i]
-        var h = ble.host
-        let code = svc.attach(var h)
-        if code != 0
-            return failed(LAYER_LOCAL, code)
-        // `Owners` is a reference, so the writes through `o` land in the Adapter's table.
-        var o = ble.owners
-        let _ = o.first.push(first as u16)
-        let _ = o.last.push(gatt_server.last_handle(ble.host.link.db) as u16)
-    ok()
+// The index in the list of the service whose attributes hold `attr`, -1 when none does (an attribute the product added outside
+// its services).
+@tier(embedded)
+fn owner_of(first: Vec[u16; noble_config.MAX_SERVICES], last: Vec[u16; noble_config.MAX_SERVICES], attr: u16) -> Int
+    for i in 0..first.len()
+        if attr >= first[i] and attr <= last[i]
+            return i
+    -1
 
 impl Adapter
+    // Install the product's services: `attach` each one in order, and keep the range of attribute handles it added, so that `pump`
+    // can give an attribute event to its owner and to no other service.  The list is the product's, made once at start-up (a
+    // `system` block in a program at the embedded tier); the Adapter keeps it.  A product writes `ble.plug(var services)`.  The row
+    // names `hw` since a service may use it: a call through `dyn` is charged with the row of every implementation (SPEC 3.7).
+    @tier(embedded)
+    fn plug(var self, var services: [dyn Service]) -> Status [e, f, g, hw, mutate]
+        if services.len() > noble_config.MAX_SERVICES
+            return failed(LAYER_LOCAL, E_NO_ROOM)
+        self.services = services
+        for i in 0..self.services.len()
+            let first = gatt_server.last_handle(self.host.link.db) + 1
+            var svc = self.services[i]
+            var h = self.host
+            let s = svc.attach(var h)
+            if not s.is_ok()
+                return s
+            let _ = self.owner_first.push(first as u16)
+            let _ = self.owner_last.push(gatt_server.last_handle(self.host.link.db) as u16)
+        ok()
+
     // Install one service module held by the product itself (program 7): its attribute events are not routed, the product's
     // policy serves them with `bind_function`.
     @tier(embedded)
     fn plug_module<S: Service[h]>(var self, var s: S) -> Status [h, mutate]
-        let code = s.attach(var self.host)
-        if code != 0
-            return failed(LAYER_LOCAL, code)
+        s.attach(var self.host)
+
+    // One turn of a program whose services are behind the pump: wait up to `wait_ms` for an event; give an attribute event to the
+    // service that owns the handle (the access check ran before the event existed, `gatt_server.access_error`), and refuse it at
+    // once when no service owns or takes it, so a client never waits for the ATT timeout; give a link event to every service in
+    // order, and any other event to the services until one takes it; run every `tick`; apply what they queued.  The row names
+    // what a service may do (`hw` among it), since a call through `dyn` is charged with the row of every implementation.  A
+    // product writes `ble.pump(100)`.
+    @tier(embedded)
+    fn pump(var self, wait_ms: Int) [e, f, g, hw, async, time, mutate]
+        var out: Outbox = Vec.new()
+        match self.wait_event(wait_ms)
+            Some(ev) =>
+                match attr_of(ev)
+                    Some(attr) =>
+                        let i = owner_of(self.owner_first, self.owner_last, attr)
+                        if i < 0
+                            refuse(ev, var out)
+                        else if not self.services[i].on_event(ev, var out)
+                            refuse(ev, var out)
+                    None =>
+                        let all = reaches_all(ev)
+                        for i in 0..self.services.len()
+                            if self.services[i].on_event(ev, var out) and not all
+                                break
+            None => ()
+        let now = self.now_ms()
+        for i in 0..self.services.len()
+            self.services[i].tick(now, var out)
+        for i in 0..out.len()
+            match out[i]
+                Out.Notify(conn, a, v) =>
+                    var w: Value = v
+                    let _ = self.notify(conn, a, Security.Open, var w)
+                Out.NotifyAll(a, v) =>
+                    var w: Value = v
+                    let _ = self.notify_all(a, Security.Open, var w)
+                Out.Respond(conn, attr, code, v) =>
+                    var w: Value = v
+                    let _ = self.respond(conn, attr, code, var w)
+
+    // Run the Host: `start` the Controller, ask `policy.on_start` and apply its answer (`Action.Advertise` starts advertising), then
+    // turn `pump(wait_ms)` for as long as `policy.keep_serving()` answers true, which is read once before each turn.  Answers the
+    // `Status` that ended it: the failure of the start or of the advertising it asked for, or `ok()` when the policy stopped it.
+    // For a product with no work of its own between turns; a product that has some calls `start` itself and writes the loop
+    // around `pump`.  A product writes `ble.serve(100)`.
+    @tier(embedded)
+    fn serve(var self, wait_ms: Int) -> Status [e, f, g, hw, async, time, mutate]
+        let started = self.start()
+        if not started.is_ok()
+            return started
+        // The policy is copied out and stored back: `on_start` takes `var self`, and a policy that is a `@value` struct is read out
+        // of the Adapter as a copy (SPEC 14.7).
+        var pol = self.policy
+        let first = pol.on_start()
+        self.policy = pol
+        match first
+            Action.Advertise(set, params, data, scan_rsp) =>
+                let advertising = self.adv_start(set as Int, params, data, scan_rsp)
+                if not advertising.is_ok()
+                    return advertising
+            _ => ()
+        while self.policy.keep_serving()
+            self.pump(wait_ms)
         ok()
-
-// The index in the list of the service whose attributes hold `attr`, -1 when none does (an attribute the product added outside
-// its services).
-@tier(embedded)
-fn owner_of(owners: Owners, attr: u16) -> Int
-    for i in 0..owners.first.len()
-        if attr >= owners.first[i] and attr <= owners.last[i]
-            return i
-    -1
-
-// One turn of a program whose services are behind the pump: wait up to `wait_ms` for an event; give an attribute event to the
-// service that owns the handle (the access check ran before the event existed, `gatt_server.access_error`), and refuse it at
-// once when no service owns or takes it, so a client never waits for the ATT timeout; give a link event to every service in
-// order, and any other event to the services until one takes it; run every `tick`; apply what they queued.  The row names what
-// a service may do, since the checker does not read it from the list.  A product writes `noble.pump(var ble, 100)`.
-// workaround(a-module-qualified-capacity-of-a-vec-is-unknown-in-a-method-of-a-generic-impl): a free function and not a method
-// `ble.pump(...)`.  In a method of the generic `impl Adapter` the capacity of `Outbox` is unknown and the Adapter's own `notify`
-// is not found.  Once the compiler lane's fix is in, `pump` is a method of the Adapter.
-pub @tier(embedded)
-fn pump<T: HciLink[e], P: HostPolicy[f], B: BondStore[g]>(var ble: Adapter<T, P, B>, wait_ms: Int) [e, f, g, hw, async, time, mutate]
-    var out: Outbox = Vec.new()
-    match ble.wait_event(wait_ms)
-        Some(ev) =>
-            match attr_of(ev)
-                Some(attr) =>
-                    let i = owner_of(ble.owners, attr)
-                    if i < 0
-                        refuse(ev, var out)
-                    else if not ble.services[i].on_event(ev, var out)
-                        refuse(ev, var out)
-                None =>
-                    let all = reaches_all(ev)
-                    for i in 0..ble.services.len()
-                        if ble.services[i].on_event(ev, var out) and not all
-                            break
-        None => ()
-    let now = ble.now_ms()
-    for i in 0..ble.services.len()
-        ble.services[i].tick(now, var out)
-    for i in 0..out.len()
-        match out[i]
-            Out.Notify(conn, a, v) =>
-                let _ = ble.notify(conn, a, Security.Open, v)
-            Out.NotifyAll(a, v) =>
-                let _ = ble.notify_all(a, Security.Open, v)
-            Out.Respond(conn, attr, code, v) =>
-                let _ = ble.respond(conn, attr, code, v)
-
-// Run the Host: `start` the Controller, ask `policy.on_start` and apply its answer (`Action.Advertise` starts advertising), then
-// turn `pump(var ble, wait_ms)` for as long as `policy.keep_serving()` answers true, which is read once before each turn.  Answers
-// the `Status` that ended it: the failure of the start or of the advertising it asked for, or `ok()` when the policy stopped it.
-// For a product with no work of its own between turns; a product that has some calls `start` itself and writes the loop around
-// `pump`.  Same shape as `pump`, and a free function for the same reason (see `pump`).
-pub @tier(embedded)
-fn serve<T: HciLink[e], P: HostPolicy[f], B: BondStore[g]>(var ble: Adapter<T, P, B>, wait_ms: Int) -> Status [e, f, g, hw, async, time, mutate]
-    let started = ble.start()
-    if not started.is_ok()
-        return started
-    // The policy is copied out and stored back: `on_start` takes `var self`, and a policy that is a `@value` struct is read out of the
-    // Adapter as a copy (SPEC 14.7).
-    var pol = ble.policy
-    let first = pol.on_start()
-    ble.policy = pol
-    match first
-        Action.Advertise(set, params, data, scan_rsp) =>
-            let advertising = ble.adv_start(set as Int, params, data, scan_rsp)
-            if not advertising.is_ok()
-                return advertising
-        _ => ()
-    while ble.policy.keep_serving()
-        pump(var ble, wait_ms)
-    ok()
 
 // The refusal of an attribute request that no service took.
 @tier(embedded)

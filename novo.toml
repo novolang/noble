@@ -342,7 +342,7 @@ doc     = "requests queued per client bearer"
 type    = "int"
 default = 256
 min     = 0
-max     = 512
+max     = 2048
 unit    = "bytes"
 doc     = "octets of the value buffer and of the payload buffer of a client bearer"
 

@@ -173,9 +173,8 @@ held; extended scanning (`ScanParams.extended`) is refused with `E_BAD_ARGUMENT`
 periodic advertising reports are not delivered; the GATT state of a bond (`BondStore.load_server`, `load_cache`) is not used, so a
 discovery cache and a client's subscriptions do not outlive the link; the descriptors a discovery finds are those of the characteristics
 that notify or indicate.  The transports `UartHci` (H4 over `hal.uart`) and the PC socket of `noble-examples` carry `now_ms` and
-`park`; the USB CDC-ACM and in-RAM transports keep the defaults (the system tick and a yield).  The sketch's `uart_adapter()` is not in
-the package (a build bug, `bugs/codegen-llvm/a-generic-struct-made-by-a-plain-function-never-used-calls-a-generic-of-another-module-that-has-no-specialisation.md`);
-a program writes `noble.adapter(noble.uart_hci(), ...)`.
+`park`; the USB CDC-ACM and in-RAM transports keep the defaults (the system tick and a yield).  `noble.uart_adapter()` makes an Adapter over
+`UartHci` with the default policy and RAM bonds.
 
 The sizes of the tables are keys of the package configuration.  A consumer
 writes a `[noble]` section in its config file (`max_connections`,

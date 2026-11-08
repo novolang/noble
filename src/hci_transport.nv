@@ -98,7 +98,7 @@ trait HciTransport
 // milliseconds and `park` gives up the processor until a packet may have
 // arrived or `ms` have passed.  Both have a default, so an impl that has
 // nothing better keeps the system tick and a yield; a link with an interrupt on
-// receive parks the task on a wake cell in `park`, and a simulated link
+// receive parks the task on its waker in `park`, and a simulated link
 // answers `now_ms` with a virtual clock that its test advances.
 
 trait HciLink[e]

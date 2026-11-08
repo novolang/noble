@@ -1744,12 +1744,10 @@ impl HciLink[hw, mutate] for UartHci
             Some(pkt) => Some(pkt[:])
             None => None
 
-// workaround(a-generic-struct-made-by-a-plain-function-never-used-calls-a-generic-of-another-module-that-has-no-specialisation): the
-// sketch's `uart_adapter()`, the Adapter over `UartHci` with the default policy and RAM bonds, is a plain function that builds an
-// `Adapter<UartHci, DefaultPolicy, RamBonds>`.  In a package no program calls it from, the build stops with "use of undefined value
-// '@novo_user_host_api.poll'", because the `step` of that instantiation calls the generic `host_api.poll` and no specialisation of it
-// is emitted.  A program writes `adapter(uart_hci(), DefaultPolicy { placeholder: 0 }, RamBonds { rows: Vec.new() })`, as the
-// programs of orbit/noble-examples/device do.
+// An Adapter over the UART transport with the default policy and RAM bonds: what the first program of a project starts from.
+pub @tier(embedded)
+fn uart_adapter() -> Adapter<UartHci, DefaultPolicy, RamBonds>
+    adapter(uart_hci(), DefaultPolicy { placeholder: 0 }, RamBonds { rows: Vec.new() })
 
 // The Host, as the sketch spells it: a program or a service module that takes the Host names it `noble.Host`.
 pub alias Host = host.Host

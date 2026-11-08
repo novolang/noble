@@ -75,6 +75,9 @@ use smp_responder
 // Packets one `poll` takes from the transport before it returns.
 const RECEIVE_BUDGET = 8
 
+// The HCI event packets kept for the roles between two turns of the pump (`Api.raw_in`).
+const RAW_QUEUE = 16
+
 // The default ATT_MTU of an LE bearer ([Vol 3] Part F, Section 3.2.8).
 const DEFAULT_MTU = 23
 
@@ -770,6 +773,10 @@ fn on_packet<P: HostPolicy[f], B: BondStore[g]>(var h: Host, pkt: [u8], var p: P
     if kind == hci_frame.H4_PKT_ACL
         on_acl(var h, pkt, var p, var b)
     else if kind == hci_frame.H4_PKT_EVENT
+        // A role has begun: keep the packet for the services (`Service.on_hci`) as well as reading it.  The queue is bounded; the
+        // newest packet is the one dropped when it is full.
+        if h.api.tap and list.len(h.api.raw_in) < RAW_QUEUE
+            list.push(h.api.raw_in, pkt[:])
         on_event(var h, pkt[1:], var p, var b)
 
 fn on_event<P: HostPolicy[f], B: BondStore[g]>(var h: Host, evt: [u8], var p: P, var b: B) [f, g, mutate]
@@ -1043,8 +1050,9 @@ fn apply_action(var h: Host, act: Action, role: Role)
         Action.Reconnect(after_ms) =>
             if is_central(role) and h.api.last_valid
                 h.api.due_ms = h.clock_ms + after_ms
-        // `Advertise` is the answer of `on_start`, which the Adapter applies (`Adapter.serve`); at a link it is read as `Stay`.
+        // `Advertise` and `Begin` are the answers of `on_start`, which the Adapter applies (`Adapter.serve`); at a link they are read as `Stay`.
         Action.Advertise(set, params, data, scan_rsp) => ()
+        Action.Begin(index) => ()
 
 // The Host disconnects a link it does not keep.
 fn refuse_link(var h: Host, handle: Int, reason: Int)

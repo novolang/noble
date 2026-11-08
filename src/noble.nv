@@ -403,7 +403,9 @@ pub const NOT_HANDLED = -3
 
 // What the Host does at a decision point of the policy: after the Controller started (`on_start`), and after a link was made or
 // ended.  Advertise starts the advertising set `set` with the parameters and the data it carries, the arguments of `adv_start`; it
-// is read at `on_start` only, and any other point reads it as Stay.  Readvertise repeats the last `adv_start` (Peripheral);
+// is read at `on_start` only, and any other point reads it as Stay.  Begin(index) starts the role that is the `index`-th element of the
+// list given to `plug`, a service that owns no attributes (the Broadcast Source): `serve` calls its `begin`; like Advertise it is read
+// at `on_start` only.  Readvertise repeats the last `adv_start` (Peripheral);
 // Reconnect repeats the last `connect` or `connect_listed` (Central) after `after_ms`, so a product sets the backoff and a peer
 // that is switched off is not asked at once and for ever; Stay does nothing.
 // Advertise holds two `AdData` (`max_adv_data` octets each, 31 by default) and the parameters, so a value of `Action` takes about
@@ -415,6 +417,7 @@ enum Action
     AdvertiseNonConnectable
     Reconnect(after_ms: Int)
     Advertise(set: u8, params: AdvParams, data: AdData, scan_rsp: AdData)
+    Begin(index: Int)
 
 // The decisions of the product, one method each, every one with a default, so a product writes the ones it takes.  The trait is
 // open to more hooks: a hook added later has a default too, and a policy that does not write it is not changed.
@@ -517,7 +520,8 @@ pub trait HostPolicy[e]
         let _ = st
 
     // What the device does once the Controller is up: `serve` asks it once, after `start` answered, and applies the answer.
-    // `Action.Advertise(...)` starts advertising; every other answer is read as `Action.Stay`.
+    // `Action.Advertise(...)` starts advertising and `Action.Begin(index)` starts the role at `index` of the plugged list; every other
+    // answer is read as `Action.Stay`.
     fn on_start(var self) -> Action [e]
         Action.Stay
 
@@ -951,6 +955,11 @@ pub struct Api
     var pend_attr: Vec[Int; limits.LINK_SLOTS]
     var pend_off: Vec[Int; limits.LINK_SLOTS]
     var pend_ms: Vec[Int; limits.LINK_SLOTS]
+    // Roles.  `tap` is set when a role begins (`Adapter.begin`): from then on `on_packet` keeps a copy of every HCI event packet in
+    // `raw_in` (at most RAW_QUEUE of them; a full queue drops the newest), which `pump` hands to the services' `on_hci`.  Off, a Host
+    // keeps none.
+    var tap: Bool
+    var raw_in: [[u8]]
 
 pub @tier(embedded)
 fn blank_addr() -> Addr
@@ -988,7 +997,8 @@ pub fn api_new(max_links: Int) -> Api
         adv_data: Vec.new(), adv_rsp: Vec.new(), adv_interval: 0, adv_again: 0, internal: false,
         scan_f: scan_all(), scan_p: scan_passive(), scan_on: false, sync_handle: -1, r_sid: 0, r_skip: 0, r_timeout: 0,
         r_attr: Attr { handle: 0, props: 0, cccd: 0 }, r_data: Vec.new(), r_svc: uuid16(0), r_mode: 0, r_response: true,
-        r_cursor: 0, r_phase: 0, svc_count: 0, pend: pend, pend_attr: pend_attr, pend_off: pend_off, pend_ms: pend_ms }
+        r_cursor: 0, r_phase: 0, svc_count: 0, pend: pend, pend_attr: pend_attr, pend_off: pend_off, pend_ms: pend_ms,
+        tap: false, raw_in: [] }
 
 // Whether `ev` reports the state of a connection or a pairing: such an event is
 // never dropped, because one slot per connection is kept for it.
@@ -1570,6 +1580,25 @@ pub trait Service[e]
     fn tick(var self, now_ms: Int, var out: Outbox) [e, mutate]
         let _ = now_ms
 
+    // A service that owns no attributes is a role (the Broadcast Source): `attach` answers `ok()` and adds nothing, and the product
+    // starts the role with `Action.Begin(index)` from `HostPolicy.on_start`, or with `ble.begin(index)`.  `begin` receives the Host
+    // (its own address, for one) and the clock; the role's first packets are what `take_hci` hands out next.
+    fn begin(var self, h: Host, now_ms: Int, var out: Outbox) -> Status [e, mutate]
+        let _ = now_ms
+        ok()
+
+    // Every HCI event packet the Controller sent (packet indicator first), offered to every service after the Host has read it, once a
+    // role has begun; none before.  A role finds the answers to its own commands here, and the events of its streams.
+    fn on_hci(var self, pkt: [u8], var out: Outbox) [e, mutate]
+        let _ = pkt
+
+    // The next HCI packet the service owes the Controller, packet indicator first (a command, or an ISO Data packet); an empty list for
+    // none.  Once a role has begun the Adapter asks every service after `begin`, after each `on_hci` and after each `tick`, until the
+    // answer is empty, and writes each packet to the transport as it stands.  The Host does not look at them, so the role keeps to its
+    // own commands and sends them while no call of the Host is in flight.  A packet has no bound but the transport's.
+    fn take_hci(var self) -> [u8] [e, mutate]
+        []
+
     fn on_read(var self, conn: ConnId, attr: u16, var out: Value) -> Int [e, mutate]
         NOT_HANDLED
 
@@ -1637,7 +1666,8 @@ impl Adapter
     // One turn of a program whose services are behind the pump: wait up to `wait_ms` for an event; give an attribute event to the
     // service that owns the handle (the access check ran before the event existed, `gatt_server.access_error`), and refuse it at
     // once when no service owns or takes it, so a client never waits for the ATT timeout; give a link event to every service in
-    // order, and any other event to the services until one takes it; run every `tick`; apply what they queued.  The row names
+    // order, and any other event to the services until one takes it; when a role has begun, give each HCI event packet the Host read to
+    // every service (`on_hci`); run every `tick`; apply what they queued and write the HCI packets they owe (`take_hci`).  The row names
     // what a service may do (`hw` among it), since a call through `dyn` is charged with the row of every implementation.  A
     // product writes `ble.pump(100)`.
     @tier(embedded)
@@ -1658,9 +1688,24 @@ impl Adapter
                             if self.services[i].on_event(ev, var out) and not all
                                 break
             None => ()
+        // The packets of the Controller that the roles read, then the services' ticks, each followed by what they queued.
+        let raw = self.host.api.raw_in
+        self.host.api.raw_in = []
+        for k in 0..raw.len()
+            for i in 0..self.services.len()
+                self.services[i].on_hci(raw[k], var out)
+            self.apply(var out)
+            out = Vec.new()
+            self.drain_hci()
         let now = self.now_ms()
         for i in 0..self.services.len()
             self.services[i].tick(now, var out)
+        self.apply(var out)
+        self.drain_hci()
+
+    // Do what the services queued: notify, answer a request.
+    @tier(embedded)
+    fn apply(var self, var out: Outbox) [e, f, g, hw, async, time, mutate]
         for i in 0..out.len()
             match out[i]
                 Out.Notify(conn, a, v) =>
@@ -1672,6 +1717,34 @@ impl Adapter
                 Out.Respond(conn, attr, code, v) =>
                     var w: Value = v
                     let _ = self.respond(conn, attr, code, var w)
+
+    // Start the role that is element `index` of the list given to `plug`: from now on the Host keeps the HCI event packets for the
+    // services (`on_hci`), and the role's `begin` runs with the Host and the clock.  Answers the `Status` of `begin`, or
+    // `E_BAD_ARGUMENT` for an index outside the list.  A product reaches it through `Action.Begin` in `on_start`, or calls it after
+    // `start`.
+    @tier(embedded)
+    fn begin(var self, index: Int) -> Status [e, f, g, hw, async, time, mutate]
+        if index < 0 or index >= self.services.len()
+            return failed(LAYER_LOCAL, E_BAD_ARGUMENT)
+        self.host.api.tap = true
+        var out: Outbox = Vec.new()
+        let now = self.io.now_ms()
+        let began = self.services[index].begin(self.host, now, var out)
+        self.apply(var out)
+        self.drain_hci()
+        began
+
+    // Write what the services owe the Controller as HCI packets (`Service.take_hci`); nothing while no role has begun.
+    @tier(embedded)
+    fn drain_hci(var self) [e, f, g, hw, mutate]
+        if not self.host.api.tap
+            return
+        for i in 0..self.services.len()
+            while true
+                let pkt = self.services[i].take_hci()
+                if list.len(pkt) == 0
+                    break
+                let _ = self.io.send_packet(pkt)
 
     // Run the Host: `start` the Controller, ask `policy.on_start` and apply its answer (`Action.Advertise` starts advertising), then
     // turn `pump(wait_ms)` for as long as `policy.keep_serving()` answers true, which is read once before each turn.  Answers the
@@ -1693,6 +1766,10 @@ impl Adapter
                 let advertising = self.adv_start(set as Int, params, data, scan_rsp)
                 if not advertising.is_ok()
                     return advertising
+            Action.Begin(index) =>
+                let began = self.begin(index)
+                if not began.is_ok()
+                    return began
             _ => ()
         while self.policy.keep_serving()
             self.pump(wait_ms)

@@ -319,6 +319,7 @@ struct TestPolicy
     var writes: Int
     var write_svc: Int
     var start_adv: Bool
+    var start_begin: Int
     var start_asked: Int
     var stop: Bool
 
@@ -329,7 +330,7 @@ fn test_policy() -> TestPolicy
         pairing_level: 0, pairing_bonding: false, shown: -1, compared: -1, disconnected: 0, disc_attempts: -1,
         disc_reason: 0, connected: 0, connected_links: 0, done: 0, done_ok: false, done_bonded: false, adverts: 0,
         keep_adverts: true, read_code: 0, read_byte: 0, reads: 0, read_svc: -1, write_code: 0, wrote: -1, writes: 0, write_svc: -1,
-        start_adv: false, start_asked: 0, stop: false }
+        start_adv: false, start_begin: -1, start_asked: 0, stop: false }
 
 fn role_is_central(r: Role) -> Bool
     match r
@@ -397,9 +398,12 @@ impl HostPolicy[] for TestPolicy
         else
             Action.Stay
 
-    // The advertising the policy asks for once the Controller is up, when `start_adv` is set: flags and the name "t".
+    // The advertising the policy asks for once the Controller is up, when `start_adv` is set: flags and the name "t".  When
+    // `start_begin` is not negative it asks for the role at that index of the list.
     fn on_start(var self) -> Action
         self.start_asked = self.start_asked + 1
+        if self.start_begin >= 0
+            return Action.Begin(self.start_begin)
         if not self.start_adv
             return Action.Stay
         var data: noble.AdData = Vec.new()
@@ -2207,6 +2211,184 @@ fn test_serve_answers_the_status_of_a_start_that_failed_and_does_not_ask_on_star
     test.assert(ble.serve(50).is(noble.LAYER_LOCAL, noble.E_TIMEOUT))
     test.assert_eq(pol.start_asked, 0)
     test.assert_eq(stopper.ticks, 0)
+
+// ── Roles: services that own no attributes ──────────────────────────
+
+// A command packet with `params` zero octets of parameters, packet indicator first, for the opcode `opcode`.
+fn role_command(opcode: Int, params: Int) -> [u8]
+    var v: [u8] = [1, (opcode & 255) as u8, (opcode >>> 8) as u8, params as u8]
+    for _ in 0..params
+        list.push(v, 0)
+    v
+
+// A role: `begin` owes the Controller LE Set Event Mask, and the Command Complete that answers it makes the role owe LE Set Random Address.
+// It counts the packets it was offered and the Command Completes among them, and `refuse` makes `begin` fail with E_REFUSED.  `owed`
+// holds what `take_hci` hands out; `long` makes the first packet 300 octets, longer than any `Value`.
+struct Probe
+    var began: Int
+    var begin_ms: Int
+    var refuse: Bool
+    var hci_seen: Int
+    var completes: Int
+    var ticks: Int
+    var owed: [[u8]]
+    var long: Bool
+
+fn probe() -> Probe
+    Probe { began: 0, begin_ms: -1, refuse: false, hci_seen: 0, completes: 0, ticks: 0, owed: [], long: false }
+
+impl noble.Service[] for Probe
+    fn attach(var self, var h: Host) -> Status
+        noble.ok()
+
+    fn begin(var self, h: Host, now_ms: Int, var out: noble.Outbox) -> Status
+        self.began = self.began + 1
+        self.begin_ms = now_ms
+        if self.refuse
+            return noble.failed(noble.LAYER_LOCAL, noble.E_REFUSED)
+        let params = if self.long then 296 else 8
+        list.push(self.owed, role_command(hci_commands.opcode_le_set_event_mask(), params))
+        noble.ok()
+
+    fn on_hci(var self, pkt: [u8], var out: noble.Outbox)
+        self.hci_seen = self.hci_seen + 1
+        if list.len(pkt) >= 6 and (pkt[1] as Int) == 0x0E
+            self.completes = self.completes + 1
+            if ((pkt[4] as Int) | ((pkt[5] as Int) << 8)) == hci_commands.opcode_le_set_event_mask()
+                list.push(self.owed, role_command(hci_commands.opcode_le_set_random_address(), 6))
+
+    fn tick(var self, now_ms: Int, var out: noble.Outbox)
+        self.ticks = self.ticks + 1
+
+    fn take_hci(var self) -> [u8]
+        if list.len(self.owed) == 0
+            return []
+        let pkt = self.owed[0]
+        self.owed = self.owed[1:]
+        pkt
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_role_adds_no_attributes_and_the_services_around_it_keep_their_ranges()
+    var ble = new_ble()
+    let r = probe()
+    let a = switch_service(0xFFA0)
+    var svcs: [dyn Service] = [r, a]
+    test.assert(ble.plug(var svcs).is_ok())
+    // The role's range is empty (first above last), and the next service's range is the first one in the database after the GAP's.
+    test.assert(ble.owner_first[0] > ble.owner_last[0])
+    test.assert(ble.owner_first[1] <= a.attr.handle and a.attr.handle <= ble.owner_last[1])
+    test.assert_eq(a.svc, 0)
+    test.assert_eq(r.began, 0)
+    // An attribute write reaches the service that owns it and the role sees no attribute event.
+    let _ = peripheral_up(var ble)
+    list.push(ble.io.inbox, att_packet(0x41, write_request(a.attr.handle, 1)))
+    ble.pump(50)
+    test.assert_eq(a.seen, 1)
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_no_packet_is_offered_to_a_service_before_a_role_begins()
+    var ble = new_ble()
+    let r = probe()
+    var svcs: [dyn Service] = [r]
+    test.assert(ble.plug(var svcs).is_ok())
+    test.assert(ble.start().is_ok())
+    list.push(ble.io.inbox, connection_complete(0, 0x41, 1, peer_octets(0x31)))
+    ble.pump(50)
+    ble.pump(50)
+    test.assert_eq(r.hci_seen, 0)
+    test.assert_eq(list.len(ble.host.api.raw_in), 0)
+    test.assert(not ble.host.api.tap)
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_on_start_answering_begin_runs_the_role_and_its_packets_reach_the_controller_and_back()
+    var pol = test_policy()
+    pol.start_begin = 1
+    var ble = ble_with(pol)
+    let a = switch_service(0xFFA0)
+    let r = probe()
+    let stopper = Stopper { pol: pol, after: 6, ticks: 0 }
+    var svcs: [dyn Service] = [a, r, stopper]
+    test.assert(ble.plug(var svcs).is_ok())
+    test.assert(ble.serve(50).is_ok())
+    // `begin` ran once, on the second element, with the clock.
+    test.assert_eq(r.began, 1)
+    test.assert(r.begin_ms > 0)
+    test.assert(a.ticks >= 1)
+    // The command it queued reached the Controller (LE Set Event Mask is sent twice: once by the start, once by the role); the Command
+    // Complete came back through `on_hci`, and the answer to it, a second command, reached the Controller too.
+    test.assert_eq(times_sent(ble.io, hci_commands.opcode_le_set_event_mask()), 2)
+    test.assert_eq(times_sent(ble.io, hci_commands.opcode_le_set_random_address()), 1)
+    test.assert(r.completes >= 2)
+    test.assert(r.hci_seen >= r.completes)
+    // The Host keeps the packets from the moment the role begins, and the policy was asked once.
+    test.assert(ble.host.api.tap)
+    test.assert_eq(pol.start_asked, 1)
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_role_that_refuses_to_begin_ends_serve_with_its_status_and_an_index_outside_the_list_is_a_bad_argument()
+    var pol = test_policy()
+    pol.start_begin = 0
+    var ble = ble_with(pol)
+    var r = probe()
+    r.refuse = true
+    var svcs: [dyn Service] = [r]
+    test.assert(ble.plug(var svcs).is_ok())
+    test.assert(ble.serve(50).is(noble.LAYER_LOCAL, noble.E_REFUSED))
+    test.assert_eq(r.began, 1)
+    // The policy asks for an element the list does not have.
+    var pol2 = test_policy()
+    pol2.start_begin = 3
+    var ble2 = ble_with(pol2)
+    var svcs2: [dyn Service] = [probe()]
+    test.assert(ble2.plug(var svcs2).is_ok())
+    test.assert(ble2.serve(50).is(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
+    test.assert(ble2.begin(-1).is(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_the_packets_kept_for_the_roles_are_bounded_and_a_pump_hands_them_all_over()
+    var ble = new_ble()
+    let r = probe()
+    var svcs: [dyn Service] = [r]
+    test.assert(ble.plug(var svcs).is_ok())
+    test.assert(ble.start().is_ok())
+    // Begin by hand, as a product that calls `begin` after `start` does; the role's command is written at once.
+    test.assert(ble.begin(0).is_ok())
+    test.assert(times_sent(ble.io, hci_commands.opcode_le_set_event_mask()) >= 2)
+    // Thirty event packets arrive between two turns of the pump: the Host reads eight a poll, and keeps sixteen.
+    for k in 0..30
+        list.push(ble.io.inbox, event_packet(0x13, [0, 0]))
+    for _ in 0..4
+        ble.step()
+    test.assert_eq(list.len(ble.host.api.raw_in), 16)
+    let before = r.hci_seen
+    ble.pump(0)
+    test.assert(r.hci_seen >= before + 16)
+    test.assert(list.len(ble.host.api.raw_in) <= 8)
+
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_packet_a_role_owes_has_no_bound_but_the_transports_and_goes_out_in_order()
+    var ble = new_ble()
+    var r = probe()
+    r.long = true
+    var svcs: [dyn Service] = [r]
+    test.assert(ble.plug(var svcs).is_ok())
+    test.assert(ble.start().is_ok())
+    test.assert(ble.begin(0).is_ok())
+    // The 300-octet command of `begin` (a `Value` holds 64 by default) is written whole, then, after its Command Complete is read, the
+    // second command.
+    var at = -1
+    for k in 0..list.len(ble.io.cmdlog)
+        if (ble.io.cmdlog[k][1] as Int) == 0x01 and (ble.io.cmdlog[k][2] as Int) == 0x20 and list.len(ble.io.cmdlog[k]) == 300
+            at = k
+    test.assert(at >= 0)
+    ble.pump(0)
+    test.assert_eq(times_sent(ble.io, hci_commands.opcode_le_set_random_address()), 1)
 
 // ── The GATT client over a server of the link ───────────────────────
 

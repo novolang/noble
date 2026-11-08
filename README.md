@@ -86,7 +86,7 @@ use noble
 
 // Connect to `peer` and poll the Host until the call ends or 100 turns have passed.  A product that
 // owns its loop does the same between its other work; the clock is the argument of `poll`.
-fn connect_to<T: HciLink[e]>(var h: host.Host, var t: T, var p: noble.DefaultPolicy, var b: noble.RamBonds, peer: noble.Addr) -> noble.Status [e, mutate]
+fn connect_to<T: HciLink[e]>(var h: noble.Host, var t: T, var p: noble.DefaultPolicy, var b: noble.RamBonds, peer: noble.Addr) -> noble.Status [e, mutate]
     let started = host_api.begin(var h, noble.Request.Connect(peer, noble.conn_params_default()))
     if not started.is_ok()
         return started
@@ -129,7 +129,7 @@ A characteristic is stored (the Host holds the bytes), bound to a function (`bin
 or `NOT_HANDLED`), or bound to an event (`bind_event`: the request is queued as `AttrRead` or `AttrWrite`, the Host holds it, and
 `respond` answers it within the ATT timeout of 30 seconds).  The security of the attribute is checked before either hook is called.
 
-A service is a module: a value that implements `Service` (`attach(var h: host.Host)` adds its attributes and keeps its handles;
+A service is a module: a value that implements `Service` (`attach(var h: noble.Host)` adds its attributes and keeps its handles;
 `on_event`, `tick`, `on_read` and `on_write` are optional).  `ble.plug(var module)` attaches one.  A program with a pump gives every
 event to `pump`, which offers it to the services, refuses an attribute request no service took, runs their `tick` and applies what they
 queued (`Out.Notify`, `NotifyAll`, `Respond`).  **Question 29 of planning/NOBLE-HOST-API-SKETCH.md (attribute requests as events and the

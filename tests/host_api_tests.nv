@@ -134,7 +134,11 @@ fn answer(var l: ScriptLink, opcode: Int, params: [u8])
         list.push(l.inbox, complete(opcode, ok_status, [l.seed as u8, 2, 3, 4, 5, 6, 7, 8]))
         l.seed = l.seed + 1
     else if opcode == hci_commands.opcode_read_bd_addr()
-        list.push(l.inbox, complete(opcode, ok_status, [l.addr as u8, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6]))
+        // `addr` below zero is a Controller with no public address, as the SoftDevice Controller reads.
+        if l.addr < 0
+            list.push(l.inbox, complete(opcode, ok_status, [0, 0, 0, 0, 0, 0]))
+        else
+            list.push(l.inbox, complete(opcode, ok_status, [l.addr as u8, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6]))
     else if opcode == hci_commands.opcode_le_create_connection()
         list.push(l.inbox, status_event(opcode, ok_status))
         // The peer address is at octets 6 to 11 of the command.
@@ -226,13 +230,9 @@ fn call<P: HostPolicy[f], B: BondStore[g]>(var h: Host, var l: ScriptLink, var p
 fn started<P: HostPolicy[f], B: BondStore[g]>(var h: Host, var l: ScriptLink, var p: P, var b: B) [f, g, mutate]
     let st = call(var h, var l, var p, var b, Request.Start)
     test.assert(st.is_ok())
-    // workaround(a-variant-pattern-inside-some-does-not-match-an-optional-value-enum): the event is matched
-    // in two levels, `Some(e)` and then `match e`, in every case of this file.
     match host_api.next_event(var h)
-        Some(e) =>
-            match e
-                Ready => ()
-                _ => test.fail("Ready is queued when the Host has started")
+        Some(Event.Ready) => ()
+        Some(_) => test.fail("Ready is queued when the Host has started")
         None => test.fail("Ready is queued when the Host has started")
 
 fn peer_addr(n: Int) -> Addr
@@ -255,6 +255,31 @@ fn test_start_brings_the_controller_up_and_queues_ready()
     test.assert_eq(list.len(l.commands), 7)
     test.assert(h.security.ready)
     test.assert_eq(h.own_address[0] as Int, 0xA1)
+
+// A Controller with no public address (Read BD_ADDR answers six zero octets, as the SoftDevice Controller does on the bench, where the
+// first run of ble_scan found the Controller refusing LE Set Scan Enable with Invalid HCI Command Parameters): the Host draws a
+// third random number, makes a static random address of it, sends LE Set Random Address and uses the random type from then on.
+@when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
+@test
+fn test_start_takes_a_static_random_address_when_the_controller_has_no_public_one()
+    var h = new_host(2)
+    var l = script_link()
+    l.addr = -1
+    var p = DefaultPolicy { placeholder: 0 }
+    var b = RamBonds { rows: Vec.new() }
+    started(var h, var l, var p, var b)
+    test.assert(h.api.ready)
+    test.assert_eq(list.len(l.commands), 9)
+    test.assert_eq(l.commands[7], hci_commands.opcode_le_rand())
+    test.assert_eq(l.commands[8], hci_commands.opcode_le_set_random_address())
+    test.assert_eq(h.api.own_kind, 1)
+    test.assert_eq(list.len(h.own_address), 6)
+    // The two most significant bits of a static random address are set.
+    test.assert_eq((h.own_address[5] as Int) & 0xC0, 0xC0)
+    // The command carries the address the Host keeps.
+    let sent = l.cmdlog[8]
+    for i in 0..6
+        test.assert_eq(sent[4 + i] as Int, h.own_address[i] as Int)
 
 // ── A policy that records its calls and answers as a test says ──────
 
@@ -423,14 +448,12 @@ fn test_connect_as_the_central_makes_a_link_and_queues_connected()
         None => test.fail("the link has a name")
     test.assert_eq(host_api.link_count(h), 1)
     match host_api.next_event(var h)
-        Some(e) =>
-            match e
-                Connected(c, role, peer, params) =>
-                    test.assert_eq(c.slot as Int, conn.slot as Int)
-                    test.assert(role_is_central(role))
-                    test.assert_eq(peer.octets[0] as Int, 0x77)
-                    test.assert_eq(params.interval_min as Int, 24)
-                _ => test.fail("Connected is queued")
+        Some(Event.Connected(c, role, peer, params)) =>
+            test.assert_eq(c.slot as Int, conn.slot as Int)
+            test.assert(role_is_central(role))
+            test.assert_eq(peer.octets[0] as Int, 0x77)
+            test.assert_eq(params.interval_min as Int, 24)
+        Some(_) => test.fail("Connected is queued")
         None => test.fail("an event is queued")
     test.assert_eq(p.connected, 1)
     test.assert_eq(p.connected_links, 1)
@@ -453,26 +476,24 @@ fn test_connect_the_policy_refuses_sends_nothing_and_answers_refused()
 // The kind of the next event: its position in the list of `Event`, or -1 for none.
 fn next_kind(var h: Host) -> Int
     match host_api.next_event(var h)
-        Some(e) =>
-            match e
-                Ready => 0
-                Advert(_) => 1
-                Connected(_, _, _, _) => 2
-                Disconnected(_, _) => 3
-                ParamsUpdated(_, _) => 4
-                SecurityChanged(_, _, _) => 5
-                PasskeyRequested(_) => 6
-                NumericRequested(_, _) => 7
-                Notification(_, _, _, _) => 8
-                Written(_, _) => 9
-                AttrRead(_, _, _) => 10
-                AttrWrite(_, _, _, _) => 11
-                Subscribed(_, _, _) => 12
-                CocOpened(_, _, _) => 13
-                CocData(_, _, _) => 14
-                CocClosed(_, _, _) => 15
-                DatabaseChanged(_) => 16
-                Dropped(_) => 17
+        Some(Event.Ready) => 0
+        Some(Event.Advert(_)) => 1
+        Some(Event.Connected(_, _, _, _)) => 2
+        Some(Event.Disconnected(_, _)) => 3
+        Some(Event.ParamsUpdated(_, _)) => 4
+        Some(Event.SecurityChanged(_, _, _)) => 5
+        Some(Event.PasskeyRequested(_)) => 6
+        Some(Event.NumericRequested(_, _)) => 7
+        Some(Event.Notification(_, _, _, _)) => 8
+        Some(Event.Written(_, _)) => 9
+        Some(Event.AttrRead(_, _, _)) => 10
+        Some(Event.AttrWrite(_, _, _, _)) => 11
+        Some(Event.Subscribed(_, _, _)) => 12
+        Some(Event.CocOpened(_, _, _)) => 13
+        Some(Event.CocData(_, _, _)) => 14
+        Some(Event.CocClosed(_, _, _)) => 15
+        Some(Event.DatabaseChanged(_)) => 16
+        Some(Event.Dropped(_)) => 17
         None => -1
 
 const EV_ADVERT = 1
@@ -521,15 +542,13 @@ fn test_a_link_a_peer_made_is_kept_and_queued_as_connected_in_the_peripheral_rol
     test.assert_eq(p.connected, 1)
     test.assert_eq(host_api.link_count(h), 1)
     match host_api.next_event(var h)
-        Some(e) =>
-            match e
-                Connected(c, role, peer, params) =>
-                    test.assert(not role_is_central(role))
-                    test.assert_eq(peer.octets[0] as Int, 0x31)
-                    match host_api.conn_info(h, c)
-                        Some(info) => test.assert(not role_is_central(info.role))
-                        None => test.fail("the link has a name")
-                _ => test.fail("Connected is queued")
+        Some(Event.Connected(c, role, peer, params)) =>
+            test.assert(not role_is_central(role))
+            test.assert_eq(peer.octets[0] as Int, 0x31)
+            match host_api.conn_info(h, c)
+                Some(info) => test.assert(not role_is_central(info.role))
+                None => test.fail("the link has a name")
+        Some(_) => test.fail("Connected is queued")
         None => test.fail("an event is queued")
 
 @when(noble_config.EVENT_QUEUE == 4 and noble_config.ATT_VALUE_BYTES >= 32)
@@ -591,13 +610,11 @@ fn test_disconnect_ends_the_link_and_queues_disconnected_and_a_stale_name_is_ref
     test.assert(st.is_ok())
     test.assert_eq(host_api.link_count(h), 0)
     match host_api.next_event(var h)
-        Some(e) =>
-            match e
-                Disconnected(c, reason) =>
-                    test.assert_eq(c.slot as Int, conn.slot as Int)
-                    test.assert(reason.is(noble.LAYER_HCI, noble.HCI_CONNECTION_TERMINATED_BY_LOCAL_HOST))
-                    test.assert_eq(reason.name(), "connection terminated by local host")
-                _ => test.fail("Disconnected is queued")
+        Some(Event.Disconnected(c, reason)) =>
+            test.assert_eq(c.slot as Int, conn.slot as Int)
+            test.assert(reason.is(noble.LAYER_HCI, noble.HCI_CONNECTION_TERMINATED_BY_LOCAL_HOST))
+            test.assert_eq(reason.name(), "connection terminated by local host")
+        Some(_) => test.fail("Disconnected is queued")
         None => test.fail("an event is queued")
     test.assert_eq(p.disconnected, 1)
     test.assert_eq(p.disc_attempts, 0)
@@ -744,10 +761,8 @@ fn test_update_params_changes_the_connection_and_queues_params_updated()
             test.assert_eq(info.params.timeout as Int, 300)
         None => test.fail("the link has a name")
     match host_api.next_event(var h)
-        Some(e) =>
-            match e
-                ParamsUpdated(c, q) => test.assert_eq(q.timeout as Int, 300)
-                _ => test.fail("ParamsUpdated is queued")
+        Some(Event.ParamsUpdated(c, q)) => test.assert_eq(q.timeout as Int, 300)
+        Some(_) => test.fail("ParamsUpdated is queued")
         None => test.fail("an event is queued")
     // Parameters the specification refuses are not accepted.
     let bad = ConnParams { interval_min: 4, interval_max: 2, latency: 0, timeout: 400 }
@@ -813,10 +828,8 @@ fn test_a_full_queue_drops_and_counts_adverts_and_still_delivers_the_state_event
     test.assert_eq(next_kind(var h), EV_CONNECTED)
     test.assert_eq(next_kind(var h), EV_DISCONNECTED)
     match host_api.next_event(var h)
-        Some(e) =>
-            match e
-                Dropped(n) => test.assert_eq(n as Int, 4)
-                _ => test.fail("Dropped is reported once the queue is empty")
+        Some(Event.Dropped(n)) => test.assert_eq(n as Int, 4)
+        Some(_) => test.fail("Dropped is reported once the queue is empty")
         None => test.fail("Dropped is reported once the queue is empty")
     test.assert_eq(next_kind(var h), -1)
 
@@ -843,16 +856,12 @@ fn test_the_queue_gives_the_oldest_event_first_and_none_when_empty()
     test.assert(noble.queue_event(var q, Event.Ready))
     test.assert(noble.queue_event(var q, Event.DatabaseChanged(noble.no_conn())))
     match noble.queue_take(var q)
-        Some(e) =>
-            match e
-                Ready => ()
-                _ => test.fail("the first event is Ready")
+        Some(Event.Ready) => ()
+        Some(_) => test.fail("the first event is Ready")
         None => test.fail("an event is queued")
     match noble.queue_take(var q)
-        Some(e) =>
-            match e
-                DatabaseChanged(_) => ()
-                _ => test.fail("the second event is DatabaseChanged")
+        Some(Event.DatabaseChanged(_)) => ()
+        Some(_) => test.fail("the second event is DatabaseChanged")
         None => test.fail("an event is queued")
 
 // ── Two Hosts with a link between them ──────────────────────────────
@@ -975,10 +984,8 @@ fn pair_up() -> Pair
     test.assert_eq(next_kind(var x.a), EV_CONNECTED)
     pump(var x, 2)
     match host_api.next_event(var x.b)
-        Some(e) =>
-            match e
-                Connected(c, _, _, _) => x.cb = c
-                _ => test.fail("the Peripheral is told of the link")
+        Some(Event.Connected(c, _, _, _)) => x.cb = c
+        Some(_) => test.fail("the Peripheral is told of the link")
         None => test.fail("the Peripheral is told of the link")
     x
 
@@ -1198,25 +1205,21 @@ fn test_coc_opens_carries_data_both_ways_and_closes()
     // The Peripheral hears the channel open.
     var chan_b = -1
     match host_api.next_event(var x.b)
-        Some(e) =>
-            match e
-                CocOpened(c, chan, psm) =>
-                    chan_b = chan as Int
-                    test.assert_eq(psm as Int, 0x0080)
-                _ => test.fail("CocOpened is queued")
+        Some(Event.CocOpened(c, chan, psm)) =>
+            chan_b = chan as Int
+            test.assert_eq(psm as Int, 0x0080)
+        Some(_) => test.fail("CocOpened is queued")
         None => test.fail("CocOpened is queued")
     // Data from the Central arrives as CocData at the Peripheral.
     test.assert(host_api.coc_send(var x.a, x.ca, chan_a, sdu_of(10, 20)).is_ok())
     pump(var x, 4)
     match host_api.next_event(var x.b)
-        Some(e) =>
-            match e
-                CocData(c, chan, sdu) =>
-                    test.assert_eq(chan as Int, chan_b)
-                    test.assert_eq(sdu.len(), 20)
-                    test.assert_eq(sdu[0] as Int, 10)
-                    test.assert_eq(sdu[19] as Int, 29)
-                _ => test.fail("CocData is queued")
+        Some(Event.CocData(c, chan, sdu)) =>
+            test.assert_eq(chan as Int, chan_b)
+            test.assert_eq(sdu.len(), 20)
+            test.assert_eq(sdu[0] as Int, 10)
+            test.assert_eq(sdu[19] as Int, 29)
+        Some(_) => test.fail("CocData is queued")
         None => test.fail("CocData is queued")
     // And back.
     test.assert(host_api.coc_send(var x.b, x.cb, chan_b, sdu_of(1, 5)).is_ok())
@@ -1330,6 +1333,11 @@ fn test_status_keeps_the_number_of_its_layer_and_names_the_codes_it_knows()
     test.assert_eq(noble.failed(noble.LAYER_SMP, noble.SMP_PASSKEY_ENTRY_FAILED).name(), "passkey entry failed")
     test.assert_eq(noble.failed(noble.LAYER_ATT, 200).name(), "unknown")
     test.assert_eq(noble.failed(noble.LAYER_L2CAP, 2).name(), "unknown")
+    // A failure of the Host itself and the HCI statuses the bench met have names, so that a log line says more than "unknown".
+    test.assert_eq(noble.failed(noble.LAYER_LOCAL, noble.E_TIMEOUT).name(), "timeout")
+    test.assert_eq(noble.ok().name(), "ok")
+    test.assert_eq(noble.failed(noble.LAYER_HCI, noble.HCI_INVALID_PARAMETERS).name(), "invalid hci command parameters")
+    test.assert_eq(noble.failed(noble.LAYER_HCI, noble.HCI_COMMAND_DISALLOWED).name(), "command disallowed")
 
 @test
 fn test_every_named_code_has_a_name()
@@ -1506,10 +1514,8 @@ fn peripheral_up(var ble: Adapter<ScriptLink, TestPolicy, RamBonds>) -> ConnId
     test.assert_eq(wait_kind(var ble, 0), 0)
     list.push(ble.io.inbox, connection_complete(0, 0x41, 1, peer_octets(0x31)))
     match ble.wait_event(100)
-        Some(e) =>
-            match e
-                Connected(c, _, _, _) => return c
-                _ => test.fail("the Peripheral is told of the link")
+        Some(Event.Connected(c, _, _, _)) => return c
+        Some(_) => test.fail("the Peripheral is told of the link")
         None => test.fail("the Peripheral is told of the link")
     noble.no_conn()
 
@@ -1851,13 +1857,11 @@ fn test_an_event_bound_characteristic_queues_the_request_and_respond_answers_it(
     test.assert(ble.respond(conn, c.attr.handle, 0, var t3).is(noble.LAYER_LOCAL, noble.E_BUSY))
     list.push(ble.io.inbox, att_packet(0x41, [0x0A, h0, h1]))
     match ble.wait_event(50)
-        Some(e) =>
-            match e
-                AttrRead(k, attr, svc) =>
-                    test.assert_eq(k.slot as Int, conn.slot as Int)
-                    test.assert_eq(attr as Int, c.attr.handle as Int)
-                    test.assert_eq(svc, 1)
-                _ => test.fail("a read of an event-bound attribute is queued")
+        Some(Event.AttrRead(k, attr, svc)) =>
+            test.assert_eq(k.slot as Int, conn.slot as Int)
+            test.assert_eq(attr as Int, c.attr.handle as Int)
+            test.assert_eq(svc, 1)
+        Some(_) => test.fail("a read of an event-bound attribute is queued")
         None => test.fail("a read of an event-bound attribute is queued")
     // The client waits: nothing was answered, and the policy was not asked.
     test.assert_eq(list.len(ble.io.acl), 0)
@@ -1872,12 +1876,10 @@ fn test_an_event_bound_characteristic_queues_the_request_and_respond_answers_it(
     // A write carries its value, and the answer can be an error.
     list.push(ble.io.inbox, att_packet(0x41, [0x12, h0, h1, 5, 6]))
     match ble.wait_event(50)
-        Some(e) =>
-            match e
-                AttrWrite(_, attr, svc, value) =>
-                    test.assert_eq(value.len(), 2)
-                    test.assert_eq(value[1] as Int, 6)
-                _ => test.fail("a write of an event-bound attribute is queued")
+        Some(Event.AttrWrite(_, attr, svc, value)) =>
+            test.assert_eq(value.len(), 2)
+            test.assert_eq(value[1] as Int, 6)
+        Some(_) => test.fail("a write of an event-bound attribute is queued")
         None => test.fail("a write of an event-bound attribute is queued")
     var nothing: noble.Value = Vec.new()
     test.assert(ble.respond(conn, c.attr.handle, noble.ATT_VALUE_NOT_ALLOWED, var nothing).is_ok())
@@ -1921,13 +1923,11 @@ fn test_a_client_that_subscribes_is_an_event_and_notify_reaches_it_only_then_and
     central_sends(var ble, [0x12, (hrm.attr.cccd & 255) as u8, (hrm.attr.cccd >> 8) as u8, 1, 0])
     test.assert_eq(acl_att(ble.io, 0)[0] as Int, 0x13)
     match ble.wait_event(10)
-        Some(e) =>
-            match e
-                Subscribed(k, attr, mode) =>
-                    test.assert_eq(k.slot as Int, conn.slot as Int)
-                    test.assert_eq(attr as Int, hrm.attr.handle as Int)
-                    test.assert_eq(mode as Int, 1)
-                _ => test.fail("Subscribed is queued")
+        Some(Event.Subscribed(k, attr, mode)) =>
+            test.assert_eq(k.slot as Int, conn.slot as Int)
+            test.assert_eq(attr as Int, hrm.attr.handle as Int)
+            test.assert_eq(mode as Int, 1)
+        Some(_) => test.fail("Subscribed is queued")
         None => test.fail("Subscribed is queued")
     var t10 = value_of_byte(60)
     test.assert(ble.notify(conn, hrm.attr, noble.Security.Encrypted, var t10).is(noble.LAYER_LOCAL, noble.E_SECURITY_LOW))
@@ -1943,10 +1943,8 @@ fn test_a_client_that_subscribes_is_an_event_and_notify_reaches_it_only_then_and
     // Writing zero is a Subscribed with mode 0, and notify is refused again.
     central_sends(var ble, [0x12, (hrm.attr.cccd & 255) as u8, (hrm.attr.cccd >> 8) as u8, 0, 0])
     match ble.wait_event(10)
-        Some(e) =>
-            match e
-                Subscribed(_, _, mode) => test.assert_eq(mode as Int, 0)
-                _ => test.fail("Subscribed is queued when the client unsubscribes")
+        Some(Event.Subscribed(_, _, mode)) => test.assert_eq(mode as Int, 0)
+        Some(_) => test.fail("Subscribed is queued when the client unsubscribes")
         None => test.fail("Subscribed is queued when the client unsubscribes")
     var t13 = value_of_byte(63)
     test.assert(ble.notify(conn, hrm.attr, noble.Security.Open, var t13).is(noble.LAYER_LOCAL, noble.E_NOT_SUBSCRIBED))
@@ -2114,14 +2112,12 @@ fn test_the_adapter_discovers_reads_writes_and_subscribes_over_a_link_and_a_noti
             test.assert_eq(gatt_server.configuration(ble.io.srv.link, level.cccd as Int), 1)
             server_notifies(var ble.io, handles[0])
             match ble.wait_event(100)
-                Some(e) =>
-                    match e
-                        Notification(k, attr, indication, value) =>
-                            test.assert_eq(k.slot as Int, up.conn.slot as Int)
-                            test.assert_eq(attr as Int, handles[0])
-                            test.assert(not indication)
-                            test.assert_eq(value[0] as Int, 87)
-                        _ => test.fail("a notification is an event")
+                Some(Event.Notification(k, attr, indication, value)) =>
+                    test.assert_eq(k.slot as Int, up.conn.slot as Int)
+                    test.assert_eq(attr as Int, handles[0])
+                    test.assert(not indication)
+                    test.assert_eq(value[0] as Int, 87)
+                Some(_) => test.fail("a notification is an event")
                 None => test.fail("a notification is an event")
             // Three notifications at once: two fit, and the rest are counted.
             server_notifies(var ble.io, handles[0])
@@ -2130,10 +2126,8 @@ fn test_the_adapter_discovers_reads_writes_and_subscribes_over_a_link_and_a_noti
             test.assert_eq(wait_kind(var ble, 50), EV_NOTIFICATION)
             test.assert_eq(wait_kind(var ble, 50), EV_NOTIFICATION)
             match ble.wait_event(50)
-                Some(e) =>
-                    match e
-                        Dropped(k) => test.assert_eq(k as Int, 1)
-                        _ => test.fail("the notifications that did not fit are counted")
+                Some(Event.Dropped(k)) => test.assert_eq(k as Int, 1)
+                Some(_) => test.fail("the notifications that did not fit are counted")
                 None => test.fail("the notifications that did not fit are counted")
             test.assert(ble.unsubscribe(up.conn, level, noble.Security.Open).is_ok())
             test.assert_eq(gatt_server.configuration(ble.io.srv.link, level.cccd as Int), 0)
@@ -2188,12 +2182,10 @@ fn test_two_hosts_discover_read_write_subscribe_and_notify_through_the_requests_
             test.assert(host_api.notify(var x.b, x.cb, level.attr, Security.Open, value_of_byte(70)).is_ok())
             pump(var x, 4)
             match host_api.next_event(var x.a)
-                Some(e) =>
-                    match e
-                        Notification(k, attr, indication, value) =>
-                            test.assert_eq(attr as Int, level.attr.handle as Int)
-                            test.assert_eq(value[0] as Int, 70)
-                        _ => test.fail("a notification is an event")
+                Some(Event.Notification(k, attr, indication, value)) =>
+                    test.assert_eq(attr as Int, level.attr.handle as Int)
+                    test.assert_eq(value[0] as Int, 70)
+                Some(_) => test.fail("a notification is an event")
                 None => test.fail("a notification is an event")
             // The queue of four holds two notifications beside the slots kept for the state events; the others are counted.
             for k in 0..4
@@ -2234,10 +2226,8 @@ fn test_two_hosts_discover_read_write_subscribe_and_notify_through_the_requests_
                     None => ()
             test.assert(done)
             match host_api.next_event(var x.a)
-                Some(e) =>
-                    match e
-                        Notification(_, _, indication, value) =>
-                            test.assert(indication)
-                            test.assert_eq(value[0] as Int, 5)
-                        _ => test.fail("an indication is an event")
+                Some(Event.Notification(_, _, indication, value)) =>
+                    test.assert(indication)
+                    test.assert_eq(value[0] as Int, 5)
+                Some(_) => test.fail("an indication is an event")
                 None => test.fail("an indication is an event")

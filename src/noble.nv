@@ -72,9 +72,15 @@ pub const ATT_INSUFFICIENT_RESOURCES = 17
 pub const ATT_DATABASE_OUT_OF_SYNC = 18
 pub const ATT_VALUE_NOT_ALLOWED = 19
 
+pub const HCI_UNKNOWN_COMMAND = 0x1
+pub const HCI_UNKNOWN_CONNECTION = 0x2
 pub const HCI_AUTHENTICATION_FAILURE = 0x5
 pub const HCI_PIN_OR_KEY_MISSING = 0x6
 pub const HCI_CONNECTION_TIMEOUT = 0x8
+pub const HCI_CONNECTION_LIMIT_EXCEEDED = 0x9
+pub const HCI_COMMAND_DISALLOWED = 0xc
+pub const HCI_UNSUPPORTED_PARAMETER = 0x11
+pub const HCI_INVALID_PARAMETERS = 0x12
 pub const HCI_REMOTE_USER_TERMINATED = 0x13
 pub const HCI_REMOTE_LOW_RESOURCES = 0x14
 pub const HCI_REMOTE_POWER_OFF = 0x15
@@ -117,6 +123,8 @@ impl Status
     // for `Status { layer: LAYER_ATT, code: ATT_INSUFFICIENT_AUTHENTICATION }`.
     @tier(embedded)
     fn name(self) -> Str
+        if self.layer == LAYER_LOCAL
+            return local_name(self.code as Int)
         if self.layer == LAYER_ATT
             return att_name(self.code as Int)
         if self.layer == LAYER_HCI
@@ -179,6 +187,18 @@ fn att_name(code: Int) -> Str
 
 pub @tier(embedded)
 fn hci_name(code: Int) -> Str
+    if code == HCI_UNKNOWN_COMMAND
+        return "unknown hci command"
+    if code == HCI_UNKNOWN_CONNECTION
+        return "unknown connection identifier"
+    if code == HCI_CONNECTION_LIMIT_EXCEEDED
+        return "connection limit exceeded"
+    if code == HCI_COMMAND_DISALLOWED
+        return "command disallowed"
+    if code == HCI_UNSUPPORTED_PARAMETER
+        return "unsupported feature or parameter value"
+    if code == HCI_INVALID_PARAMETERS
+        return "invalid hci command parameters"
     if code == HCI_AUTHENTICATION_FAILURE
         return "authentication failure"
     if code == HCI_PIN_OR_KEY_MISSING
@@ -201,6 +221,36 @@ fn hci_name(code: Int) -> Str
         return "unacceptable connection parameters"
     if code == HCI_CONNECTION_FAILED_TO_ESTABLISH
         return "connection failed to establish"
+    "unknown"
+
+pub @tier(embedded)
+fn local_name(code: Int) -> Str
+    if code == 0
+        return "ok"
+    if code == E_NOT_READY
+        return "not ready"
+    if code == E_BUSY
+        return "busy"
+    if code == E_NO_ROOM
+        return "no room"
+    if code == E_STALE
+        return "stale name"
+    if code == E_TIMEOUT
+        return "timeout"
+    if code == E_SECURITY_LOW
+        return "security too low"
+    if code == E_NOT_SUBSCRIBED
+        return "not subscribed"
+    if code == E_CANCELLED
+        return "cancelled"
+    if code == E_BAD_ARGUMENT
+        return "bad argument"
+    if code == E_NOT_FOUND
+        return "not found"
+    if code == E_LINK_LOST
+        return "link lost"
+    if code == E_REFUSED
+        return "refused"
     "unknown"
 
 pub @tier(embedded)
@@ -1269,12 +1319,10 @@ impl Adapter
         let t0 = self.io.now_ms()
         while true
             match self.wait_event(100)
-                Some(ev) =>
-                    match ev
-                        Advert(r) =>
-                            out = r
-                            return self.scan_stop()
-                        _ => ()
+                Some(Event.Advert(r)) =>
+                    out = r
+                    return self.scan_stop()
+                Some(_) => ()
                 None => ()
             if self.io.now_ms() - t0 >= timeout_ms
                 let _ = self.scan_stop()
@@ -1523,7 +1571,7 @@ pub alias Outbox = Vec[Out; noble_config.OUTBOX]
 // `bind_function`, which the product's policy gives to the service whose index the Host passed, and answer NOT_HANDLED for an
 // attribute the service leaves to the product.
 pub trait Service[e]
-    fn attach(var self, var h: host.Host) -> Status [e, mutate]
+    fn attach(var self, var h: Host) -> Status [e, mutate]
 
     fn on_event(var self, ev: Event, var out: Outbox) -> Bool [e, mutate]
         false
@@ -1617,6 +1665,5 @@ impl HciLink[hw, mutate] for UartHci
 // is emitted.  A program writes `adapter(uart_hci(), DefaultPolicy { placeholder: 0 }, RamBonds { rows: Vec.new() })`, as the
 // programs of orbit/noble-examples/device do.
 
-// workaround(a-type-alias-with-the-name-of-the-module-qualified-type-it-names-is-a-cycle): the sketch spells the Host
-// `noble.Host`, and `pub alias Host = host.Host` here is refused as a cycle (E2025).  A program or a service module
-// that takes the Host names it `host.Host`.
+// The Host, as the sketch spells it: a program or a service module that takes the Host names it `noble.Host`.
+pub alias Host = host.Host

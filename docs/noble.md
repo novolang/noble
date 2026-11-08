@@ -3,6 +3,10 @@
 `noble` is the Host of the noble stack: the layers between an HCI transport and
 an application, with no register and no Controller code.
 
+The application API, a first Host program against a Controller, and the porting of the Controller to
+another chip are described in the noble documentation set on novo-lang.org:
+[noble](https://novo-lang.org/docs/noble/README.html).
+
 ## What it reads
 
 | Package | What the Host takes from it |

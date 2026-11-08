@@ -118,7 +118,7 @@ the Host.  `step`, `run`, `start` and `wait_event(timeout_ms)` are the loop; `no
 | Connections | `connect`, `connect_listed`, `connect_cancel`, `disconnect`, `update_params`, `secure`, `conn_info`, `link_count`, and the channels `coc_listen`, `coc_open`, `coc_send`, `coc_close` |
 | GATT client | `exchange_mtu`, `discover(conn, service)`, `find_char`, `read`, `write`, `write_no_response`, `subscribe`, `unsubscribe`; `need` is the least security the link must have before a request is sent |
 | GATT server | `add_service`, `add_char`, `set_value`, `bind_function`, `bind_event`, `respond`, `notify`, `notify_all`, `indicate` |
-| Services | the trait `Service`, `ble.plug(var module)`, `pump(var ble, var services, wait_ms)` |
+| Services | the trait `Service`; `plug(var ble, var services)` takes the product's list of `[dyn Service]`, `pump(var ble, wait_ms)` is one turn and `serve(var ble, wait_ms)` is the loop (it starts the Controller, asks `HostPolicy.on_start`, and turns `pump` while `keep_serving` is true); `ble.plug_module(var module)` attaches one service the product holds itself |
 
 Events: `Advert`, `Connected`, `Disconnected`, `Written` (a stored characteristic was written), `Subscribed(conn, attr, mode)` (a client
 wrote the configuration of a value), `Notification` (a notification or an indication of a peer, with a flag), `AttrRead` and `AttrWrite`
@@ -129,12 +129,20 @@ A characteristic is stored (the Host holds the bytes), bound to a function (`bin
 or `NOT_HANDLED`), or bound to an event (`bind_event`: the request is queued as `AttrRead` or `AttrWrite`, the Host holds it, and
 `respond` answers it within the ATT timeout of 30 seconds).  The security of the attribute is checked before either hook is called.
 
-A service is a module: a value that implements `Service` (`attach(var h: noble.Host)` adds its attributes and keeps its handles;
-`on_event`, `tick`, `on_read` and `on_write` are optional).  `ble.plug(var module)` attaches one.  A program with a pump gives every
-event to `pump`, which offers it to the services, refuses an attribute request no service took, runs their `tick` and applies what they
-queued (`Out.Notify`, `NotifyAll`, `Respond`).  **Question 29 of planning/NOBLE-HOST-API-SKETCH.md (attribute requests as events and the
-product's own composite, section 3.17, against the library combinators of section 3.16) is not answered by the owner.  Layer B builds the
-form the sketch recommends, `bind_event`, the product's composite and no combinator; the combinators are NOT BUILT.**
+A service is a plain struct that implements `Service` (`attach(var h: noble.Host) -> Int` adds its attributes and keeps its handles,
+and answers 0 or the code of the `Status` that stopped it; `on_event`, `tick`, `on_read` and `on_write` are optional).  A product makes
+a list of its services, `[dyn Service]`, once at start-up and gives it to `noble.plug(var ble, var services)`, which attaches each in
+order and records the first and last attribute handle it added (the owner table, `max_services` entries).  `noble.pump(var ble, wait_ms)`
+is one turn: an attribute event (`AttrRead`, `AttrWrite`, `Written`, `Subscribed`) goes to the one service whose handles hold it and is
+refused at once when none does; a link event (`Ready`, `Connected`, `Disconnected`, `ParamsUpdated`, `SecurityChanged`,
+`DatabaseChanged`) goes to every service; any other event goes to the services until one takes it; then every `tick` runs and what the
+services queued (`Out.Notify`, `NotifyAll`, `Respond`) is applied.  The access check has run before an attribute event exists, so a
+service sees only requests the client had the right to make.  `noble.serve(var ble, wait_ms)` does the start as well: it calls `start`,
+asks `HostPolicy.on_start` (an `Action.Advertise(...)` starts advertising), turns `pump` while `HostPolicy.keep_serving` answers true
+and answers the `Status` that ended it.  A product that has work of its own between turns calls `start` itself and writes the loop.
+`plug`, `pump` and `serve` are free functions and not methods of the Adapter until the compiler lane's fix for the capacity of a `Vec`
+in a method of a generic `impl` is in; `plug_module` is the method for one service that the product holds itself and routes by
+`bind_function` (`pc/battery_product.nv`).
 
 ```novo
 use noble
@@ -154,9 +162,10 @@ fn battery_level<T: HciLink[e]>(var ble: noble.Adapter<T, noble.DefaultPolicy, n
             if ble.read(up.conn, level, noble.Security.Open, var v).is_ok() then v[0] as Int else -1
 ```
 
-`orbit/noble-examples` holds the eight example programs of the sketch (the hello-world, a scan, a read with every failure reported, a
-heart-rate Peripheral, a bonded Central, a credit based channel Central and its Peripheral, and a Battery Service module) as Host
-programs for a PC over the socket of a bridge; the three Peripheral programs also build for the nRF54LM20 DK over `UartHci`.
+`orbit/noble-examples` holds the nine example programs of the sketch (the hello-world, a scan, a read with every failure reported, a
+heart-rate Peripheral, a bonded Central, a credit based channel Central and its Peripheral, a Battery Service module, and a product of
+three services as one list) as Host programs for a PC over the socket of a bridge; the four Peripheral programs also build for the
+nRF54LM20 DK over `UartHci`.
 
 What Layer B does not do (NOT IMPLEMENTED): `HostPolicy.authorize_write` is not called, so an `Access.Authorized` attribute answers
 Insufficient Authorization; an attribute request on an Enhanced ATT bearer reaches the server's stored value, not the function or the

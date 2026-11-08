@@ -88,7 +88,7 @@ this package imports a module of the Controller or of `orbit/ble`.
    holds a `Host`, a transport, a policy and a bond store and whose methods wait
    (`step`, `run`, `start`, `wait_event`, `connect`, `adv_start`, `scan_start`, `find`,
    `discover`, `read`, `write`, `subscribe`, `notify`, `respond`), the trait `Service`
-   with `plug`, `Out`, `Outbox` and `pump`, the payload builders (`ad_flags`,
+   with `plug` (the product's list of services), `Out`, `Outbox`, `pump` and `serve`, the payload builders (`ad_flags`,
    `ad_uuid16`, `ad_name`) and `UartHci`.  `gatt_server` holds the requests for the
    attributes bound to the application (`GattDb.bound`, `AttLink.held`).  NOT
    IMPLEMENTED in it: `HostPolicy.authorize_write`, bound attributes on an Enhanced
@@ -108,9 +108,9 @@ The schema is the `[config.<key>]` tables of `novo.toml`: 41 keys (`max_connecti
 `max_pairing`, `max_cis`, `max_big`, `max_bis`, `iso_sdu_octets`, `iso_buffers`,
 `sequenced_slots`, `hci_buffer_octets`, `hci_rx_flow_control` and the GATT client
 engine's `max_client_links`, `client_bearers`, `client_cache_records`,
-`client_queue` and `client_value_bytes`) and the five of the Host API (`event_queue`, the events the queue holds, 0 in the
+`client_queue` and `client_value_bytes`) and the six of the Host API (`event_queue`, the events the queue holds, 0 in the
 default so that a Host that does not use the API pays for none; `att_value_bytes`, the octets of one value or SDU a call or an
-event carries; `max_adv_data`, the octets of the advertising data of a report; `max_name`, the octets of a device name `ad_name` writes, and `outbox`, the commands a service queues in one turn of `pump`, both values on the caller's stack and no storage of the Host).  The ranges are the bounds of the
+event carries; `max_adv_data`, the octets of the advertising data of a report; `max_name`, the octets of a device name `ad_name` writes, and `outbox`, the commands a service queues in one turn of `pump`, both values on the caller's stack and no storage of the Host; and `max_services`, the services a product's list holds, which sizes the owner table of the Adapter, 48 B at the default of 4).  The ranges are the bounds of the
 Core Specification where it states one, and a relation between keys is a field
 of the schema, which `novo config check` refuses a file to break.
 

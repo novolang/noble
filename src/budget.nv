@@ -115,6 +115,9 @@ const HAP_BTP_STATE = 640
 // the flags and the tag), beside the largest payload.
 const EVENT_FIXED = 48
 
+// The record of the owner table of the Adapter (noble.nv, `Owners`): its two lists.
+const OWNERS_RECORD = 16
+
 // The larger of `n` and 1: a table of an absent feature keeps one record.
 @tier(embedded)
 const fn max1(n: Int) -> Int
@@ -331,6 +334,12 @@ const fn hap_bytes() -> Int
 const fn event_queue_bytes() -> Int
     noble_config.EVENT_QUEUE * (noble_config.ATT_VALUE_BYTES + noble_config.MAX_ADV_DATA + EVENT_FIXED)
 
+// The owner table of the Adapter (noble.nv, `Owners`, Layer B): the first and last attribute handle of each of `MAX_SERVICES`
+// services, two lists of `u16`.
+@tier(embedded)
+const fn owner_table_bytes() -> Int
+    OWNERS_RECORD + 2 * vec_bytes(noble_config.MAX_SERVICES, 2)
+
 // The Host core's storage, in bytes.
 @tier(embedded)
 const fn total_bytes() -> Int
@@ -339,7 +348,7 @@ const fn total_bytes() -> Int
         + noble_config.MAX_PAIRING * PAIRING_CONTEXT + bond_bytes() + channel_bytes() + iso_bytes()
         + ase_bytes() + control_bytes() + 2 * slot(noble_config.HCI_BUFFER_OCTETS) + TRANSPORT_RINGS + client_bytes() + bridge_bytes()
         + broadcast_bytes() + bap_bytes() + unicast_bytes() + sink_bytes() + control_client_bytes()
-        + profile_link_bytes() + hap_bytes() + event_queue_bytes()
+        + profile_link_bytes() + hap_bytes() + event_queue_bytes() + owner_table_bytes()
 
 // The checks of the limits, made when the build is compiled: a profile that
 // breaks one stops `novo build` and `novo test` with the message, before the

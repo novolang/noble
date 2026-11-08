@@ -194,6 +194,15 @@ max     = 16
 unit    = "commands"
 doc     = "commands a service queues in one turn of `pump` (Layer B, src/noble.nv); the `Outbox` is a value on the caller's stack, not storage of the Host"
 
+[config.max_services]
+type    = "int"
+default = 4
+min     = 1
+max     = 16
+unit    = "services"
+bytes_expr = "16 + 2 * ((8 + max_services * 2 + 7) / 8 * 8)"
+doc     = "services a product's list holds, the size of the owner table that `pump` finds the owner of an attribute handle in (Layer B, src/noble.nv); the table is the record of two lists of `max_services` handles that the Adapter keeps, made once at start-up"
+
 [config.max_pairing]
 type    = "int"
 default = 1

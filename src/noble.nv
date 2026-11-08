@@ -340,6 +340,22 @@ enum Access
     Authenticated
     SecureConnections
 
+// The `Access` of the GATT server's own `gatt_server.Access`, the form in which the service modules of the package
+// noble-services keep the access a client needs.
+pub @tier(embedded)
+fn access_from_gatt(a: gatt_server.Access) -> Access
+    if a == gatt_server.Access.Open
+        return Access.Open
+    if a == gatt_server.Access.Authorized
+        return Access.Authorized
+    if a == gatt_server.Access.Encrypted
+        return Access.Encrypted
+    if a == gatt_server.Access.Authenticated
+        return Access.Authenticated
+    if a == gatt_server.Access.SecureConnections
+        return Access.SecureConnections
+    Access.Denied
+
 pub @value
 struct Permissions
     read: Access
@@ -385,18 +401,23 @@ pub const REFUSE = -2
 // does not serve, so the product's policy can decide instead.
 pub const NOT_HANDLED = -3
 
-// What the Host does after a link was made or ended, as the policy answers.
-// Readvertise repeats the last `adv_start` (Peripheral); Reconnect repeats
-// the last `connect` or `connect_listed` (Central) after `after_ms`, so a
-// product sets the backoff and a peer that is switched off is not asked at
-// once and for ever; Stay does nothing.
+// What the Host does at a decision point of the policy: after the Controller started (`on_start`), and after a link was made or
+// ended.  Advertise starts the advertising set `set` with the parameters and the data it carries, the arguments of `adv_start`; it
+// is read at `on_start` only, and any other point reads it as Stay.  Readvertise repeats the last `adv_start` (Peripheral);
+// Reconnect repeats the last `connect` or `connect_listed` (Central) after `after_ms`, so a product sets the backoff and a peer
+// that is switched off is not asked at once and for ever; Stay does nothing.
+// Advertise holds two `AdData` (`max_adv_data` octets each, 31 by default) and the parameters, so a value of `Action` takes about
+// 100 bytes on the stack where it took 16 without it (the size rule: a `Vec[u8; 31]` is 40 bytes, `AdvParams` 16).
 pub @value
 enum Action
     Stay
     Readvertise
     AdvertiseNonConnectable
     Reconnect(after_ms: Int)
+    Advertise(set: u8, params: AdvParams, data: AdData, scan_rsp: AdData)
 
+// The decisions of the product, one method each, every one with a default, so a product writes the ones it takes.  The trait is
+// open to more hooks: a hook added later has a default too, and a policy that does not write it is not changed.
 pub trait HostPolicy[e]
     // The IO capability this device offers in a pairing.
     fn io_capability(self, conn: ConnId) -> IoCap [e]
@@ -494,6 +515,16 @@ pub trait HostPolicy[e]
     // A pairing ended; `bonded` says the keys were stored.
     fn pairing_done(var self, conn: ConnId, st: Status, level: Security, bonded: Bool) [e]
         let _ = st
+
+    // What the device does once the Controller is up: `serve` asks it once, after `start` answered, and applies the answer.
+    // `Action.Advertise(...)` starts advertising; every other answer is read as `Action.Stay`.
+    fn on_start(var self) -> Action [e]
+        Action.Stay
+
+    // Whether `serve` turns the pump again.  `serve` reads it once before each turn; the default is true, so a product that never
+    // stops does not write it.
+    fn keep_serving(self) -> Bool [e]
+        true
 
 // ── Bond storage: the security database the product keeps ───────────
 pub @value
@@ -1134,12 +1165,34 @@ pub struct Adapter<T: HciLink[e], P: HostPolicy[f], B: BondStore[g]>
     var policy: P
     var bonds: B
     var host: Host
+    // The product's services (`plug`), and the first and last attribute handle each one added to the database: `pump` finds the
+    // owner of an attribute event by its handle.  At most `noble_config.MAX_SERVICES` entries (the key `max_services`).
+    var services: [dyn Service]
+    var owners: Owners
+
+// The first and last attribute handle each service of the list added.
+// workaround(a-module-qualified-capacity-of-a-vec-is-unknown-in-a-method-of-a-generic-impl): a struct of its own and not two
+// fields of the Adapter.  The capacity of a fixed-capacity `Vec` that a module-qualified constant names is not known in the layout
+// of the generic `Adapter` and in the methods of its `impl`, and the Adapter's cell came out 28 bytes with the two tables inside
+// it.  Once the compiler lane's fix is in, the two tables become fields of the Adapter.
+pub struct Owners
+    var first: Vec[u16; noble_config.MAX_SERVICES]
+    var last: Vec[u16; noble_config.MAX_SERVICES]
 
 // The Adapter of a transport, a policy and a bond store, with a Host that serves `MAX_CONNECTIONS` links and the Device Name
 // "noble".
 pub @tier(embedded)
 fn adapter<T: HciLink[e], P: HostPolicy[f], B: BondStore[g]>(io: T, policy: P, bonds: B) -> Adapter<T, P, B>
-    Adapter { io: io, policy: policy, bonds: bonds, host: host_blank(host_config(noble_config.MAX_CONNECTIONS, ['n', 'o', 'b', 'l', 'e'])) }
+    Adapter { io: io, policy: policy, bonds: bonds, host: host_blank(host_config(noble_config.MAX_CONNECTIONS, ['n', 'o', 'b', 'l', 'e'])),
+        services: no_services(), owners: Owners { first: Vec.new(), last: Vec.new() } }
+
+// The empty list of services an Adapter starts with.
+// workaround (no filing of its own; the symptom is of the class of the capacity filing named at `Owners`): a plain function and not
+// a literal in the generic `adapter`, since a literal of a `dyn` element type inside a generic function is one more site where the
+// layout of a generic struct came out wrong in the prototype.
+@tier(embedded)
+fn no_services() -> [dyn Service]
+    []
 
 impl Adapter
     // One turn of the Host at the current clock.
@@ -1571,7 +1624,11 @@ pub alias Outbox = Vec[Out; noble_config.OUTBOX]
 // `bind_function`, which the product's policy gives to the service whose index the Host passed, and answer NOT_HANDLED for an
 // attribute the service leaves to the product.
 pub trait Service[e]
-    fn attach(var self, var h: Host) -> Status [e, mutate]
+    // Answers 0, or the code of the `Status` that stopped it (`s.status.code as Int`).
+    // workaround(a-trait-method-that-answers-a-value-struct-crashes-when-called-through-a-trait-object): an `Int` and not a
+    // `Status`.  A trait method that answers a `@value` struct crashes when it is called through `dyn`, so the code travels and
+    // `plug` makes the `Status` again.  Once the compiler lane's fix is in, `attach` answers a `Status`.
+    fn attach(var self, var h: Host) -> Int [e, mutate]
 
     fn on_event(var self, ev: Event, var out: Outbox) -> Bool [e, mutate]
         false
@@ -1585,24 +1642,100 @@ pub trait Service[e]
     fn on_write(var self, conn: ConnId, attr: u16, var value: Value) -> Int [e, mutate]
         NOT_HANDLED
 
-impl Adapter
-    // Install a service module: one call, whatever the module is.
-    @tier(embedded)
-    fn plug<S: Service[h]>(var self, var s: S) -> Status [h, mutate]
-        s.attach(var self.host)
+// The handle of an attribute event, None for every other event.
+@tier(embedded)
+fn attr_of(ev: Event) -> ?u16
+    match ev
+        Event.AttrRead(conn, attr, svc) => Some(attr)
+        Event.AttrWrite(conn, attr, svc, value) => Some(attr)
+        Event.Written(conn, attr) => Some(attr)
+        Event.Subscribed(conn, attr, mode) => Some(attr)
+        _ => None
 
-// One turn of a program whose services are behind a pump: wait up to `wait_ms` for an event, offer it to the services (an
-// attribute request that no service took is refused at once, so a client never waits for the ATT timeout), run their `tick`, and
-// apply what they queued.
+// Whether every service sees the event (the state of a link), or only the first that takes it.
+@tier(embedded)
+fn reaches_all(ev: Event) -> Bool
+    match ev
+        Event.Ready => true
+        Event.Connected(conn, role, peer, params) => true
+        Event.Disconnected(conn, reason) => true
+        Event.ParamsUpdated(conn, params) => true
+        Event.SecurityChanged(conn, level, bonded) => true
+        Event.DatabaseChanged(conn) => true
+        _ => false
+
+// Install the product's services: `attach` each one in order, and keep the range of attribute handles it added, so that `pump`
+// can give an attribute event to its owner and to no other service.  The list is the product's, made once at start-up (a
+// `system` block in a program at the embedded tier); the Adapter keeps it.  A product writes `noble.plug(var ble, var svcs)`.
+// workaround(a-module-qualified-capacity-of-a-vec-is-unknown-in-a-method-of-a-generic-impl): a free function and not a method
+// `ble.plug(...)`, as `pump` and `serve` are.  In a method of the generic `impl Adapter` the capacity of the owner table is
+// unknown, and the `dyn` call of `attach` crashed.  Once the compiler lane's fix is in, `plug` is a method of the Adapter.
 pub @tier(embedded)
-fn pump<T: HciLink[e], P: HostPolicy[f], B: BondStore[g], S: Service[h]>(var ble: Adapter<T, P, B>, var svcs: S, wait_ms: Int) [e, f, g, h, async, time, mutate]
+fn plug<T: HciLink[e], P: HostPolicy[f], B: BondStore[g]>(var ble: Adapter<T, P, B>, var services: [dyn Service]) -> Status [e, f, g, hw, mutate]
+    if services.len() > noble_config.MAX_SERVICES
+        return failed(LAYER_LOCAL, E_NO_ROOM)
+    ble.services = services
+    for i in 0..ble.services.len()
+        let first = gatt_server.last_handle(ble.host.link.db) + 1
+        var svc = ble.services[i]
+        var h = ble.host
+        let code = svc.attach(var h)
+        if code != 0
+            return failed(LAYER_LOCAL, code)
+        // `Owners` is a reference, so the writes through `o` land in the Adapter's table.
+        var o = ble.owners
+        let _ = o.first.push(first as u16)
+        let _ = o.last.push(gatt_server.last_handle(ble.host.link.db) as u16)
+    ok()
+
+impl Adapter
+    // Install one service module held by the product itself (program 7): its attribute events are not routed, the product's
+    // policy serves them with `bind_function`.
+    @tier(embedded)
+    fn plug_module<S: Service[h]>(var self, var s: S) -> Status [h, mutate]
+        let code = s.attach(var self.host)
+        if code != 0
+            return failed(LAYER_LOCAL, code)
+        ok()
+
+// The index in the list of the service whose attributes hold `attr`, -1 when none does (an attribute the product added outside
+// its services).
+@tier(embedded)
+fn owner_of(owners: Owners, attr: u16) -> Int
+    for i in 0..owners.first.len()
+        if attr >= owners.first[i] and attr <= owners.last[i]
+            return i
+    -1
+
+// One turn of a program whose services are behind the pump: wait up to `wait_ms` for an event; give an attribute event to the
+// service that owns the handle (the access check ran before the event existed, `gatt_server.access_error`), and refuse it at
+// once when no service owns or takes it, so a client never waits for the ATT timeout; give a link event to every service in
+// order, and any other event to the services until one takes it; run every `tick`; apply what they queued.  The row names what
+// a service may do, since the checker does not read it from the list.  A product writes `noble.pump(var ble, 100)`.
+// workaround(a-module-qualified-capacity-of-a-vec-is-unknown-in-a-method-of-a-generic-impl): a free function and not a method
+// `ble.pump(...)`.  In a method of the generic `impl Adapter` the capacity of `Outbox` is unknown and the Adapter's own `notify`
+// is not found.  Once the compiler lane's fix is in, `pump` is a method of the Adapter.
+pub @tier(embedded)
+fn pump<T: HciLink[e], P: HostPolicy[f], B: BondStore[g]>(var ble: Adapter<T, P, B>, wait_ms: Int) [e, f, g, hw, async, time, mutate]
     var out: Outbox = Vec.new()
     match ble.wait_event(wait_ms)
         Some(ev) =>
-            if not svcs.on_event(ev, var out)
-                refuse(ev, var out)
+            match attr_of(ev)
+                Some(attr) =>
+                    let i = owner_of(ble.owners, attr)
+                    if i < 0
+                        refuse(ev, var out)
+                    else if not ble.services[i].on_event(ev, var out)
+                        refuse(ev, var out)
+                None =>
+                    let all = reaches_all(ev)
+                    for i in 0..ble.services.len()
+                        if ble.services[i].on_event(ev, var out) and not all
+                            break
         None => ()
-    svcs.tick(ble.now_ms(), var out)
+    let now = ble.now_ms()
+    for i in 0..ble.services.len()
+        ble.services[i].tick(now, var out)
     for i in 0..out.len()
         match out[i]
             Out.Notify(conn, a, v) =>
@@ -1611,6 +1744,31 @@ fn pump<T: HciLink[e], P: HostPolicy[f], B: BondStore[g], S: Service[h]>(var ble
                 let _ = ble.notify_all(a, Security.Open, v)
             Out.Respond(conn, attr, code, v) =>
                 let _ = ble.respond(conn, attr, code, v)
+
+// Run the Host: `start` the Controller, ask `policy.on_start` and apply its answer (`Action.Advertise` starts advertising), then
+// turn `pump(var ble, wait_ms)` for as long as `policy.keep_serving()` answers true, which is read once before each turn.  Answers
+// the `Status` that ended it: the failure of the start or of the advertising it asked for, or `ok()` when the policy stopped it.
+// For a product with no work of its own between turns; a product that has some calls `start` itself and writes the loop around
+// `pump`.  Same shape as `pump`, and a free function for the same reason (see `pump`).
+pub @tier(embedded)
+fn serve<T: HciLink[e], P: HostPolicy[f], B: BondStore[g]>(var ble: Adapter<T, P, B>, wait_ms: Int) -> Status [e, f, g, hw, async, time, mutate]
+    let started = ble.start()
+    if not started.is_ok()
+        return started
+    // The policy is copied out and stored back: `on_start` takes `var self`, and a policy that is a `@value` struct is read out of the
+    // Adapter as a copy (SPEC 14.7).
+    var pol = ble.policy
+    let first = pol.on_start()
+    ble.policy = pol
+    match first
+        Action.Advertise(set, params, data, scan_rsp) =>
+            let advertising = ble.adv_start(set as Int, params, data, scan_rsp)
+            if not advertising.is_ok()
+                return advertising
+        _ => ()
+    while ble.policy.keep_serving()
+        pump(var ble, wait_ms)
+    ok()
 
 // The refusal of an attribute request that no service took.
 @tier(embedded)

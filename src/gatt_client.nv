@@ -615,7 +615,7 @@ fn set_mtu(var t: ClientTable, link: links.LinkId, bearer: Int, mtu: Int) -> Boo
 
 @tier(embedded)
 @no_alloc
-fn le16(var pdu: ClientPdu, at: Int) -> Int
+fn le16(pdu: ClientPdu, at: Int) -> Int
     pdu[at] as Int | (pdu[at + 1] as Int << 8)
 
 // The eight octets from `at`, least significant first.
@@ -1520,7 +1520,7 @@ fn take_tx(var t: ClientTable, link: links.LinkId, bearer: Int, now_ms: Int,
         wr(var t, row, R_SENT_MS, now_ms)
         TX_REQUEST
     else
-        let _ = finish(t, row, STATUS_OK, 0)
+        let _ = finish(var t, row, STATUS_OK, 0)
         TX_COMMAND
 
 // End the request on `bearer` that has waited `TRANSACTION_TIMEOUT_MS` for its
@@ -1535,7 +1535,7 @@ fn tick(var t: ClientTable, link: links.LinkId, bearer: Int, now_ms: Int) -> Int
         return EV_NONE
     wr(var t, row, R_DEAD, 1)
     wr(var t, row, R_Q_LEN, 0)
-    finish(t, row, STATUS_TIMEOUT, 0)
+    finish(var t, row, STATUS_TIMEOUT, 0)
 
 // ── Receiving PDUs ──────────────────────────────────────────────────
 
@@ -1598,10 +1598,10 @@ fn on_response(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) ->
     let op = pdu[0] as Int
     if op == att.ATT_OP_ERROR_RSP
         if length < 5 or (pdu[1] as Int) != rd(var t, row, R_REQ_OP)
-            return finish(t, row, STATUS_PROTOCOL, 0)
+            return finish(var t, row, STATUS_PROTOCOL, 0)
         return on_error(var t, row, pdu[4] as Int, le16(pdu, 2))
     if op != rd(var t, row, R_REQ_OP) + 1
-        return finish(t, row, STATUS_PROTOCOL, 0)
+        return finish(var t, row, STATUS_PROTOCOL, 0)
     wr(var t, row, R_OUTSTANDING, 0)
     let request = rd(var t, row, R_OP)
     if request == OP_MTU
@@ -1623,7 +1623,7 @@ fn on_response(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) ->
     else if request == OP_READ_LONG
         rsp_read_long(var t, row, var pdu, length)
     else if request == OP_WRITE
-        finish(t, row, STATUS_OK, 0)
+        finish(var t, row, STATUS_OK, 0)
     else
         rsp_prepare(var t, row, var pdu, length)
 
@@ -1645,12 +1645,12 @@ fn on_error(var t: ClientTable, row: Int, code: Int, handle: Int) -> Int
     if code == att.ATT_ERR_ATTRIBUTE_NOT_FOUND and (discovery or op == OP_INCLUDED and phase == PHASE_MAIN)
         return finish_discovery(var t, row)
     if op == OP_READ_LONG and phase == PHASE_BLOB and (code == att.ATT_ERR_INVALID_OFFSET or code == att.ATT_ERR_ATTRIBUTE_NOT_LONG)
-        return finish(t, row, STATUS_OK, 0)
+        return finish(var t, row, STATUS_OK, 0)
     if (op == OP_WRITE_LONG or op == OP_RELIABLE) and phase == PHASE_MAIN and rd(var t, row, R_WRITTEN) > 0
         return start_cancel(var t, row, code)
     if (op == OP_WRITE_LONG or op == OP_RELIABLE) and phase == PHASE_CANCEL
-        return finish(t, row, rd(var t, row, R_PENDING), handle)
-    finish(t, row, code, handle)
+        return finish(var t, row, rd(var t, row, R_PENDING), handle)
+    finish(var t, row, code, handle)
 
 // A discovery that has nothing more to find: when an included service still
 // needs its UUID read, that comes first.
@@ -1664,7 +1664,7 @@ fn finish_discovery(var t: ClientTable, row: Int) -> Int
         build_request(var t, row)
         EV_NONE
     else
-        finish(t, row, STATUS_OK, 0)
+        finish(var t, row, STATUS_OK, 0)
 
 // Continue a discovery after a response whose last handle was `last`: the
 // next request starts after it, unless the range is done.
@@ -1694,7 +1694,7 @@ fn start_cancel(var t: ClientTable, row: Int, status: Int) -> Int
 @no_alloc
 fn rsp_mtu(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -> Int
     if length < 3
-        return finish(t, row, STATUS_PROTOCOL, 0)
+        return finish(var t, row, STATUS_PROTOCOL, 0)
     let server = le16(pdu, 1)
     let offered = rd(var t, row, R_RX_MTU)
     var mtu = if server < offered
@@ -1705,7 +1705,7 @@ fn rsp_mtu(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -> Int
         mtu = DEFAULT_MTU
     wr(var t, row, R_MTU, mtu)
     wr(var t, row, R_MTU_DONE, 1)
-    finish(t, row, STATUS_OK, 0)
+    finish(var t, row, STATUS_OK, 0)
 
 // The UUID the active request asks about.
 @tier(embedded)
@@ -1734,9 +1734,9 @@ fn rsp_services(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -
             0
     let wide = item == 20
     if item != 4 and item != 6 and item != 20
-        return finish(t, row, STATUS_PROTOCOL, 0)
+        return finish(var t, row, STATUS_PROTOCOL, 0)
     if length < first + item or (length - first) % item != 0
-        return finish(t, row, STATUS_PROTOCOL, 0)
+        return finish(var t, row, STATUS_PROTOCOL, 0)
     let flags = if rd(var t, row, R_ARG) == UUID_SECONDARY_SERVICE
         CF_SECONDARY
     else
@@ -1747,13 +1747,13 @@ fn rsp_services(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -
         let handle = le16(pdu, at)
         let end = le16(pdu, at + 2)
         if handle < rd(var t, row, R_START) or end < handle
-            return finish(t, row, STATUS_ORDER, 0)
+            return finish(var t, row, STATUS_ORDER, 0)
         let uuid = if by_uuid
             request_uuid(var t, row)
         else
             uuid_at(var pdu, at + 4, wide)
         if not cache_put(var t, slot, KIND_SERVICE, handle, end, 0, uuid, flags)
-            return finish(t, row, STATUS_CACHE_FULL, 0)
+            return finish(var t, row, STATUS_CACHE_FULL, 0)
         wr(var t, row, R_FOUND, rd(var t, row, R_FOUND) + 1)
         last = end
     next_discovery(var t, row, last)
@@ -1783,13 +1783,13 @@ fn rsp_included(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -
     else
         0
     if item != 6 and item != 8 or length < 2 + item or (length - 2) % item != 0
-        return finish(t, row, STATUS_PROTOCOL, 0)
+        return finish(var t, row, STATUS_PROTOCOL, 0)
     var last = 0
     for k in 0..(length - 2) / item
         let at = 2 + k * item
         let handle = le16(pdu, at)
         if handle < rd(var t, row, R_START)
-            return finish(t, row, STATUS_ORDER, 0)
+            return finish(var t, row, STATUS_ORDER, 0)
         let uuid = if item == 8
             uuid16(le16(pdu, at + 6))
         else
@@ -1799,7 +1799,7 @@ fn rsp_included(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -
         else
             CF_UNRESOLVED
         if not cache_put(var t, slot, KIND_INCLUDE, handle, le16(pdu, at + 2), le16(pdu, at + 4), uuid, flags)
-            return finish(t, row, STATUS_CACHE_FULL, 0)
+            return finish(var t, row, STATUS_CACHE_FULL, 0)
         wr(var t, row, R_FOUND, rd(var t, row, R_FOUND) + 1)
         last = handle
     next_discovery(var t, row, last)
@@ -1816,7 +1816,7 @@ fn rsp_resolve(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) ->
     else if length == 3
         uuid = uuid_at(var pdu, 1, false)
     else
-        return finish(t, row, STATUS_PROTOCOL, 0)
+        return finish(var t, row, STATUS_PROTOCOL, 0)
     for i in 0..t.cache_n[slot]
         let at = slot * cache() + i
         if (t.c_kind[at] as Int) == KIND_INCLUDE and (t.c_a[at] as Int) == target and (t.c_flags[at] as Int & CF_UNRESOLVED) != 0
@@ -1829,7 +1829,7 @@ fn rsp_resolve(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) ->
         build_request(var t, row)
         EV_NONE
     else if rd(var t, row, R_AUX) != 0
-        finish(t, row, STATUS_OK, 0)
+        finish(var t, row, STATUS_OK, 0)
     else
         wr(var t, row, R_PHASE, PHASE_MAIN)
         build_request(var t, row)
@@ -1844,7 +1844,7 @@ fn rsp_characteristics(var t: ClientTable, row: Int, var pdu: ClientPdu, length:
     else
         0
     if item != 7 and item != 21 or length < 2 + item or (length - 2) % item != 0
-        return finish(t, row, STATUS_PROTOCOL, 0)
+        return finish(var t, row, STATUS_PROTOCOL, 0)
     let filter = rd(var t, row, R_OP) == OP_CHARS_UUID
     let want_uuid = request_uuid(var t, row)
     var last = 0
@@ -1853,11 +1853,11 @@ fn rsp_characteristics(var t: ClientTable, row: Int, var pdu: ClientPdu, length:
         let handle = le16(pdu, at)
         let value_handle = le16(pdu, at + 3)
         if handle < rd(var t, row, R_START) or value_handle <= handle
-            return finish(t, row, STATUS_ORDER, 0)
+            return finish(var t, row, STATUS_ORDER, 0)
         let uuid = uuid_at(var pdu, at + 5, item == 21)
         if not filter or uuid_same(uuid, want_uuid)
             if not cache_put(var t, slot, KIND_CHAR, handle, value_handle, pdu[at + 2] as Int, uuid, 0)
-                return finish(t, row, STATUS_CACHE_FULL, 0)
+                return finish(var t, row, STATUS_CACHE_FULL, 0)
             wr(var t, row, R_FOUND, rd(var t, row, R_FOUND) + 1)
         last = handle
     next_discovery(var t, row, last)
@@ -1872,23 +1872,23 @@ fn rsp_descriptors(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int
         0
     let wide = format == att.ATT_FIND_INFO_FORMAT_UUID128
     if format != att.ATT_FIND_INFO_FORMAT_UUID16 and not wide
-        return finish(t, row, STATUS_PROTOCOL, 0)
+        return finish(var t, row, STATUS_PROTOCOL, 0)
     let item = if wide
         18
     else
         4
     if length < 2 + item or (length - 2) % item != 0
-        return finish(t, row, STATUS_PROTOCOL, 0)
+        return finish(var t, row, STATUS_PROTOCOL, 0)
     var last = 0
     for k in 0..(length - 2) / item
         let at = 2 + k * item
         let handle = le16(pdu, at)
         if handle < rd(var t, row, R_START)
-            return finish(t, row, STATUS_ORDER, 0)
+            return finish(var t, row, STATUS_ORDER, 0)
         if handle > rd(var t, row, R_END)
             return finish_discovery(var t, row)
         if not cache_put(var t, slot, KIND_DESC, handle, 0, 0, uuid_at(var pdu, at + 2, wide), 0)
-            return finish(t, row, STATUS_CACHE_FULL, 0)
+            return finish(var t, row, STATUS_CACHE_FULL, 0)
         wr(var t, row, R_FOUND, rd(var t, row, R_FOUND) + 1)
         last = handle
     next_discovery(var t, row, last)
@@ -1912,24 +1912,24 @@ fn copy_in(var t: ClientTable, row: Int, var pdu: ClientPdu, from: Int, count: I
 fn rsp_read(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -> Int
     let got = copy_in(var t, row, var pdu, 1, length - 1, 0)
     wr(var t, row, R_VAL_LEN, got)
-    finish(t, row, (if got < length - 1 then STATUS_TRUNCATED else STATUS_OK), 0)
+    finish(var t, row, (if got < length - 1 then STATUS_TRUNCATED else STATUS_OK), 0)
 
 @tier(embedded)
 @no_alloc
 fn rsp_read_type(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -> Int
     if length < 4
-        return finish(t, row, STATUS_PROTOCOL, 0)
+        return finish(var t, row, STATUS_PROTOCOL, 0)
     let got = copy_in(var t, row, var pdu, 2, length - 2, 0)
     wr(var t, row, R_VAL_LEN, got)
     wr(var t, row, R_ITEM_LEN, pdu[1] as Int)
-    finish(t, row, (if got < length - 2 then STATUS_TRUNCATED else STATUS_OK), 0)
+    finish(var t, row, (if got < length - 2 then STATUS_TRUNCATED else STATUS_OK), 0)
 
 // The Database Hash answer: one handle and 16 octets.
 @tier(embedded)
 @no_alloc
 fn rsp_hash(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -> Int
     if length != 4 + HASH_OCTETS or (pdu[1] as Int) != 2 + HASH_OCTETS
-        return finish(t, row, STATUS_PROTOCOL, 0)
+        return finish(var t, row, STATUS_PROTOCOL, 0)
     let slot = row / bearers()
     var same = true
     for i in 0..HASH_OCTETS
@@ -1941,7 +1941,7 @@ fn rsp_hash(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -> In
     if known and not same
         cache_clear_slot(var t, slot)
         t.flags[slot] = t.flags[slot] | F_CHANGED
-    finish(t, row, STATUS_OK, 0)
+    finish(var t, row, STATUS_OK, 0)
 
 @tier(embedded)
 @no_alloc
@@ -1956,9 +1956,9 @@ fn rsp_read_long(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) 
     wr(var t, row, R_WRITTEN, have + got)
     wr(var t, row, R_VAL_LEN, have + got)
     if got < part
-        return finish(t, row, STATUS_TRUNCATED, 0)
+        return finish(var t, row, STATUS_TRUNCATED, 0)
     if part < full or rd(var t, row, R_ARG) + have + got >= 0xFFFF
-        return finish(t, row, STATUS_OK, 0)
+        return finish(var t, row, STATUS_OK, 0)
     wr(var t, row, R_PHASE, PHASE_BLOB)
     build_request(var t, row)
     EV_NONE
@@ -1970,9 +1970,9 @@ fn rsp_read_long(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) 
 fn rsp_prepare(var t: ClientTable, row: Int, var pdu: ClientPdu, length: Int) -> Int
     let phase = rd(var t, row, R_PHASE)
     if phase == PHASE_CANCEL
-        return finish(t, row, rd(var t, row, R_PENDING), 0)
+        return finish(var t, row, rd(var t, row, R_PENDING), 0)
     if phase == PHASE_EXECUTE
-        return finish(t, row, STATUS_OK, 0)
+        return finish(var t, row, STATUS_OK, 0)
     let part = rd(var t, row, R_AUX)
     let sent = rd(var t, row, R_WRITTEN)
     if length != 5 + part or le16(pdu, 1) != rd(var t, row, R_START) or le16(pdu, 3) != ((rd(var t, row, R_ARG) + sent) & 0xFFFF)

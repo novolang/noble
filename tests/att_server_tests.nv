@@ -575,11 +575,11 @@ fn test_an_execute_write_is_refused_for_a_short_pdu_or_an_unknown_flag_and_cance
 fn test_the_write_aware_dispatcher_routes_the_prepare_and_execute_opcodes_and_refuses_an_empty_pdu()
     var blob = writable_db()
     var queue: [u8] = []
-    let empty = att_server.handle_request_m6(var blob, queue, 23, [])
+    let empty = att_server.handle_request_m6(var blob, var queue, 23, [])
     test.assert_eq(empty.rsp[4] as Int, att.ATT_ERR_INVALID_PDU)
-    let prepared = att_server.handle_request_m6(var blob, queue, 23, [0x16, 0x03, 0x00, 0x00, 0x00, 0x5A])
+    let prepared = att_server.handle_request_m6(var blob, var queue, 23, [0x16, 0x03, 0x00, 0x00, 0x00, 0x5A])
     test.assert_eq(prepared.rsp[0] as Int, att.ATT_OP_PREPARE_WRITE_RSP)
     queue = prepared.new_queue[:]
-    let executed = att_server.handle_request_m6(var blob, queue, 23, [0x18, 0x01])
+    let executed = att_server.handle_request_m6(var blob, var queue, 23, [0x18, 0x01])
     test.assert_eq(executed.rsp[0] as Int, att.ATT_OP_EXECUTE_WRITE_RSP)
     test.assert(executed.applied)

@@ -316,7 +316,7 @@ fn send_b_frame(var link: LeLink, cid: Int, payload: [u8]) -> [[u8]]
                 hci_codec.ACL_PB_CONTINUING
             list.push(link.tx_queue, hci_codec.build_h4_acl(link.connection_handle, pb, frame[at:end]))
             at = end
-    flush(link)
+    flush(var link)
 
 // The Controller completed `count` packets of `connection_handle`
 // (Number Of Completed Packets event): their buffers are free again, and
@@ -326,7 +326,7 @@ fn completed(var link: LeLink, connection_handle: Int, count: Int) -> [[u8]]
     if connection_handle != link.connection_handle
         return []
     let _ = credits_completed(var link.credits, link.id.slot, count)
-    flush(link)
+    flush(var link)
 
 // ── Receiving ───────────────────────────────────────────────────────
 
@@ -596,7 +596,7 @@ pub fn request_connection_parameter_update(var link: LeLink, interval_min: Int, 
                                            latency: Int, timeout: Int, now_ms: Int) -> ?[[u8]]
     if not may_request_update(link, now_ms)
         return None
-    let identifier = next_identifier(link)
+    let identifier = next_identifier(var link)
     link.update_identifier = identifier
     link.update_deadline_ms = now_ms + SIGNALING_RTX_MS
     Some(send_signaling(var link,
@@ -936,7 +936,7 @@ pub fn le_links_open(var ls: LeLinks, handle: Int, central: Bool, peer_type: Int
     ls.registry = registry
     if links.is_link(id)
         ls.slots[id.slot].id = id
-        connect(ls.slots[id.slot], handle, central)
+        connect(var ls.slots[id.slot], handle, central)
     id
 
 // The connection `id` has ended: its link drops what it queued, its buffers
@@ -946,7 +946,7 @@ pub fn le_links_open(var ls: LeLinks, handle: Int, central: Bool, peer_type: Int
 pub fn le_links_close(var ls: LeLinks, id: links.LinkId) -> [[u8]]
     if not links.links_live(ls.registry, id)
         return []
-    disconnect(ls.slots[id.slot])
+    disconnect(var ls.slots[id.slot])
     var registry = ls.registry
     let _ = links.links_close(var registry, id)
     ls.registry = registry
@@ -1016,7 +1016,7 @@ fn le_links_drain(var ls: LeLinks) -> [[u8]]
 fn le_links_tick(var ls: LeLinks, now_ms: Int)
     for slot in 0..links.links_slots(ls.registry)
         if is_connected(ls.slots[slot])
-            tick(ls.slots[slot], now_ms)
+            tick(var ls.slots[slot], now_ms)
 
 // ── Fixtures that the suites of other modules share ─────────────────────
 //

@@ -197,7 +197,7 @@ fn test_refuses_unacceptable_mtu_and_mps()
 @satisfies("REQ-BLE-L2CAP-008")
 fn test_the_connection_request_a_caller_sends()
     var state = new_state()
-    match connect(state, TEST_PSM, 120, 1, false, false)
+    match connect(var state, TEST_PSM, 120, 1, false, false)
         None      => test.fail("the request goes out")
         Some(out) =>
             test.assert_eq(list.len(out), 1)
@@ -219,7 +219,7 @@ fn test_the_connection_request_a_caller_sends()
 @satisfies("REQ-BLE-L2CAP-008")
 fn test_the_response_makes_the_channel_ready_and_a_refusal_reports_it()
     var state = new_state()
-    let _ = connect(state, TEST_PSM, 120, 1, false, false)
+    let _ = connect(var state, TEST_PSM, 120, 1, false, false)
     let out = receive_signaling(var state,
         l2cap.CODE_LE_CREDIT_BASED_CONNECTION_RSP,
         0x01,
@@ -240,7 +240,7 @@ fn test_the_response_makes_the_channel_ready_and_a_refusal_reports_it()
         _                           => test.fail("the channel is up")
     // A refusal reports the channel gone with the Result of the response.
     var refused = new_state()
-    let _ = connect(refused, TEST_PSM, 120, 1, false, false)
+    let _ = connect(var refused, TEST_PSM, 120, 1, false, false)
     let _ = receive_signaling(var refused,
         l2cap.CODE_LE_CREDIT_BASED_CONNECTION_RSP,
         0x01,
@@ -260,7 +260,7 @@ fn test_the_response_makes_the_channel_ready_and_a_refusal_reports_it()
 fn test_a_response_with_an_mps_below_the_minimum_drops_the_channel()
     for mps in [0, 1, 2, 22]
         var state = new_state()
-        let _ = connect(state, TEST_PSM, 120, 1, false, false)
+        let _ = connect(var state, TEST_PSM, 120, 1, false, false)
         let out = receive_signaling(var state,
             l2cap.CODE_LE_CREDIT_BASED_CONNECTION_RSP,
             0x01,
@@ -274,7 +274,7 @@ fn test_a_response_with_an_mps_below_the_minimum_drops_the_channel()
             _                                   => test.fail("the channel is gone")
     // 23 is the smallest an LE Credit Based channel is created with.
     var ok = new_state()
-    let _ = connect(ok, TEST_PSM, 120, 1, false, false)
+    let _ = connect(var ok, TEST_PSM, 120, 1, false, false)
     let _ = receive_signaling(var ok,
         l2cap.CODE_LE_CREDIT_BASED_CONNECTION_RSP,
         0x01,
@@ -285,7 +285,7 @@ fn test_a_response_with_an_mps_below_the_minimum_drops_the_channel()
 @satisfies("REQ-BLE-L2CAP-013")
 fn test_an_enhanced_response_with_an_mps_below_the_minimum_drops_the_channels()
     var state = new_state()
-    let _ = connect(state, TEST_PSM, 96, 2, true, false)
+    let _ = connect(var state, TEST_PSM, 96, 2, true, false)
     var body: [u8] = []
     list.append(body, bytes_of(128))
     list.append(body, bytes_of(63))
@@ -320,7 +320,7 @@ fn test_a_reconfigure_request_with_an_mps_below_the_minimum_is_refused()
 @satisfies("REQ-BLE-L2CAP-008")
 fn test_a_response_completes_only_the_request_with_its_identifier()
     var state = new_state()
-    let _ = connect(state, TEST_PSM, 120, 1, false, false)
+    let _ = connect(var state, TEST_PSM, 120, 1, false, false)
     let _ = receive_signaling(var state,
         l2cap.CODE_LE_CREDIT_BASED_CONNECTION_RSP,
         0x07,
@@ -339,7 +339,7 @@ fn test_a_response_completes_only_the_request_with_its_identifier()
     test.assert_eq(count(state), 1)
     // And an LE response with the Identifier of an Enhanced request.
     var enhanced = new_state()
-    let _ = connect(enhanced, TEST_PSM, 96, 2, true, false)
+    let _ = connect(var enhanced, TEST_PSM, 96, 2, true, false)
     let _ = receive_signaling(var enhanced,
         l2cap.CODE_LE_CREDIT_BASED_CONNECTION_RSP,
         0x01,
@@ -357,8 +357,8 @@ fn test_a_response_completes_only_the_request_with_its_identifier()
 @satisfies("REQ-BLE-L2CAP-008")
 fn test_two_requests_out_at_once_are_answered_by_identifier()
     var state = new_state()
-    let _ = connect(state, TEST_PSM, 120, 1, false, false)
-    let _ = connect(state, TEST_OTHER_PSM, 120, 1, false, false)
+    let _ = connect(var state, TEST_PSM, 120, 1, false, false)
+    let _ = connect(var state, TEST_OTHER_PSM, 120, 1, false, false)
     let _ = receive_signaling(var state,
         l2cap.CODE_LE_CREDIT_BASED_CONNECTION_RSP,
         0x02,
@@ -375,7 +375,7 @@ fn test_two_requests_out_at_once_are_answered_by_identifier()
 @satisfies("REQ-BLE-L2CAP-009")
 fn test_an_enhanced_response_with_too_few_destination_cids_ends_the_rest()
     var state = new_state()
-    let _ = connect(state, TEST_PSM, 96, 2, true, false)
+    let _ = connect(var state, TEST_PSM, 96, 2, true, false)
     var body: [u8] = []
     list.append(body, bytes_of(128))
     list.append(body, bytes_of(128))
@@ -557,7 +557,7 @@ fn test_gives_credits_back_as_frames_arrive()
 @satisfies("REQ-BLE-L2CAP-010")
 fn test_held_credits_wait_for_the_upper_layer()
     var state = new_state()
-    let _ = connect(state, TEST_PSM, 120, 1, false, true)
+    let _ = connect(var state, TEST_PSM, 120, 1, false, true)
     let _ = receive_signaling(var state,
         l2cap.CODE_LE_CREDIT_BASED_CONNECTION_RSP,
         0x01,
@@ -661,7 +661,7 @@ fn test_a_frame_without_credits_ends_the_channel()
     // gives them back as the frames arrive ends nothing, which is the
     // other alternative that case allows (the test above).
     var state = new_state()
-    let _ = connect(state, TEST_PSM, 120, 1, false, true)
+    let _ = connect(var state, TEST_PSM, 120, 1, false, true)
     let _ = receive_signaling(var state,
         l2cap.CODE_LE_CREDIT_BASED_CONNECTION_RSP,
         0x01,
@@ -700,7 +700,7 @@ fn test_credits_above_the_maximum_end_the_channel()
 @satisfies("REQ-BLE-L2CAP-012")
 fn test_the_caller_ends_a_channel_and_the_peer_answers()
     var state = accepting()
-    let out = match disconnect(state, 0)
+    let out = match disconnect(var state, 0)
         None    => []
         Some(o) => o
     test.assert_eq(list.len(out), 1)
@@ -809,7 +809,7 @@ fn test_an_enhanced_request_refuses_only_the_cids_it_cannot_take()
 @satisfies("REQ-BLE-L2CAP-008")
 fn test_an_enhanced_request_of_the_caller_creates_both_channels()
     var state = new_state()
-    match connect(state, TEST_PSM, 96, 2, true, false)
+    match connect(var state, TEST_PSM, 96, 2, true, false)
         None      => test.fail("the request goes out")
         Some(out) =>
             test.assert_eq(list.len(out), 1)
@@ -841,7 +841,7 @@ fn test_an_enhanced_request_of_the_caller_creates_both_channels()
 @satisfies("REQ-BLE-L2CAP-009")
 fn test_an_enhanced_response_leaves_an_unanswerable_channel_gone()
     var state = new_state()
-    let _ = connect(state, TEST_PSM, 96, 2, true, false)
+    let _ = connect(var state, TEST_PSM, 96, 2, true, false)
     var body: [u8] = []
     list.append(body, bytes_of(128))
     list.append(body, bytes_of(128))
@@ -959,7 +959,7 @@ fn test_the_channels_of_a_psm_are_the_ones_that_are_up()
     // A channel whose request is still out is not up, and neither is one
     // the answer refused.
     var connecting = new_state()
-    let _ = connect(connecting, TEST_PSM, 120, 1, false, false)
+    let _ = connect(var connecting, TEST_PSM, 120, 1, false, false)
     test.assert_eq(list.len(channels_of_psm(connecting, TEST_PSM)), 0)
     let _ = receive_signaling(var connecting,
         l2cap.CODE_LE_CREDIT_BASED_CONNECTION_RSP,

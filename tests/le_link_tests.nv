@@ -17,7 +17,7 @@ use le_link
 fn connected_link() -> LeLink
     var link = new_link(test_db())
     set_buffers(var link, 27, 2)
-    connect(link, 0x0040, false)
+    connect(var link, 0x0040, false)
     link
 
 fn acl(start: Bool, data: [u8]) -> [u8]
@@ -86,7 +86,7 @@ fn test_recombination_discards_what_does_not_match()
 fn test_fragmentation_and_flow_control()
     var link = connected_link()
     set_buffers(var link, 27, 2)
-    connect(link, 0x0040, false)
+    connect(var link, 0x0040, false)
     // A 60-octet payload: a 64-octet B-frame in fragments of 27, 27 and 10.
     var payload: [u8] = []
     for i in 0..60
@@ -165,9 +165,9 @@ fn test_connection_parameter_update_request_and_response()
 fn test_connection_parameter_update_request_rtx_expiry()
     var link = connected_link()
     let _ = request_connection_parameter_update(var link, 0x0032, 0x0046, 0x0001, 0x01F4, 0)
-    tick(link, SIGNALING_RTX_MS - 1)
+    tick(var link, SIGNALING_RTX_MS - 1)
     test.assert_eq(link.update_identifier, 1)
-    tick(link, SIGNALING_RTX_MS)
+    tick(var link, SIGNALING_RTX_MS)
     test.assert_eq(link.update_identifier, 0)
     // No response arrived, so another request may go at once.
     let _ = completed(var link, 0x0040, 1)
@@ -181,7 +181,7 @@ fn test_connection_parameter_update_request_rtx_expiry()
 @test
 fn test_connection_parameter_update_request_at_a_central()
     var link = connected_link()
-    connect(link, 0x0040, true)
+    connect(var link, 0x0040, true)
     let req = l2cap.build_connection_parameter_update_req(0x07, 0x0032, 0x0046, 0x0001, 0x01F4)
     let out = receive_acl(var link, acl(true, l2cap.build_b_frame(l2cap.CID_LE_SIGNALING, req)), 0)
     test.assert_eq(list.len(out), 1)
@@ -260,7 +260,7 @@ fn test_smp_pdus_wait_for_the_security_manager()
 fn test_unknown_cid_and_no_connection()
     var link = connected_link()
     test.assert_eq(list.len(receive_acl(var link, acl(true, l2cap.build_b_frame(0x0040, [0x01])), 0)), 0)
-    disconnect(link)
+    disconnect(var link)
     test.assert_eq(list.len(send_b_frame(var link, l2cap.CID_ATT, [0x01])), 0)
     test.assert_eq(list.len(receive_acl(var link, acl(true, l2cap.build_b_frame(l2cap.CID_ATT, [0x0A, 0x03, 0x00])), 0)),
         0)
@@ -282,12 +282,12 @@ fn test_the_gatt_server_answers_and_indicates()
     test.assert(bytes_eq(sent_payload(ind[0]), [0x1D, 0x05, 0x00, 0x01, 0x00, 0x06, 0x00]))
     // Not confirmed within the transaction timeout: the bearer answers
     // nothing more.
-    tick(link, 100 + gatt_server.ATT_TRANSACTION_TIMEOUT_MS)
+    tick(var link, 100 + gatt_server.ATT_TRANSACTION_TIMEOUT_MS)
     let _ = completed(var link, 0x0040, 1)
     test.assert_eq(list.len(receive_acl(var link, acl(true, l2cap.build_b_frame(l2cap.CID_ATT, [0x0A, 0x03, 0x00])), 0)),
         0)
     // A new connection starts the bearer afresh.
-    connect(link, 0x0041, false)
+    connect(var link, 0x0041, false)
     test.assert_eq(link.att.bearers[0].timed_out, false)
 
 // ── Connection-oriented channels over the link ──────────────────────
@@ -383,7 +383,7 @@ fn test_a_fragmented_k_frame_above_the_mps_waits_for_a_buffer_and_ends_the_chann
     // Number Of Completed Packets event and goes out with it.
     var link = connected_link()
     set_buffers(var link, 251, 1)
-    connect(link, 0x0040, false)
+    connect(var link, 0x0040, false)
     coc_listen(var link, 0x0080, 0x01, 120, 0x00)
     let rsp = receive_acl(var link, acl(true,
         l2cap.build_b_frame(l2cap.CID_LE_SIGNALING, le_request_frame(0x07, 0x0080, 0x0040, 192, 64, 2))),
@@ -470,7 +470,7 @@ fn test_the_end_of_the_connection_ends_the_channels()
         l2cap.build_b_frame(l2cap.CID_LE_SIGNALING, le_request_frame(0x07, 0x0080, 0x0042, 672, 23, 2))),
     0)
     let _ = take_coc_events(var link)
-    disconnect(link)
+    disconnect(var link)
     match take_coc_events(var link)[0]
         l2cap_coc.Disconnected(id, _, _) => test.assert_eq(id, 0)
         _                                => test.fail("the channel is gone")
@@ -481,7 +481,7 @@ fn test_the_end_of_the_connection_ends_the_channels()
 fn test_a_listener_survives_a_new_connection()
     var link = connected_link()
     coc_listen(var link, 0x0080, 0x01, 120, 0x00)
-    connect(link, 0x0041, false)
+    connect(var link, 0x0041, false)
     let out = receive_acl(var link, hci_codec.build_h4_acl(0x0041,
         hci_codec.ACL_PB_FIRST_FLUSHABLE,
         l2cap.build_b_frame(l2cap.CID_LE_SIGNALING, le_request_frame(0x07, 0x0080, 0x0042, 672, 23, 2))),
@@ -755,7 +755,7 @@ fn test_the_bearer_table_follows_the_channels_the_link_holds()
     let _ = receive_acl(var link,
         acl(true, l2cap.build_b_frame(l2cap.CID_LE_SIGNALING, eatt_request_many(0x09, 128, [0x0042]))),
         0)
-    disconnect(link)
+    disconnect(var link)
     test.assert_eq(gatt_server.bearer_count(link.att), 1)
 
 @test
@@ -958,8 +958,8 @@ fn test_a_connection_beyond_the_slots_is_refused_and_a_closed_slot_is_reused()
 @satisfies("REQ-BLE-LINKS-003")
 fn test_each_link_keeps_its_own_attribute_and_signaling_state()
     var ls = two_links()
-    let a = le_links_link(ls, le_links_find_handle(ls, 0x0040))
-    let b = le_links_link(ls, le_links_find_handle(ls, 0x0041))
+    var a = le_links_link(ls, le_links_find_handle(ls, 0x0040))
+    var b = le_links_link(ls, le_links_find_handle(ls, 0x0041))
     // An MTU exchange on the first link leaves the second at the default.
     let _ = le_links_receive_acl(var ls, hci_codec.build_h4_acl(0x0040,
         hci_codec.ACL_PB_FIRST_FLUSHABLE,
@@ -968,9 +968,9 @@ fn test_each_link_keeps_its_own_attribute_and_signaling_state()
     test.assert_eq(gatt_server.mtu_of(a.att, 0), 65)
     test.assert_eq(gatt_server.mtu_of(b.att, 0), 23)
     // Signaling identifiers count apart.
-    test.assert_eq(next_identifier(a), 1)
-    test.assert_eq(next_identifier(a), 2)
-    test.assert_eq(next_identifier(b), 1)
+    test.assert_eq(next_identifier(var a), 1)
+    test.assert_eq(next_identifier(var a), 2)
+    test.assert_eq(next_identifier(var b), 1)
 
 // ── Controllers whose buffers are not the Host's ────────────────────
 //
@@ -996,7 +996,7 @@ fn test_a_mock_controller_with_length_27_gets_27_octet_fragments()
     var link = new_link(test_db())
     // LE Read Buffer Size answered 27 octets, 8 buffers.
     set_buffers(var link, 27, 8)
-    connect(link, 0x0040, false)
+    connect(var link, 0x0040, false)
     let payload = filler(100)
     let sent = send_b_frame(var link, l2cap.CID_ATT, payload)
     // Four fragments, all within the eight buffers.
@@ -1018,7 +1018,7 @@ fn test_a_mock_controller_with_length_27_gets_27_octet_fragments()
 fn test_a_mock_controller_with_length_27_and_one_buffer_sends_one_fragment_per_credit()
     var link = new_link(test_db())
     set_buffers(var link, 27, 1)
-    connect(link, 0x0040, false)
+    connect(var link, 0x0040, false)
     let sent = send_b_frame(var link, l2cap.CID_ATT, filler(60))
     test.assert_eq(list.len(sent), 1)
     test.assert_eq(acl_data_octets(sent[0]), 27)
@@ -1037,7 +1037,7 @@ fn test_a_mock_controller_above_the_host_buffer_is_served_at_the_host_buffer()
     var link = new_link(test_db())
     // LE Read Buffer Size answered 0xFFFF octets, 8 buffers: more than a buffer of the Host.
     set_buffers(var link, 0xFFFF, 8)
-    connect(link, 0x0040, false)
+    connect(var link, 0x0040, false)
     test.assert_eq(links.acl_packet_length(link.credits.pool), links.acl_slot_payload())
     let sent = send_b_frame(var link, l2cap.CID_ATT, filler(links.acl_slot_payload() + 100))
     // The frame and its header, in as many packets of the Host's buffer as it fills.

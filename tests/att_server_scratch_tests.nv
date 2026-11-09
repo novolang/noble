@@ -177,7 +177,7 @@ fn test_writes_into_the_fixed_ram_database_match_the_server()
                 att_scratch.gatt_db_ram_init_from_blob(blob)
                 var db = blob[:]
                 let r = octets(list.concat(list.concat([op], le16(h)), value))
-                let want = att_server.handle_request_m6(var db, queue, 23, r)
+                let want = att_server.handle_request_m6(var db, var queue, 23, r)
                 att_scratch.scratch_reset()
                 let addr = stage(r)
                 let n = att_server_scratch.handle_request_to_scratch_ram_full(23, addr, list.len(r))

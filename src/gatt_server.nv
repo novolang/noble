@@ -1690,7 +1690,7 @@ fn exchange_mtu(var db: GattDb, var link: AttLink, index: Int, pdu: [u8]) -> [[u
             client
         else
             db.rx_mtu
-        set_mtu(link, index, mtu)
+        set_mtu(var link, index, mtu)
     [att.build_exchange_mtu_rsp(db.rx_mtu)]
 
 // The Starting Handle and Ending Handle of a request, checked: an error
@@ -2538,7 +2538,7 @@ fn test_server() -> GattServer
     test.assert(set_value(var s.db, 0, [0x33]))
     let _ = add_characteristic(var s.db, 0x3A, PERM_READ | PERM_WRITE, le16(0xAA05))
     test.assert(set_value(var s.db, 0, [0x44, 0x45]))
-    test.assert_eq(add_descriptor(s.db, PERM_READ | PERM_WRITE, le16(UUID_CLIENT_CHARACTERISTIC_CONFIGURATION)),
+    test.assert_eq(add_descriptor(var s.db, PERM_READ | PERM_WRITE, le16(UUID_CLIENT_CHARACTERISTIC_CONFIGURATION)),
         0x0013)
     test.assert_eq(add_characteristic(var s.db, 0x02, PERM_READ_ENCRYPT, uuid128(0x01)), 0x0014)
     test.assert(set_value(var s.db, 0, [0x55]))

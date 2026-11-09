@@ -228,7 +228,7 @@ fn reject(var s: SmpState, reason: Reason) -> SmpStep
     if s.phase == Phase.Idle
         refuse(var s, reason)
     else
-        fail(s, reason, false)
+        fail(var s, reason, false)
 
 // ── Pairing Feature Exchange ([Vol 3] Part H, Sections 2.3.5.1, 3.5.1,
 //    3.5.2) ───────────────────────────────────────────────────────────
@@ -239,7 +239,7 @@ fn reject(var s: SmpState, reason: Reason) -> SmpStep
 @satisfies("REQ-BLE-SMP-030")
 fn on_pairing_request(var s: SmpState, pdu: [u8]) -> SmpStep
     if s.phase != Phase.Idle
-        return fail(s, Reason.UnspecifiedReason, false)
+        return fail(var s, Reason.UnspecifiedReason, false)
     if smp_core.is_blocked(s)
         return refuse(var s, Reason.RepeatedAttempts)
     let init_io = pdu[1] as Int
@@ -353,7 +353,7 @@ fn on_legacy_random(var s: SmpState, pdu: [u8]) -> SmpStep
     // `legacy_peer_random_holds` makes for both halves (SM/CEN/JW/BI-06-C
     // and SM/CEN/PKE/BI-03-C are its cases).
     if not smp_core.legacy_peer_random_holds(s, rand_i)
-        return fail(s, Reason.ConfirmValueFailed, true)
+        return fail(var s, Reason.ConfirmValueFailed, true)
     smp_core.send(var s, smp.build_pairing_random(s.local_rand))
     s.peer_rand = rand_i[:]
     s.session_key = smp_core.legacy_short_term_key(s, rand_i)
@@ -370,7 +370,7 @@ fn on_public_key(var s: SmpState, pdu: [u8]) -> SmpStep
     let peer = PublicKey { x: smp.field_bytes(pdu, 1, 32), y: smp.field_bytes(pdu, 33, 32) }
     let fault = smp_core.public_key_fault(s, peer)
     if fault != None
-        return fail(s, fault!, false)
+        return fail(var s, fault!, false)
     s.peer_key = peer
     s.dhkey_wanted = true
     smp_core.send(var s, smp.build_pairing_public_key(s.key_pair.public_key.x, s.key_pair.public_key.y))
@@ -410,7 +410,7 @@ fn on_sc_random(var s: SmpState, pdu: [u8]) -> SmpStep
     var action: ?SmpAction = None
     if smp_core.is_passkey_entry(s)
         if not smp_core.passkey_round_holds(s, na)
-            return fail(s, Reason.ConfirmValueFailed, true)
+            return fail(var s, Reason.ConfirmValueFailed, true)
         smp_core.send(var s, smp.build_pairing_random(s.local_rand))
         s.round = s.round + 1
         s.peer_confirm = []
@@ -422,7 +422,7 @@ fn on_sc_random(var s: SmpState, pdu: [u8]) -> SmpStep
         // Step 5 of Figure 2.5: check Ca = f4(PKax, PKax, ra, 0) when the
         // peer's out of band data was received.
         if smp_core.holds_peer_oob_data(s) and not smp_core.oob_confirm_matches(s, s.peer_key.x)
-            return fail(s, Reason.ConfirmValueFailed, true)
+            return fail(var s, Reason.ConfirmValueFailed, true)
         s.local_rand = smp_core.draw(var s)
         smp_core.send(var s, smp.build_pairing_random(s.local_rand))
         s.phase = Phase.DhKeyCheck
@@ -444,7 +444,7 @@ fn try_stage2(var s: SmpState) -> ?SmpStep
         return None
     let keys = smp_core.sc_keys_of(s)
     if not smp_keys.equal_ct(smp_core.dhkey_check_a(s, keys), s.peer_check)
-        return Some(fail(s, Reason.DhKeyCheckFailed, true))
+        return Some(fail(var s, Reason.DhKeyCheckFailed, true))
     smp_core.send(var s, smp.build_pairing_dhkey_check(smp_core.dhkey_check_b(s, keys)))
     s.session_key = smp_keys.mask_key(keys.ltk, s.key_size)
     smp_core.expect_distribution(var s)
@@ -471,20 +471,20 @@ fn start_key_distribution(var s: SmpState) -> SmpStep
 fn next_expected(var s: SmpState) -> SmpStep
     if smp_core.expect_next_key(var s)
         return finish(s, None)
-    complete(s)
+    complete(var s)
 
 // A key of the Central that arrives before the Controller has reported
 // the encryption waits (`hold_peer_key`).
 fn hold_key(var s: SmpState, pdu: [u8]) -> SmpStep
     if not smp_core.hold_peer_key(var s, pdu)
-        return fail(s, Reason.UnspecifiedReason, false)
+        return fail(var s, Reason.UnspecifiedReason, false)
     finish(s, None)
 
 fn on_distributed_key(var s: SmpState, pdu: [u8]) -> SmpStep
     match smp_core.take_distributed_key(var s, pdu)
-        Rejected(reason) => fail(s, reason, false)
+        Rejected(reason) => fail(var s, reason, false)
         Waiting          => finish(s, None)
-        Complete         => complete(s)
+        Complete         => complete(var s)
 
 fn complete(var s: SmpState) -> SmpStep
     let result = smp_core.conclude(var s)
@@ -497,7 +497,7 @@ fn on_pdu(var s: SmpState, pdu: [u8]) -> SmpStep
         Ignore             => finish(s, None)
         PeerFailed(reason) => finish(s, Some(PairingFailed(reason, true)))
         Refuse(reason)     => refuse(var s, reason)
-        Fail(reason)       => fail(s, reason, false)
+        Fail(reason)       => fail(var s, reason, false)
         Handle(command)    => on_command(var s, command, pdu)
 
 fn on_command(var s: SmpState, command: Command, pdu: [u8]) -> SmpStep
@@ -565,7 +565,7 @@ fn on_encryption_changed(var s: SmpState, enabled: Bool) -> SmpStep
 fn on_passkey(var s: SmpState, passkey: Int) -> SmpStep
     match smp_core.take_passkey(var s, passkey)
         Ignored         => finish(s, None)
-        Refused(reason) => fail(s, reason, false)
+        Refused(reason) => fail(var s, reason, false)
         Accepted        =>
             if s.sc
                 passkey_send_confirm(var s)
@@ -576,13 +576,13 @@ fn on_passkey(var s: SmpState, passkey: Int) -> SmpStep
 fn on_numeric(var s: SmpState, accepted: Bool) -> SmpStep
     match smp_core.take_numeric(var s, accepted)
         Ignored         => finish(s, None)
-        Refused(reason) => fail(s, reason, false)
+        Refused(reason) => fail(var s, reason, false)
         Accepted        => stage2_or_wait(var s)
 
 fn on_dhkey(var s: SmpState, dhkey: [u8]) -> SmpStep
     match smp_core.take_dhkey(var s, dhkey)
         Ignored         => finish(s, None)
-        Refused(reason) => fail(s, reason, false)
+        Refused(reason) => fail(var s, reason, false)
         Accepted        => stage2_or_wait(var s)
 
 fn stage2_or_wait(var s: SmpState) -> SmpStep
@@ -647,7 +647,7 @@ pub fn handle(state: SmpState, input: SmpInput, now_ms: Int) -> SmpStep
             if smp_core.link_down(var s)
                 return finish(s, Some(PairingFailed(smp.reason_code(Reason.UnspecifiedReason), false)))
             finish(s, None)
-        Pdu(pdu)                                                        => on_pdu(s, pdu)
+        Pdu(pdu)                                                        => on_pdu(var s, pdu)
         Tick                                                            => on_tick(var s)
         LtkRequest(ediv, rand)                                          => on_ltk_request(var s, ediv, rand)
         EncryptionChanged(enabled)                                      => on_encryption_changed(var s, enabled)
@@ -672,7 +672,7 @@ pub fn handle(state: SmpState, input: SmpInput, now_ms: Int) -> SmpStep
         Cancel                                                          =>
             if s.phase == Phase.Idle
                 return finish(s, None)
-            fail(s, Reason.UnspecifiedReason, false)
+            fail(var s, Reason.UnspecifiedReason, false)
 
 // ── Fixtures that the suites of other modules share ─────────────────────
 //

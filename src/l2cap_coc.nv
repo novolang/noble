@@ -522,7 +522,7 @@ fn connect(var state: CocState, psm: Int, mtu: Int, num: Int, ecfc: Bool,
     if count(state) + want > MAX_CHANNELS
         return None
     var cids: [Int] = []
-    let identifier = next_identifier(state)
+    let identifier = next_identifier(var state)
     for _ in 0..want
         let cid = free_local_cid(state)
         let id = free_id(state)
@@ -806,7 +806,7 @@ fn enhanced_connection_response(var state: CocState, identifier: Int, data: [u8]
             // is asked to end it.
             let local_cid = state.channels[pending[i]].local_cid
             list.push(out,
-                build_disconnection(l2cap.CODE_DISCONNECTION_REQ, next_identifier(state), remote_cid, local_cid))
+                build_disconnection(l2cap.CODE_DISCONNECTION_REQ, next_identifier(var state), remote_cid, local_cid))
             list.push(unacceptable, local_cid)
         else if remote_cid != CID_NONE and accepts_partly(result)
             var c = state.channels[pending[i]]
@@ -877,7 +877,7 @@ fn flow_control_credit(var state: CocState, data: [u8]) -> [CocOut]
     if c.peer_credits + credits > MAX_CREDITS
         return end_channel(var state, i, RESULT_SUCCESS)
     c.peer_credits = c.peer_credits + credits
-    flush(state, i)
+    flush(var state, i)
 
 // L2CAP_CREDIT_BASED_RECONFIGURE_REQ: the peer states the MTU and MPS it
 // can receive on its own channels ([Vol 3] Part A, Section 4.27).  Its
@@ -1040,7 +1040,7 @@ pub fn receive_k_frame(var state: CocState, cid: Int, payload: [u8]) -> [CocOut]
     if index_of_cid(state, cid) < 0
         return out
     if not c.hold_credits and c.owed > 0
-        list.push(out, build_credit_ind(next_identifier(state), c.local_cid, c.owed))
+        list.push(out, build_credit_ind(next_identifier(var state), c.local_cid, c.owed))
         c.credits = c.credits + c.owed
         c.owed = 0
     out
@@ -1124,7 +1124,7 @@ pub fn send_sdu(var state: CocState, id: Int, sdu: [u8]) -> ?[CocOut]
     if c.connecting or c.disconnecting or list.len(sdu) > c.peer_mtu
         return None
     list.push(c.tx, sdu[:])
-    Some(flush(state, i))
+    Some(flush(var state, i))
 
 // Give the peer the credits that received K-frames spent, at least one
 // ([Vol 3] Part A, Section 4.24).  None when there is no such channel.
@@ -1141,7 +1141,7 @@ fn return_credits(var state: CocState, id: Int) -> ?[CocOut]
         1
     c.owed = 0
     c.credits = c.credits + credits
-    Some([build_credit_ind(next_identifier(state), c.local_cid, credits)])
+    Some([build_credit_ind(next_identifier(var state), c.local_cid, credits)])
 
 // Ask the peer to end the channel: L2CAP_DISCONNECTION_REQ names the
 // peer's CID as the Destination CID ([Vol 3] Part A, Section 4.6).  The
@@ -1154,7 +1154,7 @@ pub fn disconnect(var state: CocState, id: Int) -> ?[CocOut]
     if c.connecting or c.disconnecting
         return None
     c.disconnecting = true
-    Some([build_disconnection(l2cap.CODE_DISCONNECTION_REQ, next_identifier(state), c.remote_cid, c.local_cid)])
+    Some([build_disconnection(l2cap.CODE_DISCONNECTION_REQ, next_identifier(var state), c.remote_cid, c.local_cid)])
 
 // Ask the peer to accept the MTU and MPS `mtu` and `mps` this Host can
 // receive on the channels `ids`, which must be up:
@@ -1180,7 +1180,7 @@ fn reconfigure(var state: CocState, ids: [Int], mtu: Int, mps: Int) -> ?[CocOut]
     state.reconfiguring = local
     state.reconfigure_mtu = mtu
     state.reconfigure_mps = mps
-    Some([signal(l2cap.CODE_CREDIT_BASED_RECONFIGURE_REQ, next_identifier(state), body)])
+    Some([signal(l2cap.CODE_CREDIT_BASED_RECONFIGURE_REQ, next_identifier(var state), body)])
 
 // L2CAP_CREDIT_BASED_RECONFIGURE_RSP: the peer answered a request of this
 // Host's ([Vol 3] Part A, Section 4.28).  The channels take the new MTU
@@ -1207,6 +1207,6 @@ fn reconfigure_response(var state: CocState, data: [u8]) -> [CocOut]
 // dropped at once and the peer is asked to end it.
 fn end_channel(var state: CocState, i: Int, result: Int) -> [CocOut]
     let c = state.channels[i]
-    let request = build_disconnection(l2cap.CODE_DISCONNECTION_REQ, next_identifier(state), c.remote_cid, c.local_cid)
+    let request = build_disconnection(l2cap.CODE_DISCONNECTION_REQ, next_identifier(var state), c.remote_cid, c.local_cid)
     remove(var state, i, result)
     [request]

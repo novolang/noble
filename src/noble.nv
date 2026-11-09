@@ -20,7 +20,7 @@ use host_api
 use limits
 use profile_builder
 use smp
-use noble_config
+use noble.CONFIG
 
 // ── Status: the error value ─────────────────────────────────────────
 // A failure keeps the number its layer gave it.  `layer` says which
@@ -387,7 +387,7 @@ pub @tier(embedded)
 fn conn_params_default() -> ConnParams
     ConnParams { interval_min: 24, interval_max: 40, latency: 0, timeout: 400 }
 
-pub alias Value = Vec[u8; noble_config.ATT_VALUE_BYTES]
+pub alias Value = Vec[u8; noble.CONFIG.ATT_VALUE_BYTES]
 
 // ── Policy hooks: the decisions the specification leaves to the product ──
 // Every method has a default, so a product writes the ones it cares about.
@@ -551,7 +551,7 @@ struct ServerState
     peer: Addr
     csf: u8
     generation: u16
-    ccc: Vec[u16; noble_config.MAX_CCCD]
+    ccc: Vec[u16; noble.CONFIG.MAX_CCCD]
 
 // The Database Hash of a peer's GATT database (Vol 3 Part G 7.3).
 pub alias DbHash = [u8; 16]
@@ -588,7 +588,7 @@ pub trait BondStore[g]
 // a reset writes its own store over flash.
 pub @value
 struct RamBonds
-    rows: Vec[Bond; noble_config.MAX_BONDS]
+    rows: Vec[Bond; noble.CONFIG.MAX_BONDS]
 
 pub @tier(embedded)
 fn same_addr(a: Addr, b: Addr) -> Bool
@@ -646,7 +646,7 @@ struct DefaultPolicy
 impl HostPolicy[] for DefaultPolicy
 
 // ── Data the Host reports ───────────────────────────────────────────
-pub alias AdData = Vec[u8; noble_config.MAX_ADV_DATA]
+pub alias AdData = Vec[u8; noble.CONFIG.MAX_ADV_DATA]
 
 pub @value
 struct AdvReport
@@ -812,7 +812,7 @@ const fn max1(n: Int) -> Int
 // engine keeps for a link.
 @tier(embedded)
 const fn cache_image_bytes() -> Int
-    max1(noble_config.CLIENT_CACHE_RECORDS) * 32
+    max1(noble.CONFIG.CLIENT_CACHE_RECORDS) * 32
 
 // ── The state of Layer A ────────────────────────────────────────────
 // Everything the request engine (host_api.nv) keeps beside the tables of `Host`
@@ -872,7 +872,7 @@ const ADVERTISE_NON_CONNECTABLE = 2
 
 pub struct Api
     var ready: Bool
-    var events: Deque[Event; max1(noble_config.EVENT_QUEUE)]
+    var events: Deque[Event; max1(noble.CONFIG.EVENT_QUEUE)]
     var held: Int
     var dropped: Int
     var conns: Vec[Conn; limits.LINK_SLOTS]
@@ -1029,7 +1029,7 @@ fn is_droppable_event(ev: Event) -> Bool
 // less than the queue so that a droppable event can be admitted at all.
 @tier(embedded)
 fn reserve_free(a: Api) -> Int
-    var cap = noble_config.EVENT_QUEUE - 1
+    var cap = noble.CONFIG.EVENT_QUEUE - 1
     if cap < 0
         cap = 0
     var reserve = a.max_links
@@ -1047,8 +1047,8 @@ fn reserve_free(a: Api) -> Int
 pub @tier(embedded)
 fn queue_event(var a: Api, ev: Event) -> Bool
     let n = a.events.len()
-    var room = n < noble_config.EVENT_QUEUE
-    if room and is_droppable_event(ev) and n + reserve_free(a) >= noble_config.EVENT_QUEUE
+    var room = n < noble.CONFIG.EVENT_QUEUE
+    if room and is_droppable_event(ev) and n + reserve_free(a) >= noble.CONFIG.EVENT_QUEUE
         room = false
     if not room
         a.dropped = a.dropped + 1
@@ -1168,7 +1168,7 @@ struct ServiceResult
     status: Status
     svc: Int
 
-pub alias Name = String[noble_config.MAX_NAME]
+pub alias Name = String[noble.CONFIG.MAX_NAME]
 
 pub struct Adapter<T: HciLink[e], P: HostPolicy[f], B: BondStore[g]>
     var io: T
@@ -1176,16 +1176,16 @@ pub struct Adapter<T: HciLink[e], P: HostPolicy[f], B: BondStore[g]>
     var bonds: B
     var host: Host
     // The product's services (`plug`), and the first and last attribute handle each one added to the database: `pump` finds the
-    // owner of an attribute event by its handle.  At most `noble_config.MAX_SERVICES` entries (the key `max_services`).
+    // owner of an attribute event by its handle.  At most `noble.CONFIG.MAX_SERVICES` entries (the key `max_services`).
     var services: [dyn Service]
-    var owner_first: Vec[u16; noble_config.MAX_SERVICES]
-    var owner_last: Vec[u16; noble_config.MAX_SERVICES]
+    var owner_first: Vec[u16; noble.CONFIG.MAX_SERVICES]
+    var owner_last: Vec[u16; noble.CONFIG.MAX_SERVICES]
 
 // The Adapter of a transport, a policy and a bond store, with a Host that serves `MAX_CONNECTIONS` links and the Device Name
 // "noble".
 pub @tier(embedded)
 fn adapter<T: HciLink[e], P: HostPolicy[f], B: BondStore[g]>(io: T, policy: P, bonds: B) -> Adapter<T, P, B>
-    Adapter { io: io, policy: policy, bonds: bonds, host: host_blank(host_config(noble_config.MAX_CONNECTIONS, ['n', 'o', 'b', 'l', 'e'])),
+    Adapter { io: io, policy: policy, bonds: bonds, host: host_blank(host_config(noble.CONFIG.MAX_CONNECTIONS, ['n', 'o', 'b', 'l', 'e'])),
         services: [], owner_first: Vec.new(), owner_last: Vec.new() }
 
 impl Adapter
@@ -1563,7 +1563,7 @@ enum Out
     // The answer to `Event.AttrRead` or `AttrWrite`.
     Respond(conn: ConnId, attr: u16, code: Int, value: Value)
 
-pub alias Outbox = Vec[Out; noble_config.OUTBOX]
+pub alias Outbox = Vec[Out; noble.CONFIG.OUTBOX]
 
 // Every service module implements this trait and exports a value that does.  `attach` adds the service to the Host's database and
 // keeps the handles and the service index in the value; `on_event` offers the service each event the Host queued, and answers
@@ -1630,7 +1630,7 @@ fn reaches_all(ev: Event) -> Bool
 // The index in the list of the service whose attributes hold `attr`, -1 when none does (an attribute the product added outside
 // its services).
 @tier(embedded)
-fn owner_of(first: Vec[u16; noble_config.MAX_SERVICES], last: Vec[u16; noble_config.MAX_SERVICES], attr: u16) -> Int
+fn owner_of(first: Vec[u16; noble.CONFIG.MAX_SERVICES], last: Vec[u16; noble.CONFIG.MAX_SERVICES], attr: u16) -> Int
     for i in 0..first.len()
         if attr >= first[i] and attr <= last[i]
             return i
@@ -1643,7 +1643,7 @@ impl Adapter
     // names `hw` since a service may use it: a call through `dyn` is charged with the row of every implementation (SPEC 3.7).
     @tier(embedded)
     fn plug(var self, var services: [dyn Service]) -> Status [e, f, g, hw, mutate]
-        if services.len() > noble_config.MAX_SERVICES
+        if services.len() > noble.CONFIG.MAX_SERVICES
             return failed(LAYER_LOCAL, E_NO_ROOM)
         self.services = services
         for i in 0..self.services.len()

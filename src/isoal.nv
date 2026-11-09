@@ -38,7 +38,7 @@
 // Satisfies: REQ-BLE-ISO-002, REQ-BLE-ISO-007.
 
 use hci_codec
-use noble_config
+use noble.CONFIG
 // ── HCI level: segmentation of an SDU ───────────────────────────────
 
 // ISO_SDU_Length is 12 bits, so an SDU is at most 4095 octets
@@ -118,7 +118,7 @@ struct IsoSdu
 // The state of the reassembly of the SDUs of one Connection_Handle: the
 // SDU being collected, if any, a count of fragments that arrived with
 // no first fragment before them, and a count of SDUs longer than the Host's
-// SDU buffer (`noble_config.ISO_SDU_OCTETS`).  There is no flow control of ISO data
+// SDU buffer (`noble.CONFIG.ISO_SDU_OCTETS`).  There is no flow control of ISO data
 // toward the Host ([Vol 4] Part E, Section 4.1.1 covers ACL and SCO only),
 // so the Host's SDU size is told to the Controller through the SDU sizes of
 // the CIG or BIG parameters and checked here: an SDU that would not fit the
@@ -195,7 +195,7 @@ fn isoal_push(var r: IsoReassembler, pkt: hci_codec.IsoDataPacket) -> [IsoSdu]
     if hci_codec.iso_pb_has_sdu_header(pkt.pb_flag)
         if r.collecting
             list.push(out, lost_sdu(r.packet_sequence_number, r.has_time_stamp, r.time_stamp))
-        if list.len(pkt.data) > noble_config.ISO_SDU_OCTETS
+        if list.len(pkt.data) > noble.CONFIG.ISO_SDU_OCTETS
             r.collecting = false
             r.data = []
             r.oversize = r.oversize + 1
@@ -216,7 +216,7 @@ fn isoal_push(var r: IsoReassembler, pkt: hci_codec.IsoDataPacket) -> [IsoSdu]
     if not r.collecting
         r.orphan_fragments = r.orphan_fragments + 1
         return out
-    if list.len(r.data) + list.len(pkt.data) > noble_config.ISO_SDU_OCTETS
+    if list.len(r.data) + list.len(pkt.data) > noble.CONFIG.ISO_SDU_OCTETS
         let dropped = lost_sdu(r.packet_sequence_number, r.has_time_stamp, r.time_stamp)
         r.collecting = false
         r.data = []

@@ -31,7 +31,7 @@
 // Host does not yet keep the promise of no allocation after start; the
 // tables that are fixed-capacity storage (`client`, the link registry and the
 // isochronous tables) take their capacities from the package configuration
-// (`noble_config`).  `host_activate` is the one function here that changes
+// (`noble.CONFIG`).  `host_activate` is the one function here that changes
 // which connection the per-connection fields describe.
 
 use gatt_db
@@ -45,7 +45,7 @@ use smp_keys.{ KeyPair, PublicKey }
 use smp_responder
 use hci_frame
 use gatt_server
-use noble_config
+use noble.CONFIG
 use noble
 
 // The Appearance characteristic value of the GAP server: 0x0000, Unknown.
@@ -326,7 +326,7 @@ fn gatt_access(a: noble.Access) -> gatt_server.Access
 
 // Whether the database has room for `n` more attributes.
 fn database_room(host: Host, n: Int) -> Bool
-    list.len(host.link.db.attributes) + n <= noble_config.MAX_ATTRIBUTES
+    list.len(host.link.db.attributes) + n <= noble.CONFIG.MAX_ATTRIBUTES
 
 impl Host
     // Start a primary service.  Services are numbered from 0 in the order they are added.  Answers E_NO_ROOM when the database is

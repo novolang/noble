@@ -20,7 +20,7 @@
 // state the command heads for and answers 0 or the Controller error code
 // the Controller would answer, and a function that takes the answer or the
 // event and answers an `IsoEvent`.  One command is in flight at a time.  The
-// table holds `noble_config.MAX_BIG` groups and `noble_config.MAX_BIS` streams over all
+// table holds `noble.CONFIG.MAX_BIG` groups and `noble.CONFIG.MAX_BIS` streams over all
 // of them; a command that needs more is refused with Rejected Due To
 // Limited Resources.
 //
@@ -51,7 +51,7 @@ use std.test
 use hci_commands
 use hci_codec
 use iso_event
-use noble_config
+use noble.CONFIG
 
 // A table of an absent feature keeps one record: a `Vec` holds at least one element.
 const fn max1(n: Int) -> Int
@@ -131,7 +131,7 @@ const SYNC_TIMEOUT_MIN = 0x000A
 
 const SYNC_TIMEOUT_MAX = 0x4000
 
-// The Host's broadcast isochronous groups: one row for each group, in the capacity of `noble_config.MAX_BIG`, and the
+// The Host's broadcast isochronous groups: one row for each group, in the capacity of `noble.CONFIG.MAX_BIG`, and the
 // command each one has in flight.
 pub @value
 struct BigTable
@@ -141,20 +141,20 @@ struct BigTable
     pending_handle: u16
     pending_arg: u8
     // LE BIG Create Sync: the BIS_Number of each BIS asked for, in order.
-    pending_numbers: Vec[u8; max1(noble_config.MAX_BIS)]
-    state: Vec[BigState; max1(noble_config.MAX_BIG)]
-    broadcaster: Vec[Bool; max1(noble_config.MAX_BIG)]
-    big_handle: Vec[u8; max1(noble_config.MAX_BIG)]
+    pending_numbers: Vec[u8; max1(noble.CONFIG.MAX_BIS)]
+    state: Vec[BigState; max1(noble.CONFIG.MAX_BIG)]
+    broadcaster: Vec[Bool; max1(noble.CONFIG.MAX_BIG)]
+    big_handle: Vec[u8; max1(noble.CONFIG.MAX_BIG)]
     // The Advertising_Handle of a Broadcaster's group, the Sync_Handle of a
     // Receiver's.
-    link_handle: Vec[u16; max1(noble_config.MAX_BIG)]
-    stream_count: Vec[u8; max1(noble_config.MAX_BIG)]
-    encrypted: Vec[Bool; max1(noble_config.MAX_BIG)]
-    bis_used: Vec[Bool; max1(noble_config.MAX_BIS)]
-    bis_big: Vec[u8; max1(noble_config.MAX_BIS)]
-    bis_handle: Vec[u16; max1(noble_config.MAX_BIS)]
-    bis_number: Vec[u8; max1(noble_config.MAX_BIS)]
-    bis_paths: Vec[u8; max1(noble_config.MAX_BIS)]
+    link_handle: Vec[u16; max1(noble.CONFIG.MAX_BIG)]
+    stream_count: Vec[u8; max1(noble.CONFIG.MAX_BIG)]
+    encrypted: Vec[Bool; max1(noble.CONFIG.MAX_BIG)]
+    bis_used: Vec[Bool; max1(noble.CONFIG.MAX_BIS)]
+    bis_big: Vec[u8; max1(noble.CONFIG.MAX_BIS)]
+    bis_handle: Vec[u16; max1(noble.CONFIG.MAX_BIS)]
+    bis_number: Vec[u8; max1(noble.CONFIG.MAX_BIS)]
+    bis_paths: Vec[u8; max1(noble.CONFIG.MAX_BIS)]
 
 // The bytes of a group row and of a stream row.  `budget.BIG_RECORD` and
 // `budget.BIS_RECORD` have to cover them.
@@ -170,14 +170,14 @@ fn big_table_new() -> BigTable
         broadcaster: Vec.new(), big_handle: Vec.new(), link_handle: Vec.new(),
         stream_count: Vec.new(), encrypted: Vec.new(), bis_used: Vec.new(), bis_big: Vec.new(),
         bis_handle: Vec.new(), bis_number: Vec.new(), bis_paths: Vec.new() }
-    for _ in 0..noble_config.MAX_BIG
+    for _ in 0..noble.CONFIG.MAX_BIG
         let _a = t.state.push(BigState.Vacant)
         let _b = t.broadcaster.push(false)
         let _c = t.big_handle.push(0)
         let _d = t.link_handle.push(0)
         let _e = t.stream_count.push(0)
         let _f = t.encrypted.push(false)
-    for _ in 0..noble_config.MAX_BIS
+    for _ in 0..noble.CONFIG.MAX_BIS
         let _g = t.pending_numbers.push(0)
         let _h = t.bis_used.push(false)
         let _i = t.bis_big.push(NO_BIG)

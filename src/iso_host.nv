@@ -25,7 +25,7 @@ use iso_big
 use iso_cis
 use iso_event
 use iso_flow
-use noble_config
+use noble.CONFIG
 use links
 
 // The Host's isochronous state: the CIS table, the BIG table and the credits of the Controller's ISO buffers.
@@ -96,14 +96,14 @@ fn iso_host_cis_request(var h: IsoHost, evt: [u8], acl: iso_cis.AclRef) -> iso_e
 // with their credits taken: the stream exists and has its input data path,
 // the pool is configured and enough buffers are free.  0 when any of those
 // fails, and nothing is taken then.  An SDU longer than the Host's SDU buffer
-// (`noble_config.ISO_SDU_OCTETS`) is refused too.  The Controller's
+// (`noble.CONFIG.ISO_SDU_OCTETS`) is refused too.  The Controller's
 // ISO_Data_Packet_Length, which can be longer than that, only decides the
 // number of packets: the SDU itself is bounded by the Host's buffer.
 pub @satisfies("REQ-BLE-ISO-005")
 @tier(embedded)
 @no_alloc
 fn iso_host_reserve_sdu(var h: IsoHost, handle: Int, sdu_octets: Int, has_time_stamp: Bool) -> Int
-    if sdu_octets > noble_config.ISO_SDU_OCTETS
+    if sdu_octets > noble.CONFIG.ISO_SDU_OCTETS
         return 0
     if not iso_cis.cis_may_send(var h.cis, handle) and not iso_big.bis_may_send(var h.big, handle)
         return 0

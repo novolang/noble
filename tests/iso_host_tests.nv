@@ -8,7 +8,7 @@ use iso_big
 use iso_cis
 use iso_event
 use iso_flow
-use noble_config
+use noble.CONFIG
 use links
 use iso_host.{ IsoHost, big_sync_established_bytes, cis_established_bytes, command_complete, command_status, completed_packets_bytes, create_big_complete_bytes, disconnection_bytes, iso_host_acl_closed, iso_host_answer, iso_host_cis_request, iso_host_event, iso_host_new, iso_host_reserve_sdu }
 
@@ -20,17 +20,17 @@ fn host_cig(var h: IsoHost)
     let a = iso_host_answer(var h, command_complete(0x2062, 0, [0x01, 0x01, 0x10, 0x00]))
     test.assert(a.kind == iso_event.IsoEventKind.CigConfigured)
 
-@when(noble_config.MAX_CIS == 2 and noble_config.MAX_BIG == 1 and noble_config.MAX_BIS == 2)
+@when(noble.CONFIG.MAX_CIS == 2 and noble.CONFIG.MAX_BIG == 1 and noble.CONFIG.MAX_BIS == 2)
 @test
 @satisfies("REQ-BLE-ISO-003")
 fn test_a_new_iso_host_has_three_empty_tables()
     var h = iso_host_new()
-    test.assert_eq(iso_cis.cis_free_rows(var h.cis), noble_config.MAX_CIS)
-    test.assert_eq(iso_big.bis_free_rows(var h.big), noble_config.MAX_BIS)
-    test.assert_eq(iso_big.big_count_in(var h.big, iso_big.BigState.Vacant), noble_config.MAX_BIG)
+    test.assert_eq(iso_cis.cis_free_rows(var h.cis), noble.CONFIG.MAX_CIS)
+    test.assert_eq(iso_big.bis_free_rows(var h.big), noble.CONFIG.MAX_BIS)
+    test.assert_eq(iso_big.big_count_in(var h.big, iso_big.BigState.Vacant), noble.CONFIG.MAX_BIG)
     test.assert(not iso_flow.iso_credits_ready(var h.credits))
 
-@when(noble_config.MAX_CIS >= 2 and noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_CIS >= 2 and noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-003")
 fn test_the_central_procedure_runs_from_events_alone()
@@ -67,7 +67,7 @@ fn test_the_central_procedure_runs_from_events_alone()
     test.assert_eq(iso_flow.iso_in_flight(var h.credits, 0x0010), -1)
     test.assert_eq(h.credits.free as Int, 3)
 
-@when(noble_config.MAX_CIS >= 2 and noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_CIS >= 2 and noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-003")
 fn test_a_failed_cis_gets_no_credit_entry()
@@ -79,7 +79,7 @@ fn test_a_failed_cis_gets_no_credit_entry()
     test.assert(iso_host_event(var h, cis_established_bytes(0x0010, 0x3E, 0, 0)).kind == iso_event.IsoEventKind.CisFailed)
     test.assert_eq(iso_flow.iso_in_flight(var h.credits, 0x0010), -1)
 
-@when(noble_config.MAX_CIS >= 2 and noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_CIS >= 2 and noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-003")
 fn test_the_peripheral_procedure_runs_from_events_alone()
@@ -99,7 +99,7 @@ fn test_the_peripheral_procedure_runs_from_events_alone()
     test.assert_eq(iso_host_acl_closed(var h, links.link_id(0, 1)), 1)
     test.assert_eq(iso_flow.iso_in_flight(var h.credits, 0x0030), -1)
 
-@when(noble_config.MAX_CIS >= 2 and noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_CIS >= 2 and noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_the_broadcaster_procedure_runs_from_events_alone()
@@ -126,7 +126,7 @@ fn test_the_broadcaster_procedure_runs_from_events_alone()
     test.assert_eq(iso_flow.iso_in_flight(var h.credits, 0x0100), -1)
     test.assert_eq(h.credits.free as Int, 3)
 
-@when(noble_config.MAX_CIS >= 2 and noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_CIS >= 2 and noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_the_receiver_procedure_runs_from_events_alone()
@@ -151,7 +151,7 @@ fn test_the_receiver_procedure_runs_from_events_alone()
     test.assert(iso_host_answer(var h, command_complete(0x206C, 0, [0x01])).kind == iso_event.IsoEventKind.BigSyncTerminated)
     test.assert_eq(iso_flow.iso_in_flight(var h.credits, 0x0100), -1)
 
-@when(noble_config.MAX_CIS >= 2 and noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_CIS >= 2 and noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-003")
 fn test_the_cig_commands_are_routed_by_opcode()
@@ -178,7 +178,7 @@ fn test_the_cig_commands_are_routed_by_opcode()
     test.assert(iso_host_answer(var h, command_complete(0x2067, 0, [0x30, 0x00])).kind == iso_event.IsoEventKind.CommandDone)
     test.assert_eq(iso_cis.cis_row(var h.cis, 0x0030), -1)
 
-@when(noble_config.MAX_CIS >= 2 and noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_CIS >= 2 and noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-003")
 fn test_disconnect_status_is_routed_to_the_cis_table()
@@ -215,7 +215,7 @@ fn test_events_the_tables_do_not_follow_are_ignored()
     test.assert(iso_host_answer(var h, command_status(0x2064, 0)).kind == iso_event.IsoEventKind.Unrelated)
     test.assert(iso_host_answer(var h, command_complete(0x206E, 0, [0x00, 0x00])).kind == iso_event.IsoEventKind.Unrelated)
 
-@when(noble_config.MAX_CIS >= 2 and noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_CIS >= 2 and noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-005")
 fn test_reserve_sdu_needs_a_stream_a_path_and_a_configured_pool()
@@ -240,7 +240,7 @@ fn test_reserve_sdu_needs_a_stream_a_path_and_a_configured_pool()
     // An SDU that cannot be cut at all.
     test.assert_eq(iso_host_reserve_sdu(var h, 0x0010, 5000, false), 0)
 
-@when(noble_config.MAX_CIS >= 2 and noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_CIS >= 2 and noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-HCI-059")
 fn test_reserve_sdu_refuses_an_sdu_longer_than_the_host_buffer_whatever_the_controller_takes()
@@ -255,8 +255,8 @@ fn test_reserve_sdu_refuses_an_sdu_longer_than_the_host_buffer_whatever_the_cont
     // A mock Controller whose ISO packets hold 0x3FFF octets and that has 8 buffers.
     test.assert(iso_flow.iso_credits_configure(var h.credits, hci_codec.LeBufferSizeV2 {
         acl_data_packet_length: 27, total_acl_data_packets: 3, iso_data_packet_length: 0x3FFF, total_iso_data_packets: 8 }))
-    test.assert_eq(iso_host_reserve_sdu(var h, 0x0010, noble_config.ISO_SDU_OCTETS + 1, false), 0)
-    test.assert_eq(iso_host_reserve_sdu(var h, 0x0010, noble_config.ISO_SDU_OCTETS, false), 1)
+    test.assert_eq(iso_host_reserve_sdu(var h, 0x0010, noble.CONFIG.ISO_SDU_OCTETS + 1, false), 0)
+    test.assert_eq(iso_host_reserve_sdu(var h, 0x0010, noble.CONFIG.ISO_SDU_OCTETS, false), 1)
     // A mock Controller whose ISO packets hold 27 octets: the same SDU takes more packets.
     var g = iso_host_new()
     host_cig(var g)

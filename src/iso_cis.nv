@@ -20,7 +20,7 @@
 // command is heading for, and answers 0 or the Controller error code the
 // Controller would have answered.  The second takes the answer or the
 // event, completes or reverts the move, and answers an `IsoEvent`.  The
-// table allocates nothing; `noble_config.MAX_CIS` rows is all it ever holds, and a
+// table allocates nothing; `noble.CONFIG.MAX_CIS` rows is all it ever holds, and a
 // request for more is refused with Memory Capacity Exceeded or Rejected Due
 // To Limited Resources, as the table is a resource of this Host.
 //
@@ -57,7 +57,7 @@
 use hci_commands
 use hci_codec
 use iso_event
-use noble_config
+use noble.CONFIG
 use links
 
 // The ACL connection a stream rides on, as the Host's link registry names
@@ -132,7 +132,7 @@ const NO_ACL = 255
 // The rows of a CIG, its configuration, the streams and the command in
 // flight.  The `Vec` capacities are literals today (the capacity of a
 // storage type cannot be a named constant), and a test compares them with
-// `noble_config.MAX_CIS`.
+// `noble.CONFIG.MAX_CIS`.
 @value
 struct CisTable
     host_support: Bool
@@ -172,7 +172,7 @@ fn cis_table_new() -> CisTable
         state: Vec.new(), cig: Vec.new(), cis: Vec.new(), central: Vec.new(),
         handle: Vec.new(), acl_slot: Vec.new(), acl_generation: Vec.new(),
         acl_handle: Vec.new(), paths: Vec.new(), can_send: Vec.new(), can_receive: Vec.new() }
-    for _ in 0..noble_config.MAX_CIS
+    for _ in 0..noble.CONFIG.MAX_CIS
         let _a = t.pending_ids.push(0)
         let _b = t.pending_tx.push(false)
         let _c = t.pending_rx.push(false)

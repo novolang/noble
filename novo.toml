@@ -37,8 +37,8 @@ noble-hci = { path = "../noble-hci" }
 crypto-ble-ecc = { path = "../crypto-ble-ecc" }
 
 # Package configuration (docs/config.md).  One [config.<key>] table for each limit of the Host core, with the `device` profile
-# as the default.  A consumer writes a [noble] section in its config file; the generated module is `noble_config`, read in the
-# sources as `noble_config.MAX_CONNECTIONS`, and `limits.nv` holds what is derived from the keys.  The keys keep the names they had
+# as the default.  A consumer writes a [noble] section in its config file; the generated module is `noble.CONFIG`, read in the
+# sources as `noble.CONFIG.MAX_CONNECTIONS`, and `limits.nv` holds what is derived from the keys.  The keys keep the names they had
 # in the schema of orbit/ble, where the section was [ble].  The ranges are the checks of the former generator where it had one;
 # otherwise they are the lowest and highest value a profile builds, widened to the Core bound where the Core Specification states one.
 #

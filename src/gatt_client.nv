@@ -9,10 +9,10 @@
 //
 // Storage.  All state is in one `ClientTable`, which the caller declares
 // once (a module-level `var` on a device) and passes by address to every
-// function.  A table holds `noble_config.MAX_CLIENT_LINKS` links.  A link has the
-// bearers `noble_config.CLIENT_BEARERS`: bearer 0 is the unenhanced ATT bearer and
+// function.  A table holds `noble.CONFIG.MAX_CLIENT_LINKS` links.  A link has the
+// bearers `noble.CONFIG.CLIENT_BEARERS`: bearer 0 is the unenhanced ATT bearer and
 // the others are Enhanced ATT bearers ([Vol 3] Part F, Section 3.2.11).  A
-// link has one discovery cache of `noble_config.CLIENT_CACHE_RECORDS` records, and a
+// link has one discovery cache of `noble.CONFIG.CLIENT_CACHE_RECORDS` records, and a
 // bearer has its own request queue, value buffer, payload buffer and PDU
 // buffer.  Nothing allocates after `init_table`; a request that does not fit is
 // answered with a negative code.
@@ -54,7 +54,7 @@
 // -007 (the peer's database changes) and -008 (error mapping).
 
 use att
-use noble_config
+use noble.CONFIG
 use links
 
 // ── Capacities ──────────────────────────────────────────────────────
@@ -71,32 +71,32 @@ const fn max1(n: Int) -> Int
         1
 
 const fn links() -> Int
-    max1(noble_config.MAX_CLIENT_LINKS)
+    max1(noble.CONFIG.MAX_CLIENT_LINKS)
 
 const fn bearers() -> Int
-    max1(noble_config.CLIENT_BEARERS)
+    max1(noble.CONFIG.CLIENT_BEARERS)
 
 // The discovery records a client link keeps, at least 1.
 pub const fn cache() -> Int
-    max1(noble_config.CLIENT_CACHE_RECORDS)
+    max1(noble.CONFIG.CLIENT_CACHE_RECORDS)
 
 // The requests a client bearer queues, at least 1.
 pub const fn queue() -> Int
-    max1(noble_config.CLIENT_QUEUE)
+    max1(noble.CONFIG.CLIENT_QUEUE)
 
 // The octets of the value buffer and of the payload buffer of a client bearer, at least 1.
 pub const fn value_octets() -> Int
-    max1(noble_config.CLIENT_VALUE_BYTES)
+    max1(noble.CONFIG.CLIENT_VALUE_BYTES)
 
 const fn pdu_octets() -> Int
-    noble_config.MAX_ATT_MTU
+    noble.CONFIG.MAX_ATT_MTU
 
 // A value or a payload handed to a `begin_` function, `VALUE_OCTETS` long at
 // most, and a PDU buffer, `PDU_OCTETS` long.  A caller names them with these
 // aliases, so it does not repeat the literal.
-pub alias ClientPayload = Vec[u8; max1(noble_config.CLIENT_VALUE_BYTES)]
+pub alias ClientPayload = Vec[u8; max1(noble.CONFIG.CLIENT_VALUE_BYTES)]
 // A PDU buffer of a client bearer, `MAX_ATT_MTU` octets long.
-pub alias ClientPdu = Vec[u8; noble_config.MAX_ATT_MTU]
+pub alias ClientPdu = Vec[u8; noble.CONFIG.MAX_ATT_MTU]
 
 // The registers of one bearer's row, and the fields of one queue entry.
 const REGS = 41
@@ -353,24 +353,24 @@ fn uuid_same(a: Uuid, b: Uuid) -> Bool
 // records per link, record `i` of slot `s` at `s * CACHE + i`.
 pub @value
 struct ClientTable
-    generation: Vec[Int; max1(noble_config.MAX_CLIENT_LINKS)]
-    opened: Vec[Int; max1(noble_config.MAX_CLIENT_LINKS)]
-    flags: Vec[Int; max1(noble_config.MAX_CLIENT_LINKS)]
-    sc_handle: Vec[Int; max1(noble_config.MAX_CLIENT_LINKS)]
-    cache_n: Vec[Int; max1(noble_config.MAX_CLIENT_LINKS)]
-    hash: Vec[u8; max1(noble_config.MAX_CLIENT_LINKS) * 16]
-    c_kind: Vec[u8; max1(noble_config.MAX_CLIENT_LINKS) * max1(noble_config.CLIENT_CACHE_RECORDS)]
-    c_flags: Vec[u8; max1(noble_config.MAX_CLIENT_LINKS) * max1(noble_config.CLIENT_CACHE_RECORDS)]
-    c_handle: Vec[u16; max1(noble_config.MAX_CLIENT_LINKS) * max1(noble_config.CLIENT_CACHE_RECORDS)]
-    c_a: Vec[u16; max1(noble_config.MAX_CLIENT_LINKS) * max1(noble_config.CLIENT_CACHE_RECORDS)]
-    c_b: Vec[u16; max1(noble_config.MAX_CLIENT_LINKS) * max1(noble_config.CLIENT_CACHE_RECORDS)]
-    c_lo: Vec[Int; max1(noble_config.MAX_CLIENT_LINKS) * max1(noble_config.CLIENT_CACHE_RECORDS)]
-    c_hi: Vec[Int; max1(noble_config.MAX_CLIENT_LINKS) * max1(noble_config.CLIENT_CACHE_RECORDS)]
-    regs: Vec[Int; max1(noble_config.MAX_CLIENT_LINKS) * max1(noble_config.CLIENT_BEARERS) * 41]
-    queue: Vec[Int; max1(noble_config.MAX_CLIENT_LINKS) * max1(noble_config.CLIENT_BEARERS) * max1(noble_config.CLIENT_QUEUE) * 10]
-    value: Vec[u8; max1(noble_config.MAX_CLIENT_LINKS) * max1(noble_config.CLIENT_BEARERS) * max1(noble_config.CLIENT_VALUE_BYTES)]
-    payload: Vec[u8; max1(noble_config.MAX_CLIENT_LINKS) * max1(noble_config.CLIENT_BEARERS) * max1(noble_config.CLIENT_VALUE_BYTES)]
-    tx: Vec[u8; max1(noble_config.MAX_CLIENT_LINKS) * max1(noble_config.CLIENT_BEARERS) * noble_config.MAX_ATT_MTU]
+    generation: Vec[Int; max1(noble.CONFIG.MAX_CLIENT_LINKS)]
+    opened: Vec[Int; max1(noble.CONFIG.MAX_CLIENT_LINKS)]
+    flags: Vec[Int; max1(noble.CONFIG.MAX_CLIENT_LINKS)]
+    sc_handle: Vec[Int; max1(noble.CONFIG.MAX_CLIENT_LINKS)]
+    cache_n: Vec[Int; max1(noble.CONFIG.MAX_CLIENT_LINKS)]
+    hash: Vec[u8; max1(noble.CONFIG.MAX_CLIENT_LINKS) * 16]
+    c_kind: Vec[u8; max1(noble.CONFIG.MAX_CLIENT_LINKS) * max1(noble.CONFIG.CLIENT_CACHE_RECORDS)]
+    c_flags: Vec[u8; max1(noble.CONFIG.MAX_CLIENT_LINKS) * max1(noble.CONFIG.CLIENT_CACHE_RECORDS)]
+    c_handle: Vec[u16; max1(noble.CONFIG.MAX_CLIENT_LINKS) * max1(noble.CONFIG.CLIENT_CACHE_RECORDS)]
+    c_a: Vec[u16; max1(noble.CONFIG.MAX_CLIENT_LINKS) * max1(noble.CONFIG.CLIENT_CACHE_RECORDS)]
+    c_b: Vec[u16; max1(noble.CONFIG.MAX_CLIENT_LINKS) * max1(noble.CONFIG.CLIENT_CACHE_RECORDS)]
+    c_lo: Vec[Int; max1(noble.CONFIG.MAX_CLIENT_LINKS) * max1(noble.CONFIG.CLIENT_CACHE_RECORDS)]
+    c_hi: Vec[Int; max1(noble.CONFIG.MAX_CLIENT_LINKS) * max1(noble.CONFIG.CLIENT_CACHE_RECORDS)]
+    regs: Vec[Int; max1(noble.CONFIG.MAX_CLIENT_LINKS) * max1(noble.CONFIG.CLIENT_BEARERS) * 41]
+    queue: Vec[Int; max1(noble.CONFIG.MAX_CLIENT_LINKS) * max1(noble.CONFIG.CLIENT_BEARERS) * max1(noble.CONFIG.CLIENT_QUEUE) * 10]
+    value: Vec[u8; max1(noble.CONFIG.MAX_CLIENT_LINKS) * max1(noble.CONFIG.CLIENT_BEARERS) * max1(noble.CONFIG.CLIENT_VALUE_BYTES)]
+    payload: Vec[u8; max1(noble.CONFIG.MAX_CLIENT_LINKS) * max1(noble.CONFIG.CLIENT_BEARERS) * max1(noble.CONFIG.CLIENT_VALUE_BYTES)]
+    tx: Vec[u8; max1(noble.CONFIG.MAX_CLIENT_LINKS) * max1(noble.CONFIG.CLIENT_BEARERS) * noble.CONFIG.MAX_ATT_MTU]
 
 // The literal `ClientTable { generation: Vec.new(), ... }` of every column
 // empty is the table before `init_table`: no column has a length yet, and an
@@ -999,7 +999,7 @@ fn queue_handles(var t: ClientTable, link: links.LinkId, bearer: Int, op: Int, d
 fn valid_range(start: Int, end: Int) -> Bool
     start >= 1 and end >= start and end <= 0xFFFF
 
-// Exchange the ATT_MTU of the unenhanced bearer, offering `noble_config.MAX_ATT_MTU`
+// Exchange the ATT_MTU of the unenhanced bearer, offering `noble.CONFIG.MAX_ATT_MTU`
 // ([Vol 3] Part F, Section 3.4.2).  The procedure runs once per bearer;
 // `ERR_REPEAT` answers a second.  An Enhanced ATT bearer has its MTU from its
 // channel and refuses it.

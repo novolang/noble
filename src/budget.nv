@@ -1,9 +1,9 @@
 // src/budget.nv — the RAM the Host core's storage adds up to, from the limits.
 //
-// The keys of the package configuration (`noble_config`, schema in novo.toml) name every
+// The keys of the package configuration (`noble.CONFIG`, schema in novo.toml) name every
 // capacity of the Host core's storage, and this module adds the storage up with the size
 // rule measured on the toolchain: a `Vec[T; N]` takes round8(8 + N * sizeof(T)) bytes, the 8
-// being its length.  The tests assert that the sum equals `noble_config.budget_bytes()`, the
+// being its length.  The tests assert that the sum equals `noble.CONFIG.budget_bytes()`, the
 // total that the `bytes_expr` fields of the schema give (`novo config explain` prints it), so
 // the schema and this module agree on the size rule.  The storage of the extension modules
 // whose keys stay in the schema of orbit/ble (the BTP faces, the Unicast Client, the
@@ -24,7 +24,7 @@
 // The record sizes below are those of the schema's `bytes_expr` fields.
 
 use limits
-use noble_config
+use noble.CONFIG
 use links
 
 // The in-RAM transport rings of coresident/hci_ram.nv.
@@ -130,7 +130,7 @@ const fn max1(n: Int) -> Int
 // One L2CAP B-frame buffer: the largest ATT PDU and the L2CAP header.
 @tier(embedded)
 const fn frame_octets() -> Int
-    noble_config.MAX_ATT_MTU + 4
+    noble.CONFIG.MAX_ATT_MTU + 4
 
 // `n` rounded up to a multiple of 8.
 @tier(embedded)
@@ -151,9 +151,9 @@ const fn slot(octets: Int) -> Int
 // 128-bit UUID table and the scalars.
 @tier(embedded)
 const fn database_bytes() -> Int
-    let a = noble_config.MAX_ATTRIBUTES
-    vec_bytes(a, 2) * 6 + vec_bytes(a, 1) * 4 + slot(noble_config.MAX_VALUE_BYTES)
-        + vec_bytes(noble_config.MAX_UUID128, slot(16)) + DB_SCALARS
+    let a = noble.CONFIG.MAX_ATTRIBUTES
+    vec_bytes(a, 2) * 6 + vec_bytes(a, 1) * 4 + slot(noble.CONFIG.MAX_VALUE_BYTES)
+        + vec_bytes(noble.CONFIG.MAX_UUID128, slot(16)) + DB_SCALARS
 
 @tier(embedded)
 const fn registry_bytes() -> Int
@@ -164,60 +164,60 @@ const fn registry_bytes() -> Int
 
 @tier(embedded)
 const fn receive_frame_bytes() -> Int
-    8 + noble_config.MAX_CONNECTIONS * slot(frame_octets())
+    8 + noble.CONFIG.MAX_CONNECTIONS * slot(frame_octets())
 
 @tier(embedded)
 const fn att_state_bytes() -> Int
-    let prepared = if noble_config.MAX_PREPARED_BYTES > 0
-        slot(noble_config.MAX_PREPARED_BYTES)
+    let prepared = if noble.CONFIG.MAX_PREPARED_BYTES > 0
+        slot(noble.CONFIG.MAX_PREPARED_BYTES)
     else
         0
-    noble_config.MAX_CONNECTIONS * (ATT_LINK_FIXED + noble_config.MAX_BEARERS * BEARER_RECORD
-        + vec_bytes(noble_config.MAX_CCCD, 2) + prepared)
+    noble.CONFIG.MAX_CONNECTIONS * (ATT_LINK_FIXED + noble.CONFIG.MAX_BEARERS * BEARER_RECORD
+        + vec_bytes(noble.CONFIG.MAX_CCCD, 2) + prepared)
 
 @tier(embedded)
 const fn transmit_pool_bytes() -> Int
-    let slots = noble_config.ACL_BUFFERS + noble_config.MAX_CONNECTIONS
-    slots * slot(noble_config.ACL_OCTETS) + 8 + 8 * slots
+    let slots = noble.CONFIG.ACL_BUFFERS + noble.CONFIG.MAX_CONNECTIONS
+    slots * slot(noble.CONFIG.ACL_OCTETS) + 8 + 8 * slots
 
 @tier(embedded)
 const fn sequenced_bytes() -> Int
-    if noble_config.SEQUENCED_SLOTS > 0
-        noble_config.SEQUENCED_SLOTS * slot(frame_octets()) + SEQUENCED_HEADER
+    if noble.CONFIG.SEQUENCED_SLOTS > 0
+        noble.CONFIG.SEQUENCED_SLOTS * slot(frame_octets()) + SEQUENCED_HEADER
     else
         0
 
 @tier(embedded)
 const fn pending_bit_bytes() -> Int
-    noble_config.MAX_CONNECTIONS * round8((noble_config.MAX_ATTRIBUTES + 7) / 8)
+    noble.CONFIG.MAX_CONNECTIONS * round8((noble.CONFIG.MAX_ATTRIBUTES + 7) / 8)
 
 @tier(embedded)
 const fn bond_bytes() -> Int
-    BOND_HEADER + noble_config.MAX_BONDS * (BOND_RECORD + vec_bytes(noble_config.MAX_CCCD, 2))
+    BOND_HEADER + noble.CONFIG.MAX_BONDS * (BOND_RECORD + vec_bytes(noble.CONFIG.MAX_CCCD, 2))
 
 @tier(embedded)
 const fn channel_bytes() -> Int
-    noble_config.MAX_COC_CHANNELS * (slot(frame_octets()) + COC_CHANNEL_RECORD)
+    noble.CONFIG.MAX_COC_CHANNELS * (slot(frame_octets()) + COC_CHANNEL_RECORD)
 
 @tier(embedded)
 const fn iso_bytes() -> Int
-    let streams = noble_config.MAX_CIS + noble_config.MAX_BIS
+    let streams = noble.CONFIG.MAX_CIS + noble.CONFIG.MAX_BIS
     if streams > 0
-        streams * 3 * slot(noble_config.ISO_SDU_OCTETS) + noble_config.MAX_CIS * CIS_RECORD
-            + noble_config.MAX_BIG * BIG_RECORD + noble_config.MAX_BIS * BIS_RECORD
+        streams * 3 * slot(noble.CONFIG.ISO_SDU_OCTETS) + noble.CONFIG.MAX_CIS * CIS_RECORD
+            + noble.CONFIG.MAX_BIG * BIG_RECORD + noble.CONFIG.MAX_BIS * BIS_RECORD
     else
         0
 
 @tier(embedded)
 const fn ase_bytes() -> Int
-    noble_config.MAX_CONNECTIONS * noble_config.MAX_ASES * ASE_ROW
+    noble.CONFIG.MAX_CONNECTIONS * noble.CONFIG.MAX_ASES * ASE_ROW
 
 @tier(embedded)
 const fn control_bytes() -> Int
-    let configured = noble_config.MAX_AICS + noble_config.MAX_VOCS + noble_config.MAX_PRESETS + noble_config.MAX_SET_SIZE
+    let configured = noble.CONFIG.MAX_AICS + noble.CONFIG.MAX_VOCS + noble.CONFIG.MAX_PRESETS + noble.CONFIG.MAX_SET_SIZE
     if configured > 0
-        CONTROL_SERVICES + (noble_config.MAX_AICS + noble_config.MAX_VOCS) * CONTROL_INSTANCE + noble_config.MAX_PRESETS * PRESET_ROW
-            + noble_config.MAX_CONNECTIONS * (CSIS_CLIENT_ROW + HAS_CLIENT_ROW + slot(noble_config.MAX_PRESETS))
+        CONTROL_SERVICES + (noble.CONFIG.MAX_AICS + noble.CONFIG.MAX_VOCS) * CONTROL_INSTANCE + noble.CONFIG.MAX_PRESETS * PRESET_ROW
+            + noble.CONFIG.MAX_CONNECTIONS * (CSIS_CLIENT_ROW + HAS_CLIENT_ROW + slot(noble.CONFIG.MAX_PRESETS))
     else
         0
 
@@ -226,36 +226,36 @@ const fn control_bytes() -> Int
 // the request queue, the value and payload buffers and the PDU buffer.
 @tier(embedded)
 const fn client_bytes() -> Int
-    let links = noble_config.MAX_CLIENT_LINKS
-    let rows = links * noble_config.CLIENT_BEARERS
-    let cache = links * noble_config.CLIENT_CACHE_RECORDS
+    let links = noble.CONFIG.MAX_CLIENT_LINKS
+    let rows = links * noble.CONFIG.CLIENT_BEARERS
+    let cache = links * noble.CONFIG.CLIENT_CACHE_RECORDS
     if links == 0
         0
     else
         5 * vec_bytes(links, 8) + slot(links * CLIENT_HASH_OCTETS) + 2 * slot(cache) + 3 * vec_bytes(cache, 2)
             + 2 * vec_bytes(cache, 8) + vec_bytes(rows * CLIENT_REGS, 8)
-            + vec_bytes(rows * noble_config.CLIENT_QUEUE * CLIENT_QUEUE_FIELDS, 8)
-            + 2 * slot(rows * noble_config.CLIENT_VALUE_BYTES) + slot(rows * noble_config.MAX_ATT_MTU)
+            + vec_bytes(rows * noble.CONFIG.CLIENT_QUEUE * CLIENT_QUEUE_FIELDS, 8)
+            + 2 * slot(rows * noble.CONFIG.CLIENT_VALUE_BYTES) + slot(rows * noble.CONFIG.MAX_ATT_MTU)
 
 // The BTP client bridge: the scalars one session keeps for each client link it
 // serves, which are the connections of the session up to the links of the
 // engine.
 @tier(embedded)
 const fn bridge_bytes() -> Int
-    if noble_config.MAX_CLIENT_LINKS == 0
+    if noble.CONFIG.MAX_CLIENT_LINKS == 0
         0
-    else if noble_config.MAX_CONNECTIONS < noble_config.MAX_CLIENT_LINKS
-        noble_config.MAX_CONNECTIONS * BRIDGE_ROW
+    else if noble.CONFIG.MAX_CONNECTIONS < noble.CONFIG.MAX_CLIENT_LINKS
+        noble.CONFIG.MAX_CONNECTIONS * BRIDGE_ROW
     else
-        noble_config.MAX_CLIENT_LINKS * BRIDGE_ROW
+        noble.CONFIG.MAX_CLIENT_LINKS * BRIDGE_ROW
 
 // The Broadcast Source (orbit/noble-audio/src/bcast_source.nv): a row for each stream, the
 // candidate row that a reconfigure or a Metadata update builds, and the
 // procedure.
 @tier(embedded)
 const fn broadcast_bytes() -> Int
-    let sources = noble_config.MAX_BCAST_SOURCES
-    let row = BCAST_ROW_FIXED + BCAST_ROW_LISTS + vec_bytes(noble_config.MAX_BIS, 8)
+    let sources = noble.CONFIG.MAX_BCAST_SOURCES
+    let row = BCAST_ROW_FIXED + BCAST_ROW_LISTS + vec_bytes(noble.CONFIG.MAX_BIS, 8)
     if sources == 0
         0
     else
@@ -268,9 +268,9 @@ const fn broadcast_bytes() -> Int
 // sets.
 @tier(embedded)
 const fn bap_bytes() -> Int
-    let sources = noble_config.MAX_BCAST_SOURCES
+    let sources = noble.CONFIG.MAX_BCAST_SOURCES
     let ltv = slot(BAP_LTV_OCTETS)
-    let draft = noble_config.MAX_BIS * (8 + ltv + (8 + slot(5) + 2 * ltv))
+    let draft = noble.CONFIG.MAX_BIS * (8 + ltv + (8 + slot(5) + 2 * ltv))
     if sources == 0
         0
     else
@@ -281,73 +281,73 @@ const fn bap_bytes() -> Int
 // queue of steps.
 @tier(embedded)
 const fn unicast_bytes() -> Int
-    let streams = noble_config.MAX_UNICAST_STREAMS
+    let streams = noble.CONFIG.MAX_UNICAST_STREAMS
     if streams == 0
         0
     else
-        streams * (UNI_STREAM_FIXED + slot(noble_config.ISO_SDU_OCTETS)) + UNI_PROC
+        streams * (UNI_STREAM_FIXED + slot(noble.CONFIG.ISO_SDU_OCTETS)) + UNI_PROC
 
 // The Scan Delegator and the Broadcast Sink (orbit/noble-audio/src/bcast_sink.nv): a row for
 // each receive state, with the lists of BIS numbers and handles that follow
 // MAX_BIS, and the table.
 @tier(embedded)
 const fn sink_bytes() -> Int
-    let sinks = noble_config.MAX_BCAST_SINKS
+    let sinks = noble.CONFIG.MAX_BCAST_SINKS
     if sinks == 0
         0
     else
-        sinks * (SINK_ROW_FIXED + SINK_ROW_LISTS + 3 * vec_bytes(noble_config.MAX_BIS, 8)) + SINK_TABLE
+        sinks * (SINK_ROW_FIXED + SINK_ROW_LISTS + 3 * vec_bytes(noble.CONFIG.MAX_BIS, 8)) + SINK_TABLE
 // The control clients of a Volume Controller, a Microphone Controller, a Set Coordinator
-// and a CAP Commander, for the links `noble_config.MAX_GAF_CLIENTS` names.
+// and a CAP Commander, for the links `noble.CONFIG.MAX_GAF_CLIENTS` names.
 @tier(embedded)
 const fn control_client_bytes() -> Int
-    if noble_config.MAX_GAF_CLIENTS == 0
+    if noble.CONFIG.MAX_GAF_CLIENTS == 0
         0
     else
-        noble_config.MAX_GAF_CLIENTS * (vec_bytes(CTL_LINK_REGS, 8) + vec_bytes(noble_config.MAX_CTL_INSTANCES * CTL_INSTANCE_REGS, 8)
+        noble.CONFIG.MAX_GAF_CLIENTS * (vec_bytes(CTL_LINK_REGS, 8) + vec_bytes(noble.CONFIG.MAX_CTL_INSTANCES * CTL_INSTANCE_REGS, 8)
             + vec_bytes(CTL_JOB_INTS, 8) + slot(CTL_STAGE) + slot(CTL_SIRK))
-            + CTL_COORD_FIXED + noble_config.MAX_SET_SIZE * CTL_COORD_MEMBER + CTL_CMD_FIXED + noble_config.MAX_SET_SIZE * 8 + CTL_BTP_STATE
+            + CTL_COORD_FIXED + noble.CONFIG.MAX_SET_SIZE * CTL_COORD_MEMBER + CTL_CMD_FIXED + noble.CONFIG.MAX_SET_SIZE * 8 + CTL_BTP_STATE
 
 // The per-link state of the Battery and HID Services (orbit/noble-services/src/bas_policy.nv,
 // orbit/noble-services/src/hogp.nv): the level last sent for each instance on each link, and
 // the Protocol Mode and the suspend state of each link.
 @tier(embedded)
 const fn profile_link_bytes() -> Int
-    vec_bytes(noble_config.MAX_CONNECTIONS * noble_config.MAX_BAS, 8) + 2 * vec_bytes(noble_config.MAX_CONNECTIONS, 8)
+    vec_bytes(noble.CONFIG.MAX_CONNECTIONS * noble.CONFIG.MAX_BAS, 8) + 2 * vec_bytes(noble.CONFIG.MAX_CONNECTIONS, 8)
 
-// The Hearing Access Profile clients, for the links `noble_config.MAX_GAF_CLIENTS` names and
-// the preset records `noble_config.MAX_HAS_CACHE` names: a job runner and a cache for each link,
+// The Hearing Access Profile clients, for the links `noble.CONFIG.MAX_GAF_CLIENTS` names and
+// the preset records `noble.CONFIG.MAX_HAS_CACHE` names: a job runner and a cache for each link,
 // and the BTP face once.  None without both.
 @tier(embedded)
 const fn hap_bytes() -> Int
-    if noble_config.MAX_GAF_CLIENTS == 0 or noble_config.MAX_HAS_CACHE == 0
+    if noble.CONFIG.MAX_GAF_CLIENTS == 0 or noble.CONFIG.MAX_HAS_CACHE == 0
         0
     else
-        noble_config.MAX_GAF_CLIENTS * (vec_bytes(CTL_LINK_REGS, 8) + vec_bytes(HAP_INSTANCES * CTL_INSTANCE_REGS, 8)
+        noble.CONFIG.MAX_GAF_CLIENTS * (vec_bytes(CTL_LINK_REGS, 8) + vec_bytes(HAP_INSTANCES * CTL_INSTANCE_REGS, 8)
             + vec_bytes(CTL_JOB_INTS, 8) + slot(CTL_STAGE) + slot(CTL_SIRK)
-            + vec_bytes(HAP_LINK_REGS, 8) + vec_bytes(noble_config.MAX_HAS_CACHE * HAP_RECORD_FIELDS, 8)
-            + vec_bytes(noble_config.MAX_HAS_CACHE * HAP_NAME_OCTETS, 1) + slot(HAP_NAME_OCTETS)) + HAP_BTP_STATE
+            + vec_bytes(HAP_LINK_REGS, 8) + vec_bytes(noble.CONFIG.MAX_HAS_CACHE * HAP_RECORD_FIELDS, 8)
+            + vec_bytes(noble.CONFIG.MAX_HAS_CACHE * HAP_NAME_OCTETS, 1) + slot(HAP_NAME_OCTETS)) + HAP_BTP_STATE
 
 // The Host API's event queue (noble.nv, Layer A): `EVENT_QUEUE` slots, each holding the largest
 // event, which is a value of `ATT_VALUE_BYTES` octets or a report of `MAX_ADV_DATA` octets
 // beside the scalars of the event.  Zero without a queue.
 @tier(embedded)
 const fn event_queue_bytes() -> Int
-    noble_config.EVENT_QUEUE * (noble_config.ATT_VALUE_BYTES + noble_config.MAX_ADV_DATA + EVENT_FIXED)
+    noble.CONFIG.EVENT_QUEUE * (noble.CONFIG.ATT_VALUE_BYTES + noble.CONFIG.MAX_ADV_DATA + EVENT_FIXED)
 
 // The owner table of the Adapter (noble.nv, `owner_first` and `owner_last`, Layer B): the first and last attribute handle of each of `MAX_SERVICES`
 // services, two lists of `u16`.
 @tier(embedded)
 const fn owner_table_bytes() -> Int
-    OWNERS_RECORD + 2 * vec_bytes(noble_config.MAX_SERVICES, 2)
+    OWNERS_RECORD + 2 * vec_bytes(noble.CONFIG.MAX_SERVICES, 2)
 
 // The Host core's storage, in bytes.
 @tier(embedded)
 const fn total_bytes() -> Int
     database_bytes() + registry_bytes() + receive_frame_bytes() + att_state_bytes()
         + transmit_pool_bytes() + sequenced_bytes() + pending_bit_bytes()
-        + noble_config.MAX_PAIRING * PAIRING_CONTEXT + bond_bytes() + channel_bytes() + iso_bytes()
-        + ase_bytes() + control_bytes() + 2 * slot(noble_config.HCI_BUFFER_OCTETS) + TRANSPORT_RINGS + client_bytes() + bridge_bytes()
+        + noble.CONFIG.MAX_PAIRING * PAIRING_CONTEXT + bond_bytes() + channel_bytes() + iso_bytes()
+        + ase_bytes() + control_bytes() + 2 * slot(noble.CONFIG.HCI_BUFFER_OCTETS) + TRANSPORT_RINGS + client_bytes() + bridge_bytes()
         + broadcast_bytes() + bap_bytes() + unicast_bytes() + sink_bytes() + control_client_bytes()
         + profile_link_bytes() + hap_bytes() + event_queue_bytes() + owner_table_bytes()
 
@@ -357,17 +357,17 @@ const fn total_bytes() -> Int
 // tests, and the messages name the key to change.
 
 // The storage is the total the schema's `bytes_expr` fields give, so the schema and this module agree on the size rule.
-assert_const(total_bytes() == noble_config.budget_bytes(),
+assert_const(total_bytes() == noble.CONFIG.budget_bytes(),
     "noble: budget.nv and the bytes_expr fields of novo.toml disagree on the storage total: correct the size rule in one of them (`novo config explain` prints the schema's rows)")
 // Every pool holds a slot for every connection, and the registry is declared for them.
-assert_const(noble_config.MAX_CONNECTIONS >= 1, "noble: MAX_CONNECTIONS must be at least 1")
-assert_const(noble_config.MAX_CONNECTIONS <= limits.LINK_SLOTS,
+assert_const(noble.CONFIG.MAX_CONNECTIONS >= 1, "noble: MAX_CONNECTIONS must be at least 1")
+assert_const(noble.CONFIG.MAX_CONNECTIONS <= limits.LINK_SLOTS,
     "noble: max_connections exceeds LINK_SLOTS (limits.nv), the connection slots the registry and the ACL credit pool are declared for: lower MAX_CONNECTIONS or declare more slots")
-assert_const(noble_config.ACL_BUFFERS >= 1, "noble: ACL_BUFFERS must be at least 1")
-assert_const(noble_config.MAX_BEARERS >= 1, "noble: MAX_BEARERS must be at least 1")
-assert_const(noble_config.MAX_PAIRING >= 1, "noble: MAX_PAIRING must be at least 1")
-assert_const(noble_config.MAX_ATT_MTU >= 23, "noble: MAX_ATT_MTU must be at least 23, the ATT default MTU")
+assert_const(noble.CONFIG.ACL_BUFFERS >= 1, "noble: ACL_BUFFERS must be at least 1")
+assert_const(noble.CONFIG.MAX_BEARERS >= 1, "noble: MAX_BEARERS must be at least 1")
+assert_const(noble.CONFIG.MAX_PAIRING >= 1, "noble: MAX_PAIRING must be at least 1")
+assert_const(noble.CONFIG.MAX_ATT_MTU >= 23, "noble: MAX_ATT_MTU must be at least 23, the ATT default MTU")
 // The profiles keep their minimum.
-assert_const(noble_config.MAX_BAS >= 1, "noble: MAX_BAS must be at least 1")
-assert_const(noble_config.MAX_GAF_CLIENTS == 0 or noble_config.MAX_CTL_INSTANCES >= 3,
+assert_const(noble.CONFIG.MAX_BAS >= 1, "noble: MAX_BAS must be at least 1")
+assert_const(noble.CONFIG.MAX_GAF_CLIENTS == 0 or noble.CONFIG.MAX_CTL_INSTANCES >= 3,
     "noble: MAX_CTL_INSTANCES must be at least 3 where MAX_GAF_CLIENTS asks for the control clients")

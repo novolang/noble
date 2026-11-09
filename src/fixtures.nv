@@ -9,7 +9,7 @@
 use std.test
 use gatt_server
 use links
-use noble_config
+use noble.CONFIG
 use wire
 
 // The ATT request with the opcode `op` for the attribute `handle` and the
@@ -42,4 +42,4 @@ fn read(var s: GattServer, handle: Int) -> [u8]
 // it is false, as the tests of the Controller's features do where the feature is off.
 pub @tier(app)
 fn client_engine_present() -> Bool
-    noble_config.MAX_CLIENT_LINKS >= 1 and noble_config.CLIENT_BEARERS >= 1 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256
+    noble.CONFIG.MAX_CLIENT_LINKS >= 1 and noble.CONFIG.CLIENT_BEARERS >= 1 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256

@@ -3,7 +3,7 @@
 //   novo test tests/budget_tests.nv
 
 use std.test
-use noble_config
+use noble.CONFIG
 use budget.{ BAP_SCALARS, BCAST_PROC, BCAST_ROW_FIXED, BCAST_ROW_LISTS, CTL_JOB_INTS, HAP_BTP_STATE, HAP_NAME_OCTETS, SINK_ROW_FIXED, SINK_ROW_LISTS, SINK_TABLE, UNI_PROC, UNI_STREAM_FIXED, bap_bytes, broadcast_bytes, control_client_bytes, hap_bytes, profile_link_bytes, sink_bytes, slot, unicast_bytes, vec_bytes }
 use budget
 use limits
@@ -21,20 +21,20 @@ fn test_a_vec_takes_its_elements_and_an_eight_octet_length()
 
 @test
 fn test_the_btp_face_of_the_source_holds_a_draft_a_row_for_each_source_and_the_announcement()
-    if noble_config.MAX_BCAST_SOURCES == 0
+    if noble.CONFIG.MAX_BCAST_SOURCES == 0
         test.assert_eq(bap_bytes(), 0)
     else
         let ltv = slot(255)
         test.assert_eq(bap_bytes(),
-            noble_config.MAX_BIS * (8 + ltv + (8 + slot(5) + 2 * ltv)) + vec_bytes(noble_config.MAX_BCAST_SOURCES, 8) + slot(250) + ltv + BAP_SCALARS)
+            noble.CONFIG.MAX_BIS * (8 + ltv + (8 + slot(5) + 2 * ltv)) + vec_bytes(noble.CONFIG.MAX_BCAST_SOURCES, 8) + slot(250) + ltv + BAP_SCALARS)
 
 @test
 fn test_the_broadcast_source_holds_a_row_for_each_stream_a_candidate_and_a_procedure()
-    let row = BCAST_ROW_FIXED + BCAST_ROW_LISTS + vec_bytes(noble_config.MAX_BIS, 8)
-    if noble_config.MAX_BCAST_SOURCES == 0
+    let row = BCAST_ROW_FIXED + BCAST_ROW_LISTS + vec_bytes(noble.CONFIG.MAX_BIS, 8)
+    if noble.CONFIG.MAX_BCAST_SOURCES == 0
         test.assert_eq(broadcast_bytes(), 0)
     else
-        test.assert_eq(broadcast_bytes(), noble_config.MAX_BCAST_SOURCES * row + row + BCAST_PROC)
+        test.assert_eq(broadcast_bytes(), noble.CONFIG.MAX_BCAST_SOURCES * row + row + BCAST_PROC)
     // The lists at their largest: the address, the Broadcast_Code, a name of 32
     // octets, Metadata of 250, advertising data of 310 and 256, and the BASE
     // twice (the layout and its encoding) at 252.
@@ -42,19 +42,19 @@ fn test_the_broadcast_source_holds_a_row_for_each_stream_a_candidate_and_a_proce
 
 @test
 fn test_the_unicast_server_holds_a_row_and_an_sdu_buffer_for_each_stream_and_a_queue()
-    if noble_config.MAX_UNICAST_STREAMS == 0
+    if noble.CONFIG.MAX_UNICAST_STREAMS == 0
         test.assert_eq(unicast_bytes(), 0)
     else
         test.assert_eq(unicast_bytes(),
-            noble_config.MAX_UNICAST_STREAMS * (UNI_STREAM_FIXED + slot(noble_config.ISO_SDU_OCTETS)) + UNI_PROC)
+            noble.CONFIG.MAX_UNICAST_STREAMS * (UNI_STREAM_FIXED + slot(noble.CONFIG.ISO_SDU_OCTETS)) + UNI_PROC)
 
 @test
 fn test_the_sink_holds_a_row_for_each_receive_state_and_a_table()
-    if noble_config.MAX_BCAST_SINKS == 0
+    if noble.CONFIG.MAX_BCAST_SINKS == 0
         test.assert_eq(sink_bytes(), 0)
     else
         test.assert_eq(sink_bytes(),
-            noble_config.MAX_BCAST_SINKS * (SINK_ROW_FIXED + SINK_ROW_LISTS + 3 * vec_bytes(noble_config.MAX_BIS, 8)) + SINK_TABLE)
+            noble.CONFIG.MAX_BCAST_SINKS * (SINK_ROW_FIXED + SINK_ROW_LISTS + 3 * vec_bytes(noble.CONFIG.MAX_BIS, 8)) + SINK_TABLE)
     // The lists at their largest: the address, the Bad_Code and the Broadcast_Code, four
     // subgroups with 255 octets of Metadata between them, the requests, 256 octets of
     // periodic data and the BASE of 252.
@@ -62,25 +62,25 @@ fn test_the_sink_holds_a_row_for_each_receive_state_and_a_table()
 
 @test
 fn test_the_control_clients_are_there_where_the_profile_asks_for_them()
-    if noble_config.MAX_GAF_CLIENTS == 0
+    if noble.CONFIG.MAX_GAF_CLIENTS == 0
         test.assert_eq(control_client_bytes(), 0)
     else
         // A row for each link, and the set, the Commander and the BTP face once.
-        test.assert(control_client_bytes() > noble_config.MAX_GAF_CLIENTS * vec_bytes(CTL_JOB_INTS, 8))
+        test.assert(control_client_bytes() > noble.CONFIG.MAX_GAF_CLIENTS * vec_bytes(CTL_JOB_INTS, 8))
 
 @test
 @satisfies("REQ-BLE-PRF-005")
 fn test_the_battery_and_hid_link_state_is_a_level_for_each_instance_and_two_registers_for_each_link()
     test.assert_eq(profile_link_bytes(),
-        vec_bytes(noble_config.MAX_CONNECTIONS * noble_config.MAX_BAS, 8) + 2 * vec_bytes(noble_config.MAX_CONNECTIONS, 8))
+        vec_bytes(noble.CONFIG.MAX_CONNECTIONS * noble.CONFIG.MAX_BAS, 8) + 2 * vec_bytes(noble.CONFIG.MAX_CONNECTIONS, 8))
 
 @test
 fn test_the_hap_controllers_are_there_where_the_profile_asks_for_them()
-    if noble_config.MAX_GAF_CLIENTS == 0 or noble_config.MAX_HAS_CACHE == 0
+    if noble.CONFIG.MAX_GAF_CLIENTS == 0 or noble.CONFIG.MAX_HAS_CACHE == 0
         test.assert_eq(hap_bytes(), 0)
     else
         // A row for each link, and the BTP face once.
-        test.assert(hap_bytes() > noble_config.MAX_GAF_CLIENTS * vec_bytes(noble_config.MAX_HAS_CACHE * HAP_NAME_OCTETS, 1))
+        test.assert(hap_bytes() > noble.CONFIG.MAX_GAF_CLIENTS * vec_bytes(noble.CONFIG.MAX_HAS_CACHE * HAP_NAME_OCTETS, 1))
         test.assert(hap_bytes() > HAP_BTP_STATE)
 
 @test
@@ -91,76 +91,76 @@ fn test_max1_keeps_a_table_of_an_absent_feature_at_one_record()
 
 @test
 fn test_the_host_core_storage_is_the_sum_of_its_parts_and_the_total_the_schema_gives()
-    test.assert_eq(budget.total_bytes(), noble_config.budget_bytes())
-    test.assert_eq(budget.frame_octets(), noble_config.MAX_ATT_MTU + 4)
+    test.assert_eq(budget.total_bytes(), noble.CONFIG.budget_bytes())
+    test.assert_eq(budget.frame_octets(), noble.CONFIG.MAX_ATT_MTU + 4)
     // The database: six columns of two octets, four of one, the values, the 128-bit UUID table and the scalars.
     test.assert_eq(budget.database_bytes(),
-        vec_bytes(noble_config.MAX_ATTRIBUTES, 2) * 6 + vec_bytes(noble_config.MAX_ATTRIBUTES, 1) * 4
-            + slot(noble_config.MAX_VALUE_BYTES) + vec_bytes(noble_config.MAX_UUID128, slot(16)) + budget.DB_SCALARS)
+        vec_bytes(noble.CONFIG.MAX_ATTRIBUTES, 2) * 6 + vec_bytes(noble.CONFIG.MAX_ATTRIBUTES, 1) * 4
+            + slot(noble.CONFIG.MAX_VALUE_BYTES) + vec_bytes(noble.CONFIG.MAX_UUID128, slot(16)) + budget.DB_SCALARS)
     // The registry holds a record for each of the connection slots `limits` declares.
     let n = limits.LINK_SLOTS
     test.assert_eq(budget.registry_bytes(),
         8 + vec_bytes(n, 1) + vec_bytes(n, 4) + vec_bytes(n, 2) + vec_bytes(n, 1) + vec_bytes(n, 1)
             + vec_bytes(n * 6, 1) + 8 + vec_bytes(n, 1) + 2 * vec_bytes(links.ACL_OWED_HANDLES, 2))
     // A receive frame for each connection, and a transmit buffer for each of them and for the Controller's.
-    test.assert_eq(budget.receive_frame_bytes(), 8 + noble_config.MAX_CONNECTIONS * slot(budget.frame_octets()))
-    let buffers = noble_config.ACL_BUFFERS + noble_config.MAX_CONNECTIONS
-    test.assert_eq(budget.transmit_pool_bytes(), buffers * slot(noble_config.ACL_OCTETS) + 8 + 8 * buffers)
+    test.assert_eq(budget.receive_frame_bytes(), 8 + noble.CONFIG.MAX_CONNECTIONS * slot(budget.frame_octets()))
+    let buffers = noble.CONFIG.ACL_BUFFERS + noble.CONFIG.MAX_CONNECTIONS
+    test.assert_eq(budget.transmit_pool_bytes(), buffers * slot(noble.CONFIG.ACL_OCTETS) + 8 + 8 * buffers)
     test.assert_eq(budget.pending_bit_bytes(),
-        noble_config.MAX_CONNECTIONS * round8((noble_config.MAX_ATTRIBUTES + 7) / 8))
+        noble.CONFIG.MAX_CONNECTIONS * round8((noble.CONFIG.MAX_ATTRIBUTES + 7) / 8))
     test.assert_eq(budget.bond_bytes(),
-        budget.BOND_HEADER + noble_config.MAX_BONDS * (budget.BOND_RECORD + vec_bytes(noble_config.MAX_CCCD, 2)))
+        budget.BOND_HEADER + noble.CONFIG.MAX_BONDS * (budget.BOND_RECORD + vec_bytes(noble.CONFIG.MAX_CCCD, 2)))
     test.assert_eq(budget.channel_bytes(),
-        noble_config.MAX_COC_CHANNELS * (slot(budget.frame_octets()) + budget.COC_CHANNEL_RECORD))
-    test.assert_eq(budget.ase_bytes(), noble_config.MAX_CONNECTIONS * noble_config.MAX_ASES * budget.ASE_ROW)
+        noble.CONFIG.MAX_COC_CHANNELS * (slot(budget.frame_octets()) + budget.COC_CHANNEL_RECORD))
+    test.assert_eq(budget.ase_bytes(), noble.CONFIG.MAX_CONNECTIONS * noble.CONFIG.MAX_ASES * budget.ASE_ROW)
 
 @test
 fn test_a_feature_that_the_configuration_leaves_out_takes_no_storage()
-    if noble_config.SEQUENCED_SLOTS == 0
+    if noble.CONFIG.SEQUENCED_SLOTS == 0
         test.assert_eq(budget.sequenced_bytes(), 0)
     else
         test.assert_eq(budget.sequenced_bytes(),
-            noble_config.SEQUENCED_SLOTS * slot(budget.frame_octets()) + budget.SEQUENCED_HEADER)
-    if noble_config.MAX_CIS + noble_config.MAX_BIS == 0
+            noble.CONFIG.SEQUENCED_SLOTS * slot(budget.frame_octets()) + budget.SEQUENCED_HEADER)
+    if noble.CONFIG.MAX_CIS + noble.CONFIG.MAX_BIS == 0
         test.assert_eq(budget.iso_bytes(), 0)
     else
         test.assert_eq(budget.iso_bytes(),
-            (noble_config.MAX_CIS + noble_config.MAX_BIS) * 3 * slot(noble_config.ISO_SDU_OCTETS) + noble_config.MAX_CIS * budget.CIS_RECORD
-                + noble_config.MAX_BIG * budget.BIG_RECORD + noble_config.MAX_BIS * budget.BIS_RECORD)
-    if noble_config.MAX_AICS + noble_config.MAX_VOCS + noble_config.MAX_PRESETS + noble_config.MAX_SET_SIZE == 0
+            (noble.CONFIG.MAX_CIS + noble.CONFIG.MAX_BIS) * 3 * slot(noble.CONFIG.ISO_SDU_OCTETS) + noble.CONFIG.MAX_CIS * budget.CIS_RECORD
+                + noble.CONFIG.MAX_BIG * budget.BIG_RECORD + noble.CONFIG.MAX_BIS * budget.BIS_RECORD)
+    if noble.CONFIG.MAX_AICS + noble.CONFIG.MAX_VOCS + noble.CONFIG.MAX_PRESETS + noble.CONFIG.MAX_SET_SIZE == 0
         test.assert_eq(budget.control_bytes(), 0)
     else
         test.assert(budget.control_bytes() > 0)
-    if noble_config.MAX_CLIENT_LINKS == 0
+    if noble.CONFIG.MAX_CLIENT_LINKS == 0
         test.assert_eq(budget.client_bytes(), 0)
         test.assert_eq(budget.bridge_bytes(), 0)
     else
         test.assert(budget.client_bytes() > 0)
-        let linked = if noble_config.MAX_CONNECTIONS < noble_config.MAX_CLIENT_LINKS
-            noble_config.MAX_CONNECTIONS
+        let linked = if noble.CONFIG.MAX_CONNECTIONS < noble.CONFIG.MAX_CLIENT_LINKS
+            noble.CONFIG.MAX_CONNECTIONS
         else
-            noble_config.MAX_CLIENT_LINKS
+            noble.CONFIG.MAX_CLIENT_LINKS
         test.assert_eq(budget.bridge_bytes(), linked * budget.BRIDGE_ROW)
-    if noble_config.MAX_PREPARED_BYTES == 0
+    if noble.CONFIG.MAX_PREPARED_BYTES == 0
         test.assert(budget.att_state_bytes() > 0)
     else
-        test.assert(budget.att_state_bytes() > noble_config.MAX_CONNECTIONS * noble_config.MAX_PREPARED_BYTES)
-    if noble_config.MAX_UNICAST_STREAMS == 0
+        test.assert(budget.att_state_bytes() > noble.CONFIG.MAX_CONNECTIONS * noble.CONFIG.MAX_PREPARED_BYTES)
+    if noble.CONFIG.MAX_UNICAST_STREAMS == 0
         test.assert_eq(budget.unicast_bytes(), 0)
     else
-        test.assert(budget.unicast_bytes() > noble_config.MAX_UNICAST_STREAMS * noble_config.ISO_SDU_OCTETS)
-    if noble_config.MAX_BCAST_SINKS == 0
+        test.assert(budget.unicast_bytes() > noble.CONFIG.MAX_UNICAST_STREAMS * noble.CONFIG.ISO_SDU_OCTETS)
+    if noble.CONFIG.MAX_BCAST_SINKS == 0
         test.assert_eq(budget.sink_bytes(), 0)
     else
         test.assert(budget.sink_bytes() > 0)
-    if noble_config.MAX_GAF_CLIENTS == 0
+    if noble.CONFIG.MAX_GAF_CLIENTS == 0
         test.assert_eq(budget.control_client_bytes(), 0)
         test.assert_eq(budget.hap_bytes(), 0)
     else
         test.assert(budget.control_client_bytes() > 0)
-    if noble_config.MAX_GAF_CLIENTS > 0 and noble_config.MAX_HAS_CACHE > 0
+    if noble.CONFIG.MAX_GAF_CLIENTS > 0 and noble.CONFIG.MAX_HAS_CACHE > 0
         test.assert(budget.hap_bytes() > 0)
     else
         test.assert_eq(budget.hap_bytes(), 0)
     test.assert_eq(budget.profile_link_bytes(),
-        vec_bytes(noble_config.MAX_CONNECTIONS * noble_config.MAX_BAS, 8) + 2 * vec_bytes(noble_config.MAX_CONNECTIONS, 8))
+        vec_bytes(noble.CONFIG.MAX_CONNECTIONS * noble.CONFIG.MAX_BAS, 8) + 2 * vec_bytes(noble.CONFIG.MAX_CONNECTIONS, 8))

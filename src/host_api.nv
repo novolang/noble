@@ -64,7 +64,7 @@ use le_link
 use links
 use noble
 use noble.{ Action, Addr, Bond, BondStore, ConnId, ConnInfo, ConnParams, Event, HostPolicy, IoCap, Request, Role, Security, Status, Value }
-use noble_config
+use noble.CONFIG
 use smp
 use smp_bond
 use smp_core
@@ -565,8 +565,8 @@ fn params_ok(p: ConnParams) -> Bool
 
 // The MTU a channel is offered: what an event can carry.
 fn coc_mtu(mtu: Int) -> Int
-    if mtu > noble_config.ATT_VALUE_BYTES
-        noble_config.ATT_VALUE_BYTES
+    if mtu > noble.CONFIG.ATT_VALUE_BYTES
+        noble.CONFIG.ATT_VALUE_BYTES
     else
         mtu
 
@@ -2266,7 +2266,7 @@ fn serve_held<P: HostPolicy[f]>(var h: Host, slot: Int, var p: P) [f, mutate]
             var v: Value = Vec.new()
             var code = 0
             if write
-                if list.len(pdu) - 3 > noble_config.ATT_VALUE_BYTES
+                if list.len(pdu) - 3 > noble.CONFIG.ATT_VALUE_BYTES
                     code = noble.ATT_INVALID_ATTRIBUTE_VALUE_LENGTH
                 else
                     v = value_of(pdu[3:])
@@ -2281,7 +2281,7 @@ fn serve_held<P: HostPolicy[f]>(var h: Host, slot: Int, var p: P) [f, mutate]
         else
             var queued = false
             if write
-                if list.len(pdu) - 3 <= noble_config.ATT_VALUE_BYTES
+                if list.len(pdu) - 3 <= noble.CONFIG.ATT_VALUE_BYTES
                     queued = noble.queue_event(var h.api, Event.AttrWrite(conn, handle as u16, svc, value_of(pdu[3:])))
             else
                 queued = noble.queue_event(var h.api, Event.AttrRead(conn, handle as u16, svc))

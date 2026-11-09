@@ -179,7 +179,7 @@ that notify or indicate.  The transports `UartHci` (H4 over `hal.uart`) and the 
 The sizes of the tables are keys of the package configuration.  A consumer
 writes a `[noble]` section in its config file (`max_connections`,
 `max_att_mtu`, `max_attributes`, `max_bonds`, `max_cis`, `max_big` and the
-others); the build writes them as `noble_config.MAX_CONNECTIONS` and the like,
+others); the build writes them as `noble.CONFIG.MAX_CONNECTIONS` and the like,
 and `novo config explain` prints the storage the keys imply.  `configs/` holds
 the profiles this package's tests run under; `configs/layer_a.toml` gives the Host API tests their event queue.
 

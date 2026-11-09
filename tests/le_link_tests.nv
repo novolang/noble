@@ -10,7 +10,7 @@ use att
 use att_server
 use gatt_server
 use links
-use noble_config
+use noble.CONFIG
 use le_link.{ ATT_SERVER_RX_MTU, EATT_ATT_MTU, EATT_PSM, LeLink, LeLinks, SIGNALING_RTX_MS, TGAP_CONN_PARAM_TIMEOUT_MS, client_mtu, coc_channel, coc_connect, coc_connecting_ids, coc_disconnect, coc_listen, coc_send, completed, connect, credits_flow_control_set, disconnect, flush_completed, is_connected, le_links_close, le_links_completed, le_links_find_handle, le_links_flow_control_set, le_links_flush_completed, le_links_link, le_links_live, le_links_open, le_links_receive_acl, le_links_set_buffers, le_links_slots, new_le_links, new_link, next_bearer, next_identifier, receive_acl, refuse_pairing, request_connection_parameter_update, send_att, send_b_frame, send_client_att, set_buffers, set_database, take_coc_events, test_db, tick }
 use le_link
 
@@ -209,7 +209,7 @@ fn test_connection_parameter_update_request_at_a_central()
     test.assert_eq(sent_payload(out3[0])[4] as Int, 0x01)
     test.assert_eq(list.len(link.accepted_update), 0)
 
-@when(noble_config.MAX_COC_CHANNELS >= 1)
+@when(noble.CONFIG.MAX_COC_CHANNELS >= 1)
 @test
 fn test_signaling_requests_a_peripheral_rejects()
     var link = connected_link()
@@ -351,7 +351,7 @@ fn test_a_connection_request_is_answered_over_the_link()
             test.assert_eq(sdu[0] as Int, 0xAB)
         _                               => test.fail("the SDU is reported")
 
-@when(noble_config.MAX_COC_CHANNELS >= 1)
+@when(noble.CONFIG.MAX_COC_CHANNELS >= 1)
 @test
 fn test_a_k_frame_above_the_mps_is_answered_with_a_disconnection_request()
     // L2CAP/LE/CFC/BV-27-C as the trace of the PTS run shows it: the

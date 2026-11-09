@@ -4,7 +4,7 @@
 
 use std.test
 use hci_codec
-use noble_config
+use noble.CONFIG
 use isoal.{ ISO_LLID_FRAMED, ISO_LLID_UNFRAMED_END, ISO_LLID_UNFRAMED_START_OR_CONTINUATION, IsoFramedSdu, IsoPdu, IsoSdu, isoal_fragments, isoal_framed_aggregate, isoal_framed_pad, isoal_framed_pdus, isoal_framed_sdus, isoal_framed_unsegmented_pdu, isoal_push, isoal_reassembler, isoal_unframed_pad, isoal_unframed_pdus, isoal_unframed_sdus, sdu_of }
 
 @tier(app)
@@ -108,7 +108,7 @@ fn test_fragments_refuse_what_cannot_be_cut()
         None          => test.fail("4095 octets are cut")
         Some(packets) => test.assert_eq(list.len(packets), 1 + (4095 - 247 + 250) / 251)
 
-@when(noble_config.ISO_SDU_OCTETS >= 60)
+@when(noble.CONFIG.ISO_SDU_OCTETS >= 60)
 @test
 @satisfies("REQ-BLE-ISO-002")
 fn test_every_sdu_length_survives_every_packet_length()
@@ -120,13 +120,13 @@ fn test_every_sdu_length_survives_every_packet_length()
             test.assert_eq(sdus[0].packet_sequence_number, 9)
             same_data(sdus[0].data, sdu_of(n))
     // A long SDU, a Time_Stamp that comes back.
-    let long = round_trip(sdu_of(noble_config.ISO_SDU_OCTETS), 251, Some(0xCAFE))
+    let long = round_trip(sdu_of(noble.CONFIG.ISO_SDU_OCTETS), 251, Some(0xCAFE))
     test.assert_eq(list.len(long), 1)
-    same_data(long[0].data, sdu_of(noble_config.ISO_SDU_OCTETS))
+    same_data(long[0].data, sdu_of(noble.CONFIG.ISO_SDU_OCTETS))
     test.assert(long[0].has_time_stamp)
     test.assert_eq(long[0].time_stamp, 0xCAFE)
 
-@when(noble_config.ISO_SDU_OCTETS >= 60)
+@when(noble.CONFIG.ISO_SDU_OCTETS >= 60)
 @test
 @satisfies("REQ-BLE-ISO-002")
 fn test_reassembly_reports_lost_data_and_cut_short_sdus()
@@ -180,7 +180,7 @@ fn test_reassembly_reports_lost_data_and_cut_short_sdus()
             test.assert_eq(d[0].packet_status, hci_codec.ISO_PSF_POSSIBLY_INVALID)
             test.assert_eq(list.len(d[0].data), 16)
 
-@when(noble_config.ISO_SDU_OCTETS >= 60)
+@when(noble.CONFIG.ISO_SDU_OCTETS >= 60)
 @test
 @satisfies("REQ-BLE-ISO-002")
 fn test_reassembly_keeps_possibly_invalid_and_counts_orphans()
@@ -628,14 +628,14 @@ fn test_padding_pdus_make_up_the_burst_and_carry_no_sdu()
     test.assert_eq(list.len(isoal_framed_pad(padded, 2)), 3)
     test.assert_eq(list.len(isoal_framed_pad([], 0)), 0)
 
-@when(noble_config.ISO_SDU_OCTETS < 4095)
+@when(noble.CONFIG.ISO_SDU_OCTETS < 4095)
 @test
 @satisfies("REQ-BLE-HCI-059")
 fn test_an_sdu_longer_than_the_host_buffer_is_lost_data_and_counted()
     // An SDU one octet over the Host's buffer, cut into packets of 251.
     var r = isoal_reassembler(0x0040)
     var out: [IsoSdu] = []
-    match isoal_fragments(0x0040, 9, None, sdu_of(noble_config.ISO_SDU_OCTETS + 1), 251)
+    match isoal_fragments(0x0040, 9, None, sdu_of(noble.CONFIG.ISO_SDU_OCTETS + 1), 251)
         None          => test.fail("the SDU is cut")
         Some(packets) =>
             for p in packets
@@ -649,7 +649,7 @@ fn test_an_sdu_longer_than_the_host_buffer_is_lost_data_and_counted()
     test.assert(not r.collecting)
     // A complete SDU that is too long in one packet is the same.
     var q = isoal_reassembler(0x0040)
-    match isoal_fragments(0x0040, 4, None, sdu_of(noble_config.ISO_SDU_OCTETS + 1), 400)
+    match isoal_fragments(0x0040, 4, None, sdu_of(noble.CONFIG.ISO_SDU_OCTETS + 1), 400)
         None          => test.fail("the SDU is cut")
         Some(packets) =>
             let got = isoal_push(var q, packets[0])
@@ -657,6 +657,6 @@ fn test_an_sdu_longer_than_the_host_buffer_is_lost_data_and_counted()
             test.assert_eq(got[0].packet_status, hci_codec.ISO_PSF_LOST)
             test.assert_eq(q.oversize, 1)
     // The largest SDU the buffer holds is taken whole.
-    let fits = round_trip(sdu_of(noble_config.ISO_SDU_OCTETS), 251, None)
+    let fits = round_trip(sdu_of(noble.CONFIG.ISO_SDU_OCTETS), 251, None)
     test.assert_eq(list.len(fits), 1)
     test.assert_eq(fits[0].packet_status, hci_codec.ISO_PSF_VALID)

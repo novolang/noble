@@ -24,7 +24,7 @@ use gatt_client
 use gatt_db
 use gatt_server
 use links
-use noble_config
+use noble.CONFIG
 
 // ── Fixtures ────────────────────────────────────────────────────────
 
@@ -211,7 +211,7 @@ fn server() -> gatt_server.GattServer
 
 // ── Link and bearer ─────────────────────────────────────────────────
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_the_mtu_is_exchanged_once_and_is_the_smaller_of_the_two()
     var t = table()
@@ -224,7 +224,7 @@ fn test_the_mtu_is_exchanged_once_and_is_the_smaller_of_the_two()
     test.assert_eq(gatt_server.mtu_of(s.link, 0), 65)
     test.assert_eq(gatt_client.begin_exchange_mtu(var t, link_a(), 0), gatt_client.ERR_REPEAT)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_the_mtu_request_carries_the_clients_rx_mtu()
     var t = table()
@@ -232,7 +232,7 @@ fn test_the_mtu_request_carries_the_clients_rx_mtu()
     var trace = new_log()
     let _ = gatt_client.begin_exchange_mtu(var t, link_a(), 0)
     pump(t, link_a(), s, trace)
-    test.assert_eq(trace.sent[0], [0x02, noble_config.MAX_ATT_MTU & 0xFF, noble_config.MAX_ATT_MTU >>> 8])
+    test.assert_eq(trace.sent[0], [0x02, noble.CONFIG.MAX_ATT_MTU & 0xFF, noble.CONFIG.MAX_ATT_MTU >>> 8])
 
 // ── Discovery ───────────────────────────────────────────────────────
 
@@ -255,7 +255,7 @@ fn discover_everything(var t: gatt_client.ClientTable, link: links.LinkId,
     test.assert_eq(run(t, link, s, gatt_client.begin_exchange_mtu(var t, link, 0)), 0)
     test.assert_eq(run(t, link, s, gatt_client.begin_discover_services(var t, link, 0, 1, 0xFFFF, false)), 0)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_primary_services_are_discovered_and_cached()
     var t = table()
@@ -268,7 +268,7 @@ fn test_primary_services_are_discovered_and_cached()
     test.assert_eq(rec(var t, link_a(), 3), [1, 0x0023, 0x0026, 0, 0xBB00])
     test.assert(not gatt_client.cache_secondary_at(var t, link_a(), 0))
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_discovery_pages_until_the_range_ends()
     var t = table()
@@ -286,7 +286,7 @@ fn test_discovery_pages_until_the_range_ends()
     test.assert_eq(gatt_client.result_found(var t, link_a(), 0), 4)
     test.assert_eq(gatt_client.cache_count(var t, link_a()), 4)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_discovery_of_a_narrow_range_stops_at_its_end()
     var t = table()
@@ -298,7 +298,7 @@ fn test_discovery_of_a_narrow_range_stops_at_its_end()
     test.assert_eq(gatt_client.cache_count(var t, link_a()), 1)
     test.assert_eq(rec(var t, link_a(), 0), [1, 0x0018, 0x0022, 0, 0xAA00])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_range_with_no_service_ends_well_with_nothing_found()
     var t = table()
@@ -308,7 +308,7 @@ fn test_a_range_with_no_service_ends_well_with_nothing_found()
     test.assert_eq(gatt_client.result_found(var t, link_a(), 0), 0)
     test.assert_eq(gatt_client.cache_count(var t, link_a()), 0)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_services_of_both_uuid_widths_are_discovered()
     var t = table()
@@ -322,7 +322,7 @@ fn test_services_of_both_uuid_widths_are_discovered()
     test.assert(gatt_client.uuid_same(u, uuid_of(gatt_server.uuid128(0x05))))
     test.assert_eq(gatt_client.cache_handle_at(var t, link_a(), 4), 0x0027)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_secondary_services_are_discovered_apart_from_primary_ones()
     var t = table()
@@ -334,7 +334,7 @@ fn test_secondary_services_are_discovered_apart_from_primary_ones()
     test.assert_eq(gatt_client.cache_handle_at(var t, link_a(), 0), secondary)
     test.assert(gatt_client.cache_secondary_at(var t, link_a(), 0))
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_service_is_found_by_uuid()
     var t = table()
@@ -347,7 +347,7 @@ fn test_a_service_is_found_by_uuid()
     test.assert_eq(gatt_client.cache_count(var t, link_a()), 1)
     test.assert_eq(rec(var t, link_a(), 0), [1, 0x0023, 0x0026, 0, 0xBB00])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_128_bit_service_is_found_by_uuid()
     var t = table()
@@ -362,7 +362,7 @@ fn test_a_128_bit_service_is_found_by_uuid()
     test.assert_eq(gatt_client.cache_count(var t, link_a()), 1)
     test.assert(gatt_client.uuid_same(gatt_client.cache_uuid_at(var t, link_a(), 0), want))
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_service_that_is_not_there_is_not_found_and_not_an_error()
     var t = table()
@@ -374,7 +374,7 @@ fn test_a_service_that_is_not_there_is_not_found_and_not_an_error()
     0)
     test.assert_eq(gatt_client.cache_count(var t, link_a()), 0)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_characteristics_of_a_service_are_discovered()
     var t = table()
@@ -387,7 +387,7 @@ fn test_characteristics_of_a_service_are_discovered()
     test.assert_eq(rec(var t, link_a(), 2), [3, 0x001F, 0x0020, 0x02, 0xAA03])
     test.assert_eq(rec(var t, link_a(), 3), [3, 0x0021, 0x0022, 0x04, 0xAA04])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_characteristics_are_found_by_uuid_and_only_those_are_cached()
     var t = table()
@@ -400,7 +400,7 @@ fn test_characteristics_are_found_by_uuid_and_only_those_are_cached()
     test.assert_eq(rec(var t, link_a(), 0), [3, 0x001F, 0x0020, 0x02, 0xAA03])
     test.assert_eq(gatt_client.result_found(var t, link_a(), 0), 1)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_128_bit_characteristic_is_discovered()
     var t = table()
@@ -413,7 +413,7 @@ fn test_a_128_bit_characteristic_is_discovered()
     test.assert(gatt_client.uuid_same(gatt_client.cache_uuid_at(var t, link_a(), 0), uuid_of(gatt_server.uuid128(0x06))))
     test.assert_eq(gatt_client.cache_a_at(var t, link_a(), 0), decl + 1)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_descriptors_are_discovered_and_the_cccd_is_found()
     var t = table()
@@ -431,7 +431,7 @@ fn test_descriptors_are_discovered_and_the_cccd_is_found()
     test.assert_eq(gatt_client.cccd_of(var t, link_a(), 2), 0)
     test.assert_eq(gatt_client.descriptor_of(var t, link_a(), 1, 0x2901), 0x001E)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_descriptor_range_with_nothing_in_it_ends_well()
     var t = table()
@@ -440,7 +440,7 @@ fn test_a_descriptor_range_with_nothing_in_it_ends_well()
         0)
     test.assert_eq(gatt_client.cache_count(var t, link_a()), 0)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_included_services_are_found_with_their_range_and_uuid()
     var t = table()
@@ -453,7 +453,7 @@ fn test_included_services_are_found_with_their_range_and_uuid()
     test.assert_eq(gatt_client.cache_count(var t, link_a()), 1)
     test.assert_eq(rec(var t, link_a(), 0), [2, 0x0024, 0x0018, 0x0022, 0xAA00])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_an_included_service_with_a_128_bit_uuid_costs_a_read_for_its_uuid()
     var t = table()
@@ -484,7 +484,7 @@ fn open_value(var s: gatt_server.GattServer, uuid16: Int) -> Int
     let decl = gatt_server.add_characteristic(var s.db, 0x0A, gatt_server.PERM_READ | gatt_server.PERM_WRITE, gatt_server.le16(uuid16))
     decl + 1
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_value_is_read_with_one_request()
     var t = table()
@@ -497,7 +497,7 @@ fn test_a_value_is_read_with_one_request()
     test.assert_eq(trace.values[0], [1, 2, 3, 4])
     test.assert_eq(gatt_client.value_len(var t, link_a(), 0), 4)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_read_of_a_value_longer_than_the_mtu_is_cut_by_the_peer()
     var t = table()
@@ -508,7 +508,7 @@ fn test_a_read_of_a_value_longer_than_the_mtu_is_cut_by_the_peer()
     // ATT_MTU 23 leaves 22 octets of a 100 octet value.
     test.assert_eq(trace.values[0], ramp(22))
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_read_by_type_answers_the_handle_value_pairs()
     var t = table()
@@ -521,7 +521,7 @@ fn test_read_by_type_answers_the_handle_value_pairs()
     test.assert_eq(trace.values[0], [0x1A, 0x00, 1, 2, 3, 4])
     test.assert_eq(gatt_client.result_item_len(var t, link_a(), 0), 6)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_long_value_is_read_with_blobs_until_a_short_part()
     var t = table()
@@ -538,7 +538,7 @@ fn test_a_long_value_is_read_with_blobs_until_a_short_part()
     test.assert_eq(trace.sent[1], [0x0C, 0x20, 0x00, 22, 0x00])
     test.assert_eq(trace.sent[4], [0x0C, 0x20, 0x00, 88, 0x00])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_long_read_takes_the_larger_mtu_once_it_is_exchanged()
     var t = table()
@@ -551,7 +551,7 @@ fn test_a_long_read_takes_the_larger_mtu_once_it_is_exchanged()
     test.assert_eq(list.len(trace.sent), 2)
     test.assert_eq(trace.sent[1], [0x0C, 0x20, 0x00, 64, 0x00])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_value_that_fills_the_last_part_ends_on_an_empty_blob()
     var t = table()
@@ -565,7 +565,7 @@ fn test_a_value_that_fills_the_last_part_ends_on_an_empty_blob()
     test.assert_eq(trace.values[0], ramp(44))
     test.assert_eq(list.len(trace.sent), 3)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_VALUE_BYTES < 300 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_VALUE_BYTES < 300 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_value_longer_than_the_buffer_is_cut_and_says_so()
     var t = table()
@@ -581,7 +581,7 @@ fn test_a_value_longer_than_the_buffer_is_cut_and_says_so()
     test.assert_eq(trace.values[0], ramp(gatt_client.value_octets()))
     test.assert(gatt_client.is_local(gatt_client.STATUS_TRUNCATED))
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_read_blob_the_peer_refuses_at_the_end_ends_the_value()
     var t = table()
@@ -599,7 +599,7 @@ fn test_a_read_blob_the_peer_refuses_at_the_end_ends_the_value()
     test.assert_eq(trace.statuses, [0])
     test.assert_eq(trace.values[0], ramp(22))
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_read_the_peer_refuses_ends_with_its_error_code_and_handle()
     var t = table()
@@ -612,7 +612,7 @@ fn test_a_read_the_peer_refuses_ends_with_its_error_code_and_handle()
     test.assert(gatt_client.is_peer_error(trace.statuses[0]))
     test.assert_eq(trace.values[0], [])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_refusal_for_security_ends_the_procedure_and_sends_nothing_more()
     var t = table()
@@ -630,7 +630,7 @@ fn test_a_refusal_for_security_ends_the_procedure_and_sends_nothing_more()
 
 // ── Writes ──────────────────────────────────────────────────────────
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_value_is_written_with_a_request()
     var t = table()
@@ -642,7 +642,7 @@ fn test_a_value_is_written_with_a_request()
     test.assert_eq(trace.statuses, [0])
     test.assert_eq(served(var s, 0x001A), [9, 8])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_write_the_peer_refuses_ends_with_its_code()
     var t = table()
@@ -654,7 +654,7 @@ fn test_a_write_the_peer_refuses_ends_with_its_code()
     test.assert_eq(gatt_client.result_handle(var t, link_a(), 0), 0x0020)
     test.assert_eq(served(var s, 0x0020), ramp(100))
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_write_longer_than_the_mtu_allows_is_not_queued()
     var t = table()
@@ -666,7 +666,7 @@ fn test_a_write_longer_than_the_mtu_allows_is_not_queued()
     test.assert_eq(gatt_client.begin_write(var t, link_a(), 0, 0x001A, payload([]), -1), gatt_client.ERR_ARGUMENT)
     test.assert_eq(gatt_client.begin_write(var t, link_a(), 0, 0, payload([1]), 1), gatt_client.ERR_ARGUMENT)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_write_command_has_no_response_and_ends_when_it_is_sent()
     var t = table()
@@ -681,7 +681,7 @@ fn test_a_write_command_has_no_response_and_ends_when_it_is_sent()
     test.assert_eq(gatt_client.is_busy(var t, link_a(), 0), false)
     test.assert_eq(served(var s, 0x0022), [5])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_request_queued_behind_a_command_runs_after_it()
     var t = table()
@@ -694,7 +694,7 @@ fn test_a_request_queued_behind_a_command_runs_after_it()
     test.assert_eq(trace.tickets, [read])
     test.assert_eq(trace.statuses, [att.ATT_ERR_READ_NOT_PERMITTED])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_long_value_is_written_in_parts_and_executed()
     var t = table()
@@ -713,7 +713,7 @@ fn test_a_long_value_is_written_in_parts_and_executed()
     test.assert_eq(trace.sent[6], [0x18, 0x01])
     test.assert_eq(served(var s, handle), ramp(100))
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_value_that_fits_one_part_is_still_prepared_and_executed()
     var t = table()
@@ -725,7 +725,7 @@ fn test_a_value_that_fits_one_part_is_still_prepared_and_executed()
     test.assert_eq(list.len(trace.sent), 2)
     test.assert_eq(served(var s, handle), [1, 2, 3])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_an_execute_the_peer_refuses_ends_with_the_handle_it_names()
     var t = table()
@@ -739,7 +739,7 @@ fn test_an_execute_the_peer_refuses_ends_with_the_handle_it_names()
     test.assert_eq(gatt_client.result_handle(var t, link_a(), 0), decl + 1)
     test.assert_eq(served(var s, decl + 1), ramp(30))
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_part_the_peer_refuses_after_one_was_accepted_is_cancelled()
     var t = table()
@@ -767,7 +767,7 @@ fn test_a_part_the_peer_refuses_after_one_was_accepted_is_cancelled()
     test.assert_eq(list.len(s.link.prepare_queue), 0)
     test.assert_eq(served(var s, handle), [])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_first_part_the_peer_refuses_needs_no_cancel()
     var t = table()
@@ -778,7 +778,7 @@ fn test_a_first_part_the_peer_refuses_needs_no_cancel()
     test.assert_eq(list.len(trace.sent), 1)
     test.assert_eq(trace.statuses, [att.ATT_ERR_WRITE_NOT_PERMITTED])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_reliable_write_checks_what_the_peer_echoes()
     var t = table()
@@ -790,7 +790,7 @@ fn test_a_reliable_write_checks_what_the_peer_echoes()
     test.assert_eq(trace.statuses, [0])
     test.assert_eq(served(var s, handle), ramp(40))
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_reliable_write_the_peer_echoes_wrongly_is_cancelled()
     var t = table()
@@ -808,7 +808,7 @@ fn test_a_reliable_write_the_peer_echoes_wrongly_is_cancelled()
     test.assert_eq(trace.statuses, [gatt_client.STATUS_MISMATCH])
     test.assert_eq(served(var s, handle), [])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_long_write_does_not_compare_the_echo()
     var t = table()
@@ -823,7 +823,7 @@ fn test_a_long_write_does_not_compare_the_echo()
     pump(t, link_a(), s, trace)
     test.assert_eq(trace.statuses, [0])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_prepare_response_for_another_handle_is_cancelled()
     var t = table()
@@ -846,7 +846,7 @@ fn subscribe(var t: gatt_client.ClientTable, link: links.LinkId, var s: gatt_ser
              mode: Int)
     test.assert_eq(run(t, link, s, gatt_client.begin_subscribe(var t, link, 0, 0x001D, mode)), 0)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_subscription_is_a_write_of_the_configuration_descriptor()
     var t = table()
@@ -858,7 +858,7 @@ fn test_a_subscription_is_a_write_of_the_configuration_descriptor()
     test.assert_eq(trace.statuses, [0])
     test.assert_eq(gatt_server.configuration(s.link, 0x001D), 1)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_notification_is_reported_with_its_handle_and_value()
     var t = table()
@@ -875,7 +875,7 @@ fn test_a_notification_is_reported_with_its_handle_and_value()
     var out: gatt_client.ClientPdu = Vec.new()
     test.assert_eq(gatt_client.take_tx(var t, link_a(), 0, 0, var out), gatt_client.TX_NONE)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_an_indication_is_reported_and_confirmed()
     var t = table()
@@ -893,7 +893,7 @@ fn test_an_indication_is_reported_and_confirmed()
     test.assert_eq(trace.sent[0], [0x1E])
     test.assert_eq(s.link.bearers[0].indicating, 0)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_the_next_indication_follows_the_confirmation_of_the_one_before()
     var t = table()
@@ -914,7 +914,7 @@ fn test_the_next_indication_follows_the_confirmation_of_the_one_before()
     test.assert_eq(trace.pushed, [[0x01], [0x02]])
     test.assert_eq(trace.events, [gatt_client.EV_INDICATION, gatt_client.EV_INDICATION])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_subscription_ends_with_a_write_of_zero()
     var t = table()
@@ -923,7 +923,7 @@ fn test_a_subscription_ends_with_a_write_of_zero()
     subscribe(t, link_a(), s, 0)
     test.assert_eq(list.len(gatt_server.send_value(var s.db, var s.link, 0x001C, 0)), 0)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_notification_arrives_while_a_request_is_outstanding()
     var t = table()
@@ -938,7 +938,7 @@ fn test_a_notification_arrives_while_a_request_is_outstanding()
     test.assert_eq(trace.events, [gatt_client.EV_NOTIFICATION, gatt_client.EV_DONE])
     test.assert_eq(trace.tickets, [read])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_pdu_for_the_server_role_is_not_the_clients()
     var t = table()
@@ -947,7 +947,7 @@ fn test_a_pdu_for_the_server_role_is_not_the_clients()
     deliver(t, link_a(), 0, [0x52, 0x03, 0x00, 0x01], trace)
     test.assert_eq(trace.events, [gatt_client.EV_FOREIGN, gatt_client.EV_FOREIGN])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_response_with_no_request_waiting_is_dropped()
     var t = table()
@@ -960,7 +960,7 @@ fn test_a_response_with_no_request_waiting_is_dropped()
     deliver(t, link_a(), 0, [0x0B, 0x01], trace)
     test.assert_eq(trace.events, [])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_notification_too_short_to_read_is_dropped()
     var t = table()
@@ -982,7 +982,7 @@ fn broken(var t: gatt_client.ClientTable, answer: [Int]) -> Int
     test.assert_eq(trace.events, [gatt_client.EV_DONE])
     trace.statuses[0]
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_response_the_client_cannot_read_ends_the_request_with_protocol_or_order_error()
     var t = table()
@@ -1027,7 +1027,7 @@ fn test_a_response_the_client_cannot_read_ends_the_request_with_protocol_or_orde
     let _ = gatt_client.begin_database_hash(var t, link_a(), 0)
     test.assert_eq(broken(var t, [0x09, 6, 0x15, 0, 1, 2]), protocol)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_response_that_does_not_answer_the_request_ends_it_with_protocol_error()
     var t = table()
@@ -1039,7 +1039,7 @@ fn test_a_response_that_does_not_answer_the_request_ends_it_with_protocol_error(
     let _ = gatt_client.begin_read(var t, link_a(), 0, 3)
     test.assert_eq(broken(var t, [0x01, 0x0A, 3]), gatt_client.STATUS_PROTOCOL)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.CLIENT_CACHE_RECORDS < 128 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.CLIENT_CACHE_RECORDS < 128 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_cache_that_is_full_ends_discovery_with_its_own_status()
     var t = table()
@@ -1056,7 +1056,7 @@ fn test_a_cache_that_is_full_ends_discovery_with_its_own_status()
     gatt_client.cache_clear(var t, link_a())
     test.assert_eq(gatt_client.cache_count(var t, link_a()), 0)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_rediscovery_replaces_what_was_found_before()
     var t = table()
@@ -1067,7 +1067,7 @@ fn test_rediscovery_replaces_what_was_found_before()
         0)
     test.assert_eq(gatt_client.cache_count(var t, link_a()), 4)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_the_cache_is_searched_by_kind_and_uuid()
     var t = table()
@@ -1088,7 +1088,7 @@ fn test_the_cache_is_searched_by_kind_and_uuid()
 
 // ── Queue, time and the transaction rule ────────────────────────────
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_one_transaction_is_outstanding_and_the_rest_wait_in_order()
     var t = table()
@@ -1112,7 +1112,7 @@ fn test_one_transaction_is_outstanding_and_the_rest_wait_in_order()
     test.assert_eq(trace.values[1], ramp(22))
     test.assert_eq(trace.values[2], [0x54, 0x65, 0x73, 0x74])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_full_queue_refuses_the_next_request_and_takes_it_again_when_room_is_made()
     var t = table()
@@ -1126,7 +1126,7 @@ fn test_a_full_queue_refuses_the_next_request_and_takes_it_again_when_room_is_ma
     test.assert_eq(list.len(trace.tickets), gatt_client.queue() + 1)
     test.assert(gatt_client.begin_read(var t, link_a(), 0, 0x001A) > 0)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_tickets_rise_by_one_for_each_request_of_a_bearer()
     var t = table()
@@ -1136,7 +1136,7 @@ fn test_tickets_rise_by_one_for_each_request_of_a_bearer()
     test.assert_eq(b, a + 1)
     test.assert_eq(c, a + 2)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES == 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES == 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_queued_payloads_share_the_buffer_and_it_is_free_again_when_they_are_sent()
     var t = table()
@@ -1152,7 +1152,7 @@ fn test_queued_payloads_share_the_buffer_and_it_is_free_again_when_they_are_sent
     test.assert_eq(served(var s, handle), ramp(56))
     test.assert(gatt_client.begin_write_long(var t, link_a(), 0, handle, payload(ramp(100)), 100) > 0)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_transaction_that_gets_no_response_in_30_s_ends_the_bearer()
     var t = table()
@@ -1178,7 +1178,7 @@ fn test_a_transaction_that_gets_no_response_in_30_s_ends_the_bearer()
     test.assert_eq(trace.events, [])
     test.assert_eq(gatt_client.tick(var t, link_a(), 0, 99999), gatt_client.EV_NONE)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_the_timer_runs_from_the_moment_the_request_is_sent()
     var t = table()
@@ -1190,7 +1190,7 @@ fn test_the_timer_runs_from_the_moment_the_request_is_sent()
     test.assert_eq(gatt_client.tick(var t, link_a(), 0, 129999), gatt_client.EV_NONE)
     test.assert_eq(gatt_client.tick(var t, link_a(), 0, 130000), gatt_client.EV_DONE)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_an_answered_request_does_not_time_out()
     var t = table()
@@ -1202,7 +1202,7 @@ fn test_an_answered_request_does_not_time_out()
     test.assert_eq(gatt_client.tick(var t, link_a(), 0, 500000), gatt_client.EV_NONE)
     test.assert(not gatt_client.is_dead(var t, link_a(), 0))
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_dead_bearer_is_alive_again_when_the_link_is_opened_again()
     var t = table()
@@ -1215,7 +1215,7 @@ fn test_a_dead_bearer_is_alive_again_when_the_link_is_opened_again()
 
 // ── The peer's database changes ─────────────────────────────────────
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_the_database_hash_is_read_and_compared_with_the_last_one()
     var t = table()
@@ -1236,7 +1236,7 @@ fn test_the_database_hash_is_read_and_compared_with_the_last_one()
     test.assert(gatt_client.take_changed(var t, link_a()))
     test.assert(not gatt_client.take_changed(var t, link_a()))
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_the_hash_request_is_read_by_type_over_all_handles()
     var t = table()
@@ -1247,7 +1247,7 @@ fn test_the_hash_request_is_read_by_type_over_all_handles()
     test.assert_eq(trace.sent[0], [0x08, 0x01, 0x00, 0xFF, 0xFF, 0x2A, 0x2B])
     test.assert_eq(trace.values[0], [])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_database_out_of_sync_marks_the_link_and_the_hash_read_clears_it()
     var t = table()
@@ -1279,7 +1279,7 @@ fn test_database_out_of_sync_marks_the_link_and_the_hash_read_clears_it()
     test.assert_eq(gatt_client.cache_count(var t, link_a()), 5)
     test.assert_eq(run(t, link_a(), s, gatt_client.begin_read(var t, link_a(), 0, 0x001A)), 0)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_service_changed_indication_drops_the_records_of_its_range()
     var t = table()
@@ -1310,7 +1310,7 @@ fn test_a_service_changed_indication_drops_the_records_of_its_range()
     pump(t, link_a(), s, trace)
     test.assert_eq(trace.kinds, [gatt_client.TX_CONFIRM])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_an_indication_of_another_handle_is_not_service_changed()
     var t = table()
@@ -1330,7 +1330,7 @@ fn table2() -> gatt_client.ClientTable
     test.assert(gatt_client.open(var t, link_b()))
     t
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_two_links_run_their_procedures_side_by_side()
     var t = table2()
@@ -1353,7 +1353,7 @@ fn test_two_links_run_their_procedures_side_by_side()
     test.assert_eq(gatt_client.cache_count(var t, link_b()), 5)
     test.assert_eq(gatt_client.cache_handle_at(var t, link_b(), 4), 0x0027)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_each_link_keeps_its_own_mtu_cache_and_hash()
     var t = table2()
@@ -1375,7 +1375,7 @@ fn test_each_link_keeps_its_own_mtu_cache_and_hash()
     test.assert(not gatt_client.take_changed(var t, link_b()))
     test.assert_eq(gatt_client.cache_count(var t, link_b()), 4)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_timeout_on_one_link_leaves_the_other_alone()
     var t = table2()
@@ -1388,7 +1388,7 @@ fn test_a_timeout_on_one_link_leaves_the_other_alone()
     test.assert(not gatt_client.is_dead(var t, link_b(), 0))
     test.assert_eq(run(t, link_b(), sb, gatt_client.begin_read(var t, link_b(), 0, 0x001A)), 0)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_link_that_ends_does_not_answer_for_the_next_one_in_its_slot()
     var t = table2()
@@ -1407,7 +1407,7 @@ fn test_a_link_that_ends_does_not_answer_for_the_next_one_in_its_slot()
     // The other link was not touched.
     test.assert(gatt_client.begin_read(var t, link_b(), 0, 3) > 0)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_closing_a_link_drops_its_requests_without_a_completion()
     var t = table2()
@@ -1418,7 +1418,7 @@ fn test_closing_a_link_drops_its_requests_without_a_completion()
     test.assert_eq(gatt_client.take_tx(var t, link_a(), 0, 0, var out), gatt_client.TX_NONE)
     test.assert(not gatt_client.is_busy(var t, link_a(), 0))
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_the_bearers_of_a_link_each_keep_a_transaction_outstanding()
     var t = table()
@@ -1446,7 +1446,7 @@ fn test_the_bearers_of_a_link_each_keep_a_transaction_outstanding()
     test.assert_eq(l0.values[0], ramp(22))
     test.assert_eq(l1.values[0], ramp(63))
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_timeout_ends_one_bearer_and_not_the_other()
     var t = table()
@@ -1461,7 +1461,7 @@ fn test_a_timeout_ends_one_bearer_and_not_the_other()
     test.assert(gatt_client.is_dead(var t, link_a(), 0))
     test.assert(not gatt_client.is_dead(var t, link_a(), 1))
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_the_discovery_cache_is_the_links_and_not_a_bearers()
     var t = table()
@@ -1482,7 +1482,7 @@ fn test_the_discovery_cache_is_the_links_and_not_a_bearers()
 
 // ── A client for the services the host builds ───────────────────────
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_the_gap_service_of_the_host_is_discovered_and_its_name_read()
     var t = table()
@@ -1502,7 +1502,7 @@ fn test_the_gap_service_of_the_host_is_discovered_and_its_name_read()
 
 // ── More edges ──────────────────────────────────────────────────────
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_service_that_includes_nothing_ends_well_with_nothing_found()
     var t = table()
@@ -1511,7 +1511,7 @@ fn test_a_service_that_includes_nothing_ends_well_with_nothing_found()
     test.assert_eq(gatt_client.result_found(var t, link_a(), 0), 0)
     test.assert_eq(gatt_client.cache_count(var t, link_a()), 0)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_read_by_type_of_a_type_the_peer_has_not_is_a_refusal()
     var t = table()
@@ -1523,7 +1523,7 @@ fn test_read_by_type_of_a_type_the_peer_has_not_is_a_refusal()
     test.assert_eq(status, att.ATT_ERR_ATTRIBUTE_NOT_FOUND)
     test.assert(gatt_client.is_peer_error(status))
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_request_the_peer_does_not_support_ends_with_its_code()
     var t = table()
@@ -1535,7 +1535,7 @@ fn test_a_request_the_peer_does_not_support_ends_with_its_code()
     test.assert_eq(trace.statuses, [att.ATT_ERR_REQUEST_NOT_SUPPORTED])
     test.assert_eq(gatt_client.result_handle(var t, link_a(), 0), 0x001A)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_the_results_of_a_bearer_are_read_before_the_next_response_replaces_them()
     var t = table()
@@ -1553,7 +1553,7 @@ fn test_the_results_of_a_bearer_are_read_before_the_next_response_replaces_them(
     test.assert_eq(gatt_client.result_ticket(var t, link_a(), 0), second)
     test.assert_eq(value_of(t, link_a(), 0), [0x54, 0x65, 0x73, 0x74])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_write_clears_the_value_a_read_left()
     var t = table()
@@ -1565,7 +1565,7 @@ fn test_a_write_clears_the_value_a_read_left()
     test.assert_eq(trace.values[0], [1, 2, 3, 4])
     test.assert_eq(trace.values[1], [])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_slot_taken_over_starts_with_no_state()
     var t = table()
@@ -1578,7 +1578,7 @@ fn test_a_slot_taken_over_starts_with_no_state()
     test.assert_eq(gatt_client.mtu(var t, links.link_id(0, 7), 0), 23)
     test.assert_eq(gatt_client.begin_exchange_mtu(var t, links.link_id(0, 7), 0) > 0, true)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_bearer_that_is_not_open_has_no_state_to_read()
     var t = table()
@@ -1602,7 +1602,7 @@ fn test_a_bearer_that_is_not_open_has_no_state_to_read()
 // on, reads a long value from an offset, reads several values at once, signs
 // the writes it sends and writes values of no octets.
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_caller_can_lift_the_refusal_of_a_second_mtu_exchange()
     var t = table()
@@ -1614,7 +1614,7 @@ fn test_a_caller_can_lift_the_refusal_of_a_second_mtu_exchange()
     test.assert(not gatt_client.allow_another_mtu_exchange(var t, link_a(), 1))
     test.assert(not gatt_client.allow_another_mtu_exchange(var t, link_b(), 0))
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_the_rx_mtu_offered_is_the_one_the_caller_names()
     var t = table()
@@ -1627,22 +1627,22 @@ fn test_the_rx_mtu_offered_is_the_one_the_caller_names()
     // The server's own Rx MTU is 65, so the smaller of the two is the client's.
     test.assert_eq(gatt_client.mtu(var t, link_a(), 0), 40)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_an_rx_mtu_or_an_mtu_out_of_range_or_for_a_bearer_that_is_not_open_is_refused()
     var t = table()
     test.assert(not gatt_client.set_rx_mtu(var t, link_a(), 0, 22))
-    test.assert(not gatt_client.set_rx_mtu(var t, link_a(), 0, noble_config.MAX_ATT_MTU + 1))
+    test.assert(not gatt_client.set_rx_mtu(var t, link_a(), 0, noble.CONFIG.MAX_ATT_MTU + 1))
     test.assert(not gatt_client.set_rx_mtu(var t, link_a(), 1, 40))
     test.assert(not gatt_client.set_rx_mtu(var t, link_b(), 0, 40))
     test.assert(not gatt_client.set_mtu(var t, link_a(), 0, 22))
-    test.assert(not gatt_client.set_mtu(var t, link_a(), 0, noble_config.MAX_ATT_MTU + 1))
+    test.assert(not gatt_client.set_mtu(var t, link_a(), 0, noble.CONFIG.MAX_ATT_MTU + 1))
     test.assert(not gatt_client.set_mtu(var t, link_a(), 1, 40))
     test.assert(not gatt_client.set_mtu(var t, link_b(), 0, 40))
-    test.assert(gatt_client.set_mtu(var t, link_a(), 0, noble_config.MAX_ATT_MTU))
-    test.assert_eq(gatt_client.mtu(var t, link_a(), 0), noble_config.MAX_ATT_MTU)
+    test.assert(gatt_client.set_mtu(var t, link_a(), 0, noble.CONFIG.MAX_ATT_MTU))
+    test.assert_eq(gatt_client.mtu(var t, link_a(), 0), noble.CONFIG.MAX_ATT_MTU)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_the_mtu_set_for_a_bearer_shapes_the_requests_built_after_it()
     var t = table()
@@ -1653,7 +1653,7 @@ fn test_the_mtu_set_for_a_bearer_shapes_the_requests_built_after_it()
     // A Prepare Write Request of ATT_MTU - 5 = 60 octets of value.
     test.assert_eq(out.len(), 65)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_long_read_from_an_offset_opens_with_a_blob_and_reads_to_the_end()
     var t = table()
@@ -1667,7 +1667,7 @@ fn test_a_long_read_from_an_offset_opens_with_a_blob_and_reads_to_the_end()
     test.assert_eq(trace.sent[3], [0x0C, 0x20, 0x00, 88, 0x00])
     test.assert_eq(trace.values[0], ramp(100)[22:])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_long_read_from_offset_zero_opens_with_a_read_request()
     var t = table()
@@ -1678,7 +1678,7 @@ fn test_a_long_read_from_offset_zero_opens_with_a_read_request()
     test.assert_eq(trace.sent[0], [0x0A, 0x20, 0x00])
     test.assert_eq(trace.values[0], ramp(100))
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_long_read_from_an_offset_the_peer_refuses_ends_with_its_code()
     var t = table()
@@ -1689,7 +1689,7 @@ fn test_a_long_read_from_an_offset_the_peer_refuses_ends_with_its_code()
     test.assert_eq(trace.statuses, [att.ATT_ERR_INVALID_OFFSET])
     test.assert_eq(gatt_client.value_len(var t, link_a(), 0), 0)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_long_read_from_an_offset_out_of_range_is_not_queued()
     var t = table()
@@ -1698,7 +1698,7 @@ fn test_a_long_read_from_an_offset_out_of_range_is_not_queued()
     test.assert_eq(gatt_client.begin_read_long_from(var t, link_a(), 0, 0x0020, -1), gatt_client.ERR_ARGUMENT)
     test.assert_eq(gatt_client.begin_read_long_from(var t, link_a(), 0, 0, 0), gatt_client.ERR_ARGUMENT)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_several_values_are_read_with_one_request()
     var t = table()
@@ -1710,7 +1710,7 @@ fn test_several_values_are_read_with_one_request()
     test.assert_eq(trace.statuses, [0])
     test.assert_eq(trace.values[0], [1, 2, 3, 4, 0x77])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_read_multiple_the_peer_refuses_ends_with_its_code_and_handle()
     var t = table()
@@ -1722,7 +1722,7 @@ fn test_a_read_multiple_the_peer_refuses_ends_with_its_code_and_handle()
     test.assert_eq(gatt_client.result_handle(var t, link_a(), 0), 0x0022)
     test.assert_eq(gatt_client.value_len(var t, link_a(), 0), 0)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_values_of_any_length_are_read_with_one_variable_request()
     var t = table()
@@ -1734,7 +1734,7 @@ fn test_values_of_any_length_are_read_with_one_variable_request()
     test.assert_eq(trace.statuses, [0])
     test.assert_eq(trace.values[0], [4, 0, 1, 2, 3, 4, 1, 0, 0x77])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_read_multiple_asks_for_the_handles_it_can_carry()
     var t = table()
@@ -1750,7 +1750,7 @@ fn test_a_read_multiple_asks_for_the_handles_it_can_carry()
     test.assert_eq(gatt_client.begin_read_multiple(var t, link_b(), 0, payload([0x1A, 0x00]), 2),
         gatt_client.ERR_NO_LINK)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_signed_write_goes_out_as_a_command_the_server_verifies()
     var t = table()
@@ -1773,7 +1773,7 @@ fn test_a_signed_write_goes_out_as_a_command_the_server_verifies()
     test.assert_eq(served(var s, handle), [0x13, 0x37])
     test.assert(not gatt_client.is_busy(var t, link_a(), 0))
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_signed_write_carries_at_least_a_signature_and_what_the_mtu_allows()
     var t = table()
@@ -1786,7 +1786,7 @@ fn test_a_signed_write_carries_at_least_a_signature_and_what_the_mtu_allows()
     test.assert_eq(gatt_client.begin_signed_write(var u, link_a(), 0, 0x001A, payload(fill(21, 1)), 21),
         gatt_client.ERR_ARGUMENT)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_value_of_no_octets_is_written()
     var t = table()
@@ -1799,7 +1799,7 @@ fn test_a_value_of_no_octets_is_written()
     test.assert_eq(trace.statuses, [0])
     test.assert_eq(served(var s, handle), [])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_write_command_of_no_octets_is_sent()
     var t = table()
@@ -1810,7 +1810,7 @@ fn test_a_write_command_of_no_octets_is_sent()
     test.assert_eq(trace.sent[0], [0x52, 0x22, 0x00])
     test.assert_eq(trace.kinds, [gatt_client.TX_COMMAND])
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_long_write_from_an_offset_carries_it_in_every_part()
     var t = table()
@@ -1825,7 +1825,7 @@ fn test_a_long_write_from_an_offset_carries_it_in_every_part()
     test.assert_eq(trace.sent[2], [0x18, 0x01])
     test.assert_eq(list.len(trace.statuses), 1)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_reliable_write_from_an_offset_checks_the_echo_against_it()
     var t = table()
@@ -1842,7 +1842,7 @@ fn test_a_reliable_write_from_an_offset_checks_the_echo_against_it()
     test.assert_eq(gatt_client.begin_reliable_write_at(var t, link_a(), 0, handle, -1, payload(ramp(10)), 10),
         gatt_client.ERR_ARGUMENT)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.MAX_ATT_MTU >= 247)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.MAX_ATT_MTU >= 247)
 @test
 fn test_a_long_or_reliable_write_of_no_octets_is_not_queued()
     var t = table()
@@ -1859,12 +1859,12 @@ fn test_a_long_or_reliable_write_of_no_octets_is_not_queued()
 fn test_the_table_is_sized_by_the_configuration_and_serves_a_link_at_every_size()
     var t = table()
     test.assert_eq(gatt_client.links(),
-        (if noble_config.MAX_CLIENT_LINKS > 1 then noble_config.MAX_CLIENT_LINKS else 1))
+        (if noble.CONFIG.MAX_CLIENT_LINKS > 1 then noble.CONFIG.MAX_CLIENT_LINKS else 1))
     test.assert_eq(gatt_client.bearers(),
-        (if noble_config.CLIENT_BEARERS > 1 then noble_config.CLIENT_BEARERS else 1))
+        (if noble.CONFIG.CLIENT_BEARERS > 1 then noble.CONFIG.CLIENT_BEARERS else 1))
     test.assert_eq(gatt_client.cache(),
-        (if noble_config.CLIENT_CACHE_RECORDS > 1 then noble_config.CLIENT_CACHE_RECORDS else 1))
-    test.assert_eq(gatt_client.queue(), (if noble_config.CLIENT_QUEUE > 1 then noble_config.CLIENT_QUEUE else 1))
+        (if noble.CONFIG.CLIENT_CACHE_RECORDS > 1 then noble.CONFIG.CLIENT_CACHE_RECORDS else 1))
+    test.assert_eq(gatt_client.queue(), (if noble.CONFIG.CLIENT_QUEUE > 1 then noble.CONFIG.CLIENT_QUEUE else 1))
     test.assert_eq(gatt_client.value_octets(),
-        (if noble_config.CLIENT_VALUE_BYTES > 1 then noble_config.CLIENT_VALUE_BYTES else 1))
+        (if noble.CONFIG.CLIENT_VALUE_BYTES > 1 then noble.CONFIG.CLIENT_VALUE_BYTES else 1))
     test.assert_eq(gatt_client.slot_of(var t, link_a()), 0)

@@ -5,7 +5,7 @@
 use gatt_client
 use std.test
 use att
-use noble_config
+use noble.CONFIG
 use links
 use gatt_client.{ ClientTable, DEFAULT_MTU, ERR_ARGUMENT, ERR_NO_BEARER, ERR_NO_LINK, HASH_OCTETS, QUEUE_FIELDS, REGS, STATUS_MISMATCH, STATUS_OK, STATUS_TIMEOUT, base_lo, bearers, begin_discover_characteristics, begin_discover_services, begin_exchange_mtu, begin_read, begin_read_long, begin_subscribe, cache, close, close_bearer, init_table, is_busy, is_local, is_out_of_sync, is_peer_error, max1, mtu, needs_security, new_table, open, open_bearer, pdu_octets, queue, short_of, slot_of, uuid128, uuid16, uuid_same, value_octets }
 
@@ -17,12 +17,12 @@ use gatt_client.{ ClientTable, DEFAULT_MTU, ERR_ARGUMENT, ERR_NO_BEARER, ERR_NO_
 @test
 fn test_the_capacities_are_the_limits()
     var t = new_table()
-    test.assert_eq(gatt_client.links(), max1(noble_config.MAX_CLIENT_LINKS))
-    test.assert_eq(bearers(), max1(noble_config.CLIENT_BEARERS))
-    test.assert_eq(cache(), max1(noble_config.CLIENT_CACHE_RECORDS))
-    test.assert_eq(queue(), max1(noble_config.CLIENT_QUEUE))
-    test.assert_eq(value_octets(), max1(noble_config.CLIENT_VALUE_BYTES))
-    test.assert_eq(pdu_octets(), noble_config.MAX_ATT_MTU)
+    test.assert_eq(gatt_client.links(), max1(noble.CONFIG.MAX_CLIENT_LINKS))
+    test.assert_eq(bearers(), max1(noble.CONFIG.CLIENT_BEARERS))
+    test.assert_eq(cache(), max1(noble.CONFIG.CLIENT_CACHE_RECORDS))
+    test.assert_eq(queue(), max1(noble.CONFIG.CLIENT_QUEUE))
+    test.assert_eq(value_octets(), max1(noble.CONFIG.CLIENT_VALUE_BYTES))
+    test.assert_eq(pdu_octets(), noble.CONFIG.MAX_ATT_MTU)
     test.assert_eq(t.generation.capacity(), gatt_client.links())
     test.assert_eq(t.opened.capacity(), gatt_client.links())
     test.assert_eq(t.flags.capacity(), gatt_client.links())
@@ -93,7 +93,7 @@ fn test_other_uuids_stay_wide_and_compare_by_value()
     test.assert(not uuid_same(a, c))
     test.assert(not uuid_same(a, uuid16(0x1122)))
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2)
 @test
 fn test_a_link_is_named_by_its_slot_and_generation()
     var t = new_table()
@@ -122,7 +122,7 @@ fn test_a_closed_link_names_nothing()
     test.assert_eq(slot_of(var t, id), -1)
     test.assert_eq(begin_read(t, id, 0, 3), ERR_NO_LINK)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2)
 @test
 fn test_a_request_on_a_bearer_that_is_not_open_is_refused()
     var t = new_table()
@@ -135,7 +135,7 @@ fn test_a_request_on_a_bearer_that_is_not_open_is_refused()
     test.assert_eq(mtu(var t, id, 1), 100)
     test.assert(begin_read(t, id, 1, 3) > 0)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 2 and noble_config.CLIENT_BEARERS >= 2)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 2 and noble.CONFIG.CLIENT_BEARERS >= 2)
 @test
 fn test_an_enhanced_bearer_takes_the_mtu_of_its_channel_and_no_exchange()
     var t = new_table()
@@ -178,7 +178,7 @@ fn test_status_codes_map_to_what_a_caller_does_about_them()
     test.assert(is_local(STATUS_MISMATCH))
     test.assert(not is_local(att.ATT_ERR_INVALID_HANDLE))
 
-@when(noble_config.MAX_CLIENT_LINKS >= 1 and noble_config.CLIENT_CACHE_RECORDS >= 3)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 1 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 3)
 @test
 fn test_the_cache_stores_a_record_once_per_kind_and_handle_and_finds_the_next_boundary()
     var t = gatt_client.new_table()
@@ -202,7 +202,7 @@ fn test_the_cache_stores_a_record_once_per_kind_and_handle_and_finds_the_next_bo
     test.assert(refused)
     test.assert(gatt_client.cache_put(var t, 0, gatt_client.KIND_SERVICE, 0x0010, 0x0010, 0x0020, uuid, 0))
 
-@when(noble_config.MAX_CLIENT_LINKS >= 1 and noble_config.CLIENT_BEARERS >= 1 and noble_config.CLIENT_CACHE_RECORDS >= 1)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 1 and noble.CONFIG.CLIENT_BEARERS >= 1 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 1)
 @test
 fn test_a_request_with_a_bad_range_or_for_no_link_or_no_open_bearer_is_refused_before_it_is_queued()
     var t = gatt_client.new_table()
@@ -222,7 +222,7 @@ fn test_a_request_with_a_bad_range_or_for_no_link_or_no_open_bearer_is_refused_b
     // A bearer the table does not have.
     test.assert_eq(gatt_client.begin_exchange_mtu(var t, link, gatt_client.bearers()), gatt_client.ERR_NO_BEARER)
 
-@when(noble_config.MAX_CLIENT_LINKS >= 1 and noble_config.CLIENT_BEARERS >= 1 and noble_config.CLIENT_CACHE_RECORDS >= 1)
+@when(noble.CONFIG.MAX_CLIENT_LINKS >= 1 and noble.CONFIG.CLIENT_BEARERS >= 1 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 1)
 @test
 fn test_what_a_link_the_table_does_not_hold_has_to_report_is_zero()
     var t = gatt_client.new_table()

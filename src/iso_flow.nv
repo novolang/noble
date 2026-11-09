@@ -27,7 +27,7 @@
 // Satisfies: REQ-BLE-ISO-005.
 
 use hci_codec
-use noble_config
+use noble.CONFIG
 // The sequence numbers are 16 bits.
 const SEQUENCE_MODULUS = 0x10000
 
@@ -40,24 +40,24 @@ const fn max1(n: Int) -> Int
 
 // The pool, the packets in flight of each stream and the next sequence
 // number of each.  The capacity of the stream tables is
-// `max1(noble_config.MAX_CIS + noble_config.MAX_BIS)`; the pool holds
-// `noble_config.MAX_CIS + noble_config.MAX_BIS` streams, none when both keys are 0.
+// `max1(noble.CONFIG.MAX_CIS + noble.CONFIG.MAX_BIS)`; the pool holds
+// `noble.CONFIG.MAX_CIS + noble.CONFIG.MAX_BIS` streams, none when both keys are 0.
 @value
 struct IsoCredits
     packet_length: u16
     total: u8
     free: u8
-    used: Vec[Bool; max1(noble_config.MAX_CIS + noble_config.MAX_BIS)]
-    handles: Vec[u16; max1(noble_config.MAX_CIS + noble_config.MAX_BIS)]
-    in_flight: Vec[u8; max1(noble_config.MAX_CIS + noble_config.MAX_BIS)]
-    sequence: Vec[u16; max1(noble_config.MAX_CIS + noble_config.MAX_BIS)]
+    used: Vec[Bool; max1(noble.CONFIG.MAX_CIS + noble.CONFIG.MAX_BIS)]
+    handles: Vec[u16; max1(noble.CONFIG.MAX_CIS + noble.CONFIG.MAX_BIS)]
+    in_flight: Vec[u8; max1(noble.CONFIG.MAX_CIS + noble.CONFIG.MAX_BIS)]
+    sequence: Vec[u16; max1(noble.CONFIG.MAX_CIS + noble.CONFIG.MAX_BIS)]
 
 @tier(embedded)
 fn iso_credits_new() -> IsoCredits
     var c = IsoCredits {
         packet_length: 0, total: 0, free: 0, used: Vec.new(), handles: Vec.new(),
         in_flight: Vec.new(), sequence: Vec.new() }
-    for _ in 0..noble_config.MAX_CIS + noble_config.MAX_BIS
+    for _ in 0..noble.CONFIG.MAX_CIS + noble.CONFIG.MAX_BIS
         let _a = c.used.push(false)
         let _b = c.handles.push(0)
         let _c = c.in_flight.push(0)

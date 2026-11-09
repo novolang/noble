@@ -4,7 +4,7 @@
 
 use std.test
 use fixtures.{ client_engine_present, peer, read, req, subscribe }
-use noble_config
+use noble.CONFIG
 use gatt_server
 use links
 
@@ -26,5 +26,5 @@ fn test_subscribe_writes_the_descriptor_and_read_gives_it_back()
 
 @test
 fn test_the_client_engine_is_present_where_the_keys_size_a_session()
-    let sized = noble_config.MAX_CLIENT_LINKS >= 1 and noble_config.CLIENT_BEARERS >= 1 and noble_config.CLIENT_CACHE_RECORDS >= 24 and noble_config.CLIENT_QUEUE >= 4 and noble_config.CLIENT_VALUE_BYTES >= 256
+    let sized = noble.CONFIG.MAX_CLIENT_LINKS >= 1 and noble.CONFIG.CLIENT_BEARERS >= 1 and noble.CONFIG.CLIENT_CACHE_RECORDS >= 24 and noble.CONFIG.CLIENT_QUEUE >= 4 and noble.CONFIG.CLIENT_VALUE_BYTES >= 256
     test.assert_eq(client_engine_present(), sized)

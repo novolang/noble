@@ -1,7 +1,7 @@
 // links.nv — the identity of a connection slot, the registry of the
 // connection slots, and the Controller's ACL buffers the slots share.
 //
-// The Host holds a fixed number of connection slots (`noble_config.MAX_CONNECTIONS`)
+// The Host holds a fixed number of connection slots (`noble.CONFIG.MAX_CONNECTIONS`)
 // and every per-connection table is indexed by the slot.  A `LinkId` is a
 // slot number together with the generation of the slot: the generation rises
 // each time the slot is given to a new connection, so an id kept from a
@@ -29,7 +29,7 @@
 // A registry is made for the `slots` a Host serves, at most `LINK_SLOTS`.
 
 use limits
-use noble_config
+use noble.CONFIG
 // The slot of a link that holds none.
 const NO_SLOT = -1
 
@@ -85,7 +85,7 @@ const ACL_DATA_MIN = 27
 // flags, and Data_Total_Length ([Vol 4] Part E, Section 5.4.2).
 const ACL_HEADER_OCTETS = 4
 
-// The data octets one of the Host's own ACL buffers holds: `noble_config.ACL_OCTETS`
+// The data octets one of the Host's own ACL buffers holds: `noble.CONFIG.ACL_OCTETS`
 // less the header, and never fewer than the 27 octets every Host accepts.
 // This is the Host's private size.  It is not agreed with the Controller at
 // build time: the Controller's LE_ACL_Data_Packet_Length is read at run time
@@ -94,7 +94,7 @@ const ACL_HEADER_OCTETS = 4
 pub @tier(embedded)
 @no_alloc
 fn acl_slot_payload() -> Int
-    let n = noble_config.ACL_OCTETS - ACL_HEADER_OCTETS
+    let n = noble.CONFIG.ACL_OCTETS - ACL_HEADER_OCTETS
     if n < ACL_DATA_MIN
         ACL_DATA_MIN
     else

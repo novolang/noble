@@ -156,7 +156,7 @@ they are `pub`, each with a doc comment, and every other item is private.
 | Isochronous | `iso_cis` (17), `iso_host` (14), `iso_big` (13), `iso_setup` (10), `iso_flow` (8), `iso_event` (6), `isoal` (4) |
 | Shared with the services | `wire` (39), `profile_builder` (9), `control_common` (7), `encrypted_data` (5), `notify` (1), `limits` (1), `fixtures` (5) |
 
-The configuration module `noble_config` is generated from the keys of
+The configuration module `noble.CONFIG` is generated from the keys of
 `novo.toml`; a consumer reads its constants and sets them in its own config file.
 
 ## Tests
@@ -173,7 +173,7 @@ database.  `att_server_scratch_tests` holds the fixed-RAM ATT paths to the
 answers of `att_server.handle_request`.
 
 A test that reads a limit computes the figure it expects from the configuration
-key (`limits.frame_octets()`, `noble_config.MAX_ATT_MTU`) and not from the
+key (`limits.frame_octets()`, `noble.CONFIG.MAX_ATT_MTU`) and not from the
 default.  The publish runs every suite under the smallest and the largest
 configuration the schema allows and under each file of `configs/` (`novo config
 ci`), so a test whose subject is absent under a configuration carries `@when` on

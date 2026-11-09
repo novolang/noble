@@ -5,7 +5,7 @@
 use std.test
 use hci_codec
 use isoal
-use noble_config
+use noble.CONFIG
 use iso_flow.{ IsoCredits, iso_credits_close, iso_credits_completed, iso_credits_configure, iso_credits_new, iso_credits_on_completed, iso_credits_open, iso_credits_ready, iso_credits_take, iso_in_flight, iso_may_send, iso_next_sequence, iso_packet_length, iso_packets_for_sdu, sizes }
 use iso_flow
 
@@ -14,7 +14,7 @@ use iso_flow
 // full-table test check.
 @tier(app)
 fn streams() -> Int
-    noble_config.MAX_CIS + noble_config.MAX_BIS
+    noble.CONFIG.MAX_CIS + noble.CONFIG.MAX_BIS
 
 // A configured pool of 3 buffers of 255 octets.
 @tier(app)
@@ -84,7 +84,7 @@ fn test_open_refuses_a_handle_out_of_range_a_duplicate_and_a_full_table()
         test.assert(iso_credits_open(var c, 0x0040 + i))
     test.assert(not iso_credits_open(var c, 0x0100))
 
-@when(noble_config.MAX_CIS + noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_CIS + noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-005")
 fn test_take_gives_a_credit_per_buffer_and_refuses_when_none_is_free()
@@ -104,7 +104,7 @@ fn test_take_gives_a_credit_per_buffer_and_refuses_when_none_is_free()
     test.assert(not iso_may_send(var c, 0x0040))
     test.assert(not iso_credits_take(var c, 0x0040, 1))
 
-@when(noble_config.MAX_CIS + noble_config.MAX_BIS >= 1)
+@when(noble.CONFIG.MAX_CIS + noble.CONFIG.MAX_BIS >= 1)
 @test
 @satisfies("REQ-BLE-ISO-005")
 fn test_take_refuses_a_stream_the_pool_does_not_hold_and_less_than_one_packet()
@@ -116,7 +116,7 @@ fn test_take_refuses_a_stream_the_pool_does_not_hold_and_less_than_one_packet()
     test.assert(not iso_credits_take(var c, 0x0040, -1))
     test.assert_eq(c.free as Int, 3)
 
-@when(noble_config.MAX_CIS + noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_CIS + noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-005")
 fn test_number_of_completed_packets_returns_credits_to_the_stream_it_names()
@@ -138,7 +138,7 @@ fn test_number_of_completed_packets_returns_credits_to_the_stream_it_names()
     test.assert_eq(c.free as Int, 3)
     test.assert_eq(iso_in_flight(var c, 0x0040), 0)
 
-@when(noble_config.MAX_CIS + noble_config.MAX_BIS >= 1)
+@when(noble.CONFIG.MAX_CIS + noble.CONFIG.MAX_BIS >= 1)
 @test
 @satisfies("REQ-BLE-ISO-005")
 fn test_completed_packets_never_return_more_than_the_stream_took()
@@ -157,7 +157,7 @@ fn test_completed_packets_never_return_more_than_the_stream_took()
     test.assert_eq(iso_credits_completed(var c, 0x0040, -1), 0)
     test.assert_eq(c.free as Int, 2)
 
-@when(noble_config.MAX_CIS + noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_CIS + noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-005")
 fn test_a_stream_that_ends_gives_its_buffers_back()
@@ -180,7 +180,7 @@ fn test_a_stream_that_ends_gives_its_buffers_back()
     // A completed-packets event for the closed stream returns nothing more.
     test.assert_eq(iso_credits_completed(var c, 0x0042, 1), 0)
 
-@when(noble_config.MAX_CIS + noble_config.MAX_BIS >= 1)
+@when(noble.CONFIG.MAX_CIS + noble.CONFIG.MAX_BIS >= 1)
 @test
 @satisfies("REQ-BLE-ISO-005")
 fn test_configuring_again_starts_with_every_buffer_free()
@@ -191,7 +191,7 @@ fn test_configuring_again_starts_with_every_buffer_free()
     test.assert_eq(c.free as Int, 7)
     test.assert_eq(iso_in_flight(var c, 0x0040), 0)
 
-@when(noble_config.MAX_CIS + noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_CIS + noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-005")
 fn test_the_sequence_number_counts_sdus_and_wraps_at_16_bits()
@@ -248,7 +248,7 @@ fn test_packets_for_sdu_is_the_length_of_the_cut_isoal_makes()
                     None          => test.assert_eq(iso_packets_for_sdu(n, max, ts), 0)
                     Some(packets) => test.assert_eq(iso_packets_for_sdu(n, max, ts), list.len(packets))
 
-@when(noble_config.MAX_CIS + noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_CIS + noble.CONFIG.MAX_BIS >= 2)
 @test
 fn test_a_stream_is_found_by_its_handle_in_the_pool()
     var c = pool()

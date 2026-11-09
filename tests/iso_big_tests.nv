@@ -7,7 +7,7 @@ use hci_commands
 use budget
 use hci_codec
 use iso_event
-use noble_config
+use noble.CONFIG
 use iso_big.{ BIG_ROW_BYTES, BIS_ROW_BYTES, BigPending, BigState, BigTable, PATH_BIT_INPUT, PATH_INPUT, PATH_OUTPUT, big_bis_rows, big_count_in, big_create, big_create_complete, big_create_status, big_create_test, big_row, big_sync_create, big_sync_established, big_sync_lost, big_sync_status, big_sync_terminate, big_sync_terminate_complete, big_table_new, big_terminate, big_terminate_complete, big_terminate_status, bis_data_path_remove, bis_data_path_remove_complete, bis_data_path_setup, bis_data_path_setup_complete, bis_free_rows, bis_may_send, bis_row, bis_unused_rows, broadcasting, create, create_complete_event, max1, zero_code }
 
 @tier(app)
@@ -34,15 +34,15 @@ fn synchronized(var t: BigTable, big_handle: Int, sync_handle: Int, numbers: [In
 @satisfies("REQ-BLE-ISO-004")
 fn test_a_new_big_table_is_empty_and_its_capacities_are_the_limits()
     var t = big_table_new()
-    test.assert_eq(t.state.capacity(), max1(noble_config.MAX_BIG))
-    test.assert_eq(t.state.len(), noble_config.MAX_BIG)
-    test.assert_eq(t.stream_count.capacity(), max1(noble_config.MAX_BIG))
-    test.assert_eq(t.bis_used.capacity(), max1(noble_config.MAX_BIS))
-    test.assert_eq(t.bis_used.len(), noble_config.MAX_BIS)
-    test.assert_eq(t.pending_numbers.capacity(), max1(noble_config.MAX_BIS))
-    test.assert_eq(t.bis_handle.capacity(), max1(noble_config.MAX_BIS))
+    test.assert_eq(t.state.capacity(), max1(noble.CONFIG.MAX_BIG))
+    test.assert_eq(t.state.len(), noble.CONFIG.MAX_BIG)
+    test.assert_eq(t.stream_count.capacity(), max1(noble.CONFIG.MAX_BIG))
+    test.assert_eq(t.bis_used.capacity(), max1(noble.CONFIG.MAX_BIS))
+    test.assert_eq(t.bis_used.len(), noble.CONFIG.MAX_BIS)
+    test.assert_eq(t.pending_numbers.capacity(), max1(noble.CONFIG.MAX_BIS))
+    test.assert_eq(t.bis_handle.capacity(), max1(noble.CONFIG.MAX_BIS))
     test.assert(t.pending == BigPending.NoCommand)
-    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS)
+    test.assert_eq(bis_free_rows(var t), noble.CONFIG.MAX_BIS)
     test.assert_eq(big_row(var t, 0), -1)
 
 @test
@@ -52,7 +52,7 @@ fn test_the_rows_fit_the_budget_records()
 
 // ── LE Create BIG ───────────────────────────────────────────────────
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_create_big_takes_a_row_and_claims_its_streams()
@@ -66,16 +66,16 @@ fn test_create_big_takes_a_row_and_claims_its_streams()
     test.assert_eq(t.stream_count[at] as Int, 2)
     test.assert(t.encrypted[at])
     test.assert(t.pending == BigPending.CreateBig)
-    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS - 2)
+    test.assert_eq(bis_free_rows(var t), noble.CONFIG.MAX_BIS - 2)
     // The stream rows are not used yet.
-    test.assert_eq(bis_unused_rows(var t), noble_config.MAX_BIS)
+    test.assert_eq(bis_unused_rows(var t), noble.CONFIG.MAX_BIS)
     let s = big_create_status(var t, 0)
     test.assert(s.kind == iso_event.IsoEventKind.CommandDone)
     test.assert(t.pending == BigPending.NoCommand)
     test.assert(t.state[at] == BigState.Building)
-    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS - 2)
+    test.assert_eq(bis_free_rows(var t), noble.CONFIG.MAX_BIS - 2)
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_create_big_complete_makes_the_streams()
@@ -87,7 +87,7 @@ fn test_create_big_complete_makes_the_streams()
     test.assert_eq(e.handle, 3)
     test.assert(t.state[e.slot] == BigState.Broadcasting)
     test.assert_eq(big_bis_rows(var t, e.slot), 2)
-    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS - 2)
+    test.assert_eq(bis_free_rows(var t), noble.CONFIG.MAX_BIS - 2)
     let a = bis_row(var t, 0x0100)
     let b = bis_row(var t, 0x0101)
     test.assert(a >= 0 and b >= 0 and a != b)
@@ -95,7 +95,7 @@ fn test_create_big_complete_makes_the_streams()
     test.assert_eq(t.bis_number[b] as Int, 2)
     test.assert_eq(t.bis_big[a] as Int, 3)
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_create_big_refuses_a_parameter_out_of_range()
@@ -129,17 +129,17 @@ fn test_create_big_refuses_a_parameter_out_of_range()
     test.assert_eq(big_create(var t, 0, 0, 1, 10000, 100, 20, 2, 0x08, 0, 0, false, z),
         iso_event.STATUS_UNSUPPORTED_FEATURE_OR_PARAMETER)
     test.assert(t.pending == BigPending.NoCommand)
-    test.assert_eq(big_count_in(var t, BigState.Vacant), noble_config.MAX_BIG)
+    test.assert_eq(big_count_in(var t, BigState.Vacant), noble.CONFIG.MAX_BIG)
     // The bounds are accepted.
     test.assert_eq(big_create(var t, 0xEF, 0xEF, 1, 0xFF, 1, 5, 0, 0x07, 1, 2, true, some_code()), 0)
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2 and noble_config.MAX_BIG == 1 and noble_config.MAX_BIS == 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2 and noble.CONFIG.MAX_BIG == 1 and noble.CONFIG.MAX_BIS == 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_create_big_refuses_what_the_table_cannot_hold()
     var t = big_table_new()
     // More streams than the table has rows: Rejected Due To Limited Resources.
-    test.assert_eq(create(var t, 1, 1, noble_config.MAX_BIS + 1), iso_event.STATUS_REJECTED_LIMITED_RESOURCES)
+    test.assert_eq(create(var t, 1, 1, noble.CONFIG.MAX_BIS + 1), iso_event.STATUS_REJECTED_LIMITED_RESOURCES)
     test.assert_eq(create(var t, 1, 1, 1), 0)
     // A command in flight, and the same BIG handle: Command Disallowed.
     test.assert_eq(create(var t, 2, 2, 1), iso_event.STATUS_COMMAND_DISALLOWED)
@@ -150,7 +150,7 @@ fn test_create_big_refuses_what_the_table_cannot_hold()
     // No free group row.
     test.assert_eq(create(var t, 2, 2, 1), iso_event.STATUS_REJECTED_LIMITED_RESOURCES)
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_create_big_command_status_failure_frees_the_row()
@@ -161,12 +161,12 @@ fn test_create_big_command_status_failure_frees_the_row()
     test.assert_eq(e.status, 0x0D)
     test.assert_eq(big_row(var t, 1), -1)
     test.assert(t.pending == BigPending.NoCommand)
-    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS)
+    test.assert_eq(bis_free_rows(var t), noble.CONFIG.MAX_BIS)
     test.assert(big_create_status(var t, 0).kind == iso_event.IsoEventKind.Unrelated)
     // The same handle can be used again.
     test.assert_eq(create(var t, 1, 1, 2), 0)
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_create_big_complete_with_a_failure_frees_the_group()
@@ -178,9 +178,9 @@ fn test_create_big_complete_with_a_failure_frees_the_group()
     test.assert(e.kind == iso_event.IsoEventKind.BigCreateFailed)
     test.assert_eq(e.status, 0x45)
     test.assert_eq(big_row(var t, 1), -1)
-    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS)
+    test.assert_eq(bis_free_rows(var t), noble.CONFIG.MAX_BIS)
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_create_big_complete_that_does_not_fit_the_command_changes_nothing()
@@ -195,7 +195,7 @@ fn test_create_big_complete_that_does_not_fit_the_command_changes_nothing()
     test.assert(big_create_complete(var t, create_complete_event(1, 0, [-1, 0x0100])).kind == iso_event.IsoEventKind.Unrelated)
     test.assert(big_create_complete(var t, create_complete_event(1, 0, [0x0100, 0x0100])).kind == iso_event.IsoEventKind.Unrelated)
     test.assert(t.state[big_row(var t, 1)] == BigState.Building)
-    test.assert_eq(bis_unused_rows(var t), noble_config.MAX_BIS)
+    test.assert_eq(bis_unused_rows(var t), noble.CONFIG.MAX_BIS)
     // For a group of the other role.
     var r = big_table_new()
     synchronized(r, 1, 0x20, [1], [0x0100])
@@ -228,7 +228,7 @@ fn create_test(var t: BigTable, iso_interval: Int, nse: Int, max_pdu: Int, bn: I
         false,
         zero_code())
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_create_big_test_takes_a_row_like_create_big()
@@ -270,7 +270,7 @@ fn test_create_big_test_refuses_a_parameter_out_of_range_as_unsupported()
         unsupported)
     test.assert(t.pending == BigPending.NoCommand)
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_create_big_test_refuses_an_nse_that_does_not_fit_bn_and_irc()
@@ -283,7 +283,7 @@ fn test_create_big_test_refuses_an_nse_that_does_not_fit_bn_and_irc()
     // NSE equal to IRC times BN is allowed.
     test.assert_eq(create_test(var t, 8, 6, 100, 2, 3, 0), 0)
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_create_big_test_refuses_what_the_table_cannot_hold()
@@ -291,7 +291,7 @@ fn test_create_big_test_refuses_what_the_table_cannot_hold()
     test.assert_eq(big_create_test(var t,
         1,
         1,
-        noble_config.MAX_BIS + 1,
+        noble.CONFIG.MAX_BIS + 1,
         10000,
         8,
         2,
@@ -311,7 +311,7 @@ fn test_create_big_test_refuses_what_the_table_cannot_hold()
 
 // ── LE Terminate BIG ────────────────────────────────────────────────
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_terminate_big_runs_broadcasting_terminating_free()
@@ -331,10 +331,10 @@ fn test_terminate_big_runs_broadcasting_terminating_free()
     test.assert_eq(big_row(var t, 1), -1)
     // The streams and their paths are gone.
     test.assert_eq(bis_row(var t, 0x0100), -1)
-    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS)
+    test.assert_eq(bis_free_rows(var t), noble.CONFIG.MAX_BIS)
     test.assert_eq(t.bis_paths[0] as Int, 0)
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_terminate_big_refusals_and_failure()
@@ -359,7 +359,7 @@ fn test_terminate_big_refusals_and_failure()
     synchronized(r, 1, 0x20, [1], [0x0100])
     test.assert_eq(big_terminate(var r, 1, 0x16), iso_event.STATUS_COMMAND_DISALLOWED)
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_terminate_big_while_creating_cancels_the_creation()
@@ -379,9 +379,9 @@ fn test_terminate_big_while_creating_cancels_the_creation()
     test.assert(e.kind == iso_event.IsoEventKind.BigCreateFailed)
     test.assert_eq(e.status, 0x44)
     test.assert_eq(big_row(var t, 1), -1)
-    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS)
+    test.assert_eq(bis_free_rows(var t), noble.CONFIG.MAX_BIS)
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_a_big_created_before_the_cancellation_is_then_terminated()
@@ -398,7 +398,7 @@ fn test_a_big_created_before_the_cancellation_is_then_terminated()
     test.assert(g.kind == iso_event.IsoEventKind.BigTerminated)
     test.assert_eq(big_row(var t, 1), -1)
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_terminate_big_complete_for_nothing_the_table_terminates_is_ignored()
@@ -415,7 +415,7 @@ fn test_terminate_big_complete_for_nothing_the_table_terminates_is_ignored()
 
 // ── LE BIG Create Sync ──────────────────────────────────────────────
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_big_create_sync_takes_a_row_and_claims_its_streams()
@@ -429,11 +429,11 @@ fn test_big_create_sync_takes_a_row_and_claims_its_streams()
     test.assert(t.encrypted[at])
     test.assert_eq(t.pending_numbers[1] as Int, 2)
     test.assert(t.pending == BigPending.CreateSync)
-    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS - 2)
+    test.assert_eq(bis_free_rows(var t), noble.CONFIG.MAX_BIS - 2)
     test.assert(big_sync_status(var t, 0).kind == iso_event.IsoEventKind.CommandDone)
     test.assert(t.pending == BigPending.NoCommand)
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_big_create_sync_refuses_a_parameter_out_of_range()
@@ -461,7 +461,7 @@ fn test_big_create_sync_refuses_a_parameter_out_of_range()
     // The bounds are accepted.
     test.assert_eq(big_sync_create(var t, 0xEF, 0x0EFF, true, some_code(), 0x1F, 0x4000, [0x1F]), 0)
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2 and noble_config.MAX_BIG == 1 and noble_config.MAX_BIS == 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2 and noble.CONFIG.MAX_BIG == 1 and noble.CONFIG.MAX_BIS == 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_big_create_sync_refusals_from_the_state_of_the_table()
@@ -483,12 +483,12 @@ fn test_big_create_sync_refusals_from_the_state_of_the_table()
         iso_event.STATUS_REJECTED_LIMITED_RESOURCES)
     var u = big_table_new()
     var many: [Int] = []
-    for i in 0..noble_config.MAX_BIS + 1
+    for i in 0..noble.CONFIG.MAX_BIS + 1
         list.push(many, i + 1)
     test.assert_eq(big_sync_create(var u, 1, 0x20, false, z, 0, 100, many),
         iso_event.STATUS_REJECTED_LIMITED_RESOURCES)
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_big_create_sync_command_status_failure_frees_the_row()
@@ -497,12 +497,12 @@ fn test_big_create_sync_command_status_failure_frees_the_row()
     let e = big_sync_status(var t, iso_event.STATUS_COMMAND_DISALLOWED)
     test.assert(e.kind == iso_event.IsoEventKind.CommandFailed)
     test.assert_eq(big_row(var t, 1), -1)
-    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS)
+    test.assert_eq(bis_free_rows(var t), noble.CONFIG.MAX_BIS)
     test.assert(big_sync_status(var t, 0).kind == iso_event.IsoEventKind.Unrelated)
 
 // ── LE BIG Sync Established, Terminate Sync, Sync Lost ──────────────
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_big_sync_established_numbers_the_streams_as_asked_for()
@@ -516,7 +516,7 @@ fn test_big_sync_established_numbers_the_streams_as_asked_for()
     test.assert_eq(t.bis_number[bis_row(var t, 0x0101)] as Int, 5)
     test.assert_eq(big_bis_rows(var t, e.slot), 2)
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_big_sync_established_with_a_failure_frees_the_group()
@@ -528,9 +528,9 @@ fn test_big_sync_established_with_a_failure_frees_the_group()
     test.assert(e.kind == iso_event.IsoEventKind.BigSyncFailed)
     test.assert_eq(e.status, 0x3E)
     test.assert_eq(big_row(var t, 1), -1)
-    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS)
+    test.assert_eq(bis_free_rows(var t), noble.CONFIG.MAX_BIS)
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_big_sync_established_that_does_not_fit_the_command_changes_nothing()
@@ -547,7 +547,7 @@ fn test_big_sync_established_that_does_not_fit_the_command_changes_nothing()
     broadcasting(var b, 1, 1, [0x0100])
     test.assert(big_sync_established(var b, sync_established_event(1, 0, [0x0100])).kind == iso_event.IsoEventKind.Unrelated)
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_big_terminate_sync_of_a_followed_big_frees_it()
@@ -561,10 +561,10 @@ fn test_big_terminate_sync_of_a_followed_big_frees_it()
     test.assert(e.kind == iso_event.IsoEventKind.BigSyncTerminated)
     test.assert_eq(big_row(var t, 1), -1)
     test.assert_eq(bis_row(var t, 0x0100), -1)
-    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS)
+    test.assert_eq(bis_free_rows(var t), noble.CONFIG.MAX_BIS)
     test.assert(t.pending == BigPending.NoCommand)
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_big_terminate_sync_while_syncing_cancels_the_attempt()
@@ -584,9 +584,9 @@ fn test_big_terminate_sync_while_syncing_cancels_the_attempt()
     test.assert(e.kind == iso_event.IsoEventKind.BigSyncFailed)
     test.assert_eq(e.status, 0x44)
     test.assert_eq(big_row(var t, 1), -1)
-    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS)
+    test.assert_eq(bis_free_rows(var t), noble.CONFIG.MAX_BIS)
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_big_terminate_sync_refusals_and_failure()
@@ -612,7 +612,7 @@ fn test_big_terminate_sync_refusals_and_failure()
     test.assert(big_sync_terminate_complete(var c, 0, 1).kind == iso_event.IsoEventKind.CommandDone)
     test.assert_eq(big_sync_terminate(var c, 1), iso_event.STATUS_COMMAND_DISALLOWED)
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_big_sync_lost_frees_the_group_with_the_reason()
@@ -624,11 +624,11 @@ fn test_big_sync_lost_frees_the_group_with_the_reason()
     test.assert_eq(e.status, 0x08)
     test.assert_eq(big_row(var t, 1), -1)
     test.assert_eq(bis_row(var t, 0x0100), -1)
-    test.assert_eq(bis_free_rows(var t), noble_config.MAX_BIS)
+    test.assert_eq(bis_free_rows(var t), noble.CONFIG.MAX_BIS)
     // The same BIG handle may be used again.
     synchronized(t, 1, 0x20, [1], [0x0100])
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_big_sync_lost_for_nothing_the_table_follows_is_ignored()
@@ -646,7 +646,7 @@ fn test_big_sync_lost_for_nothing_the_table_follows_is_ignored()
 
 // ── ISO data paths of BISes ─────────────────────────────────────────
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_a_broadcasters_bis_takes_an_input_path_only()
@@ -669,7 +669,7 @@ fn test_a_broadcasters_bis_takes_an_input_path_only()
     test.assert_eq(big_terminate(var t, 1, 0x16), 0)
     test.assert(not bis_may_send(var t, 0x0100))
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_a_receivers_bis_takes_an_output_path_only()
@@ -681,7 +681,7 @@ fn test_a_receivers_bis_takes_an_output_path_only()
     // A Receiver never sends.
     test.assert(not bis_may_send(var t, 0x0100))
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_setup_iso_data_path_for_a_bis_refusals()
@@ -703,7 +703,7 @@ fn test_setup_iso_data_path_for_a_bis_refusals()
     test.assert_eq(t.bis_paths[bis_row(var t, 0x0100)] as Int, 0)
     test.assert(bis_data_path_setup_complete(var t, 0, 0x0100).kind == iso_event.IsoEventKind.Unrelated)
 
-@when(noble_config.MAX_BIG >= 1 and noble_config.MAX_BIS >= 2)
+@when(noble.CONFIG.MAX_BIG >= 1 and noble.CONFIG.MAX_BIS >= 2)
 @test
 @satisfies("REQ-BLE-ISO-004")
 fn test_remove_iso_data_path_for_a_bis()

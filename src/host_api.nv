@@ -2135,7 +2135,10 @@ fn next_service(var h: Host, slot: Int, after: Int) -> Bool
     let id = link_id(h, slot)
     let want = noble.to_client_uuid(h.api.r_svc)
     var at = gatt_client.cache_find(var h.client, id, gatt_client.KIND_SERVICE, want, 0)
-    while at >= 0
+    // Each search starts after the last hit, so the cache's count of entries bounds the passes.
+    for _ in 0..gatt_client.cache_count(var h.client, id)
+        if at < 0
+            break
         let first = gatt_client.cache_handle_at(var h.client, id, at)
         if first > after
             h.api.r_mode = gatt_client.cache_a_at(var h.client, id, at)
@@ -2217,12 +2220,18 @@ pub fn find_char(h: Host, conn: ConnId, svc: noble.Uuid, chr: noble.Uuid) -> ?no
     let id = link_id(h, slot)
     let want = noble.to_client_uuid(chr)
     // A device may hold several services of one UUID (two instances of the Battery Service, say): look in each in turn.
+    // Each search starts after the last hit, so the cache's count of entries bounds the passes of both loops.
+    let n = gatt_client.cache_count(var t, id)
     var s = gatt_client.cache_find(var t, id, gatt_client.KIND_SERVICE, noble.to_client_uuid(svc), 0)
-    while s >= 0
+    for _ in 0..n
+        if s < 0
+            break
         let first = gatt_client.cache_handle_at(var t, id, s)
         let last = gatt_client.cache_a_at(var t, id, s)
         var at = gatt_client.cache_find(var t, id, gatt_client.KIND_CHAR, want, s)
-        while at >= 0
+        for _ in 0..n
+            if at < 0
+                break
             let declaration = gatt_client.cache_handle_at(var t, id, at)
             if declaration >= first and declaration <= last
                 return Some(noble.Attr { handle: gatt_client.cache_a_at(var t, id, at) as u16, props: gatt_client.cache_b_at(var t, id, at) as u8, cccd: gatt_client.cccd_of(var t, id, at) as u16 })

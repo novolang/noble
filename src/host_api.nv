@@ -1007,12 +1007,6 @@ fn coc_events(var h: Host, slot: Int)
                 if h.api.kind == noble.R_COC_OPEN and slot_of(h, h.api.r_conn) == slot and id == h.api.r_chan
                     h.api.op.chan = id as u8
                     finish(var h, noble.ok())
-                else if level_int(h.api.conns[slot].info.level) < level_int(h.api.coc_need)
-                    // The channel is refused after the fact: its link is below the security
-                    // `coc_listen` asked for.
-                    match le_link.coc_disconnect(var h.le.slots[slot], id)
-                        Some(out) => send_acl(var h, out)
-                        None => ()
                 else
                     emit(var h, Event.CocOpened(conn, id as u8, psm as u16))
             l2cap_coc.Disconnected(id, psm, result) =>
@@ -1098,6 +1092,7 @@ fn on_connection_complete<P: HostPolicy[f], B: BondStore[g]>(var h: Host, c: hci
     let conn = conn_id_of(id)
     let info = ConnInfo { role: role, peer: peer, params: params, mtu: DEFAULT_MTU as u16, level: Security.Open, bonded: bond != None }
     set_conn(var h, slot, noble.Conn { live: true, id: conn, info: info })
+    coc_gate(var h, slot)
     set_link_security(var h, false, 1)
     h.api.attempts = 0
     h.api.reconnecting = false
@@ -1335,6 +1330,7 @@ fn secure_reached(var h: Host, slot: Int)
 fn set_level(var h: Host, slot: Int, level: Security, bonded: Bool)
     let c = h.api.conns[slot]
     set_conn(var h, slot, noble.Conn { live: c.live, id: c.id, info: ConnInfo { role: c.info.role, peer: c.info.peer, params: c.info.params, mtu: c.info.mtu, level: level, bonded: bonded } })
+    coc_gate(var h, slot)
 
 // What the Security Manager reports, for the application: the hooks of the policy, the bond store,
 // the HCI commands of the encryption and the events of the pairing.
@@ -1495,15 +1491,34 @@ pub fn unbond<B: BondStore[g]>(var h: Host, var b: B, peer: Addr) [g, mutate]
             let c = h.api.conns[s]
             set_conn(var h, s, noble.Conn { live: c.live, id: c.id, info: ConnInfo { role: c.info.role, peer: c.info.peer, params: c.info.params, mtu: c.info.mtu, level: c.info.level, bonded: false } })
 
+// The Response a listener gives on a link of security `level` when `coc_listen` asked for `need`: success, or the L2CAP Result that names
+// what the link lacks, Insufficient Encryption (0x04) for a link that is not encrypted and Insufficient Authentication (0x01) for an
+// encrypted one that is not strong enough ([Vol 3] Part A, Section 4.22).  A peer that can raise the security, BlueZ for one, then
+// raises it and asks again.
+fn coc_response(level: Security, need: Security) -> Int
+    if level_int(level) >= level_int(need)
+        l2cap_coc.LISTEN_SUCCESS
+    else if level_int(level) == level_int(Security.Open)
+        0x04
+    else
+        0x01
+
+// Set the listener of `slot` for the security the link has now.
+fn coc_gate(var h: Host, slot: Int)
+    if h.api.coc_psm > 0
+        le_link.coc_listen(var h.le.slots[slot], h.api.coc_psm, TRANSPORT_LE, h.api.coc_mtu, coc_response(h.api.conns[slot].info.level, h.api.coc_need))
+
 // Accept channels on `psm` on every link, present and future, if the link has at least `need`
-// when the channel opens.
+// when the channel opens.  A request that arrives on a link below `need` is answered with the Result that names what is missing, and the
+// channel is not created.
 pub fn coc_listen(var h: Host, psm: Int, mtu: Int, need: Security) -> Status
     if psm <= 0 or mtu < 23
         return noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT)
     h.api.coc_psm = psm
+    h.api.coc_mtu = coc_mtu(mtu)
     h.api.coc_need = need
     for s in 0..le_link.le_links_slots(h.le)
-        le_link.coc_listen(var h.le.slots[s], psm, TRANSPORT_LE, coc_mtu(mtu), l2cap_coc.LISTEN_SUCCESS)
+        coc_gate(var h, s)
     noble.ok()
 
 // Queue one SDU on the channel `chan` of `conn`.  E_NO_ROOM while the peer's credits are used up,
@@ -2113,9 +2128,28 @@ fn next_descriptors(var h: Host, slot: Int) -> Bool
                     return true
     false
 
-// A discovery step ended: the service, then its characteristics, then the descriptors of those that notify or indicate.
-fn discover_step(var h: Host, slot: Int, raw: Int)
+// Queue the characteristic discovery of the next service of the discovered UUID that begins after handle `after`.  False when there
+// is none; a failure to queue it ends the request and counts as started.
+fn next_service(var h: Host, slot: Int, after: Int) -> Bool
     let id = link_id(h, slot)
+    let want = noble.to_client_uuid(h.api.r_svc)
+    var at = gatt_client.cache_find(var h.client, id, gatt_client.KIND_SERVICE, want, 0)
+    while at >= 0
+        let first = gatt_client.cache_handle_at(var h.client, id, at)
+        if first > after
+            h.api.r_mode = gatt_client.cache_a_at(var h.client, id, at)
+            h.api.r_cursor = gatt_client.cache_count(var h.client, id)
+            h.api.r_phase = 2
+            let t = gatt_client.begin_discover_characteristics(var h.client, id, 0, first, h.api.r_mode)
+            if t < 0
+                finish(var h, client_error(h, t))
+            return true
+        at = gatt_client.cache_find(var h.client, id, gatt_client.KIND_SERVICE, want, at + 1)
+    false
+
+// A discovery step ended: the services, then for each its characteristics and the descriptors of those that notify or indicate.  A
+// device may hold several services of the UUID; they are discovered in the order of their handles.
+fn discover_step(var h: Host, slot: Int, raw: Int)
     if h.api.r_phase == 1
         if raw == noble.ATT_ATTRIBUTE_NOT_FOUND
             finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_NOT_FOUND))
@@ -2123,23 +2157,14 @@ fn discover_step(var h: Host, slot: Int, raw: Int)
         if raw != gatt_client.STATUS_OK
             finish(var h, noble.from_client_status(raw))
             return
-        let at = gatt_client.cache_find(var h.client, id, gatt_client.KIND_SERVICE, noble.to_client_uuid(h.api.r_svc), 0)
-        if at < 0
+        if not next_service(var h, slot, 0)
             finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_NOT_FOUND))
-            return
-        let first = gatt_client.cache_handle_at(var h.client, id, at)
-        h.api.r_mode = gatt_client.cache_a_at(var h.client, id, at)
-        h.api.r_cursor = 0
-        h.api.r_phase = 2
-        let t = gatt_client.begin_discover_characteristics(var h.client, id, 0, first, h.api.r_mode)
-        if t < 0
-            finish(var h, client_error(h, t))
         return
     if raw != gatt_client.STATUS_OK and raw != noble.ATT_ATTRIBUTE_NOT_FOUND
         finish(var h, noble.from_client_status(raw))
         return
     h.api.r_phase = 3
-    if not next_descriptors(var h, slot)
+    if not next_descriptors(var h, slot) and not next_service(var h, slot, h.api.r_mode)
         finish(var h, noble.ok())
 
 // The request in flight on the client engine ended for `slot`.
@@ -2189,18 +2214,19 @@ pub fn find_char(h: Host, conn: ConnId, svc: noble.Uuid, chr: noble.Uuid) -> ?no
         return None
     var t = h.client
     let id = link_id(h, slot)
-    let s = gatt_client.cache_find(var t, id, gatt_client.KIND_SERVICE, noble.to_client_uuid(svc), 0)
-    if s < 0
-        return None
-    let first = gatt_client.cache_handle_at(var t, id, s)
-    let last = gatt_client.cache_a_at(var t, id, s)
     let want = noble.to_client_uuid(chr)
-    var at = gatt_client.cache_find(var t, id, gatt_client.KIND_CHAR, want, s)
-    while at >= 0
-        let declaration = gatt_client.cache_handle_at(var t, id, at)
-        if declaration >= first and declaration <= last
-            return Some(noble.Attr { handle: gatt_client.cache_a_at(var t, id, at) as u16, props: gatt_client.cache_b_at(var t, id, at) as u8, cccd: gatt_client.cccd_of(var t, id, at) as u16 })
-        at = gatt_client.cache_find(var t, id, gatt_client.KIND_CHAR, want, at + 1)
+    // A device may hold several services of one UUID (two instances of the Battery Service, say): look in each in turn.
+    var s = gatt_client.cache_find(var t, id, gatt_client.KIND_SERVICE, noble.to_client_uuid(svc), 0)
+    while s >= 0
+        let first = gatt_client.cache_handle_at(var t, id, s)
+        let last = gatt_client.cache_a_at(var t, id, s)
+        var at = gatt_client.cache_find(var t, id, gatt_client.KIND_CHAR, want, s)
+        while at >= 0
+            let declaration = gatt_client.cache_handle_at(var t, id, at)
+            if declaration >= first and declaration <= last
+                return Some(noble.Attr { handle: gatt_client.cache_a_at(var t, id, at) as u16, props: gatt_client.cache_b_at(var t, id, at) as u8, cccd: gatt_client.cccd_of(var t, id, at) as u16 })
+            at = gatt_client.cache_find(var t, id, gatt_client.KIND_CHAR, want, at + 1)
+        s = gatt_client.cache_find(var t, id, gatt_client.KIND_SERVICE, noble.to_client_uuid(svc), s + 1)
     None
 
 // ── The GATT server ─────────────────────────────────────────────────

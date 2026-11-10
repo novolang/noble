@@ -161,9 +161,9 @@ fn battery_level<T: HciLink[e]>(var ble: noble.Adapter<T, noble.DefaultPolicy, n
             if ble.read(up.conn, level, noble.Security.Open, var v).is_ok() then v[0] as Int else -1
 ```
 
-`orbit/noble-examples` holds the nine example programs of the sketch (the hello-world, a scan, a read with every failure reported, a
-heart-rate Peripheral, a bonded Central, a credit based channel Central and its Peripheral, a Battery Service module, and a product of
-three services as one list) as Host programs for a PC over the socket of a bridge; the four Peripheral programs also build for the
+`orbit/noble-examples` holds the ten example programs of the sketch (the hello-world, a scan, a read with every failure reported, a
+heart-rate Peripheral, a bonded Central, a credit based channel Central and its Peripheral, a Battery Service module, a product of
+three services as one list, and the Central for that product) as Host programs for a PC over the socket of a bridge; the four Peripheral programs also build for the
 nRF54LM20 DK over `UartHci`.
 
 What Layer B does not do (NOT IMPLEMENTED): `HostPolicy.authorize_write` is not called, so an `Access.Authorized` attribute answers
@@ -172,7 +172,7 @@ event (a request for a bound attribute is held on the unenhanced bearer only); a
 held; extended scanning (`ScanParams.extended`) is refused with `E_BAD_ARGUMENT`, because the Host reads the legacy report only;
 periodic advertising reports are not delivered; the GATT state of a bond (`BondStore.load_server`, `load_cache`) is not used, so a
 discovery cache and a client's subscriptions do not outlive the link; the descriptors a discovery finds are those of the characteristics
-that notify or indicate.  The transports `UartHci` (H4 over `hal.uart`) and the PC socket of `noble-examples` carry `now_ms` and
+that notify or indicate.  The transports `UartHci` (H4 over `hal.uart`; `uart_hci()` starts the port at `UART_BAUD`, 1 Mbaud) and the PC socket of `noble-examples` carry `now_ms` and
 `park`; the USB CDC-ACM and in-RAM transports keep the defaults (the system tick and a yield).  `noble.uart_adapter()` makes an Adapter over
 `UartHci` with the default policy and RAM bonds.
 

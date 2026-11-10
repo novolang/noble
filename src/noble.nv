@@ -902,6 +902,7 @@ pub struct Api
     var advertise: Int
     // The one PSM `coc_listen` accepts, with the MTU and the security it asked.
     var coc_psm: Int
+    var coc_mtu: Int
     var coc_need: Security
     // The settings the pairing reads (HostConfig of the sketch).
     var bondable: Bool
@@ -991,7 +992,7 @@ pub fn api_new(max_links: Int) -> Api
         kind: 0, step: 0, r_conn: no_conn(), r_params: conn_params_default(), r_need: Security.Open, r_peer: blank_addr(),
         r_psm: 0, r_mtu: 0, r_chan: 0, r_reason: 0,
         last_peer: blank_addr(), last_params: conn_params_default(), last_listed: false, last_valid: false,
-        attempts: 0, due_ms: -1, reconnecting: false, advertise: 0, coc_psm: 0, coc_need: Security.Open,
+        attempts: 0, due_ms: -1, reconnecting: false, advertise: 0, coc_psm: 0, coc_mtu: 0, coc_need: Security.Open,
         bondable: true, sc_only: false, min_key_size: 7, seed: Vec.new(), own_kind: 0, ask: ask, ans: ans,
         adv_valid: false, adv_on: false, adv_ext: false, adv_periodic: false, adv_set: 0, adv_p: adv_legacy(),
         adv_data: Vec.new(), adv_rsp: Vec.new(), adv_interval: 0, adv_again: 0, internal: false,
@@ -1793,8 +1794,15 @@ fn refuse(ev: Event, var out: Outbox)
 pub struct UartHci
     var rx: [u8]
 
+// The rate of the HCI UART Transport Layer in bits per second: 1 Mbaud, with RTS/CTS, the rate the noble Controller starts its port at.
+// (The UARTE driver of a board starts at 115200 for that value and at 1 Mbaud for any other.)
+pub const UART_BAUD = 1000000
+
+// The transport on the board's UART.  It starts the port at `UART_BAUD`: until `hal.uart.init` has run, the transmitter is not
+// enabled and the first octet `send_packet` writes waits for it for ever.
 pub @tier(embedded)
-fn uart_hci() -> UartHci
+fn uart_hci() -> UartHci [hw]
+    hal.uart.init(UART_BAUD)
     UartHci { rx: [] }
 
 // How many octets one `recv_packet` takes from the UART before it cuts a packet.
@@ -1823,7 +1831,7 @@ impl HciLink[hw, mutate] for UartHci
 
 // An Adapter over the UART transport with the default policy and RAM bonds: what the first program of a project starts from.
 pub @tier(embedded)
-fn uart_adapter() -> Adapter<UartHci, DefaultPolicy, RamBonds>
+fn uart_adapter() -> Adapter<UartHci, DefaultPolicy, RamBonds> [hw]
     adapter(uart_hci(), DefaultPolicy { placeholder: 0 }, RamBonds { rows: Vec.new() })
 
 // The Host, as the sketch spells it: a program or a service module that takes the Host names it `noble.Host`.

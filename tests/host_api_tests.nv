@@ -1255,6 +1255,33 @@ fn test_coc_opens_carries_data_both_ways_and_closes()
     pump(var x, 4)
     test.assert_eq(next_kind(var x.b), EV_COC_CLOSED)
 
+// A listener that asked for security answers a request on a weaker link with the Result that names what is missing, creates no channel,
+// and accepts the same request once the link is strong enough.  A peer that raises the security on that Result (BlueZ does) then
+// succeeds; found on the bench with BlueZ opening a channel on the echo Peripheral (2026-11-10), which the Host had accepted and closed.
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_listener_that_needs_security_refuses_a_request_on_a_weaker_link_with_the_result_that_names_what_is_missing()
+    var x = pair_up()
+    test.assert(host_api.coc_listen(var x.b, 0x0080, 64, Security.Authenticated).is_ok())
+    // The link is open: Insufficient Encryption (0x0008).
+    let open = call_a(var x, Request.CocOpen(x.ca, 0x0080, 64, Security.Open))
+    test.assert(open.is(noble.LAYER_L2CAP, 8))
+    pump(var x, 4)
+    test.assert_eq(next_kind(var x.b), -1)
+    // The link is encrypted and not authenticated: Insufficient Authentication (0x0005).
+    test.assert(call_a(var x, Request.Secure(x.ca, Security.Encrypted)).is_ok())
+    let unauthenticated = call_a(var x, Request.CocOpen(x.ca, 0x0080, 64, Security.Open))
+    test.assert(unauthenticated.is(noble.LAYER_L2CAP, 5))
+    // A listener that asks for an encrypted link takes the request now.
+    test.assert(host_api.coc_listen(var x.b, 0x0080, 64, Security.Encrypted).is_ok())
+    test.assert(call_a(var x, Request.CocOpen(x.ca, 0x0080, 64, Security.Open)).is_ok())
+    pump(var x, 4)
+    var seen_open = false
+    for _ in 0..4
+        if next_kind(var x.b) == EV_COC_OPENED
+            seen_open = true
+    test.assert(seen_open)
+
 @when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
 @test
 fn test_coc_open_to_a_psm_nobody_listens_on_fails_with_the_l2cap_result()
@@ -2489,6 +2516,38 @@ fn test_the_adapter_discovers_reads_writes_and_subscribes_over_a_link_and_a_noti
     test.assert(ble.find_char(up.conn, battery, noble.uuid16(0x2A99)) == None)
     test.assert(ble.find_char(up.conn, noble.uuid16(0x1800), noble.uuid16(0x2A19)) == None)
 
+// A device may hold several services of one UUID (the Environmental Sensing Service of a product made of three structs, two instances of
+// the Battery Service): the discovery follows each in the order of its handles, whether the characteristics of an instance notify or not,
+// and `find_char` looks in every instance.
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_device_with_three_services_of_one_uuid_is_discovered_whole_and_find_char_looks_in_each()
+    var x = pair_up()
+    let ess = noble.uuid16(0x181A)
+    let notify_only = noble.Permissions { read: noble.Access.Denied, write: noble.Access.Denied }
+    test.assert(x.b.add_service(ess).status.is_ok())
+    let temperature = x.b.add_char(noble.uuid16(0x2A6E), noble.PROP_NOTIFY, notify_only, noble.Access.Open, 2)
+    test.assert(x.b.add_service(ess).status.is_ok())
+    let pressure = x.b.add_char(noble.uuid16(0x2A6D), noble.PROP_READ, noble.open_perms(), noble.Access.Denied, 2)
+    test.assert(x.b.add_service(ess).status.is_ok())
+    let humidity = x.b.add_char(noble.uuid16(0x2A6F), noble.PROP_NOTIFY, notify_only, noble.Access.Open, 2)
+    test.assert(temperature.status.is_ok() and pressure.status.is_ok() and humidity.status.is_ok())
+    test.assert(call_a(var x, Request.Discover(x.ca, ess)).is_ok())
+    match host_api.find_char(x.a, x.ca, ess, noble.uuid16(0x2A6E))
+        None => test.fail("the temperature of the first instance is in the cache")
+        Some(found) =>
+            test.assert_eq(found.handle as Int, temperature.attr.handle as Int)
+            test.assert_eq(found.cccd as Int, temperature.attr.cccd as Int)
+    match host_api.find_char(x.a, x.ca, ess, noble.uuid16(0x2A6D))
+        None => test.fail("the pressure of the second instance is in the cache")
+        Some(found) => test.assert_eq(found.handle as Int, pressure.attr.handle as Int)
+    match host_api.find_char(x.a, x.ca, ess, noble.uuid16(0x2A6F))
+        None => test.fail("the humidity of the third instance is in the cache")
+        Some(found) =>
+            test.assert_eq(found.handle as Int, humidity.attr.handle as Int)
+            test.assert_eq(found.cccd as Int, humidity.attr.cccd as Int)
+    test.assert(host_api.find_char(x.a, x.ca, ess, noble.uuid16(0x2A99)) == None)
+
 // ── Two Hosts: the GATT client and server end to end ────────────────
 
 @when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
@@ -2573,3 +2632,13 @@ fn test_two_hosts_discover_read_write_subscribe_and_notify_through_the_requests_
                     test.assert_eq(value[0] as Int, 5)
                 Some(_) => test.fail("an indication is an event")
                 None => test.fail("an indication is an event")
+
+// The transport on the board's UART starts the port: a Host image that never ran `hal.uart.init` waited for ever on the first octet
+// it wrote (found on the bench, 2026-11-10).  On a PC `hal.uart.init` prints its line, so the test checks the value and the rate.
+@test
+fn test_the_uart_transport_starts_the_port_at_one_megabaud_and_holds_no_octets()
+    let link = noble.uart_hci()
+    test.assert_eq(list.len(link.rx), 0)
+    test.assert_eq(noble.UART_BAUD, 1000000)
+    var ble = noble.uart_adapter()
+    test.assert_eq(ble.link_count(), 0)

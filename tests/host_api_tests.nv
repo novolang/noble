@@ -1194,11 +1194,14 @@ fn test_the_ram_bond_store_replaces_a_peer_it_has_and_reports_a_full_table()
     s.forget(peer_addr(1))
     test.assert_eq(s.count(), noble.CONFIG.MAX_BONDS - 1)
     test.assert(s.find(peer_addr(1)) == None)
-    test.assert(s.find(peer_addr(2)) != None)
+    // The smallest table holds one bond, the one that was forgotten; a larger one still holds the second.
+    if noble.CONFIG.MAX_BONDS > 1
+        test.assert(s.find(peer_addr(2)) != None)
     // Forgetting a peer that is not there changes nothing.
     s.forget(peer_addr(77))
     test.assert_eq(s.count(), noble.CONFIG.MAX_BONDS - 1)
-    test.assert(s.at(0) != None)
+    if noble.CONFIG.MAX_BONDS > 1
+        test.assert(s.at(0) != None)
     test.assert(s.at(noble.CONFIG.MAX_BONDS) == None)
 
 fn bond_for(peer: Addr, level: Security) -> Bond

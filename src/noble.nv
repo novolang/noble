@@ -30,81 +30,146 @@ use noble.CONFIG
 // an HCI "connection failed to be established" is
 // `Status { layer: LAYER_HCI, code: HCI_CONNECTION_FAILED_TO_ESTABLISH }`.
 pub const LAYER_LOCAL = 0
+// The layer of a Status whose code is an HCI status of the Controller.
 pub const LAYER_HCI = 1
+// The layer of a Status whose code is an ATT error code.
 pub const LAYER_ATT = 2
+// The layer of a Status whose code is a Security Manager failure reason.
 pub const LAYER_SMP = 3
+// The layer of a Status whose code is an L2CAP result.
 pub const LAYER_L2CAP = 4
 
 // Local codes: failures the Host itself reports.
 pub const E_NOT_READY = 1
+// Local code: another call is in progress and the Host takes one at a time.
 pub const E_BUSY = 2
+// Local code: a table of the configuration has no free entry for the call.
 pub const E_NO_ROOM = 3
+// Local code: the ConnId names a link that ended, whose slot may serve another since.
 pub const E_STALE = 4
+// Local code: the call did not end within its time.
 pub const E_TIMEOUT = 5
+// Local code: the link has less security than the call needs.
 pub const E_SECURITY_LOW = 6
+// Local code: the client has not subscribed to the attribute.
 pub const E_NOT_SUBSCRIBED = 7
+// Local code: the call was cancelled before it ended.
 pub const E_CANCELLED = 8
+// Local code: an argument is out of range or names something that does not exist.
 pub const E_BAD_ARGUMENT = 9
+// Local code: the attribute, service or peer asked for is not there.
 pub const E_NOT_FOUND = 10
+// Local code: the link ended while the call was in progress.
 pub const E_LINK_LOST = 11
+// Local code: the policy of the product refused the call.
 pub const E_REFUSED = 12
 
 // The numbers of the other layers, by the name their specification gives
 // them (Core 6.3: ATT Part F 3.4.1.1, HCI Vol 1 Part F, SMP Part H 3.5.5).
 // No example or comment on this page uses the bare number.
 pub const ATT_INVALID_HANDLE = 1
+// ATT error code 2: read not permitted.
 pub const ATT_READ_NOT_PERMITTED = 2
+// ATT error code 3: write not permitted.
 pub const ATT_WRITE_NOT_PERMITTED = 3
+// ATT error code 4: invalid pdu.
 pub const ATT_INVALID_PDU = 4
+// ATT error code 5: insufficient authentication.
 pub const ATT_INSUFFICIENT_AUTHENTICATION = 5
+// ATT error code 6: request not supported.
 pub const ATT_REQUEST_NOT_SUPPORTED = 6
+// ATT error code 7: invalid offset.
 pub const ATT_INVALID_OFFSET = 7
+// ATT error code 8: insufficient authorization.
 pub const ATT_INSUFFICIENT_AUTHORIZATION = 8
+// ATT error code 9: prepare queue full.
 pub const ATT_PREPARE_QUEUE_FULL = 9
+// ATT error code 10: attribute not found.
 pub const ATT_ATTRIBUTE_NOT_FOUND = 10
+// ATT error code 11: attribute not long.
 pub const ATT_ATTRIBUTE_NOT_LONG = 11
+// ATT error code 12: insufficient encryption key size.
 pub const ATT_INSUFFICIENT_ENCRYPTION_KEY_SIZE = 12
+// ATT error code 13: invalid attribute value length.
 pub const ATT_INVALID_ATTRIBUTE_VALUE_LENGTH = 13
+// ATT error code 14: unlikely error.
 pub const ATT_UNLIKELY_ERROR = 14
+// ATT error code 15: insufficient encryption.
 pub const ATT_INSUFFICIENT_ENCRYPTION = 15
+// ATT error code 16: unsupported group type.
 pub const ATT_UNSUPPORTED_GROUP_TYPE = 16
+// ATT error code 17: insufficient resources.
 pub const ATT_INSUFFICIENT_RESOURCES = 17
+// ATT error code 18: database out of sync.
 pub const ATT_DATABASE_OUT_OF_SYNC = 18
+// ATT error code 19: value not allowed.
 pub const ATT_VALUE_NOT_ALLOWED = 19
 
+// HCI status 0x1: unknown command.
 pub const HCI_UNKNOWN_COMMAND = 0x1
+// HCI status 0x2: unknown connection.
 pub const HCI_UNKNOWN_CONNECTION = 0x2
+// HCI status 0x5: authentication failure.
 pub const HCI_AUTHENTICATION_FAILURE = 0x5
+// HCI status 0x6: pin or key missing.
 pub const HCI_PIN_OR_KEY_MISSING = 0x6
+// HCI status 0x8: connection timeout.
 pub const HCI_CONNECTION_TIMEOUT = 0x8
+// HCI status 0x9: connection limit exceeded.
 pub const HCI_CONNECTION_LIMIT_EXCEEDED = 0x9
+// HCI status 0xc: command disallowed.
 pub const HCI_COMMAND_DISALLOWED = 0xc
+// HCI status 0x11: unsupported parameter.
 pub const HCI_UNSUPPORTED_PARAMETER = 0x11
+// HCI status 0x12: invalid parameters.
 pub const HCI_INVALID_PARAMETERS = 0x12
+// HCI status 0x13: remote user terminated.
 pub const HCI_REMOTE_USER_TERMINATED = 0x13
+// HCI status 0x14: remote low resources.
 pub const HCI_REMOTE_LOW_RESOURCES = 0x14
+// HCI status 0x15: remote power off.
 pub const HCI_REMOTE_POWER_OFF = 0x15
+// HCI status 0x16: connection terminated by local host.
 pub const HCI_CONNECTION_TERMINATED_BY_LOCAL_HOST = 0x16
+// HCI status 0x1a: unsupported remote feature.
 pub const HCI_UNSUPPORTED_REMOTE_FEATURE = 0x1a
+// HCI status 0x3d: mic failure.
 pub const HCI_MIC_FAILURE = 0x3d
+// HCI status 0x3b: unacceptable connection parameters.
 pub const HCI_UNACCEPTABLE_CONNECTION_PARAMETERS = 0x3b
+// HCI status 0x3e: connection failed to establish.
 pub const HCI_CONNECTION_FAILED_TO_ESTABLISH = 0x3e
 
+// SMP pairing failure reason 1: passkey entry failed.
 pub const SMP_PASSKEY_ENTRY_FAILED = 1
+// SMP pairing failure reason 2: oob not available.
 pub const SMP_OOB_NOT_AVAILABLE = 2
+// SMP pairing failure reason 3: authentication requirements.
 pub const SMP_AUTHENTICATION_REQUIREMENTS = 3
+// SMP pairing failure reason 4: confirm value failed.
 pub const SMP_CONFIRM_VALUE_FAILED = 4
+// SMP pairing failure reason 5: pairing not supported.
 pub const SMP_PAIRING_NOT_SUPPORTED = 5
+// SMP pairing failure reason 6: encryption key size.
 pub const SMP_ENCRYPTION_KEY_SIZE = 6
+// SMP pairing failure reason 7: command not supported.
 pub const SMP_COMMAND_NOT_SUPPORTED = 7
+// SMP pairing failure reason 8: unspecified reason.
 pub const SMP_UNSPECIFIED_REASON = 8
+// SMP pairing failure reason 9: repeated attempts.
 pub const SMP_REPEATED_ATTEMPTS = 9
+// SMP pairing failure reason 10: invalid parameters.
 pub const SMP_INVALID_PARAMETERS = 10
+// SMP pairing failure reason 11: dhkey check failed.
 pub const SMP_DHKEY_CHECK_FAILED = 11
+// SMP pairing failure reason 12: numeric comparison failed.
 pub const SMP_NUMERIC_COMPARISON_FAILED = 12
+// SMP pairing failure reason 13: br edr pairing in progress.
 pub const SMP_BR_EDR_PAIRING_IN_PROGRESS = 13
+// SMP pairing failure reason 14: cross transport key not allowed.
 pub const SMP_CROSS_TRANSPORT_KEY_NOT_ALLOWED = 14
 
+// Why a call failed, or that it did not: the layer that names the failure and the code in that layer's numbers.
 pub @value
 struct Status
     layer: u8
@@ -133,10 +198,12 @@ impl Status
             return smp_name(self.code as Int)
         "unknown"
 
+// The Status of a call that succeeded.
 pub @tier(embedded)
 fn ok() -> Status
     Status { layer: 0, code: 0 }
 
+// A Status for `code` of `layer`.
 pub @tier(embedded)
 fn failed(layer: Int, code: Int) -> Status
     Status { layer: layer as u8, code: code as u16 }
@@ -185,6 +252,7 @@ fn att_name(code: Int) -> Str
         return "value not allowed"
     "unknown"
 
+// A name for an HCI status, for a log line; "unknown" for any code this page does not name.
 pub @tier(embedded)
 fn hci_name(code: Int) -> Str
     if code == HCI_UNKNOWN_COMMAND
@@ -223,6 +291,7 @@ fn hci_name(code: Int) -> Str
         return "connection failed to establish"
     "unknown"
 
+// A name for a local code, for a log line; "unknown" for any code this page does not name.
 pub @tier(embedded)
 fn local_name(code: Int) -> Str
     if code == 0
@@ -253,6 +322,7 @@ fn local_name(code: Int) -> Str
         return "refused"
     "unknown"
 
+// A name for a Security Manager failure reason, for a log line; "unknown" for any code this page does not name.
 pub @tier(embedded)
 fn smp_name(code: Int) -> Str
     if code == SMP_PASSKEY_ENTRY_FAILED
@@ -302,12 +372,14 @@ struct ConnId
     slot: u8
     generation: u8
 
+// A UUID: a 16-bit value in `lo` when `wide` is false, the 128 bits in `hi` and `lo` when it is true.
 pub @value
 struct Uuid
     wide: Bool
     lo: Int
     hi: Int
 
+// The UUID of a 16-bit value of the Bluetooth base.
 pub @tier(embedded)
 fn uuid16(v: Int) -> Uuid
     Uuid { wide: false, lo: v & 0xFFFF, hi: 0 }
@@ -356,16 +428,19 @@ fn access_from_gatt(a: gatt_server.Access) -> Access
         return Access.SecureConnections
     Access.Denied
 
+// Who may read and who may write an attribute.
 pub @value
 struct Permissions
     read: Access
     write: Access
 
+// The role of the Host on a link.
 pub @value
 enum Role
     Central
     Peripheral
 
+// The input and output capabilities of the product, which choose the pairing method.
 pub @value
 enum IoCap
     DisplayOnly
@@ -383,10 +458,12 @@ struct ConnParams
     latency: u16
     timeout: u16
 
+// Connection parameters most peripherals accept: an interval of 30 to 50 ms, no latency and a supervision timeout of 4 s.
 pub @tier(embedded)
 fn conn_params_default() -> ConnParams
     ConnParams { interval_min: 24, interval_max: 40, latency: 0, timeout: 400 }
 
+// The octets of an attribute value, at most `att_value_bytes`.
 pub alias Value = Vec[u8; noble.CONFIG.ATT_VALUE_BYTES]
 
 // ── Policy hooks: the decisions the specification leaves to the product ──
@@ -394,6 +471,7 @@ pub alias Value = Vec[u8; noble.CONFIG.ATT_VALUE_BYTES]
 // `e` is what the product's code costs (a hook that draws on a display
 // declares `[hw]`), and the functions that call a hook carry that effect.
 pub const PENDING = -1
+// The answer of a hook that refuses the call.
 pub const REFUSE = -2
 // The answer of `on_read` and `on_write` that leaves the decision to the
 // Host, which then answers the client ATT_READ_NOT_PERMITTED or
@@ -560,6 +638,7 @@ pub alias DbHash = [u8; 16]
 // the octets and does not interpret them.
 pub alias CacheImage = Vec[u8; cache_image_bytes()]
 
+// Where the bonds are kept: find the bond of a peer, save one, forget one.
 pub trait BondStore[g]
     fn find(self, peer: Addr) -> ?Bond [g]
     fn save(var self, bond: Bond) -> Status [g]
@@ -590,6 +669,7 @@ pub @value
 struct RamBonds
     rows: Vec[Bond; noble.CONFIG.MAX_BONDS]
 
+// Whether two addresses have the same type and the same six octets.
 pub @tier(embedded)
 fn same_addr(a: Addr, b: Addr) -> Bool
     if a.kind != b.kind
@@ -648,6 +728,7 @@ impl HostPolicy[] for DefaultPolicy
 // ── Data the Host reports ───────────────────────────────────────────
 pub alias AdData = Vec[u8; noble.CONFIG.MAX_ADV_DATA]
 
+// One advertising report: the address, the signal strength, the flags and the advertising data.
 pub @value
 struct AdvReport
     addr: Addr
@@ -655,6 +736,7 @@ struct AdvReport
     flags: u8
     data: AdData
 
+// What the Host knows of a link: the role, the peer, the parameters, the ATT_MTU, the security level and whether the peer is bonded.
 pub @value
 struct ConnInfo
     role: Role
@@ -709,6 +791,7 @@ struct AdvParams
     interval_max_ms: u16
     duration_ms: u32
 
+// How to scan: active or passive, legacy or extended, the interval and window in milliseconds, and how long (0 for no end).
 pub @value
 struct ScanParams
     active: Bool
@@ -717,6 +800,7 @@ struct ScanParams
     window_ms: u16
     duration_ms: u32
 
+// What a scan reports: the service UUID, the name prefix, the least signal strength, and whether a repeated report is passed on.
 pub @value
 struct ScanFilter
     uuid16: u16
@@ -724,6 +808,7 @@ struct ScanFilter
     rssi_min: i8
     duplicates: Bool
 
+// A call of the Host, as `begin` takes it.
 pub @value
 enum Request
     Start
@@ -765,10 +850,12 @@ pub struct Op
     var chan: u8
     var value: Value
 
+// A ConnId that names no link.
 pub @tier(embedded)
 fn no_conn() -> ConnId
     ConnId { slot: 255, generation: 0 }
 
+// An advertising report with every field empty.
 pub @tier(embedded)
 fn blank_report() -> AdvReport
     AdvReport { addr: Addr { kind: 0, octets: [0, 0, 0, 0, 0, 0] }, rssi: 0, flags: 0, data: Vec.new() }
@@ -792,6 +879,7 @@ pub @tier(embedded)
 fn to_client_uuid(u: Uuid) -> gatt_client.Uuid
     gatt_client.Uuid { wide: u.wide, lo: u.lo, hi: u.hi }
 
+// The UUID of the GATT client module, in the form the Host API names it.
 pub @tier(embedded)
 fn from_client_uuid(u: gatt_client.Uuid) -> Uuid
     Uuid { wide: u.wide, lo: u.lo, hi: u.hi }
@@ -870,6 +958,7 @@ const ADVERTISE_NONE = 0
 const ADVERTISE_CONNECTABLE = 1
 const ADVERTISE_NON_CONNECTABLE = 2
 
+// The state of the Host API: the event queue, the call in progress and the data its requests carry.
 pub struct Api
     var ready: Bool
     var events: Deque[Event; max1(noble.CONFIG.EVENT_QUEUE)]
@@ -962,6 +1051,7 @@ pub struct Api
     var tap: Bool
     var raw_in: [[u8]]
 
+// An address of type 0 with six zero octets.
 pub @tier(embedded)
 fn blank_addr() -> Addr
     Addr { kind: 0, octets: [0, 0, 0, 0, 0, 0] }
@@ -1169,8 +1259,10 @@ struct ServiceResult
     status: Status
     svc: Int
 
+// A device name, at most `max_name` octets.
 pub alias Name = String[noble.CONFIG.MAX_NAME]
 
+// A Host with its transport, the policy of the product and its bond store, so that a program does not thread four values through every call.
 pub struct Adapter<T: HciLink[e], P: HostPolicy[f], B: BondStore[g]>
     var io: T
     var policy: P
@@ -1400,6 +1492,7 @@ impl Adapter
 
 // The values of a subscription: notifications or indications.
 pub const NOTIFY = 1
+// The subscription mode of indications.
 pub const INDICATE = 2
 
 impl Adapter
@@ -1448,12 +1541,18 @@ impl Adapter
 
 // ── GATT server ─────────────────────────────────────────────────────
 
+// Characteristic property: a client may read the value.
 pub const PROP_READ = 0x02
+// Characteristic property: a client may write the value without a response.
 pub const PROP_WRITE_NO_RESPONSE = 0x04
+// Characteristic property: a client may write the value with a response.
 pub const PROP_WRITE = 0x08
+// Characteristic property: the value may be notified.
 pub const PROP_NOTIFY = 0x10
+// Characteristic property: the value may be indicated.
 pub const PROP_INDICATE = 0x20
 
+// Permissions that let any peer read and write.
 pub @tier(embedded)
 fn open_perms() -> Permissions
     Permissions { read: Access.Open, write: Access.Open }
@@ -1564,6 +1663,7 @@ enum Out
     // The answer to `Event.AttrRead` or `AttrWrite`.
     Respond(conn: ConnId, attr: u16, code: Int, value: Value)
 
+// What the services of a turn queued for the Host: notifications and answers.
 pub alias Outbox = Vec[Out; noble.CONFIG.OUTBOX]
 
 // Every service module implements this trait and exports a value that does.  `attach` adds the service to the Host's database and

@@ -383,6 +383,7 @@ pub fn result(var h: Host) -> ?Status
 pub fn op_conn(h: Host) -> ConnId
     h.api.op.conn
 
+// The channel a finished `CocOpen` opened.
 pub fn op_chan(h: Host) -> Int
     h.api.op.chan as Int
 

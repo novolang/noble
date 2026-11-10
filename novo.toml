@@ -1,6 +1,6 @@
 [package]
 name        = "noble"
-version     = "0.1.0"
+version     = "0.2.0"
 description = "The Host of the noble Bluetooth Low Energy stack, written to Core 6.3: the HCI session, the link table, L2CAP and credit based channels, ATT, the GATT server and client, GAP and the advertisers, the Security Manager and bonding, privacy, and the isochronous transport.  Talks to a Controller only through the noble-hci seam."
 license     = "Apache-2.0"
 stability   = "experimental"
@@ -9,7 +9,13 @@ layer       = "host"
 tags        = ["bluetooth", "ble", "host", "gatt", "att", "l2cap", "smp", "gap", "isochronous", "embedded"]
 repository  = "https://github.com/novolang/noble"
 maintainers = ["novo-lang"]
-novo        = ">= 0.23.0"
+novo        = ">= 0.24.1"
+
+# The tests of this package, and the coverage the publish measures, run with configs/layer_a.toml: it gives the Host API an event queue,
+# without which the cases of tests/host_api_tests.nv that need one return at their first line.  Only the tests read this key; a package that
+# depends on this one is built with its own configuration.  `novo config ci` still runs every suite under the smallest and the largest
+# configuration the schema allows and under each file of configs/.
+config      = "configs/layer_a.toml"
 
 # A library: no `main`, so `novo pkg build` type-checks and effect-checks every module under `src/` and writes no binary.
 

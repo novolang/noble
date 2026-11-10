@@ -206,7 +206,7 @@ novo test
 `novo test` runs the suites under `tests/`: one suite for each module, `tests/<module>_tests.nv`, and three that drive
 several modules together (`gatt_client_engine_tests.nv`, `integration_gatt_tests.nv` and `two_centrals_tests.nv`).
 `host_api_tests.nv` drives a Host through `begin`, `poll` and `next_event` over a scripted Controller, two Hosts through a
-pairing and through a GATT round trip, and the `Adapter` over a Controller that plays a GATT server; its cases that need an event queue run with `--config configs/layer_a.toml`.
+pairing and through a GATT round trip, and the `Adapter` over a Controller that plays a GATT server; its cases that need an event queue run under `configs/layer_a.toml`, which `novo.toml` names as the configuration of the tests (`config = "configs/layer_a.toml"`).
 `novo test tests/<module>_tests.nv` runs one of them.  A suite takes a profile with `--config configs/pc.toml`;
 `novo config ci` runs every suite under the smallest and the largest configuration the schema allows and under each file
 of `configs/`.  The tests are not part of the published package.

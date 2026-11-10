@@ -1,0 +1,104 @@
+// tests/noble_surface_tests.nv — the small public functions of src/noble.nv, src/host.nv and src/host_api.nv that the larger suites reach only through
+// others: the names of local codes, the forms of an address and of a UUID, the Access of the GATT server, the UART transport and its Adapter, and the
+// session, seed and address of a Host.
+//
+//   novo test tests/noble_surface_tests.nv
+
+use std.test
+use noble
+use gatt_client
+use gatt_server
+use host
+use host_api
+
+fn name_of(text: Str) -> [u8]
+    var out: [u8] = []
+    for i in 0..str.len(text)
+        list.push(out, str.byte_at_or(text, i, 0) as u8)
+    out
+
+@test
+fn test_a_local_code_has_a_name_for_a_log_line()
+    test.assert_eq(noble.local_name(0), "ok")
+    test.assert_eq(noble.local_name(noble.E_BUSY), "busy")
+    test.assert_eq(noble.local_name(noble.E_LINK_LOST), "link lost")
+    test.assert_eq(noble.local_name(noble.E_REFUSED), "refused")
+    test.assert_eq(noble.local_name(99), "unknown")
+
+@test
+fn test_the_access_of_the_gatt_server_is_the_access_of_the_host_api()
+    test.assert(noble.access_from_gatt(gatt_server.Access.Open) == noble.Access.Open)
+    test.assert(noble.access_from_gatt(gatt_server.Access.Authorized) == noble.Access.Authorized)
+    test.assert(noble.access_from_gatt(gatt_server.Access.Encrypted) == noble.Access.Encrypted)
+    test.assert(noble.access_from_gatt(gatt_server.Access.Authenticated) == noble.Access.Authenticated)
+    test.assert(noble.access_from_gatt(gatt_server.Access.SecureConnections) == noble.Access.SecureConnections)
+    test.assert(noble.access_from_gatt(gatt_server.Access.Denied) == noble.Access.Denied)
+
+@test
+fn test_two_addresses_are_the_same_when_type_and_octets_are_the_same()
+    let a = noble.Addr { kind: 1, octets: [1, 2, 3, 4, 5, 6] }
+    let b = noble.Addr { kind: 1, octets: [1, 2, 3, 4, 5, 6] }
+    let other_kind = noble.Addr { kind: 0, octets: [1, 2, 3, 4, 5, 6] }
+    let other_octet = noble.Addr { kind: 1, octets: [1, 2, 3, 4, 5, 7] }
+    test.assert(noble.same_addr(a, b))
+    test.assert(not noble.same_addr(a, other_kind))
+    test.assert(not noble.same_addr(a, other_octet))
+    let blank = noble.blank_addr()
+    test.assert_eq(blank.kind as Int, 0)
+    test.assert(noble.same_addr(blank, noble.Addr { kind: 0, octets: [0, 0, 0, 0, 0, 0] }))
+
+@test
+fn test_a_uuid_is_two_octets_or_sixteen_on_the_air_and_the_client_names_it_the_same()
+    test.assert_eq(noble.uuid_octets(noble.uuid16(0x180F)), [0x0F, 0x18])
+    let wide = noble.Uuid { wide: true, lo: 0x0807060504030201, hi: 0x100F0E0D0C0B0A09 }
+    let on_air = noble.uuid_octets(wide)
+    test.assert_eq(list.len(on_air), 16)
+    test.assert_eq(on_air[0] as Int, 1)
+    test.assert_eq(on_air[7] as Int, 8)
+    test.assert_eq(on_air[8] as Int, 9)
+    test.assert_eq(on_air[15] as Int, 16)
+    let c = noble.to_client_uuid(wide)
+    test.assert_eq(c.wide, true)
+    test.assert_eq(c.lo, wide.lo)
+    test.assert_eq(c.hi, wide.hi)
+    let back = noble.from_client_uuid(gatt_client.Uuid { wide: false, lo: 0x2A19, hi: 0 })
+    test.assert_eq(back.wide, false)
+    test.assert_eq(back.lo, 0x2A19)
+
+@test
+fn test_the_uart_transport_starts_empty_and_its_adapter_has_the_default_policy()
+    let t = noble.uart_hci()
+    test.assert_eq(list.len(t.rx), 0)
+    let a = noble.uart_adapter()
+    test.assert_eq(list.len(a.io.rx), 0)
+    test.assert_eq(list.len(a.services), 0)
+
+@test
+fn test_a_new_link_session_has_nothing_in_progress()
+    let h = host.host_blank(host.host_config(2, name_of("noble")))
+    let s = host.fresh_link_session(h.smp, h.smp_central)
+    test.assert_eq(list.len(s.ll_update), 0)
+    test.assert(not s.car_wanted)
+    test.assert_eq(list.len(s.car_records), 0)
+
+@test
+fn test_a_seed_makes_the_host_ready_to_pair_and_keeps_the_irk()
+    var h = host.host_blank(host.host_config(2, name_of("noble")))
+    test.assert(not h.security.ready)
+    var seed: [u8] = []
+    for i in 0..32
+        list.push(seed, (i * 7 + 3) as u8)
+    let irk = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    host.host_seed(var h, seed, irk)
+    test.assert(h.security.ready)
+    test.assert_eq(h.security.irk, irk)
+
+@test
+fn test_the_own_address_of_the_host_is_the_one_it_was_told()
+    var h = host.host_blank(host.host_config(2, name_of("noble")))
+    host_api.host_set_own_address(var h, 1, [0x11, 0x22, 0x33, 0x44, 0x55, 0xC6])
+    test.assert_eq(h.api.own_kind, 1)
+    test.assert_eq(h.own_address, [0x11, 0x22, 0x33, 0x44, 0x55, 0xC6])
+    // Only the low bit of the type is kept: 0 is public and 1 is random.
+    host_api.host_set_own_address(var h, 2, [1, 2, 3, 4, 5, 6])
+    test.assert_eq(h.api.own_kind, 0)

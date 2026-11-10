@@ -2221,6 +2221,7 @@ pub fn take_changed(var link: AttLink) -> [Int]
 // How a bound attribute is answered: `BOUND_FUNCTION` asks the application inside the Host's turn and `BOUND_EVENT` queues
 // an event and waits for the application's answer.
 pub const BOUND_FUNCTION = 1
+// Binding mode: the request is queued as an event and waits for the application's answer.
 pub const BOUND_EVENT = 2
 
 // Bind the attribute `handle` to the application in `mode`, as the service with index `svc` owns it.  False when there is no

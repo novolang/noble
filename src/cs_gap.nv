@@ -52,24 +52,39 @@ use hci_frame
 
 // The stages of the procedure.
 pub const STAGE_IDLE = 0
+// Stage: read the capabilities of the local Controller.
 pub const STAGE_READ_LOCAL = 1
+// Stage: read the capabilities of the remote Controller.
 pub const STAGE_READ_REMOTE = 2
+// Stage: set the default settings of the local Controller.
 pub const STAGE_DEFAULTS = 3
+// Stage: start the Channel Sounding security procedure.
 pub const STAGE_SECURITY = 4
+// Stage: set the default security requirements.
 pub const STAGE_REQUIREMENTS = 5
+// Stage: read the frequency actuation error table of the remote Controller.
 pub const STAGE_FAE = 6
+// Stage: create the Channel Sounding configuration.
 pub const STAGE_CONFIG = 7
+// Stage: set the procedure parameters.
 pub const STAGE_PARAMS = 8
+// Stage: enable the procedure.
 pub const STAGE_ENABLE = 9
+// Stage: the procedure runs and its results arrive.
 pub const STAGE_RUNNING = 10
+// Stage: the procedure ended and its result is complete.
 pub const STAGE_DONE = 11
+// Stage: the procedure failed; `cs_gap_status` says with what.
 pub const STAGE_FAILED = 12
 
 // The statuses beyond the HCI error codes: a wait that ended without the event (0x100), a security level the Controllers do not meet (0x101), a Controller
 // without the role this Host wants (0x102) and an event or return parameter that did not read (0x103).
 pub const GAP_TIMEOUT = 0x100
+// Status 0x101: the security level the Host asked for is more than the Controllers offer.
 pub const GAP_LEVEL_NOT_MET = 0x101
+// Status 0x102: a Controller does not have the role this Host wants.
 pub const GAP_ROLE_UNSUPPORTED = 0x102
+// Status 0x103: an event or a return parameter did not read.
 pub const GAP_MALFORMED = 0x103
 
 // The HCI status codes the module reads: Unsupported Feature or Parameter Value, which a Controller answers LE CS Read Remote FAE Table with when the remote has
@@ -131,21 +146,25 @@ fn cs_gap_set_level(var p: CsGapParams, level: Int, requirements: Bool)
     p.level = level
     p.set_requirements = requirements
 
+// Set the RTT type the configuration will use.
 pub @tier(embedded)
 @no_alloc
 fn cs_gap_set_rtt_type(var p: CsGapParams, rtt_type: Int)
     p.rtt_type = rtt_type
 
+// Set the number of procedures to run.
 pub @tier(embedded)
 @no_alloc
 fn cs_gap_set_procedures(var p: CsGapParams, procedures: Int)
     p.procedures = procedures
 
+// Set whether this Host creates the configuration or waits for the peer's.
 pub @tier(embedded)
 @no_alloc
 fn cs_gap_set_creates_config(var p: CsGapParams, creates_config: Bool)
     p.creates_config = creates_config
 
+// Set the time in milliseconds a wait for a Controller may last.
 pub @tier(embedded)
 @no_alloc
 fn cs_gap_set_timeout(var p: CsGapParams, timeout_ms: Int)
@@ -184,6 +203,7 @@ struct CsGap
     lost: Int
     selected_tx_power: Int
 
+// An engine at its first stage with the parameters `p`.
 pub @tier(embedded)
 fn cs_gap_new(p: CsGapParams) -> CsGap
     CsGap { p: p, stage: STAGE_READ_LOCAL, status: 0, sent: false, acked: false, pending: 0, since_ms: 0, timed_stage: -1, local: hci_cs.cs_caps_none(),
@@ -197,6 +217,7 @@ pub @tier(embedded)
 fn cs_gap_done(g: CsGap) -> Bool
     g.stage == STAGE_DONE
 
+// Whether the procedure ended in failure.
 pub @tier(embedded)
 @no_alloc
 fn cs_gap_failed(g: CsGap) -> Bool

@@ -1,0 +1,57 @@
+// tests/gatt_server_bound_tests.nv — the attributes the Host API binds to the application: `bind`, `bound_mode`, `bound_service`, `take_held` and
+// `value_of_configuration` of src/gatt_server.nv.
+//
+//   novo test tests/gatt_server_bound_tests.nv
+
+use std.test
+use gatt_server.{ BOUND_EVENT, BOUND_FUNCTION, bind, bound_mode, bound_service, octets, receive, take_held, test_server, value_of_configuration }
+
+@test
+fn test_a_bound_attribute_reports_its_mode_and_the_service_that_owns_it()
+    var s = test_server()
+    test.assert_eq(bound_mode(s.db, 0x000A), 0)
+    test.assert_eq(bound_service(s.db, 0x000A), -1)
+    test.assert(bind(var s.db, 0x000A, BOUND_FUNCTION, 2))
+    test.assert_eq(bound_mode(s.db, 0x000A), BOUND_FUNCTION)
+    test.assert_eq(bound_service(s.db, 0x000A), 2)
+    // A second bind of the same attribute replaces the first, and the others stay.
+    test.assert(bind(var s.db, 0x000C, BOUND_FUNCTION, 0))
+    test.assert(bind(var s.db, 0x000A, BOUND_EVENT, 1))
+    test.assert_eq(bound_mode(s.db, 0x000A), BOUND_EVENT)
+    test.assert_eq(bound_service(s.db, 0x000A), 1)
+    test.assert_eq(bound_mode(s.db, 0x000C), BOUND_FUNCTION)
+
+@test
+fn test_a_declaration_or_a_mode_that_is_none_cannot_be_bound()
+    var s = test_server()
+    // The service declaration (0x0008) and the characteristic declaration (0x0009) are the Host's own.
+    test.assert(not bind(var s.db, 0x0008, BOUND_FUNCTION, 0))
+    test.assert(not bind(var s.db, 0x0009, BOUND_FUNCTION, 0))
+    // No attribute has the handle 0x7000, and the modes are 1 and 2.
+    test.assert(not bind(var s.db, 0x7000, BOUND_FUNCTION, 0))
+    test.assert(not bind(var s.db, 0x000A, 0, 0))
+    test.assert(not bind(var s.db, 0x000A, 3, 0))
+    test.assert_eq(bound_mode(s.db, 0x000A), 0)
+
+@test
+fn test_a_request_for_a_bound_attribute_is_held_for_the_caller_and_not_answered()
+    var s = test_server()
+    test.assert(bind(var s.db, 0x000A, BOUND_EVENT, 0))
+    // A Read Request that passes the checks gets no answer from the server; the caller takes it.
+    test.assert_eq(list.len(receive(var s.db, var s.link, octets([0x0A, 0x0A, 0x00]), 0)), 0)
+    // So does a Write Request.
+    test.assert_eq(list.len(receive(var s.db, var s.link, octets([0x12, 0x0A, 0x00, 0x55]), 0)), 0)
+    let held = take_held(var s.link)
+    test.assert_eq(list.len(held), 2)
+    test.assert_eq(held[0], octets([0x0A, 0x0A, 0x00]))
+    test.assert_eq(held[1], octets([0x12, 0x0A, 0x00, 0x55]))
+    test.assert_eq(list.len(take_held(var s.link)), 0)
+    // A request for an attribute that is not bound is answered at once.
+    test.assert_eq(list.len(receive(var s.db, var s.link, octets([0x0A, 0x0C, 0x00]), 0)), 1)
+
+@test
+fn test_the_value_of_a_configuration_descriptor_is_the_value_before_it()
+    let s = test_server()
+    // The notifying characteristic of the test service has its value at 0x0012 and its configuration at 0x0013.
+    test.assert_eq(value_of_configuration(s.db, 0x0013), 0x0012)
+    test.assert_eq(value_of_configuration(s.db, 0x7000), 0)

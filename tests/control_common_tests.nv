@@ -98,3 +98,17 @@ fn test_all_services_names_only_service_declarations()
     test.assert(control_common.all_services(s.db, []))
     test.assert(not control_common.all_services(s.db, [a, v]))
     test.assert(not control_common.all_services(s.db, [a, 0x0999]))
+
+@test
+fn test_attr_reads_the_current_database_hash_after_a_change_of_the_definitions()
+    var s = gatt_server.new_server([], 65)
+    let _ = profile_builder.start_service(var s.db, gatt_server.le16(0xAA00))!
+    let handle = profile_builder.add_value(var s.db, gatt_server.PROP_READ, profile_builder.read_only(gatt_server.Access.Open),
+        gatt_server.le16(gatt_server.UUID_DATABASE_HASH), [])!
+    let first = control_common.attr(s.db, handle)
+    test.assert_eq(list.len(first), gatt_server.HASH_OCTETS)
+    test.assert(gatt_server.same_bytes(first, gatt_server.database_hash(s.db)))
+    let _ = profile_builder.start_service(var s.db, gatt_server.le16(0xAB00))!
+    let second = control_common.attr(s.db, handle)
+    test.assert(gatt_server.same_bytes(second, gatt_server.database_hash(s.db)))
+    test.assert_eq(gatt_server.same_bytes(first, second), false)

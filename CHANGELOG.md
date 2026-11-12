@@ -4,6 +4,10 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
+## Unreleased
+
+2026-11-12: `gatt_server`: the Database Hash is computed at the first read after a change of the definitions, and not at each change.  `add_service`, `add_characteristic` and the other definition calls recomputed it, an AES-CMAC over every attribute of the table, so a table of n attributes built one call at a time cost n hashes over a growing table: a product that builds its table at start-up paid that in proportion to its size, and the full-table tests of `noble-audio` (65,000 attributes) ran longer than the test budget.  A definition call now marks the characteristic stale, and each reader of the value (Read Request, Read Blob, Read Multiple, Read By Type, `tester_read`, `send_value`, `control_common.attr`) computes the hash first; two reads with no change between them hash once.  What a client reads is unchanged, and so is the Robust Caching state (change-unaware after a change, Database Out Of Sync once).  `GattDb` gains the field `hash_at` and `gatt_server` gains `load_records` (the record table put in place of the attributes, which `le_link.set_database` calls) and `settle_hash`; a program that reads `GattAttribute.value` of the Database Hash characteristic directly, and not through these readers, calls `settle_hash(db, attribute)` first.  The attribute's `max_len` is 0 while the hash is stale.  Filed as bugs/orbit/closed/the-full-table-test-of-noble-audio-adds-sixty-five-thousand-services-and-exceeds-the-test-budget.md; it ships as 0.2.2.
+
 ## 0.2.1 — 2026-11-12
 
 The archive of 0.2.0 held no `configs/`, while the manifest names `configs/layer_a.toml` as the file every build of the package reads, so no consumer could build the fetched package (E2929 at its first line).  The publish of the toolchain now ships `configs/` and the file a `config` key names (bugs/tooling/closed/the-publish-archive-leaves-out-the-configuration-file-the-manifest-names.md); this version is the same sources published whole.  Nothing in the API changed.

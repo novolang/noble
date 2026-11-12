@@ -7,7 +7,7 @@ use att
 use att_server
 use gatt_db
 use uuid
-use gatt_server.{ ATT_DEFAULT_MTU, ATT_TRANSACTION_TIMEOUT_MS, ATT_VALUE_MAX, Access, CCC_INDICATION, CCC_NOTIFICATION, CSF_ENHANCED_ATT, CSF_ROBUST_CACHING, ERR_VALUE_CHANGED_DURING_READ_LONG, GattAttribute, GattDb, GattServer, HASH_OCTETS, LinkSecurity, PERM_READ, PERM_READ_AUTHEN, PERM_READ_AUTHOR, PERM_READ_ENCRYPT, PERM_READ_SC, PERM_WRITE, PERM_WRITE_AUTHEN, PERM_WRITE_AUTHOR, PERM_WRITE_ENCRYPT, PERM_WRITE_SC, PREPARE_QUEUE_CAPACITY, PROP_INDICATE, PROP_NOTIFY, PROP_READ, PROP_WRITE, Permissions, UUID_CHARACTERISTIC, UUID_CHARACTERISTIC_EXTENDED_PROPERTIES, UUID_CLIENT_CHARACTERISTIC_CONFIGURATION, UUID_CLIENT_SUPPORTED_FEATURES, UUID_DATABASE_HASH, UUID_INCLUDE, UUID_PRIMARY_SERVICE, UUID_SECONDARY_SERVICE, UUID_SERVICE_CHANGED, add_characteristic, add_configuration, add_descriptor, add_included, add_read_long_rule, add_service, append, assert_bytes, assert_error, bearer_count, bearer_of_channel, both_ways, channel_of_bearer, configuration, database_hash, encrypted, example_csrk, handle_of_type, has_service, host_server, host_server_with, index_of, last_handle, le16, link_security, long_read_error, mtu_of, new_att_link, new_server, octets, one, open_bearer, open_permissions, permission_bits, read, receive, receive_on, records, refresh_hash, remove_range, require_indication, require_value_format, reset_bearer, restore_configuration, restrict_first_octet, retain_bearers, same_bytes, save_configuration, send_value, send_value_on, service_changed, set_configuration, set_key_size, set_peer_csrk, set_security, set_value, signature_mac, take_changed, take_client_pdus, test_server, tester_read, tick, uuid128, uuid_equal, value_at, value_format_error, write }
+use gatt_server.{ ATT_DEFAULT_MTU, ATT_TRANSACTION_TIMEOUT_MS, ATT_VALUE_MAX, Access, CCC_INDICATION, CCC_NOTIFICATION, CSF_ENHANCED_ATT, CSF_ROBUST_CACHING, ERR_VALUE_CHANGED_DURING_READ_LONG, GattAttribute, GattDb, GattServer, HASH_OCTETS, LinkSecurity, PERM_READ, PERM_READ_AUTHEN, PERM_READ_AUTHOR, PERM_READ_ENCRYPT, PERM_READ_SC, PERM_WRITE, PERM_WRITE_AUTHEN, PERM_WRITE_AUTHOR, PERM_WRITE_ENCRYPT, PERM_WRITE_SC, PREPARE_QUEUE_CAPACITY, PROP_INDICATE, PROP_NOTIFY, PROP_READ, PROP_WRITE, Permissions, UUID_CHARACTERISTIC, UUID_CHARACTERISTIC_EXTENDED_PROPERTIES, UUID_CLIENT_CHARACTERISTIC_CONFIGURATION, UUID_CLIENT_SUPPORTED_FEATURES, UUID_DATABASE_HASH, UUID_INCLUDE, UUID_PRIMARY_SERVICE, UUID_SECONDARY_SERVICE, UUID_SERVICE_CHANGED, add_characteristic, add_configuration, add_descriptor, add_included, add_read_long_rule, add_service, append, assert_bytes, assert_error, bearer_count, bearer_of_channel, both_ways, channel_of_bearer, configuration, database_hash, encrypted, example_csrk, handle_of_type, has_service, host_server, host_server_with, index_of, last_handle, le16, link_security, load_records, long_read_error, mtu_of, new_att_link, new_server, octets, one, open_bearer, open_permissions, permission_bits, read, receive, receive_on, records, refresh_hash, remove_range, require_indication, require_value_format, reset_bearer, restore_configuration, restrict_first_octet, retain_bearers, same_bytes, save_configuration, send_value, send_value_on, service_changed, set_configuration, set_key_size, set_peer_csrk, set_security, set_value, signature_mac, take_changed, take_client_pdus, test_server, tester_read, tick, uuid128, uuid_equal, value_at, value_format_error, write }
 use gatt_server
 
 @test
@@ -817,6 +817,93 @@ fn test_database_hash_follows_the_definitions()
     remove_range(var s.db, added, 0xFFFF)
     test.assert_eq(same_bytes(after_add, database_hash(s.db)), false)
     test.assert_eq(same_bytes(before, database_hash(s.db)), true)
+
+// The hash is computed when a client first reads it after a change of the
+// definitions, and not at the change: a table built by many calls hashes
+// nothing until then, and two reads with no change between them hash once.
+@test
+fn test_a_stale_hash_is_computed_at_the_first_read_and_once()
+    var s = host_server()
+    let handle = host_hash_handle()
+    let at = index_of(s.db, handle)
+    let read = octets([0x0A, handle & 0xFF, handle >>> 8])
+    test.assert_eq(s.db.hash_at, at)
+    // A table that was just built holds no hash yet, and three definition
+    // calls leave it so: the value is what the table gave the attribute.
+    let built = s.db.attributes[at].value[:]
+    test.assert_eq(s.db.attributes[at].max_len, 0)
+    for k in 0..3
+        let _ = add_service(var s.db, false, le16(0xAA00 + k))
+    test.assert_eq(s.db.attributes[at].max_len, 0)
+    test.assert(same_bytes(s.db.attributes[at].value, built))
+    // The first read computes the hash of the table as it is now.
+    let first = one(receive(var s.db, var s.link, read, 0))
+    test.assert_eq(first[0] as Int, 0x0B)
+    test.assert(same_bytes(first[1:1 + HASH_OCTETS], database_hash(s.db)))
+    test.assert_eq(s.db.attributes[at].max_len, HASH_OCTETS)
+    // A second read computes nothing: a value written over the attribute
+    // since is what it answers.
+    var marker: [u8] = []
+    for _ in 0..HASH_OCTETS
+        list.push(marker, 0xEE)
+    s.db.attributes[at].value = marker
+    let second = one(receive(var s.db, var s.link, read, 0))
+    test.assert(same_bytes(second[1:1 + HASH_OCTETS], marker))
+    // The next change makes it stale again, and the next read computes it.
+    let _ = add_service(var s.db, false, le16(0xAB00))
+    test.assert_eq(s.db.attributes[at].max_len, 0)
+    let third = one(receive(var s.db, var s.link, read, 0))
+    test.assert(same_bytes(third[1:1 + HASH_OCTETS], database_hash(s.db)))
+
+// Every reader of the attribute settles the hash first, not only the Read
+// Request: `value_at` and `tester_read`, a notification of the value, and
+// the reading of a value out of the database (`control_common.attr`).  A
+// database with no such characteristic has nothing to settle, one that
+// loses it forgets it, and the hash is the first characteristic of its type.
+@test
+fn test_every_reader_of_the_hash_characteristic_settles_it()
+    var s = new_server([], 65)
+    test.assert_eq(s.db.hash_at, -1)
+    refresh_hash(var s.db)
+    let _ = add_service(var s.db, false, le16(0xAA00))
+    let declaration = add_characteristic(var s.db, PROP_READ | PROP_NOTIFY, PERM_READ, le16(UUID_DATABASE_HASH))
+    let value = declaration + 1
+    let configuration_handle = add_descriptor(var s.db, PERM_READ | PERM_WRITE,
+        le16(UUID_CLIENT_CHARACTERISTIC_CONFIGURATION))
+    let at = index_of(s.db, value)
+    test.assert_eq(s.db.hash_at, at)
+    test.assert_eq(s.db.attributes[at].max_len, 0)
+    test.assert(same_bytes(value_at(s.db, s.link, at), database_hash(s.db)))
+    test.assert_eq(s.db.attributes[at].max_len, HASH_OCTETS)
+    // A second characteristic of the type is not the hash.
+    let again = add_characteristic(var s.db, PROP_READ, PERM_READ, le16(UUID_DATABASE_HASH))
+    test.assert_eq(s.db.hash_at, at)
+    test.assert_eq(list.len(value_at(s.db, s.link, index_of(s.db, again + 1))), 0)
+    test.assert_eq(s.db.attributes[at].max_len, 0)
+    let read = tester_read(s.db, s.link, value, true)
+    test.assert_eq(read.0, 0)
+    test.assert(same_bytes(read.1, database_hash(s.db)))
+    let _ = add_service(var s.db, false, le16(0xAC00))
+    test.assert_eq(s.db.attributes[at].max_len, 0)
+    set_configuration(var s.link, configuration_handle, CCC_NOTIFICATION)
+    let notification = one(send_value(var s.db, var s.link, value, 0))
+    test.assert_eq(notification[0] as Int, 0x1B)
+    test.assert(same_bytes(notification[3:3 + HASH_OCTETS], database_hash(s.db)))
+    // Without the characteristic there is nothing to hash.
+    remove_range(var s.db, declaration, 0xFFFF)
+    test.assert_eq(s.db.hash_at, -1)
+    let _ = add_service(var s.db, false, le16(0xAD00))
+    test.assert_eq(s.db.hash_at, -1)
+
+// A record table put in place of the database keeps the hash it carries:
+// the table is not a change that this database made.
+@test
+fn test_a_record_table_put_in_place_keeps_its_own_hash_value()
+    var s = host_server()
+    let _ = add_service(var s.db, false, le16(0xAA00))
+    load_records(var s.db, appendix_records())
+    test.assert_eq(s.db.hash_at, index_of(s.db, 0x000D))
+    assert_bytes(value_at(s.db, s.link, s.db.hash_at), [0x00])
 
 // The Device Name and the Appearance of the GAP service take a write,
 // with or without a response, and the value read back is the new one

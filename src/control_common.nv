@@ -16,6 +16,7 @@ pub fn attr(db: GattDb, handle: Int) -> [u8]
     if i < 0
         []
     else
+        gatt_server.settle_hash(db, db.attributes[i])
         db.attributes[i].value[:]
 
 // The Client Characteristic Configuration descriptor takes the access of the

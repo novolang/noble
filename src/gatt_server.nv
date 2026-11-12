@@ -373,6 +373,10 @@ struct SavedConfiguration
 // order; `rx_mtu` the Server Rx MTU an ATT_EXCHANGE_MTU_REQ is answered
 // with; `generation` counts the changes to the database definitions, and a
 // connection compares it with the generation it last saw (`AttLink`).
+// `hash_at` is the position in `attributes` of the value of the Database Hash
+// characteristic, -1 when the database has none: the characteristic is stale
+// from a change of the definitions until the first read, which computes the
+// hash (`mark_hash_stale`, `settle_hash`).
 // `saved` is the configuration the bond store keeps for each bonded client
 // across connections.  `indication_rules` holds the handles of the control
 // points that need an indication (`require_indication`), three entries
@@ -392,6 +396,7 @@ pub struct GattDb
     rx_mtu: Int
     var saved: [SavedConfiguration]
     var generation: Int
+    var hash_at: Int
     var indication_rules: [Int]
     var octet_rules: [OctetRule]
     var value_rules: [ValueRule]
@@ -491,8 +496,10 @@ pub fn no_security() -> LinkSecurity
 pub fn new_db(records: [u8], rx_mtu: Int) -> GattDb
     var db = GattDb {
         attributes: from_records(records), rx_mtu: rx_mtu, saved: [], generation: 0,
+        hash_at: -1,
         indication_rules: [], octet_rules: [], value_rules: [], guards: [], long_reads: [], bound: [] }
-    refresh_hash(var db)
+    db.hash_at = find_hash(db)
+    mark_hash_stale(var db)
     db
 
 // The state of a new connection to `db`: the unenhanced bearer at the
@@ -797,29 +804,74 @@ fn zero_key() -> [u8]
 fn database_hash(db: GattDb) -> [u8]
     reversed(aes_cmac.aes_cmac(zero_key(), hash_input(db)))
 
-// Put the Database Hash of the current definitions into the Database Hash
+// The position of the value of the Database Hash characteristic, the first
+// attribute of that type, or -1 for none.
+fn find_hash(db: GattDb) -> Int
+    for i in 0..list.len(db.attributes)
+        if is_type(db.attributes[i], UUID_DATABASE_HASH)
+            return i
+    -1
+
+// The Database Hash characteristic is stale from a change of the definitions
+// until something reads it, and the first read computes the hash of the
+// definitions the database has then (`settle_hash`).  The mark is the
+// longest value a client may write to the characteristic, 0: the hash is
+// read-only, so no write is ever meant to find the 0 there, and a hash that
+// is current has `max_len` HASH_OCTETS.  The mark takes no allocation and
+// no field of its own, which a boxed flag or an empty value would.
+fn mark_hash_stale(var db: GattDb)
+    if db.hash_at >= 0
+        var a = db.attributes[db.hash_at]
+        a.max_len = 0
+
+// The Database Hash of the current definitions goes into the Database Hash
 // characteristic, when the database has one ([Vol 3] Part G, Section 7.3:
 // "If any of the input fields to the hash function ... have changed, the
 // server shall calculate a new Database Hash and update the
 // characteristic value").
-fn refresh_hash(var db: GattDb)
-    let index = index_of(db, handle_of_type(db, le16(UUID_DATABASE_HASH)))
-    if index >= 0
-        var a = db.attributes[index]
+fn compute_hash(db: GattDb)
+    if db.hash_at >= 0
+        var a = db.attributes[db.hash_at]
         a.value = database_hash(db)
         a.max_len = HASH_OCTETS
 
-// The database definitions changed: the Database Hash follows, and every
-// client is change-unaware and hears the Database Out Of Sync response
-// once more ([Vol 3] Part G, Section 2.5.2.1, "Whenever the server
-// updates the database definitions, all connected clients become
+// The same, for a caller that holds the database as a `var`: the hash is
+// put in at once, and not at the next read.
+fn refresh_hash(var db: GattDb)
+    compute_hash(db)
+
+// The hash is computed when something reads the characteristic, and not at
+// each change of the definitions: it is a CMAC over every attribute, and a
+// database of n attributes built one call at a time would compute it n
+// times over a growing table.  A server only has to hold the current hash
+// when a client can see it (Section 7.3: the client reads it with a Read
+// Using Characteristic UUID, or a read of its handle), so each reader of
+// an attribute's value calls this first.  Reads with no change between
+// them compute it once.
+pub fn settle_hash(db: GattDb, a: GattAttribute)
+    if a.max_len == 0 and db.hash_at >= 0 and a.handle == db.attributes[db.hash_at].handle
+        compute_hash(db)
+
+// The database definitions changed: the Database Hash is stale until it is
+// read, and every client is change-unaware and hears the Database Out Of
+// Sync response once more ([Vol 3] Part G, Section 2.5.2.1, "Whenever the
+// server updates the database definitions, all connected clients become
 // change-unaware").  A change to an attribute value is not a change of
 // the definitions (Section 7.1), and the values of the Service Changed
 // and Client Supported Features characteristics are changes to no
 // service definition either (Section 2.5.2).
 fn definitions_changed(var db: GattDb)
     db.generation = db.generation + 1
-    refresh_hash(var db)
+    mark_hash_stale(var db)
+
+// Serve the attributes of the record table `records` from now on, in place
+// of every attribute the database had.  The Database Hash characteristic
+// of the table keeps the value the table gives it, as it did when the hash
+// was computed at each change: the table is not a change of definitions
+// that this database made.
+pub fn load_records(var db: GattDb, records: [u8])
+    db.attributes = from_records(records)
+    db.hash_at = find_hash(db)
 
 // Bring the Robust Caching state of the connection up to the database.
 // `definitions_changed` makes every connected client change-unaware
@@ -880,6 +932,8 @@ fn append(var db: GattDb, type_uuid: [u8], value: [u8], permissions: Int, tester
     list.push(db.attributes, GattAttribute {
         handle: handle, type_uuid: type_uuid[:], value: value[:], max_len: max, permissions: permissions,
         key_size: 0, tester: tester, included: included, per_link: false })
+    if db.hash_at < 0 and list.len(type_uuid) == 2 and read_le16(type_uuid, 0) == UUID_DATABASE_HASH
+        db.hash_at = list.len(db.attributes) - 1
     handle
 
 fn valid_uuid(u: [u8]) -> Bool
@@ -1068,6 +1122,7 @@ pub fn remove_range(var db: GattDb, first: Int, last: Int)
             removed = true
     db.attributes = kept
     if removed
+        db.hash_at = find_hash(db)
         definitions_changed(var db)
 
 // The handle of the first attribute whose type is `type_uuid`, 0 for none.
@@ -1165,6 +1220,7 @@ pub fn set_link_value(db: GattDb, var link: AttLink, handle: Int, value: [u8]) -
 // Section 3.2).
 pub fn value_at(db: GattDb, link: AttLink, idx: Int) -> [u8]
     let a = db.attributes[idx]
+    settle_hash(db, a)
     if is_type(a, UUID_CLIENT_CHARACTERISTIC_CONFIGURATION)
         return le16(configuration(link, a.handle))
     if is_type(a, UUID_CLIENT_SUPPORTED_FEATURES)
@@ -2367,6 +2423,7 @@ fn send_value_on(db: GattDb, var link: AttLink, index: Int, handle: Int, now_ms:
     let p = db.attributes[i].permissions
     if (p & (PERM_READ_ENCRYPT | PERM_READ_AUTHEN)) != 0 and not link.security.encrypted
         return []
+    settle_hash(db, db.attributes[i])
     let v = if db.attributes[i].per_link
         value_at(db, link, i)
     else

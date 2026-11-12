@@ -229,7 +229,7 @@ fn set_buffers(var link: LeLink, acl_data_packet_length: Int, total: Int)
 // Serve the attributes of the record table `db` from now on, in place of
 // every attribute the server had.
 fn set_database(var link: LeLink, records: [u8])
-    link.db.attributes = gatt_server.from_records(records)
+    gatt_server.load_records(var link.db, records)
 
 // The connection `connection_handle` has started, with the Host in the
 // Central role when `central`.  The fixed channels

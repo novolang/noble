@@ -4,6 +4,10 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
+## 0.2.1 — 2026-11-12
+
+The archive of 0.2.0 held no `configs/`, while the manifest names `configs/layer_a.toml` as the file every build of the package reads, so no consumer could build the fetched package (E2929 at its first line).  The publish of the toolchain now ships `configs/` and the file a `config` key names (bugs/tooling/closed/the-publish-archive-leaves-out-the-configuration-file-the-manifest-names.md); this version is the same sources published whole.  Nothing in the API changed.
+
 ## 0.2.0 — 2026-11-10
 
 This release is a minor because `HciLink.send_packet` takes `var self` (below): a transport that implements `HciLink` changes its signature.  It needs `noble-hci` 0.1.1 (the module `hci_cs`) and a toolchain 0.24.1 or later.

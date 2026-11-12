@@ -1,6 +1,6 @@
 [package]
 name        = "noble"
-version     = "0.2.1"
+version     = "0.2.2"
 description = "The Host of the noble Bluetooth Low Energy stack, written to Core 6.3: the HCI session, the link table, L2CAP and credit based channels, ATT, the GATT server and client, GAP and the advertisers, the Security Manager and bonding, privacy, and the isochronous transport.  Talks to a Controller only through the noble-hci seam."
 license     = "Apache-2.0"
 stability   = "experimental"

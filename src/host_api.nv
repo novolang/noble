@@ -2344,6 +2344,19 @@ pub fn respond(var h: Host, conn: ConnId, attr_handle: u16, code: Int, v: Value)
     send_acl(var h, le_link.send_att(var h.link, held_answer(h, slot, op, attr, offset, att_code_of(code, kind == 2), v)))
     noble.ok()
 
+// Store `data` as the value of the attribute `handle` for a notification or an indication.  The longest value a client may write
+// stays what `add_char` gave: `gatt_server.set_value` fixes it at the length of the first value an empty attribute gets.  False
+// when `handle` names no attribute that holds a value.
+pub fn store_sent_value(var h: Host, handle: Int, data: [u8]) -> Bool
+    let i = gatt_server.index_of(h.link.db, handle)
+    if i < 0
+        return false
+    let longest = h.link.db.attributes[i].max_len
+    if not gatt_server.set_value(var h.link.db, handle, data)
+        return false
+    let _ = gatt_server.set_max_length(var h.link.db, handle, longest)
+    true
+
 // Send `v` as a notification to the client on `conn`.
 pub fn notify(var h: Host, conn: ConnId, a: noble.Attr, need: Security, v: Value) -> Status
     let slot = slot_of(h, conn)
@@ -2354,7 +2367,7 @@ pub fn notify(var h: Host, conn: ConnId, a: noble.Attr, need: Security, v: Value
     host_activate(var h, slot)
     if a.cccd == 0 or (gatt_server.configuration(h.link.att, a.cccd as Int) & gatt_server.CCC_NOTIFICATION) == 0
         return noble.failed(noble.LAYER_LOCAL, noble.E_NOT_SUBSCRIBED)
-    if not gatt_server.set_value(var h.link.db, a.handle as Int, bytes_of(v))
+    if not store_sent_value(var h, a.handle as Int, bytes_of(v))
         return noble.failed(noble.LAYER_LOCAL, noble.E_NOT_FOUND)
     let pdus = gatt_server.send_value(var h.link.db, var h.link.att, a.handle as Int, h.clock_ms)
     send_acl(var h, le_link.send_att(var h.link, pdus))
@@ -2371,7 +2384,7 @@ fn start_indicate(var h: Host)
     if a.cccd == 0 or (gatt_server.configuration(h.link.att, a.cccd as Int) & gatt_server.CCC_INDICATION) == 0
         finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_NOT_SUBSCRIBED))
         return
-    if not gatt_server.set_value(var h.link.db, a.handle as Int, bytes_of(h.api.r_data))
+    if not store_sent_value(var h, a.handle as Int, bytes_of(h.api.r_data))
         finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_NOT_FOUND))
         return
     let pdus = gatt_server.send_value(var h.link.db, var h.link.att, a.handle as Int, h.clock_ms)

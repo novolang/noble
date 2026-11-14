@@ -2022,6 +2022,67 @@ fn test_a_client_that_subscribes_is_an_event_and_notify_reaches_it_only_then_and
     var t17 = value_of_byte(1)
     test.assert(ble.notify(conn, hrm.attr, noble.Security.Open, var t17).is(noble.LAYER_LOCAL, noble.E_STALE))
 
+// A value of `n` octets.
+fn value_of_length(n: Int) -> noble.Value
+    var v: noble.Value = Vec.new()
+    for k in 0..n
+        let _ = v.push(k as u8)
+    v
+
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_notification_does_not_shorten_the_longest_write_of_its_characteristic()
+    var ble = new_ble()
+    test.assert(ble.add_service(noble.uuid16(0xFFF0)).svc == 0)
+    let c = ble.add_char(noble.uuid16(0xFFF1), noble.PROP_WRITE | noble.PROP_NOTIFY, noble.open_perms(), noble.Access.Open, 30)
+    test.assert(c.status.is_ok())
+    let conn = peripheral_up(var ble)
+    central_sends(var ble, [0x12, (c.attr.cccd & 255) as u8, (c.attr.cccd >> 8) as u8, 1, 0])
+    test.assert_eq(acl_att(ble.io, 0)[0] as Int, 0x13)
+    // One notification of 3 octets, then a write request of 20: the longest write is still 30.
+    var three = value_of_length(3)
+    test.assert(ble.notify(conn, c.attr, noble.Security.Open, var three).is_ok())
+    ble.step()
+    test.assert_eq(acl_att(ble.io, 1)[0] as Int, 0x1B)
+    var write: [u8] = [0x12, (c.attr.handle & 255) as u8, (c.attr.handle >> 8) as u8]
+    for k in 0..20
+        list.push(write, k as u8)
+    central_sends(var ble, write)
+    test.assert_eq(acl_att(ble.io, 2)[0] as Int, 0x13)
+    // A write of 31 is still refused.
+    for k in 20..31
+        list.push(write, k as u8)
+    central_sends(var ble, write)
+    test.assert_eq(acl_att(ble.io, 3)[0] as Int, 0x01)
+    test.assert_eq(acl_att(ble.io, 3)[4] as Int, noble.ATT_INVALID_ATTRIBUTE_VALUE_LENGTH)
+    // A handle that names no attribute, and one that names a declaration, store nothing.
+    var four = value_of_length(4)
+    let nowhere = noble.Attr { handle: 900, props: c.attr.props, cccd: c.attr.cccd }
+    test.assert(ble.notify(conn, nowhere, noble.Security.Open, var four).is(noble.LAYER_LOCAL, noble.E_NOT_FOUND))
+    var five = value_of_length(5)
+    let declaration = noble.Attr { handle: c.attr.handle - 1, props: c.attr.props, cccd: c.attr.cccd }
+    test.assert(ble.notify(conn, declaration, noble.Security.Open, var five).is(noble.LAYER_LOCAL, noble.E_NOT_FOUND))
+
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
+@test
+fn test_an_indication_does_not_shorten_the_longest_write_of_its_characteristic()
+    var ble = new_ble()
+    test.assert(ble.add_service(noble.uuid16(0xFFF0)).svc == 0)
+    let c = ble.add_char(noble.uuid16(0xFFF1), noble.PROP_WRITE | noble.PROP_INDICATE, noble.open_perms(), noble.Access.Open, 30)
+    test.assert(c.status.is_ok())
+    let conn = peripheral_up(var ble)
+    central_sends(var ble, [0x12, (c.attr.cccd & 255) as u8, (c.attr.cccd >> 8) as u8, 2, 0])
+    test.assert_eq(acl_att(ble.io, 0)[0] as Int, 0x13)
+    ble.io.confirm = true
+    var three = value_of_length(3)
+    test.assert(ble.indicate(conn, c.attr, var three).is_ok())
+    var write: [u8] = [0x12, (c.attr.handle & 255) as u8, (c.attr.handle >> 8) as u8]
+    for k in 0..20
+        list.push(write, k as u8)
+    central_sends(var ble, write)
+    let last = list.len(ble.io.acl) - 1
+    test.assert_eq(acl_att(ble.io, last)[0] as Int, 0x13)
+
 // ── Services behind the pump ────────────────────────────────────────
 
 // A service that keeps a switch: a write of 0 or 1 is taken, anything else is refused.

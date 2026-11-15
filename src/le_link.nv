@@ -53,8 +53,9 @@ const NO_CONNECTION = -1
 
 // The Server Rx MTU this ATT server answers ATT_EXCHANGE_MTU_REQ with:
 // the largest Attribute Protocol PDU it receives ([Vol 3] Part F,
-// Section 3.4.2.2).  The default ATT_MTU of LE is 23.
-pub const ATT_SERVER_RX_MTU = 65
+// Section 3.4.2.2), which is the configuration key `max_att_mtu`.  The
+// default ATT_MTU of LE is 23.
+let ATT_SERVER_RX_MTU = noble.CONFIG.MAX_ATT_MTU
 
 // The RTX timer of an L2CAP signaling request.  Its initial value is
 // implementation-dependent, 1 s at least and 60 s at most ([Vol 3]

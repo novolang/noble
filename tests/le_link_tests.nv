@@ -109,11 +109,23 @@ fn test_fragmentation_and_flow_control()
     let _ = completed(var link, 0x0040, 9)
     test.assert_eq(links.acl_free(link.credits.pool), 2)
 
+// The Server Rx MTU is the configuration key `max_att_mtu`, as the key's documentation says ("the largest ATT_MTU offered"); it was
+// 65 whatever the key was (bugs/orbit/the-hosts-att-server-answers-an-mtu-exchange-with-65-whatever-max-att-mtu-says.md).
+@test
+fn test_the_server_rx_mtu_is_the_configuration_key()
+    test.assert_eq(ATT_SERVER_RX_MTU, noble.CONFIG.MAX_ATT_MTU)
+    var link = connected_link()
+    // A client that offers the largest ATT_MTU the key allows is answered with the key.
+    let out = receive_acl(var link, acl(true, l2cap.build_b_frame(l2cap.CID_ATT, [0x02, 0x05, 0x02])), 0)
+    let want = noble.CONFIG.MAX_ATT_MTU
+    test.assert(bytes_eq(sent_payload(out[0]), [0x03, (want & 0xFF) as u8, (want >> 8) as u8]))
+    test.assert_eq(gatt_server.mtu_of(link.att, 0), noble.CONFIG.MAX_ATT_MTU)
+
 @test
 fn test_exchange_mtu()
     var link = connected_link()
     let out = receive_acl(var link, acl(true, l2cap.build_b_frame(l2cap.CID_ATT, [0x02, 0x00, 0x02])), 0)
-    test.assert(bytes_eq(sent_payload(out[0]), [0x03, ATT_SERVER_RX_MTU, 0x00]))
+    test.assert(bytes_eq(sent_payload(out[0]), [0x03, (ATT_SERVER_RX_MTU & 0xFF) as u8, (ATT_SERVER_RX_MTU >> 8) as u8]))
     test.assert_eq(gatt_server.mtu_of(link.att, 0), ATT_SERVER_RX_MTU)
     // A Client Rx MTU below the default leaves ATT_MTU at 23.
     var other = connected_link()
@@ -960,12 +972,13 @@ fn test_each_link_keeps_its_own_attribute_and_signaling_state()
     var ls = two_links()
     var a = le_links_link(ls, le_links_find_handle(ls, 0x0040))
     var b = le_links_link(ls, le_links_find_handle(ls, 0x0041))
-    // An MTU exchange on the first link leaves the second at the default.
+    // An MTU exchange on the first link leaves the second at the default.  The client offers 100, and the server's Rx MTU is
+    // `max_att_mtu`, so the smaller of the two is the link's ATT_MTU.
     let _ = le_links_receive_acl(var ls, hci_codec.build_h4_acl(0x0040,
         hci_codec.ACL_PB_FIRST_FLUSHABLE,
         l2cap.build_b_frame(l2cap.CID_ATT, [0x02, 0x64, 0x00])),
     0)
-    test.assert_eq(gatt_server.mtu_of(a.att, 0), 65)
+    test.assert_eq(gatt_server.mtu_of(a.att, 0), 100)
     test.assert_eq(gatt_server.mtu_of(b.att, 0), 23)
     // Signaling identifiers count apart.
     test.assert_eq(next_identifier(var a), 1)

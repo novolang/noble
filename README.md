@@ -180,7 +180,7 @@ held; extended scanning (`ScanParams.extended`) is refused with `E_BAD_ARGUMENT`
 periodic advertising reports are not delivered; the GATT state of a bond (`BondStore.load_server`, `load_cache`) is not used, so a
 discovery cache and a client's subscriptions do not outlive the link; the descriptors a discovery finds are those of the characteristics
 that notify or indicate.  The transports `UartHci` (H4 over `hal.uart`; `uart_hci()` starts the port at `UART_BAUD`, 1 Mbaud) and the PC socket of `noble-examples` carry `now_ms` and
-`park`; the USB CDC-ACM and in-RAM transports keep the defaults (the system tick and a yield).  `noble.uart_adapter()` makes an Adapter over
+`park`, and `UartHci` parks the task on the UART's receive interrupt, so a Host that runs as a task of the scheduler halts the core between the events of the Controller; the USB CDC-ACM and in-RAM transports keep the defaults (the system tick and a wait on the waker of the task, which answers at once outside a task).  `noble.uart_adapter()` makes an Adapter over
 `UartHci` with the default policy and RAM bonds.
 
 The sizes of the tables are keys of the package configuration.  A consumer

@@ -1235,7 +1235,7 @@ fn from_profile_error(e: profile_builder.ProfileError) -> Status
 // An `Adapter` holds a Host, the transport, the product's policy and its bond store, so a program does not thread four values
 // through every call.  Its methods start a call with `begin`, run the Host until the call ends or the timeout passes, and answer
 // the `Status`.  A method that can wait carries `[async]`: the task parks in the transport's `park` (by default
-// `core.rt.yield_now`) between two turns of the Host.  Nothing in this layer reads a clock but through the transport's `now_ms`.
+// a wait on the waker of the task, `core.rt.park`) between two turns of the Host.  Nothing in this layer reads a clock but through the transport's `now_ms`.
 // planning/NOBLE-HOST-API-SKETCH.md sections 3.5, 3.6, 3.10 and 3.13 are the design.
 
 // The longest a turn of the Adapter parks, in milliseconds: the timers of the Host (the ATT transaction timeout, the supervision
@@ -1921,6 +1921,9 @@ fn refuse(ev: Event, var out: Outbox)
 // indicator ([Vol 4] Part A, Section 2).  The bytes that have not yet made a packet are kept in `rx`.
 pub struct UartHci
     var rx: [u8]
+    // The Future the UART's receive interrupt resolves while the Host is parked in `park`, made once so that a park allocates
+    // nothing.
+    var rx_ready: Future
 
 // The rate of the HCI UART Transport Layer in bits per second: 1 Mbaud, with RTS/CTS, the rate the noble Controller starts its port at.
 // (The UARTE driver of a board starts at 115200 for that value and at 1 Mbaud for any other.)
@@ -1931,7 +1934,7 @@ pub const UART_BAUD = 1000000
 pub @tier(embedded)
 fn uart_hci() -> UartHci [hw]
     hal.uart.init(UART_BAUD)
-    UartHci { rx: [] }
+    UartHci { rx: [], rx_ready: core.rt.future_new() }
 
 // How many octets one `recv_packet` takes from the UART before it cuts a packet.
 const UART_READ_MAX = 255
@@ -1956,6 +1959,28 @@ impl HciLink[hw, mutate] for UartHci
         match r.packet
             Some(pkt) => Some(pkt[:])
             None => None
+
+    // The Host parks here between two turns: the task sleeps on its waker until the UART's receive interrupt delivers an octet or
+    // `ms` milliseconds have passed, and the core halts meanwhile.  The octet the interrupt took is kept for `recv_packet`.  An
+    // octet that has already landed ends the park at once, and the arm of a receive that finds one raises the interrupt at once, so
+    // no octet falls between the test and the wait.  Outside a task there is no waker and the park yields, as the default does.
+    @tier(embedded)
+    fn park(var self, ms: Int) [hw, async, mutate]
+        let w = core.rt.waker()
+        if w == 0
+            core.rt.yield_now()
+            return
+        let landed = hal.uart.try_read_byte()
+        if landed >= 0
+            list.push(self.rx, landed as u8)
+            return
+        core.rt.waker_on_future(w, self.rx_ready)
+        core.rt.future_reset(self.rx_ready)
+        if hal.uart.rx_arm(self.rx_ready) < 0
+            return
+        let _ = core.rt.park(w, ms)
+        if not hal.uart.rx_disarm()
+            list.push(self.rx, core.rt.future_await(self.rx_ready) as u8)
 
 // An Adapter over the UART transport with the default policy and RAM bonds: what the first program of a project starts from.
 pub @tier(embedded)

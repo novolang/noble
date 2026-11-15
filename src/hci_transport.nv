@@ -96,10 +96,12 @@ trait HciTransport
 // same link, because the link is where the Host meets the outside world: it is
 // the one thing that already waits with a deadline.  `now_ms` is the clock in
 // milliseconds and `park` gives up the processor until a packet may have
-// arrived or `ms` have passed.  Both have a default, so an impl that has
-// nothing better keeps the system tick and a yield; a link with an interrupt on
-// receive parks the task on its waker in `park`, and a simulated link
-// answers `now_ms` with a virtual clock that its test advances.
+// arrived or `ms` have passed.  Both have a default: `now_ms` keeps the system
+// tick, and `park` waits on the waker of the task (`core.rt.park`) for `ms`
+// milliseconds, or answers at once outside a task.  A link with an interrupt
+// on receive registers the Future that interrupt resolves with the waker and
+// parks the task on it in `park`, so the task wakes when an octet arrives; a
+// simulated link answers `now_ms` with a virtual clock that its test advances.
 
 trait HciLink[e]
     fn send_packet(var self, pkt: [u8]) -> Bool [e]
@@ -109,5 +111,4 @@ trait HciLink[e]
         core.rt.tick_ms()
 
     fn park(var self, ms: Int) [e, async]
-        let _ = ms
-        core.rt.yield_now()
+        let _ = core.rt.park(core.rt.waker(), ms)

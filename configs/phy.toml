@@ -1,0 +1,8 @@
+# A Host that reports the PHY of its links (`phy_events`) and writes LE Set Default PHY at the end of the start-up (`default_phy`).  Every suite of the
+# package runs under it with `novo config ci`; with the queue of configs/layer_a.toml the cases of tests/host_api_tests.nv that need the PHY are built.
+#   novo test --config configs/phy.toml tests/host_api_tests.nv
+[noble]
+phy_events = 1
+default_phy = 3
+max_connections = 2
+event_queue = 4

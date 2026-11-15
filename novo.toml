@@ -67,6 +67,20 @@ max     = 4
 bytes_expr = "1664 + max_connections * ((max_att_mtu + 4 + 15) / 8 * 8) + max_connections * 52 + max_connections * (((max_attributes + 7) / 8 + 7) / 8 * 8) + min(1, max_aics + max_vocs + max_presets + max_set_size) * (256 + max_connections * (48 + (max_presets + 15) / 8 * 8))"
 doc     = "simultaneous LE links, both roles"
 
+[config.phy_events]
+type    = "int"
+default = 0
+min     = 0
+max     = 1
+doc     = "1 serves `Adapter.set_phy` and queues `Event.PhyUpdated` for every change of a link's PHY (the Host unmasks LE PHY Update Complete); 0 leaves the code out of the image, and a Central that changes the PHY is not reported"
+
+[config.default_phy]
+type    = "int"
+default = 0
+min     = 0
+max     = 7
+doc     = "the PHYs written with LE Set Default PHY at start, as a mask (1 LE 1M, 2 LE 2M, 4 LE Coded); 0 writes nothing and leaves the Controller's own default"
+
 [config.max_att_mtu]
 type    = "int"
 default = 247

@@ -115,10 +115,17 @@ the Host.  `step`, `run`, `start` and `wait_event(timeout_ms)` are the loop; `no
 | Advertising | `adv_start(set, params, data, scan_rsp)` (legacy or extended, by `AdvParams.extended`), `periodic_start`, `adv_stop`; `ad_flags`, `ad_uuid16`, `ad_name` and `adv_legacy()` make the payload and the parameters; `Action.Readvertise` of the policy restarts the last advertising |
 | Scanning | `scan_start(params, filter)`, `scan_stop`, `find(filter, timeout_ms, var report)`; the `ScanFilter` (a service, a name prefix, a signal floor) is applied by the Host before `HostPolicy.on_advert` |
 | Synchronising | `sync_create`, `sync_stop`, `accept_list_from_bonds` |
-| Connections | `connect`, `connect_listed`, `connect_cancel`, `disconnect`, `update_params`, `secure`, `conn_info`, `link_count`, and the channels `coc_listen`, `coc_open`, `coc_send`, `coc_close` |
+| Connections | `connect`, `connect_listed`, `connect_cancel`, `disconnect`, `update_params`, `set_phy`, `secure`, `conn_info`, `link_count`, and the channels `coc_listen`, `coc_open`, `coc_send`, `coc_close` |
 | GATT client | `exchange_mtu`, `discover(conn, service)`, `find_char`, `read`, `write`, `write_no_response`, `subscribe`, `unsubscribe`; `need` is the least security the link must have before a request is sent |
 | GATT server | `add_service`, `add_char`, `set_value`, `bind_function`, `bind_event`, `respond`, `notify`, `notify_all`, `indicate` |
 | Services | the trait `Service`; `ble.plug(var services)` takes the product's list of `[dyn Service]`, `ble.pump(wait_ms)` is one turn and `ble.serve(wait_ms)` is the loop (it starts the Controller, asks `HostPolicy.on_start`, and turns `pump` while `keep_serving` is true); `ble.plug_module(var module)` attaches one service the product holds itself |
+
+A Peripheral asks the Central for another interval with `update_params` and for another PHY with `set_phy` (a mask: 1 LE 1M, 2 LE 2M, 4 LE Coded); both return when the Central has
+answered, with the status it refused with.  A Central owns both choices: BlueZ asks for LE 2M by itself soon after the connection, and refuses a request made in the first
+events of the connection with Unknown Connection Identifier (0x02), so a Peripheral waits the 5 s of TGAP(conn_pause_peripheral) and asks again when it is answered 0x0C
+(the Controller's own procedure is under way).  The PHY code is left out of an image unless the key `phy_events` is 1, which serves `set_phy` and queues `Event.PhyUpdated(conn, tx, rx)` for every change
+of a link's PHY (about 1 KB of flash in a Host image).  The key `default_phy` (a mask, 0 by default) writes LE Set Default PHY at the end of the start; with 0 the Host sends nothing and the
+Controller keeps its own default.
 
 Events: `Advert`, `Connected`, `Disconnected`, `Written` (a stored characteristic was written), `Subscribed(conn, attr, mode)` (a client
 wrote the configuration of a value), `Notification` (a notification or an indication of a peer, with a flag), `AttrRead` and `AttrWrite`
@@ -134,7 +141,7 @@ and answers the `Status` that stopped it, or `ok()`; `on_event`, `tick`, `on_rea
 a list of its services, `[dyn Service]`, once at start-up and gives it to `ble.plug(var services)`, which attaches each in
 order and records the first and last attribute handle it added (the owner table, `max_services` entries).  `ble.pump(wait_ms)`
 is one turn: an attribute event (`AttrRead`, `AttrWrite`, `Written`, `Subscribed`) goes to the one service whose handles hold it and is
-refused at once when none does; a link event (`Ready`, `Connected`, `Disconnected`, `ParamsUpdated`, `SecurityChanged`,
+refused at once when none does; a link event (`Ready`, `Connected`, `Disconnected`, `ParamsUpdated`, `PhyUpdated`, `SecurityChanged`,
 `DatabaseChanged`) goes to every service; any other event goes to the services until one takes it; then every `tick` runs and what the
 services queued (`Out.Notify`, `NotifyAll`, `Respond`) is applied.  The access check has run before an attribute event exists, so a
 service sees only requests the client had the right to make.  `ble.serve(wait_ms)` does the start as well: it calls `start`,

@@ -453,6 +453,16 @@ pub fn begin(var h: Host, req: Request) -> Status
                     h.api.r_conn = conn
                     h.api.r_params = p
                     kind = noble.R_UPDATE
+                Request.SetPhy(conn, tx, rx) =>
+                    if noble.CONFIG.PHY_EVENTS == 0
+                        return noble.failed(noble.LAYER_LOCAL, noble.E_REFUSED)
+                    if slot_of(h, conn) < 0
+                        return noble.failed(noble.LAYER_LOCAL, noble.E_STALE)
+                    h.api.r_conn = conn
+                    // The masks ride in two fields that this request has no other use for.
+                    h.api.r_reason = tx as Int
+                    h.api.r_mtu = rx as Int
+                    kind = noble.R_PHY
                 Request.Secure(conn, need) =>
                     if slot_of(h, conn) < 0
                         return noble.failed(noble.LAYER_LOCAL, noble.E_STALE)
@@ -666,6 +676,12 @@ fn kick<P: HostPolicy[f], B: BondStore[g]>(var h: Host, var p: P, var b: B) [f, 
         else
             let q = h.api.r_params
             send_cmd(var h, hci_commands.opcode_le_connection_update(), hci_commands.build_connection_parameters(handle_of(h, slot), q.interval_min as Int, q.interval_max as Int, q.latency as Int, q.timeout as Int, 0, 0))
+    else if noble.CONFIG.PHY_EVENTS != 0 and kind == noble.R_PHY
+        let slot = slot_of(h, h.api.r_conn)
+        if slot < 0
+            finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_STALE))
+        else
+            send_cmd(var h, hci_commands.opcode_le_set_phy(), hci_commands.build_le_set_phy(handle_of(h, slot), h.api.r_reason, h.api.r_mtu, 0))
     else if kind == noble.R_SECURE
         start_secure(var h, var p, var b)
     else if kind == noble.R_COC_OPEN
@@ -809,6 +825,12 @@ fn on_event<P: HostPolicy[f], B: BondStore[g]>(var h: Host, evt: [u8], var p: P,
             on_update_complete(var h, u)
             return
         None => ()
+    if noble.CONFIG.PHY_EVENTS != 0
+        match hci_codec.le_phy_update_complete(evt)
+            Some(u) =>
+                on_phy_complete(var h, u)
+                return
+            None => ()
     match hci_codec.le_remote_connection_parameter_request(evt)
         Some(r) =>
             on_remote_parameters(var h, r, var p)
@@ -875,6 +897,12 @@ fn command_answered<P: HostPolicy[f], B: BondStore[g]>(var h: Host, opcode: Int,
                 finish(var h, noble.failed(noble.LAYER_HCI, status))
             else
                 h.api.step = 2
+    else if noble.CONFIG.PHY_EVENTS != 0 and kind == noble.R_PHY
+        if opcode == hci_commands.opcode_le_set_phy()
+            if status != 0
+                finish(var h, noble.failed(noble.LAYER_HCI, status))
+            else
+                h.api.step = 2
     else if kind == noble.R_SECURE
         if opcode == hci_commands.opcode_le_start_encryption() and status != 0
             finish(var h, noble.failed(noble.LAYER_HCI, status))
@@ -888,6 +916,10 @@ fn command_answered<P: HostPolicy[f], B: BondStore[g]>(var h: Host, opcode: Int,
 // numbers of the Security Manager.
 
 fn start_answered(var h: Host, opcode: Int, status: Int, rp: [u8])
+    if noble.CONFIG.DEFAULT_PHY != 0 and h.api.step == START_PHY_STEP
+        // A Controller that refuses the preference (a PHY it lacks) has come up all the same.
+        start_done(var h)
+        return
     if status != 0
         finish(var h, noble.failed(noble.LAYER_HCI, status))
         return
@@ -896,7 +928,9 @@ fn start_answered(var h: Host, opcode: Int, status: Int, rp: [u8])
         let mask = hci_commands.EVENT_MASK_DEFAULT | hci_commands.EVENT_MASK_ENCRYPTION_KEY_REFRESH_COMPLETE | hci_commands.EVENT_MASK_LE_META
         send_cmd(var h, hci_commands.opcode_hci_set_event_mask(), hci_commands.build_set_event_mask(mask))
     else if step == 2
-        let le_mask = hci_commands.LE_EVENT_MASK_DEFAULT | hci_commands.LE_EVENT_MASK_REMOTE_CONNECTION_PARAMETER_REQUEST | hci_commands.LE_EVENT_MASK_PERIODIC_ADVERTISING
+        var le_mask = hci_commands.LE_EVENT_MASK_DEFAULT | hci_commands.LE_EVENT_MASK_REMOTE_CONNECTION_PARAMETER_REQUEST | hci_commands.LE_EVENT_MASK_PERIODIC_ADVERTISING
+        if noble.CONFIG.PHY_EVENTS != 0
+            le_mask = le_mask | hci_commands.LE_EVENT_MASK_PHY_UPDATE_COMPLETE
         send_cmd(var h, hci_commands.opcode_le_set_event_mask(), hci_commands.build_set_event_mask(le_mask))
     else if step == 3
         send_cmd(var h, hci_commands.opcode_le_read_buffer_size(), [])
@@ -921,7 +955,7 @@ fn start_answered(var h: Host, opcode: Int, status: Int, rp: [u8])
             // with one: the Host takes a static random address of its own, drawn from the Controller's generator.
             send_cmd(var h, hci_commands.opcode_le_rand(), [])
         else
-            start_done(var h)
+            start_phy(var h)
             return
     else if step == 8
         if list.len(rp) < 6
@@ -934,9 +968,22 @@ fn start_answered(var h: Host, opcode: Int, status: Int, rp: [u8])
         h.api.own_kind = 1
         send_cmd(var h, hci_commands.opcode_le_set_random_address(), hci_commands.build_le_set_random_address(addr))
     else
-        start_done(var h)
+        start_phy(var h)
         return
     h.api.step = step + 1
+
+// The step of the bring-up that waits for the answer to LE Set Default PHY.
+const START_PHY_STEP = 100
+
+// The PHYs the Controller may use for a connection when a peer or the Controller itself changes the PHY, written once at the end of the
+// bring-up when the key `default_phy` of the [noble] section is not 0 (bit 0 LE 1M, bit 1 LE 2M, bit 2 LE Coded).  With 0 the Host sends nothing and
+// the Controller keeps its own default, which for the Controllers of this repository and the SoftDevice Controller is every PHY it has.
+fn start_phy(var h: Host)
+    if noble.CONFIG.DEFAULT_PHY != 0
+        h.api.step = START_PHY_STEP
+        send_cmd(var h, hci_commands.opcode_le_set_default_phy(), hci_commands.build_le_set_default_phy(noble.CONFIG.DEFAULT_PHY, noble.CONFIG.DEFAULT_PHY))
+    else
+        start_done(var h)
 
 // The bring-up is complete: the Security Manager is seeded and the application told.
 fn start_done(var h: Host)
@@ -1189,6 +1236,19 @@ fn on_update_complete(var h: Host, u: hci_codec.LeConnectionUpdateComplete)
     let q = ConnParams { interval_min: u.connection_interval as u16, interval_max: u.connection_interval as u16, latency: u.peripheral_latency as u16, timeout: u.supervision_timeout as u16 }
     set_conn(var h, slot, noble.Conn { live: c.live, id: c.id, info: ConnInfo { role: c.info.role, peer: c.info.peer, params: q, mtu: c.info.mtu, level: c.info.level, bonded: c.info.bonded } })
     emit(var h, Event.ParamsUpdated(conn, q))
+    if mine
+        finish(var h, noble.ok())
+
+fn on_phy_complete(var h: Host, u: hci_codec.LePhyUpdateComplete)
+    let slot = slot_of_handle(h, u.connection_handle)
+    if slot < 0
+        return
+    let mine = h.api.kind == noble.R_PHY and slot_of_name(h, h.api.r_conn) == slot
+    if u.status != 0
+        if mine
+            finish(var h, noble.failed(noble.LAYER_HCI, u.status))
+        return
+    emit(var h, Event.PhyUpdated(h.api.conns[slot].id, u.tx_phy as u8, u.rx_phy as u8))
     if mine
         finish(var h, noble.ok())
 
@@ -1567,7 +1627,7 @@ fn le16_of(pdu: [u8], at: Int) -> Int
 
 // Whether a request is one that names a connection in `Api.r_conn`.
 fn uses_conn(kind: Int) -> Bool
-    kind == noble.R_DISCONNECT or kind == noble.R_UPDATE or kind == noble.R_SECURE or kind == noble.R_COC_OPEN
+    kind == noble.R_DISCONNECT or kind == noble.R_UPDATE or kind == noble.R_PHY or kind == noble.R_SECURE or kind == noble.R_COC_OPEN
         or kind == noble.R_COC_CLOSE or kind == noble.R_MTU or kind == noble.R_DISCOVER or kind == noble.R_READ
         or kind == noble.R_WRITE or kind == noble.R_SUBSCRIBE or kind == noble.R_INDICATE
 

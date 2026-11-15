@@ -458,6 +458,11 @@ struct ConnParams
     latency: u16
     timeout: u16
 
+// The bits of the masks of `set_phy` and the key `default_phy`: LE 1M, LE 2M and LE Coded.  `Event.PhyUpdated` names a PHY by its value (1, 2, 3).
+pub const PHY_1M = 1
+pub const PHY_2M = 2
+pub const PHY_CODED = 4
+
 // Connection parameters most peripherals accept: an interval of 30 to 50 ms, no latency and a supervision timeout of 4 s.
 pub @tier(embedded)
 fn conn_params_default() -> ConnParams
@@ -762,6 +767,8 @@ enum Event
     Connected(conn: ConnId, role: Role, peer: Addr, params: ConnParams)
     Disconnected(conn: ConnId, reason: Status)
     ParamsUpdated(conn: ConnId, params: ConnParams)
+    // The PHY of a link changed, whoever asked for it (LE PHY Update Complete): 1 is LE 1M, 2 is LE 2M, 3 is LE Coded.  A link begins on LE 1M.
+    PhyUpdated(conn: ConnId, tx_phy: u8, rx_phy: u8)
     SecurityChanged(conn: ConnId, level: Security, bonded: Bool)
     PasskeyRequested(conn: ConnId)
     NumericRequested(conn: ConnId, value: Int)
@@ -825,6 +832,7 @@ enum Request
     ConnectCancel
     Disconnect(conn: ConnId, reason: u8)
     UpdateParams(conn: ConnId, p: ConnParams)
+    SetPhy(conn: ConnId, tx_mask: u8, rx_mask: u8)
     ExchangeMtu(conn: ConnId)
     Discover(conn: ConnId, svc: Uuid)
     Read(conn: ConnId, attr: Attr, need: Security)
@@ -948,6 +956,7 @@ const R_READ = 19
 const R_WRITE = 20
 const R_SUBSCRIBE = 21
 const R_INDICATE = 22
+const R_PHY = 23
 
 // The value of an answer that was not given.
 const NO_ANSWER = -1000
@@ -1099,6 +1108,7 @@ fn is_state_event(ev: Event) -> Bool
         Connected(_, _, _, _) => true
         Disconnected(_, _) => true
         ParamsUpdated(_, _) => true
+        PhyUpdated(_, _, _) => true
         SecurityChanged(_, _, _) => true
         PasskeyRequested(_) => true
         NumericRequested(_, _) => true
@@ -1474,9 +1484,26 @@ impl Adapter
     fn disconnect(var self, conn: ConnId, reason: Int) -> Status [e, f, g, async, time, mutate]
         self.run(Request.Disconnect(conn, reason as u8), 5000)
 
+    // Ask for another interval, latency and supervision timeout on the link (LE Connection Update).  A Central's Controller applies the
+    // longest interval of the range; a Peripheral's asks the Central, and the call returns when the Central has answered, with `Event.ParamsUpdated`
+    // queued.  The Central decides: its refusal comes back as the HCI status it gave (layer `LAYER_HCI`), so 0x1E is a range its Host does not
+    // allow (BlueZ keeps the range of its `conn_max_interval`, 50 ms by default, and of the parameters it stored for the device), and 0x02 is a
+    // Central that has not finished setting the connection up.  A Peripheral should not ask within TGAP(conn_pause_peripheral), 5 s of the
+    // connection ([Vol 3] Part C, Section 9.3.12.2); 0x0C comes from this end's Controller while another procedure of the link (the Central's
+    // own update, the PHY or the data length) is under way, and the call can be made again.
     @tier(embedded)
     fn update_params(var self, conn: ConnId, p: ConnParams) -> Status [e, f, g, async, time, mutate]
         self.run(Request.UpdateParams(conn, p), 5000)
+
+    // Ask for the PHYs in `tx_mask` and `rx_mask` on the link (LE Set PHY): bit 0 is LE 1M, bit 1 LE 2M, bit 2 LE Coded, and a mask of 0 is no
+    // preference for that direction.  The Controller runs the PHY Update procedure with the peer, which may keep the PHYs it has; the call
+    // returns when the procedure has ended, with `Event.PhyUpdated` queued for the PHYs now in use.  A Controller or a peer without the PHY
+    // answers with its HCI status.  A link begins on LE 1M; a Central may change it without being asked.
+    @tier(embedded)
+    fn set_phy(var self, conn: ConnId, tx_mask: Int, rx_mask: Int) -> Status [e, f, g, async, time, mutate]
+        if tx_mask < 0 or tx_mask > 7 or rx_mask < 0 or rx_mask > 7
+            return failed(LAYER_LOCAL, E_BAD_ARGUMENT)
+        self.run(Request.SetPhy(conn, tx_mask as u8, rx_mask as u8), 5000)
 
     // What the Host knows of a connection; None for a name that is stale.
     @tier(embedded)
@@ -1724,6 +1751,7 @@ fn reaches_all(ev: Event) -> Bool
         Event.Connected(conn, role, peer, params) => true
         Event.Disconnected(conn, reason) => true
         Event.ParamsUpdated(conn, params) => true
+        Event.PhyUpdated(conn, tx, rx) => true
         Event.SecurityChanged(conn, level, bonded) => true
         Event.DatabaseChanged(conn) => true
         _ => false

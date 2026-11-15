@@ -49,13 +49,14 @@ struct ScriptLink
     var srv: gatt_server.GattServer
     var confirm: Bool
     var sync: Int
+    var refuse_phy: Bool
 
 // `credit` makes the Controller return the buffer of each ACL packet it is given.  `serve` makes the Controller carry the ATT requests the Host writes to a GATT server of its own (`srv`) and bring the answers
 // back, as the peer of a Central would; `confirm` makes it confirm each indication it is given; `sync` is the status of the LE
 // Periodic Advertising Sync Established event that answers a Create Sync (-1 for none).
 fn script_link() -> ScriptLink
     ScriptLink { inbox: [], sent: [], now: 0, handle: 0x40, connect_status: 0, mute: false, commands: [], acl: [], cmdlog: [], seed: 1, addr: 0xA1,
-        serve: false, credit: false, srv: gatt_server.new_server([], 247), confirm: false, sync: -1 }
+        serve: false, credit: false, srv: gatt_server.new_server([], 247), confirm: false, sync: -1, refuse_phy: false }
 
 // An HCI event packet, H4 indicator first.
 fn event_packet(code: Int, params: [u8]) -> [u8]
@@ -112,6 +113,32 @@ fn update_complete(handle: Int, interval: Int, latency: Int, timeout: Int) -> [u
     list.append(params, le16(timeout))
     le_meta(0x03, params)
 
+// LE PHY Update Complete ([Vol 4] Part E, Section 7.7.65.12): the PHYs now in use are 1 (LE 1M), 2 (LE 2M) or 3 (LE Coded).
+fn phy_update_complete(handle: Int, status: Int, tx: Int, rx: Int) -> [u8]
+    var params: [u8] = [status as u8]
+    list.append(params, le16(handle))
+    list.push(params, tx as u8)
+    list.push(params, rx as u8)
+    le_meta(0x0C, params)
+
+// The PHY a Controller that has all three picks from the PHYs of a mask: the fastest of the mask, LE 1M for a mask of 0.
+fn phy_of_mask(mask: Int) -> Int
+    if (mask & 0x02) != 0
+        2
+    else if (mask & 0x04) != 0
+        3
+    else
+        1
+
+// LE Connection Update Complete with `status`, the answer of a Controller whose peer refused the request.
+fn update_complete_status(handle: Int, status: Int) -> [u8]
+    var params: [u8] = [status as u8]
+    list.append(params, le16(handle))
+    list.append(params, le16(0))
+    list.append(params, le16(0))
+    list.append(params, le16(0))
+    le_meta(0x03, params)
+
 fn remote_request(handle: Int, lo: Int, hi: Int, latency: Int, timeout: Int) -> [u8]
     var params: [u8] = []
     list.append(params, le16(handle))
@@ -158,6 +185,13 @@ fn answer(var l: ScriptLink, opcode: Int, params: [u8])
         list.push(l.inbox, status_event(opcode, ok_status))
         let handle = (params[0] as Int) | ((params[1] as Int) << 8)
         list.push(l.inbox, update_complete(handle, (params[2] as Int) | ((params[3] as Int) << 8), (params[6] as Int) | ((params[7] as Int) << 8), (params[8] as Int) | ((params[9] as Int) << 8)))
+    else if opcode == hci_commands.opcode_le_set_default_phy() and l.refuse_phy
+        list.push(l.inbox, complete(opcode, 0x11, []))
+    else if opcode == hci_commands.opcode_le_set_phy()
+        // The octets are Connection_Handle (2), All_PHYs, TX_PHYS, RX_PHYS and PHY_options (2).
+        list.push(l.inbox, status_event(opcode, ok_status))
+        let handle = (params[0] as Int) | ((params[1] as Int) << 8)
+        list.push(l.inbox, phy_update_complete(handle, 0, phy_of_mask(params[3] as Int), phy_of_mask(params[4] as Int)))
     else
         list.push(l.inbox, complete(opcode, ok_status, []))
 
@@ -226,6 +260,13 @@ fn call<P: HostPolicy[f], B: BondStore[g]>(var h: Host, var l: ScriptLink, var p
             None => ()
     noble.failed(noble.LAYER_LOCAL, noble.E_TIMEOUT)
 
+// The commands the bring-up sends for the key `default_phy`: LE Set Default PHY when it is not 0.
+fn default_phy_commands() -> Int
+    if noble.CONFIG.DEFAULT_PHY != 0
+        1
+    else
+        0
+
 // A Host that has started: the Controller answered the bring-up commands.
 fn started<P: HostPolicy[f], B: BondStore[g]>(var h: Host, var l: ScriptLink, var p: P, var b: B) [f, g, mutate]
     let st = call(var h, var l, var p, var b, Request.Start)
@@ -252,7 +293,7 @@ fn test_start_brings_the_controller_up_and_queues_ready()
     test.assert(h.api.ready)
     // Reset first, then the masks, the buffers, two draws of the seed and the address.
     test.assert_eq(l.commands[0], hci_commands.opcode_hci_reset())
-    test.assert_eq(list.len(l.commands), 7)
+    test.assert_eq(list.len(l.commands), 7 + default_phy_commands())
     test.assert(h.security.ready)
     test.assert_eq(h.own_address[0] as Int, 0xA1)
 
@@ -269,7 +310,7 @@ fn test_start_takes_a_static_random_address_when_the_controller_has_no_public_on
     var b = RamBonds { rows: Vec.new() }
     started(var h, var l, var p, var b)
     test.assert(h.api.ready)
-    test.assert_eq(list.len(l.commands), 9)
+    test.assert_eq(list.len(l.commands), 9 + default_phy_commands())
     test.assert_eq(l.commands[7], hci_commands.opcode_le_rand())
     test.assert_eq(l.commands[8], hci_commands.opcode_le_set_random_address())
     test.assert_eq(h.api.own_kind, 1)
@@ -516,6 +557,7 @@ fn next_kind(var h: Host) -> Int
         Some(Event.CocClosed(_, _, _)) => 15
         Some(Event.DatabaseChanged(_)) => 16
         Some(Event.Dropped(_)) => 17
+        Some(Event.PhyUpdated(_, _, _)) => 18
         None => -1
 
 const EV_ADVERT = 1
@@ -789,6 +831,200 @@ fn test_update_params_changes_the_connection_and_queues_params_updated()
     // Parameters the specification refuses are not accepted.
     let bad = ConnParams { interval_min: 4, interval_max: 2, latency: 0, timeout: 400 }
     test.assert(host_api.begin(var h, Request.UpdateParams(conn, bad)).is(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
+
+// A Peripheral's request for other parameters is answered by its Controller with the code the Central's Link Layer refused it with
+// (LE Connection Update Complete, [Vol 4] Part E, Section 7.7.65.3): 0x02 from a Central that has not finished the connection (BlueZ at the
+// first events), 0x1E for a range it does not allow.  The Host passes the code on as an HCI status and queues no ParamsUpdated.
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
+@test
+fn test_an_update_the_central_refuses_answers_with_the_code_the_central_gave()
+    var h = new_host(2)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    list.push(l.inbox, connection_complete(0, 0x41, 1, peer_octets(1)))
+    run(var h, var l, var p, var b, 1)
+    var conn = noble.no_conn()
+    match host_api.next_event(var h)
+        Some(Event.Connected(c, _, _, _)) => conn = c
+        Some(_) => test.fail("Connected is queued")
+        None => test.fail("Connected is queued")
+    let want = ConnParams { interval_min: 6, interval_max: 12, latency: 0, timeout: 400 }
+    var sent = 0
+    for code in [0x02, 0x1E]
+        // The Controller takes the command and the Central refuses it two events later.
+        l.mute = true
+        test.assert(host_api.begin(var h, Request.UpdateParams(conn, want)).is_ok())
+        run(var h, var l, var p, var b, 1)
+        sent = sent + 1
+        test.assert_eq(times_sent(l, hci_commands.opcode_le_connection_update()), sent)
+        list.push(l.inbox, status_event(hci_commands.opcode_le_connection_update(), 0))
+        run(var h, var l, var p, var b, 1)
+        test.assert(host_api.result(var h) == None)
+        list.push(l.inbox, update_complete_status(0x41, code))
+        run(var h, var l, var p, var b, 1)
+        match host_api.result(var h)
+            Some(st) => test.assert(st.is(noble.LAYER_HCI, code))
+            None => test.fail("the refusal ends the call")
+        test.assert_eq(next_kind(var h), -1)
+    // The link is as it was, and the same call made again with the Controller answering is accepted.
+    l.mute = false
+    let st = call(var h, var l, var p, var b, Request.UpdateParams(conn, want))
+    test.assert(st.is_ok())
+
+// ── The PHY ─────────────────────────────────────────────────────────
+
+// The command that was sent last with `opcode`, as its parameter octets, or an empty list.
+fn last_parameters(l: ScriptLink, opcode: Int) -> [u8]
+    var found: [u8] = []
+    for c in l.cmdlog
+        if list.len(c) >= 4 and ((c[1] as Int) | ((c[2] as Int) << 8)) == opcode
+            found = c[4:]
+    found
+
+// A connection of the Host as the Central, and its name.
+fn one_link<P: HostPolicy[f], B: BondStore[g]>(var h: Host, var l: ScriptLink, var p: P, var b: B, role: Int) -> ConnId [f, g, mutate]
+    list.push(l.inbox, connection_complete(0, 0x41, role, peer_octets(1)))
+    run(var h, var l, var p, var b, 1)
+    var conn = noble.no_conn()
+    match host_api.next_event(var h)
+        Some(Event.Connected(c, _, _, _)) => conn = c
+        Some(_) => test.fail("Connected is queued")
+        None => test.fail("Connected is queued")
+    conn
+
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32 and noble.CONFIG.PHY_EVENTS != 0)
+@test
+fn test_set_phy_asks_the_controller_and_queues_the_phy_in_use()
+    var h = new_host(2)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    let conn = one_link(var h, var l, var p, var b, 1)
+    let st = call(var h, var l, var p, var b, Request.SetPhy(conn, 0x02, 0x03))
+    test.assert(st.is_ok())
+    // Connection_Handle, All_PHYs 0, TX_PHYS 2, RX_PHYS 3, PHY_options 0.
+    let sent = last_parameters(l, hci_commands.opcode_le_set_phy())
+    test.assert_eq(list.len(sent), 7)
+    test.assert_eq(sent[0] as Int, 0x41)
+    test.assert_eq(sent[2] as Int, 0)
+    test.assert_eq(sent[3] as Int, 0x02)
+    test.assert_eq(sent[4] as Int, 0x03)
+    match host_api.next_event(var h)
+        Some(Event.PhyUpdated(c, tx, rx)) =>
+            test.assert_eq(tx as Int, 2)
+            test.assert_eq(rx as Int, 2)
+        Some(_) => test.fail("PhyUpdated is queued")
+        None => test.fail("PhyUpdated is queued")
+    // A mask of 0 is no preference: the bit of All_PHYs is set.
+    let none = call(var h, var l, var p, var b, Request.SetPhy(conn, 0x00, 0x01))
+    test.assert(none.is_ok())
+    test.assert_eq(last_parameters(l, hci_commands.opcode_le_set_phy())[2] as Int, 0x01)
+    // A link that is gone is stale.
+    test.assert(host_api.begin(var h, Request.SetPhy(noble.no_conn(), 0x02, 0x02)).is(noble.LAYER_LOCAL, noble.E_STALE))
+
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32 and noble.CONFIG.PHY_EVENTS != 0)
+@test
+fn test_a_phy_the_peer_or_the_controller_refuses_answers_the_hci_status_and_a_central_may_change_it_unasked()
+    var h = new_host(2)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    let conn = one_link(var h, var l, var p, var b, 1)
+    // The Controller takes the command, and the procedure fails (Unsupported Remote Feature, 0x1A): the call ends with that status and
+    // queues no event.
+    l.mute = true
+    test.assert(host_api.begin(var h, Request.SetPhy(conn, 0x02, 0x02)).is_ok())
+    run(var h, var l, var p, var b, 1)
+    list.push(l.inbox, status_event(hci_commands.opcode_le_set_phy(), 0))
+    list.push(l.inbox, phy_update_complete(0x41, 0x1A, 1, 1))
+    run(var h, var l, var p, var b, 2)
+    match host_api.result(var h)
+        Some(st) => test.assert(st.is(noble.LAYER_HCI, 0x1A))
+        None => test.fail("the refusal ends the call")
+    test.assert_eq(next_kind(var h), -1)
+    // The Controller refuses the command itself.
+    test.assert(host_api.begin(var h, Request.SetPhy(conn, 0x02, 0x02)).is_ok())
+    run(var h, var l, var p, var b, 1)
+    list.push(l.inbox, status_event(hci_commands.opcode_le_set_phy(), 0x0C))
+    run(var h, var l, var p, var b, 1)
+    match host_api.result(var h)
+        Some(st) => test.assert(st.is(noble.LAYER_HCI, 0x0C))
+        None => test.fail("the status ends the call")
+    // The Central changes the PHY with no call in flight: the event is queued for the link.  An event of a handle that is no link is not.
+    list.push(l.inbox, phy_update_complete(0x41, 0, 2, 2))
+    list.push(l.inbox, phy_update_complete(0x55, 0, 2, 2))
+    run(var h, var l, var p, var b, 2)
+    match host_api.next_event(var h)
+        Some(Event.PhyUpdated(c, tx, rx)) =>
+            test.assert_eq(c.slot as Int, conn.slot as Int)
+            test.assert_eq(tx as Int, 2)
+        Some(_) => test.fail("PhyUpdated is queued")
+        None => test.fail("PhyUpdated is queued")
+    test.assert_eq(next_kind(var h), -1)
+    // A failed update nobody asked for is not an event.
+    list.push(l.inbox, phy_update_complete(0x41, 0x1A, 1, 1))
+    run(var h, var l, var p, var b, 1)
+    test.assert_eq(next_kind(var h), -1)
+
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32 and noble.CONFIG.DEFAULT_PHY != 0)
+@test
+fn test_the_start_writes_the_default_phy_of_the_configuration_and_comes_up_when_the_controller_refuses_it()
+    var h = new_host(2)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    let sent = last_parameters(l, hci_commands.opcode_le_set_default_phy())
+    test.assert_eq(list.len(sent), 3)
+    test.assert_eq(sent[1] as Int, noble.CONFIG.DEFAULT_PHY)
+    test.assert_eq(sent[2] as Int, noble.CONFIG.DEFAULT_PHY)
+    // A Controller that answers the command with an error has come up all the same.
+    var h2 = new_host(2)
+    var l2 = script_link()
+    l2.refuse_phy = true
+    started(var h2, var l2, var p, var b)
+    test.assert(h2.api.ready)
+
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32 and noble.CONFIG.PHY_EVENTS == 0)
+@test
+fn test_a_build_without_phy_events_refuses_set_phy_and_does_not_unmask_the_event()
+    var h = new_host(2)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    let conn = one_link(var h, var l, var p, var b, 1)
+    test.assert(host_api.begin(var h, Request.SetPhy(conn, 0x02, 0x02)).is(noble.LAYER_LOCAL, noble.E_REFUSED))
+    // The LE event mask is the 8 octets of the third command; bit 11 is clear.
+    let mask = last_parameters(l, hci_commands.opcode_le_set_event_mask())
+    test.assert_eq(list.len(mask), 8)
+    test.assert_eq((mask[1] as Int) & 0x08, 0)
+
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32 and noble.CONFIG.PHY_EVENTS != 0)
+@test
+fn test_a_build_with_phy_events_unmasks_the_event()
+    var h = new_host(2)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    let mask = last_parameters(l, hci_commands.opcode_le_set_event_mask())
+    test.assert_eq(list.len(mask), 8)
+    test.assert_eq((mask[1] as Int) & 0x08, 0x08)
+
+@when(noble.CONFIG.DEFAULT_PHY == 0)
+@test
+fn test_the_start_writes_no_default_phy_when_the_key_is_zero()
+    var h = new_host(2)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    test.assert_eq(times_sent(l, hci_commands.opcode_le_set_default_phy()), 0)
 
 // ── One call at a time ──────────────────────────────────────────────
 
@@ -1533,6 +1769,7 @@ fn kind_of(e: Event) -> Int
         CocClosed(_, _, _) => 15
         DatabaseChanged(_) => 16
         Dropped(_) => 17
+        PhyUpdated(_, _, _) => 18
 
 const EV_NOTIFICATION = 8
 const EV_WRITTEN = 9

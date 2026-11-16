@@ -109,8 +109,8 @@ fn test_fragmentation_and_flow_control()
     let _ = completed(var link, 0x0040, 9)
     test.assert_eq(links.acl_free(link.credits.pool), 2)
 
-// The Server Rx MTU is the configuration key `max_att_mtu`, as the key's documentation says ("the largest ATT_MTU offered"); it was
-// 65 whatever the key was (bugs/orbit/the-hosts-att-server-answers-an-mtu-exchange-with-65-whatever-max-att-mtu-says.md).
+// The Server Rx MTU is the configuration key `max_att_mtu`, as the key's documentation says ("the largest ATT_MTU offered"); the test holds it to the key,
+// so that an MTU exchange is not answered with a fixed 65 for every setting.
 @test
 fn test_the_server_rx_mtu_is_the_configuration_key()
     test.assert_eq(ATT_SERVER_RX_MTU, noble.CONFIG.MAX_ATT_MTU)

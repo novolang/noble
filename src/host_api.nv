@@ -63,7 +63,7 @@ use l2cap_coc
 use le_link
 use links
 use noble
-use noble.{ Action, Addr, Bond, BondStore, ConnId, ConnInfo, ConnParams, Event, HostPolicy, IoCap, Request, Role, Security, Status, Value }
+use noble.{ Action, Addr, Bond, BondStore, CallLifeEvent, CallLifeState, ConnId, ConnInfo, ConnParams, Event, HostPolicy, IoCap, Request, Role, Security, Status, Value }
 use noble.CONFIG
 use smp
 use smp_bond
@@ -349,33 +349,27 @@ pub fn next_event(var h: Host) -> ?Event
 
 // End the call in flight with `st`.
 fn finish(var h: Host, st: Status)
-    h.api.op.done = true
+    h.api.op.call.step(CallLifeEvent.Finish)
     h.api.op.status = st
     h.api.kind = noble.R_NONE
     h.api.step = 0
-    if h.api.internal
-        // A call the Host started for itself has no caller to read it.
-        h.api.internal = false
-        h.api.op.busy = false
-        h.api.op.done = false
 
-// Give up the call in flight.  The Controller may still answer the command that was sent for it;
-// the answer is taken and dropped.
+// Give up the call in flight.  The commands it queued and the Controller has not been given are dropped.  The
+// Controller may still answer the command that was sent for it; the answer reaches the next call, which takes only
+// the answers it is waiting for (`start_answered` checks the opcode of each step).
 pub fn abandon(var h: Host)
-    h.api.internal = false
-    h.api.op.busy = false
-    h.api.op.done = false
+    h.queued = []
+    h.api.op.call.step(CallLifeEvent.Abandon)
     h.api.kind = noble.R_NONE
     h.api.step = 0
 
 // The outcome of the call in flight: None until it has ended.  Reading it frees the Host for the
 // next call.
 pub fn result(var h: Host) -> ?Status
-    if not h.api.op.done
+    if h.api.op.call.state != CallLifeState.Done
         return None
     let st = h.api.op.status
-    h.api.op.busy = false
-    h.api.op.done = false
+    h.api.op.call.step(CallLifeEvent.Take)
     Some(st)
 
 // The connection a finished `Connect` made, and the channel a finished `CocOpen` opened; they
@@ -404,11 +398,17 @@ pub fn conn_info(h: Host, conn: ConnId) -> ?ConnInfo
 // E_NO_ROOM when the Host holds `max_links` connections.  An accepted call is carried out by the
 // next `poll`, and its outcome is read with `result`.
 pub fn begin(var h: Host, req: Request) -> Status
-    if h.api.op.busy
+    if h.api.op.call.state != CallLifeState.Idle
         return noble.failed(noble.LAYER_LOCAL, noble.E_BUSY)
     var kind = noble.R_NONE
     match req
-        Request.Start => kind = noble.R_START
+        Request.Start =>
+            // A Start begins with HCI Reset, which the Controller takes whatever it was doing, so the Host forgets the
+            // command it was waiting for: a Controller that was not listening when the last Start asked never answers it,
+            // and the Host would wait for that answer for good.
+            h.cmd_wait = -1
+            h.queued = []
+            kind = noble.R_START
         _ =>
             if not h.api.ready
                 return noble.failed(noble.LAYER_LOCAL, noble.E_NOT_READY)
@@ -563,8 +563,7 @@ pub fn begin(var h: Host, req: Request) -> Status
                     h.api.r_data = data
                     kind = noble.R_INDICATE
                 Request.Start => ()
-    h.api.op.busy = true
-    h.api.op.done = false
+    h.api.op.call.step(CallLifeEvent.Accept(false))
     h.api.op.status = noble.ok()
     h.api.kind = kind
     h.api.step = 0
@@ -657,6 +656,7 @@ fn kick<P: HostPolicy[f], B: BondStore[g]>(var h: Host, var p: P, var b: B) [f, 
         return
     let kind = h.api.kind
     h.api.step = 1
+    h.api.op.call.step(CallLifeEvent.Kick)
     if kind == noble.R_START
         send_cmd(var h, hci_commands.opcode_hci_reset(), [])
     else if kind == noble.R_CONNECT
@@ -752,10 +752,10 @@ fn timers<P: HostPolicy[f], B: BondStore[g]>(var h: Host, var p: P, var b: B) [f
             le_link.tick(var h.le.slots[slot], h.clock_ms)
             host_activate(var h, slot)
             if h.link.central
-                if h.smp_central.phase != smp_core.Phase.Idle
+                if smp_core.is_pairing(h.smp_central)
                     feed_initiator(var h, slot, smp_initiator.Tick, var p, var b)
             else
-                if h.smp.phase != smp_core.Phase.Idle
+                if smp_core.is_pairing(h.smp)
                     feed_responder(var h, slot, smp_responder.Tick, var p, var b)
     // A reconnection the policy asked for and whose time has come.
     if h.api.due_ms >= 0 and h.clock_ms >= h.api.due_ms
@@ -915,7 +915,28 @@ fn command_answered<P: HostPolicy[f], B: BondStore[g]>(var h: Host, opcode: Int,
 // (twice) and the public address (Read BD_ADDR).  The seed makes the key pair and the random
 // numbers of the Security Manager.
 
+// The opcode whose answer the bring-up waits for at `step`: the command the previous step sent.
+fn start_step_opcode(step: Int) -> Int
+    if step == 1
+        return hci_commands.opcode_hci_reset()
+    if step == 2
+        return hci_commands.opcode_hci_set_event_mask()
+    if step == 3
+        return hci_commands.opcode_le_set_event_mask()
+    if step == 4
+        return hci_commands.opcode_le_read_buffer_size()
+    if step == 5 or step == 6 or step == 8
+        return hci_commands.opcode_le_rand()
+    if step == 7
+        return hci_commands.opcode_read_bd_addr()
+    if step == START_PHY_STEP
+        return hci_commands.opcode_le_set_default_phy()
+    hci_commands.opcode_le_set_random_address()
+
 fn start_answered(var h: Host, opcode: Int, status: Int, rp: [u8])
+    // The answer to a command of an earlier Start, or to one nobody asked for, is not the answer to this step.
+    if opcode != start_step_opcode(h.api.step)
+        return
     if noble.CONFIG.DEFAULT_PHY != 0 and h.api.step == START_PHY_STEP
         // A Controller that refuses the preference (a PHY it lacks) has come up all the same.
         start_done(var h)
@@ -1336,7 +1357,7 @@ fn sec_pdu<P: HostPolicy[f], B: BondStore[g]>(var h: Host, slot: Int, pdu: [u8],
     if h.link.central
         feed_initiator(var h, slot, smp_initiator.Pdu(pdu), var p, var b)
         return
-    if smp.is_pairing_request(pdu) and h.smp.phase == smp_core.Phase.Idle
+    if smp.is_pairing_request(pdu) and not smp_core.is_pairing(h.smp)
         let auth = smp.pairing_auth_req(pdu)
         let level = if smp.auth_req_sc(auth) and smp.auth_req_mitm(auth) then 4 else if smp.auth_req_mitm(auth) then 3 else 2
         let conn = h.api.conns[slot].id
@@ -2007,12 +2028,10 @@ fn restart_advertising(var h: Host)
     let p = h.api.adv_p
     if how == noble.ADVERTISE_NON_CONNECTABLE or link_count(h) >= h.api.max_links
         h.api.adv_p = noble.AdvParams { extended: p.extended, connectable: false, scannable: p.scannable, interval_min_ms: p.interval_min_ms, interval_max_ms: p.interval_max_ms, duration_ms: p.duration_ms }
-    h.api.op.busy = true
-    h.api.op.done = false
+    h.api.op.call.step(CallLifeEvent.Accept(true))
     h.api.op.status = noble.ok()
     h.api.kind = noble.R_ADV_START
     h.api.step = 0
-    h.api.internal = true
 
 // ── Scan filter ─────────────────────────────────────────────────────
 
@@ -2493,5 +2512,5 @@ fn layer_b_timers<P: HostPolicy[f], B: BondStore[g]>(var h: Host, var p: P, var 
                     finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_TIMEOUT))
                 else if not gatt_server.indication_pending(h.link.att, h.api.r_attr.handle as Int)
                     finish(var h, noble.ok())
-    if h.api.advertise != 0 and h.api.adv_valid and not h.api.op.busy and h.api.ready
+    if h.api.advertise != 0 and h.api.adv_valid and h.api.op.call.state == CallLifeState.Idle and h.api.ready
         restart_advertising(var h)

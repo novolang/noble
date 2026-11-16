@@ -31,40 +31,122 @@ const MAX_HELD_KEYS = 5
 // Devices remembered for repeated attempts.
 const ATTEMPT_RECORDS = 4
 
-// ── The Security Manager Timer ──────────────────────────────────────
+// ── The pairing of one link ─────────────────────────────────────────
 //
-// [Vol 3] Part H, Section 3.4: the timer starts with a Pairing Request or a
-// Security Request, restarts each time a command is queued or a Keypress
-// Notification arrives, stops when the pairing ends, and when it runs out no
-// SMP command is sent on the connection again until the next one.  A machine
-// of its own, so the deadline is armed by the row that enters `Running` and
-// cancelled by the row that leaves it; the handler reads `deadline()` and
-// calls `expire` when it has passed.  `now` is the handler's clock.
-state_machine SmpTimer
+// One machine holds what the Security Manager is waiting for and the
+// Security Manager Timer that watches it.  [Vol 3] Part H, Section 3.4: the
+// timer starts with a Pairing Request or a Security Request, restarts each
+// time a command is queued or a Keypress Notification arrives, stops when the
+// pairing ends, and when it runs out no SMP command is sent on the connection
+// again until the next one.  Every state in which the Security Manager waits
+// for a command carries `after 30 s Timeout`, so the deadline is armed by the
+// row that enters the state and cancelled by the row that leaves it; the
+// handler reads `deadline()` and calls `expire` when it has passed.  `now` is
+// the handler's clock.
+//
+// The states.
+//   Idle               nothing runs: no pairing and no timer
+//   Requested          the timer runs and no pairing does: a Security Request
+//                      was sent, or the Central asked the Controller to
+//                      encrypt with a bond.  A Security Request arms the timer
+//                      while the phase is Idle, which an `after` on entering a
+//                      phase cannot say, so the state is its own.  `is_pairing`
+//                      is false for it, as it was for the phase Idle
+//   PairingResponse .. KeyDistribution
+//                      the phases of a pairing, in the order of the procedure;
+//                      the comments at the rows name what each one waits for
+//   TimedOut           the timer ran out; stays until the next connection
+//
+// The events are the steps of the procedure and not the phases they lead to:
+// a step says what happened (the features were exchanged, the nonces were
+// exchanged, the keys went out), and the row says which phase follows.  A step
+// that no row takes in the state the pairing is in is refused, and the hook of
+// `core.rt.machine_hook` sees it.
+state_machine LinkPairing
     states
-        Stopped
-        Running
+        Idle
+        Requested
+        // Initiating device: Pairing Request sent, waiting for the Pairing
+        // Response.
+        PairingResponse
+        // LE legacy pairing, responding device: waiting for LP_CONFIRM_I.
+        // Initiating device: LP_CONFIRM_I sent, waiting for LP_CONFIRM_R.
+        LegacyConfirm
+        // LE legacy pairing: the confirm values are exchanged, waiting for the
+        // peer's random value.
+        LegacyRandom
+        // LE Secure Connections: waiting for the peer's Pairing Public Key.
+        PublicKeyExchange
+        // LE Secure Connections: waiting for Cai or Cbi (Passkey Entry, one per
+        // round) or for Cb (Just Works, Numeric Comparison).
+        ScConfirm
+        // LE Secure Connections: waiting for the peer's nonce.
+        ScRandom
+        // Authentication stage 2: waiting for the peer's DHKey Check, the
+        // DHKey, or the user.
+        DhKeyCheck
+        // Key generation done: waiting for the link to be encrypted with the
+        // STK or LTK.
+        Encryption
+        // Key distribution: this device's keys are sent, the peer's are
+        // expected.
+        KeyDistribution
         TimedOut
     events
-        Start
+        // A Security Request went out, or encryption with a bond was asked for.
+        Request
+        // The Pairing Request went out (the initiating device).
+        Ask
+        // The features are exchanged: `sc` is whether LE Secure Connections run.
+        Features(sc: Bool)
+        // Both confirm values of LE legacy pairing are on the wire.
+        ConfirmsExchanged
+        // The Short Term Key is made and the random values are exchanged.
+        StkDerived
+        // The public keys are exchanged; `wait` is whether a confirm value of
+        // the peer comes next (otherwise a nonce does).
+        KeysExchanged(wait: Bool)
+        // This device's confirm value went out, the peer's nonce comes next.
+        ConfirmSent
+        // Nonces are exchanged; `more` is whether another Passkey Entry round
+        // follows.
+        NonceExchanged(more: Bool)
+        // Authentication stage 2 is done.
+        Checked
+        // The keys of this device went out (or the next of the peer's came in).
+        Distribute
+        // A command was queued or a Keypress Notification arrived.
         Touch
-        Stop
-        Timeout
+        // The pairing ended, by completing or failing.
+        End
+        // The connection started or ended.
         Reset
+        Timeout
     transitions
-        (Stopped, Start)   => Running after 30 s Timeout
-        (Running, Start)   => Running after 30 s Timeout
-        (Running, Touch)   => Running after 30 s Timeout
-        (Running, Stop)    => Stopped
-        (Running, Timeout) => TimedOut
-        (_, Reset)         => Stopped
-        (Stopped, Touch)   => _
-        (TimedOut, Touch)  => _
-        (Stopped, Stop)    => _
-        (TimedOut, Stop)   => _
-        (TimedOut, Start)  => _
+        (_, Reset)                                                   => Idle
+        (TimedOut, _)                                                => _
+        (Idle, Request)                                              => Requested after 30 s Timeout
+        (Requested, Request)                                         => Requested after 30 s Timeout
+        (Idle, Ask)                                                  => PairingResponse after 30 s Timeout
+        (Requested, Ask)                                             => PairingResponse after 30 s Timeout
+        (Idle, Features(sc))                                         => (if sc then PublicKeyExchange else LegacyConfirm) after 30 s Timeout
+        (Requested, Features(sc))                                    => (if sc then PublicKeyExchange else LegacyConfirm) after 30 s Timeout
+        (PairingResponse, Features(sc))                              => (if sc then PublicKeyExchange else LegacyConfirm) after 30 s Timeout
+        (LegacyConfirm, ConfirmsExchanged)                           => LegacyRandom after 30 s Timeout
+        (LegacyRandom, StkDerived)                                   => Encryption after 30 s Timeout
+        (PublicKeyExchange, KeysExchanged(wait))                     => (if wait then ScConfirm else ScRandom) after 30 s Timeout
+        (ScConfirm, ConfirmSent)                                     => ScRandom after 30 s Timeout
+        (ScRandom, NonceExchanged(more))                             => (if more then ScConfirm else DhKeyCheck) after 30 s Timeout
+        (DhKeyCheck, Checked)                                        => Encryption after 30 s Timeout
+        (Encryption, Distribute)                                     => KeyDistribution after 30 s Timeout
+        (KeyDistribution, Distribute)                                => KeyDistribution after 30 s Timeout
+        (Idle, Touch)                                                => _
+        (_, Touch)                                                   => self.state after 30 s Timeout
+        (_, Timeout)                                                 => TimedOut
+        (Idle, End)                                                  => _
+        (_, End)                                                     => Idle
 
-// ── Roles and phases of one pairing ─────────────────────────────────
+// ── The role of one pairing ─────────────────────────────────────────
 
 // The end of the pairing this state runs: the initiating device is the
 // Central, the responding device the Peripheral (Section 2.4).
@@ -72,36 +154,6 @@ state_machine SmpTimer
 enum Role
     Initiator
     Responder
-
-@value
-enum Phase
-    // No pairing in progress.
-    Idle
-    // Initiating device: Pairing Request sent, waiting for the Pairing
-    // Response.
-    PairingResponse
-    // LE legacy pairing, responding device: waiting for LP_CONFIRM_I.
-    // Initiating device: LP_CONFIRM_I sent, waiting for LP_CONFIRM_R.
-    LegacyConfirm
-    // LE legacy pairing: the confirm values are exchanged, waiting for the
-    // peer's random value.
-    LegacyRandom
-    // LE Secure Connections: waiting for the peer's Pairing Public Key.
-    PublicKeyExchange
-    // LE Secure Connections: waiting for Cai or Cbi (Passkey Entry, one per
-    // round) or for Cb (Just Works, Numeric Comparison).
-    ScConfirm
-    // LE Secure Connections: waiting for the peer's nonce.
-    ScRandom
-    // Authentication stage 2: waiting for the peer's DHKey Check, the
-    // DHKey, or the user.
-    DhKeyCheck
-    // Key generation done: waiting for the link to be encrypted with the
-    // STK or LTK.
-    Encryption
-    // Key distribution: this device's keys are sent, the peer's are
-    // expected.
-    KeyDistribution
 
 // What a half does with a command after the checks both ends make.
 //   Ignore      nothing: a reserved Code, a command after the timer ran
@@ -279,7 +331,7 @@ struct AttemptRecord
 
 // ── State ───────────────────────────────────────────────────────────
 //
-// The fields from `phase` down to `peer_csrk` belong to one pairing and
+// The fields from `preq` down to `peer_csrk` belong to one pairing and
 // are cleared when it ends; `attempts`, the random number generator, the
 // key pair and the counters outlive connections.  `peer_check` and
 // `held_keys` are the responding device's (the initiator's DHKey Check
@@ -299,13 +351,12 @@ struct PairingState
     var peer_address: [u8]
     var bond: ?SmpBond
     var encrypting_with_bond: Bool
-    var timer: SmpTimer
+    var pairing: LinkPairing
     var requested_level: Int
     var legacy_oob_tk: [u8]
     var peer_oob_r: [u8]
     var peer_oob_c: [u8]
     var local_oob_r: [u8]
-    var phase: Phase
     var preq: [u8]
     var pres: [u8]
     var sc: Bool
@@ -358,9 +409,9 @@ fn new_pairing_state(role: Role, config: SmpConfig, key_pair: KeyPair, seed: [u8
         role: role, config: config, key_pair: key_pair, rng: smp_keys.random_from_seed(seed), now: 0, outbox: [],
         own_address_type: 0, own_address: smp_keys.zeros(6), peer_address_type: 0,
         peer_address: smp_keys.zeros(6), bond: None, encrypting_with_bond: false,
-        timer: SmpTimer.new(), requested_level: 0, legacy_oob_tk: [],
+        pairing: LinkPairing.new(), requested_level: 0, legacy_oob_tk: [],
         peer_oob_r: [], peer_oob_c: [], local_oob_r: [],
-        phase: Phase.Idle, preq: [], pres: [], sc: false, method: Method.JustWorks, key_size: 16,
+        preq: [], pres: [], sc: false, method: Method.JustWorks, key_size: 16,
         bonding: false, keypress: false, init_dist: 0, resp_dist: 0, tk: [], passkey: -1,
         local_rand: [], peer_confirm: [], peer_rand: [], peer_key: empty_key(), dhkey: [],
         dhkey_wanted: false, peer_check: [], check_sent: false, numeric_confirmed: false, round: 0,
@@ -375,10 +426,10 @@ fn copy(s: PairingState) -> PairingState
         role: s.role, config: s.config, key_pair: s.key_pair, rng: s.rng, now: s.now, outbox: [],
         own_address_type: s.own_address_type, own_address: s.own_address[:],
         peer_address_type: s.peer_address_type, peer_address: s.peer_address[:], bond: s.bond,
-        encrypting_with_bond: s.encrypting_with_bond, timer: s.timer,
+        encrypting_with_bond: s.encrypting_with_bond, pairing: s.pairing,
         requested_level: s.requested_level, legacy_oob_tk: s.legacy_oob_tk[:],
         peer_oob_r: s.peer_oob_r[:], peer_oob_c: s.peer_oob_c[:], local_oob_r: s.local_oob_r[:],
-        phase: s.phase, preq: s.preq[:], pres: s.pres[:], sc: s.sc, method: s.method, key_size: s.key_size,
+        preq: s.preq[:], pres: s.pres[:], sc: s.sc, method: s.method, key_size: s.key_size,
         bonding: s.bonding, keypress: s.keypress, init_dist: s.init_dist, resp_dist: s.resp_dist,
         tk: s.tk[:], passkey: s.passkey, local_rand: s.local_rand[:], peer_confirm: s.peer_confirm[:],
         peer_rand: s.peer_rand[:], peer_key: s.peer_key, dhkey: s.dhkey[:], dhkey_wanted: s.dhkey_wanted,
@@ -393,8 +444,7 @@ fn copy(s: PairingState) -> PairingState
 
 // Clear the fields of one pairing and stop the timer.
 fn end_pairing(var s: PairingState)
-    s.phase = Phase.Idle
-    s.timer.step(SmpTimerEvent.Stop, s.now)
+    step(var s, LinkPairingEvent.End)
     s.preq = []
     s.pres = []
     s.tk = []
@@ -434,7 +484,9 @@ fn dhkey_request(s: PairingState) -> ?PublicKey
 
 // True while a pairing is in progress on this connection.
 fn is_pairing(s: PairingState) -> Bool
-    s.phase != Phase.Idle
+    match s.pairing.state
+        Idle | Requested | TimedOut => false
+        _                           => true
 
 // True when the private key should be replaced: [Vol 3] Part H,
 // Section 2.3.6 recommends a new key pair when S + 3F > 8, S successful
@@ -477,21 +529,19 @@ fn has(bits: Int, bit: Int) -> Bool
 // Queue `pdu`; queuing a command resets a running timer (Section 3.4).
 fn send(var s: PairingState, pdu: [u8])
     list.push(s.outbox, pdu[:])
-    s.timer.step(SmpTimerEvent.Touch, s.now)
+    step(var s, LinkPairingEvent.Touch)
 
-fn start_timer(var s: PairingState)
-    s.timer.step(SmpTimerEvent.Start, s.now)
-
-fn stop_timer(var s: PairingState)
-    s.timer.step(SmpTimerEvent.Stop, s.now)
+// Give the machine of the pairing one step at the handler's clock.
+fn step(var s: PairingState, e: LinkPairingEvent)
+    s.pairing.step(e, s.now)
 
 // True when the Security Manager Timer has run out.
 fn timer_due(s: PairingState) -> Bool
-    s.timer.deadline() >= 0 and s.now >= s.timer.deadline()
+    s.pairing.deadline() >= 0 and s.now >= s.pairing.deadline()
 
 // True from the moment the timer ran out until the next connection.
 fn timed_out(s: PairingState) -> Bool
-    s.timer.state == SmpTimerState.TimedOut
+    s.pairing.state == LinkPairingState.TimedOut
 
 fn draw(var s: PairingState) -> [u8]
     let d = smp_keys.random_draw(s.rng)
@@ -512,7 +562,7 @@ fn draw_passkey(var s: PairingState) -> Int
 @satisfies("REQ-BLE-SMP-024")
 fn abort(var s: PairingState, reason: Reason, attempt: Bool)
     send(var s, smp.build_pairing_failed(smp.reason_code(reason)))
-    if s.phase != Phase.Idle
+    if is_pairing(s)
         s.failures = s.failures + 1
     if attempt
         record_failure(var s)
@@ -525,8 +575,9 @@ fn decline(var s: PairingState, reason: Reason)
 // The Security Manager Timer ran out: no SMP command is sent on this
 // connection again (Section 3.4).
 fn expire(var s: PairingState)
-    s.timer.expire(s.now)
-    s.failures = s.failures + (if s.phase != Phase.Idle then 1 else 0)
+    let was_pairing = is_pairing(s)
+    s.pairing.expire(s.now)
+    s.failures = s.failures + (if was_pairing then 1 else 0)
     end_pairing(var s)
 
 // A connection starts: the addresses the Controller reported and the bond
@@ -534,7 +585,7 @@ fn expire(var s: PairingState)
 fn link_up(var s: PairingState, own_type: Int, own_address: [u8], peer_type: Int,
            peer_address: [u8], bond: ?SmpBond)
     end_pairing(var s)
-    s.timer.step(SmpTimerEvent.Reset, s.now)
+    step(var s, LinkPairingEvent.Reset)
     s.encrypting_with_bond = false
     s.own_address_type = own_type
     s.own_address = own_address[:]
@@ -545,11 +596,11 @@ fn link_up(var s: PairingState, own_type: Int, own_address: [u8], peer_type: Int
 // The connection ends.  True when a pairing was running, which the caller
 // reports as failed.
 fn link_down(var s: PairingState) -> Bool
-    let was_pairing = s.phase != Phase.Idle
+    let was_pairing = is_pairing(s)
     if was_pairing
         s.failures = s.failures + 1
     end_pairing(var s)
-    s.timer.step(SmpTimerEvent.Reset, s.now)
+    step(var s, LinkPairingEvent.Reset)
     s.encrypting_with_bond = false
     s.bond = None
     was_pairing
@@ -638,7 +689,7 @@ fn classify(var s: PairingState, pdu: [u8]) -> Received
         return Received.Ignore
     let command = known!
     if command == Command.PairingFailed
-        if s.phase == Phase.Idle
+        if not is_pairing(s)
             return Received.Ignore
         let reason = if list.len(pdu) >= 2
             pdu[1] as Int
@@ -650,11 +701,11 @@ fn classify(var s: PairingState, pdu: [u8]) -> Received
     if not s.config.pairing_supported
         return Received.Refuse(Reason.PairingNotSupported)
     if list.len(pdu) != smp.command_length(pdu[0] as Int)
-        if s.phase == Phase.Idle
+        if not is_pairing(s)
             return Received.Refuse(Reason.InvalidParameters)
         return Received.Fail(Reason.InvalidParameters)
     if command == Command.PairingKeypressNotification
-        s.timer.step(SmpTimerEvent.Touch, s.now)
+        step(var s, LinkPairingEvent.Touch)
         return Received.Ignore
     Received.Handle(command)
 
@@ -888,7 +939,7 @@ fn dhkey_check_b(s: PairingState, keys: ScKeys) -> [u8]
 // pairing it is also the TK.
 @satisfies("REQ-BLE-SMP-003")
 fn take_passkey(var s: PairingState, passkey: Int) -> Taken
-    if s.phase == Phase.Idle or not local_user_types(s) or s.passkey >= 0
+    if not is_pairing(s) or not local_user_types(s) or s.passkey >= 0
         return Taken.Ignored
     if passkey < 0 or passkey > 999999
         return Taken.Refused(Reason.PasskeyEntryFailed)
@@ -900,7 +951,7 @@ fn take_passkey(var s: PairingState, passkey: Int) -> Taken
 // The user's answer to Numeric Comparison.
 @satisfies("REQ-BLE-SMP-020")
 fn take_numeric(var s: PairingState, accepted: Bool) -> Taken
-    if s.method != Method.NumericComparison or s.phase != Phase.DhKeyCheck or s.numeric_confirmed
+    if s.method != Method.NumericComparison or s.pairing.state != LinkPairingState.DhKeyCheck or s.numeric_confirmed
         return Taken.Ignored
     if not accepted
         return Taken.Refused(Reason.NumericComparisonFailed)
@@ -921,7 +972,7 @@ fn take_dhkey(var s: PairingState, dhkey: [u8]) -> Taken
 // (Section 3.5.8): only when both devices set the Keypress flag.
 @satisfies("REQ-BLE-SMP-017")
 fn send_keypress(var s: PairingState, notification_type: Int)
-    if s.keypress and local_user_types(s) and s.phase != Phase.Idle and notification_type >= 0 and notification_type <= smp.SMP_KEYPRESS_ENTRY_COMPLETED
+    if s.keypress and local_user_types(s) and is_pairing(s) and notification_type >= 0 and notification_type <= smp.SMP_KEYPRESS_ENTRY_COMPLETED
         send(var s, smp.build_keypress_notification(notification_type))
 
 // ── Transport Specific Key Distribution ([Vol 3] Part H, Section 3.6)
@@ -993,7 +1044,7 @@ fn expect_distribution(var s: PairingState)
 fn expect_next_key(var s: PairingState) -> Bool
     expect_key(var s, first_expected_code(s.expect_dist))
     if s.expecting
-        s.phase = Phase.KeyDistribution
+        step(var s, LinkPairingEvent.Distribute)
         return true
     false
 
@@ -1094,7 +1145,7 @@ fn conclude(var s: PairingState) -> PairingResult
 // one was sent, is answered (Section 3.4).  Answers the level of the
 // bond.
 fn bond_encryption_established(var s: PairingState) -> Int
-    s.timer.step(SmpTimerEvent.Stop, s.now)
+    step(var s, LinkPairingEvent.End)
     s.requested_level = 0
     smp_bond.security_level(s.bond!)
 

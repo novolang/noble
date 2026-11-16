@@ -297,6 +297,46 @@ fn test_start_brings_the_controller_up_and_queues_ready()
     test.assert(h.security.ready)
     test.assert_eq(h.own_address[0] as Int, 0xA1)
 
+// A Controller that is not listening when the Host asks (it comes up a second later) leaves the Host's first Start unanswered: the Adapter gives
+// the call up after its five seconds and the product asks again.  The second Start must bring the Controller up as the first would have, and
+// the Controller's late answer to the first Reset, if it comes, must not move the second Start by a step.
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_start_asked_again_after_one_nobody_answered_brings_the_controller_up()
+    var h = new_host(2)
+    var l = script_link()
+    var p = DefaultPolicy { placeholder: 0 }
+    var b = RamBonds { rows: Vec.new() }
+    l.mute = true
+    let first = call(var h, var l, var p, var b, Request.Start)
+    test.assert_eq(first.is_ok(), false)
+    host_api.abandon(var h)
+    test.assert(not h.api.ready)
+    l.mute = false
+    started(var h, var l, var p, var b)
+    test.assert(h.api.ready)
+    test.assert_eq(h.own_address[0] as Int, 0xA1)
+    test.assert_eq(l.commands[list.len(l.commands) - 1 - default_phy_commands()], hci_commands.opcode_read_bd_addr())
+
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
+@test
+fn test_the_late_answer_to_an_abandoned_start_does_not_move_the_next_one()
+    var h = new_host(2)
+    var l = script_link()
+    var p = DefaultPolicy { placeholder: 0 }
+    var b = RamBonds { rows: Vec.new() }
+    l.mute = true
+    let first = call(var h, var l, var p, var b, Request.Start)
+    test.assert_eq(first.is_ok(), false)
+    host_api.abandon(var h)
+    l.mute = false
+    // The Controller was slow and answers the first Reset now, then every command it is sent.
+    list.push(l.inbox, complete(hci_commands.opcode_hci_reset(), 0, []))
+    started(var h, var l, var p, var b)
+    test.assert(h.api.ready)
+    test.assert_eq(h.own_address[0] as Int, 0xA1)
+    test.assert_eq(h.api.seed.len(), 16)
+
 // A Controller with no public address (Read BD_ADDR answers six zero octets, as the SoftDevice Controller does on the bench, where the
 // first run of ble_scan found the Controller refusing LE Set Scan Enable with Invalid HCI Command Parameters): the Host draws a
 // third random number, makes a static random address of it, sends LE Set Random Address and uses the random type from then on.

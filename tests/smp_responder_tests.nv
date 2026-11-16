@@ -5,7 +5,7 @@
 use std.test
 use smp
 use smp_core
-use smp_core.{ Phase, Method, SmpConfig, PairingResult }
+use smp_core.{ LinkPairingState, Method, SmpConfig, PairingResult }
 use smp_keys
 use smp_keys.{ PublicKey, KeyPair }
 use smp_bond
@@ -149,7 +149,7 @@ fn test_the_pairing_response_asks_mitm_only_for_a_model_that_can_give_it()
     test.assert_eq(pres[3] as Int & smp.SMP_AUTHREQ_MITM, 0)
     test.assert(r.state.method == Method.JustWorks)
     let st = legacy_phase2(r.state, preq, pres, smp_keys.zeros(16), hex("00112233445566778899aabbccddeeff"))
-    test.assert(st.phase == Phase.Encryption)
+    test.assert(st.pairing.state == LinkPairingState.Encryption)
     // An initiator that can give MITM keeps the request: the flag is the
     // pairing's own, not dropped with the model that cannot reach it.
     let k = connected(config_with(smp.SMP_IO_CAP_DISPLAY_ONLY), no_key_pair())
@@ -190,7 +190,7 @@ fn test_reserved_auth_req_bits_are_ignored_and_never_sent()
     test.assert_eq(pres[5] as Int, 0)
     test.assert_eq(pres[6] as Int, 0)
     let st = legacy_phase2(r.state, preq, pres, smp_keys.zeros(16), hex("00112233445566778899aabbccddeeff"))
-    test.assert(st.phase == Phase.Encryption)
+    test.assert(st.pairing.state == LinkPairingState.Encryption)
 
 @test
 fn test_wrong_confirm_fails_and_earns_a_waiting_interval()
@@ -359,7 +359,7 @@ fn test_a_key_that_arrives_before_the_encryption_completes()
     test.assert(r.state.method == Method.JustWorks)
     let rand_i = hex("5783D52156AD6F0E6388274EC6702EE0")
     let st = legacy_phase2(r.state, preq, pres, smp_keys.zeros(16), rand_i)
-    test.assert(st.phase == Phase.Encryption)
+    test.assert(st.pairing.state == LinkPairingState.Encryption)
     test.assert_eq(st.expect_dist, smp.SMP_KEY_DIST_SIGN)
     // The Central's CSRK, before any Encryption Change event.
     let csrk = hex("e36479e25c581b8b682c8cd151b482c0")
@@ -494,7 +494,7 @@ fn test_peer_pairing_failed_ends_the_pairing_without_a_waiting_interval()
         smp_keys.zeros(16),
         hex("2112131415161718191a1b1c1d1e1f20"))
     let enc2 = handle(st2, EncryptionChanged(true), 140)
-    test.assert(enc2.state.phase == Phase.KeyDistribution)
+    test.assert(enc2.state.pairing.state == LinkPairingState.KeyDistribution)
     let rejected = handle(enc2.state, Pdu(smp.build_pairing_failed(smp.SMP_FAIL_KEY_REJECTED)), 150)
     test.assert_eq(list.len(rejected.pdus), 0)
     test.assert_eq(action_int(rejected), 0x100 + smp.SMP_FAIL_KEY_REJECTED)
@@ -556,7 +556,7 @@ fn test_keypress_notifications_only_when_both_set_keypress()
     test.assert_eq(list.len(handle(without.state, SendKeypress(0), 5).pdus), 0)
     // A received notification restarts the timer (Section 3.4).
     let k = handle(with.state, Pdu(smp.build_keypress_notification(1)), 20000)
-    test.assert_eq(k.state.timer.deadline(), 50000)
+    test.assert_eq(k.state.pairing.deadline(), 50000)
 
 @test
 fn test_method_selection_tables()
@@ -786,7 +786,7 @@ fn test_sc_passkey_displayed_by_the_responder()
     test.assert_eq(action_name(run.first), "display")
     let passkey = action_int(run.first)
     let rounds = passkey_rounds(run, run.state, passkey)
-    test.assert(rounds.step.state.phase == Phase.DhKeyCheck)
+    test.assert(rounds.step.state.pairing.state == LinkPairingState.DhKeyCheck)
     let r = smp_keys.passkey_r(passkey)
     let e = sc_stage2(run, rounds.step.state, rounds.na, rounds.nb, r, r)
     test.assert_eq(e.pdus[0][0] as Int, smp.SMP_OP_PAIRING_DHKEY_CHECK)
@@ -818,7 +818,7 @@ fn test_sc_passkey_typed_by_the_responder()
     // Typed before the first Cai, the rounds run straight through.
     let early = handle(run.state, PasskeyEntered(123456), 20).state
     let rounds = passkey_rounds(run, early, 123456)
-    test.assert(rounds.step.state.phase == Phase.DhKeyCheck)
+    test.assert(rounds.step.state.pairing.state == LinkPairingState.DhKeyCheck)
 
 @test
 fn test_sc_invalid_public_keys_fail_with_dhkey_check_failed()

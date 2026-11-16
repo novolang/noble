@@ -79,7 +79,7 @@
 use smp
 use smp.{ Command, Reason }
 use smp_core
-use smp_core.{ Role, Phase, Method, SmpConfig }
+use smp_core.{ Role, LinkPairingEvent, LinkPairingState, Method, SmpConfig }
 use smp_keys
 use smp_keys.{ PublicKey, KeyPair }
 use smp_bond
@@ -161,7 +161,7 @@ pub enum SmpInitAction
 // ── State ───────────────────────────────────────────────────────────
 //
 // The state of both halves is smp_core.PairingState: the fields from
-// `phase` down to `peer_csrk` belong to one pairing and are cleared when
+// `preq` down to `peer_csrk` belong to one pairing and are cleared when
 // it ends; the random number generator and the key pair outlive
 // connections.  `check_sent` records that Ea went out, so a later DHKey
 // or user answer does not send a second one.
@@ -233,7 +233,7 @@ fn refuse(var s: SmpInitState, reason: Reason) -> SmpInitStep
 // A Pairing Failed answer to a command the procedure does not expect:
 // refused outside a pairing, a failure of the pairing inside one.
 fn reject(var s: SmpInitState, reason: Reason) -> SmpInitStep
-    if s.phase == Phase.Idle
+    if not is_pairing(s)
         refuse(var s, reason)
     else
         fail(var s, reason)
@@ -276,14 +276,14 @@ fn local_oob_flag(s: SmpInitState, sc: Bool) -> Bool
 @satisfies("REQ-BLE-SMP-014")
 @satisfies("REQ-BLE-SMP-032")
 fn start_pairing(var s: SmpInitState, level: Int) -> SmpInitStep
-    if s.phase != Phase.Idle or smp_core.timed_out(s)
+    if is_pairing(s) or smp_core.timed_out(s)
         return finish(s, None)
     match s.bond
         Some(b) =>
             if list.len(b.ltk) == 16
                 s.requested_level = level
                 s.encrypting_with_bond = true
-                smp_core.start_timer(var s)
+                smp_core.step(var s, LinkPairingEvent.Request)
                 return finish(s, Some(bond_encryption(b)))
         None    => ()
     s.requested_level = level
@@ -299,9 +299,8 @@ fn start_pairing(var s: SmpInitState, level: Int) -> SmpInitStep
     s.preq = preq[:]
     s.pres = []
     s.replaced_bond = s.bond != None
-    smp_core.start_timer(var s)
     smp_core.send(var s, preq)
-    s.phase = Phase.PairingResponse
+    smp_core.step(var s, LinkPairingEvent.Ask)
     finish(s, None)
 
 // The Pairing Response, and with it the association model
@@ -314,7 +313,7 @@ fn start_pairing(var s: SmpInitState, level: Int) -> SmpInitStep
 @satisfies("REQ-BLE-SMP-030")
 @satisfies("REQ-BLE-SMP-032")
 fn on_pairing_response(var s: SmpInitState, pdu: [u8]) -> SmpInitStep
-    if s.phase != Phase.PairingResponse
+    if s.pairing.state != LinkPairingState.PairingResponse
         return fail(var s, Reason.UnspecifiedReason)
     let resp_io = pdu[1] as Int
     let resp_oob = pdu[2] as Int
@@ -367,13 +366,12 @@ fn on_pairing_response(var s: SmpInitState, pdu: [u8]) -> SmpInitStep
     smp_core.settle(var s, sc, method, key_size, bonding,
                     smp_core.has(req_auth, smp.SMP_AUTHREQ_KEYPRESS) and smp_core.has(resp_auth, smp.SMP_AUTHREQ_KEYPRESS),
                     init_dist, resp_dist)
+    smp_core.step(var s, LinkPairingEvent.Features(sc))
     var action: ?SmpInitAction = None
     if sc
         // The initiator's Pairing Public Key goes first (Figure 2.4).
         smp_core.send(var s, smp.build_pairing_public_key(s.key_pair.public_key.x, s.key_pair.public_key.y))
-        s.phase = Phase.PublicKeyExchange
     else
-        s.phase = Phase.LegacyConfirm
         s.local_rand = smp_core.draw(var s)
         if method == Method.JustWorks
             s.tk = smp_keys.zeros(16)
@@ -402,7 +400,6 @@ fn legacy_confirm_possible(s: SmpInitState) -> Bool
 fn legacy_send_confirm(var s: SmpInitState)
     if legacy_confirm_possible(s)
         smp_core.send(var s, smp.build_pairing_confirm(smp_core.legacy_confirm_value(s, s.local_rand)))
-        s.phase = Phase.LegacyConfirm
 
 @satisfies("REQ-BLE-SMP-006")
 fn on_legacy_confirm(var s: SmpInitState, pdu: [u8]) -> SmpInitStep
@@ -410,7 +407,7 @@ fn on_legacy_confirm(var s: SmpInitState, pdu: [u8]) -> SmpInitStep
     // LP_RAND_I goes out once LP_CONFIRM_R is in, so both confirms are on
     // the wire before either random is (Section 2.3.5.5).
     smp_core.send(var s, smp.build_pairing_random(s.local_rand))
-    s.phase = Phase.LegacyRandom
+    smp_core.step(var s, LinkPairingEvent.ConfirmsExchanged)
     finish(s, None)
 
 @satisfies("REQ-BLE-SMP-007")
@@ -428,7 +425,7 @@ fn on_legacy_random(var s: SmpInitState, pdu: [u8]) -> SmpInitStep
         return fail(var s, Reason.ConfirmValueFailed)
     s.peer_rand = rand_r[:]
     s.session_key = smp_core.legacy_short_term_key(s, rand_r)
-    s.phase = Phase.Encryption
+    smp_core.step(var s, LinkPairingEvent.StkDerived)
     finish(s, Some(StartEncryption(s.session_key, 0, smp_keys.zeros(8))))
 
 // ── LE Secure Connections, the Long Term Key generation ([Vol 3]
@@ -447,7 +444,7 @@ fn on_public_key(var s: SmpInitState, pdu: [u8]) -> SmpInitStep
     var action: ?SmpInitAction = None
     if smp_core.is_passkey_entry(s)
         s.round = 0
-        s.phase = Phase.ScConfirm
+        smp_core.step(var s, LinkPairingEvent.KeysExchanged(true))
         if s.method == Method.PasskeyDisplay
             // The responder displays; this device's user types it.
             action = Some(RequestPasskey)
@@ -468,17 +465,17 @@ fn on_public_key(var s: SmpInitState, pdu: [u8]) -> SmpInitStep
             return fail(var s, Reason.ConfirmValueFailed)
         s.local_rand = smp_core.draw(var s)
         smp_core.send(var s, smp.build_pairing_random(s.local_rand))
-        s.phase = Phase.ScRandom
+        smp_core.step(var s, LinkPairingEvent.KeysExchanged(false))
     else
         // Just Works and Numeric Comparison: Na goes out once the
         // responder's Cb is in, and there is no Ca.
-        s.phase = Phase.ScConfirm
+        smp_core.step(var s, LinkPairingEvent.KeysExchanged(true))
     finish(s, action)
 
 // Cai = f4(PKax, PKbx, Nai, Zi), once the passkey and the round's Na are
 // known (Section 2.3.5.6.3).
 fn passkey_send_confirm(var s: SmpInitState)
-    if s.passkey >= 0 and s.phase == Phase.ScConfirm and list.len(s.peer_confirm) == 0
+    if s.passkey >= 0 and s.pairing.state == LinkPairingState.ScConfirm and list.len(s.peer_confirm) == 0
         smp_core.send(var s, smp.build_pairing_confirm(smp_core.passkey_round_confirm(var s)))
 
 // Cb, in Passkey Entry the round's Cbi and otherwise the one the
@@ -491,7 +488,7 @@ fn on_sc_confirm(var s: SmpInitState, pdu: [u8]) -> SmpInitStep
     else
         s.local_rand = smp_core.draw(var s)
     smp_core.send(var s, smp.build_pairing_random(s.local_rand))
-    s.phase = Phase.ScRandom
+    smp_core.step(var s, LinkPairingEvent.ConfirmSent)
     finish(s, None)
 
 fn on_sc_random(var s: SmpInitState, pdu: [u8]) -> SmpInitStep
@@ -506,7 +503,7 @@ fn on_sc_random(var s: SmpInitState, pdu: [u8]) -> SmpInitStep
         if s.round < smp_core.PASSKEY_ROUNDS
             // The next round's Cai goes out at once (Section 2.3.5.6.3).
             s.local_rand = []
-            s.phase = Phase.ScConfirm
+            smp_core.step(var s, LinkPairingEvent.NonceExchanged(true))
             passkey_send_confirm(var s)
         else
             // The twentieth round's Nai and Nbi STAY.  They are the Na and
@@ -514,7 +511,7 @@ fn on_sc_random(var s: SmpInitState, pdu: [u8]) -> SmpInitStep
             // last round's nonces with the f5 and f6 values that follow it,
             // and the rig found the failure of a dropped one -- f5 over an
             // empty nonce, and a Lower Tester answering DHKey Check Failed.
-            s.phase = Phase.DhKeyCheck
+            smp_core.step(var s, LinkPairingEvent.NonceExchanged(false))
     else
         if s.method == Method.OutOfBand
             // The Out of band model's Cb check again, for the case where
@@ -526,7 +523,7 @@ fn on_sc_random(var s: SmpInitState, pdu: [u8]) -> SmpInitStep
                 return fail(var s, Reason.ConfirmValueFailed)
         else if not smp_keys.equal_ct(smp_keys.sc_confirm(s.peer_key.x, smp_core.local_x(s), nb, 0), s.peer_confirm)
             return fail(var s, Reason.ConfirmValueFailed)
-        s.phase = Phase.DhKeyCheck
+        smp_core.step(var s, LinkPairingEvent.NonceExchanged(false))
         if s.method == Method.NumericComparison
             action = Some(ConfirmNumericValue(smp_core.numeric_comparison_value(s)))
     try_e_check(var s)
@@ -538,7 +535,7 @@ fn on_sc_random(var s: SmpInitState, pdu: [u8]) -> SmpInitStep
 @satisfies("REQ-BLE-SMP-016")
 @satisfies("REQ-BLE-SMP-027")
 fn try_e_check(var s: SmpInitState) -> ?SmpInitStep
-    if s.phase != Phase.DhKeyCheck or list.len(s.dhkey) != 32 or s.check_sent
+    if s.pairing.state != LinkPairingState.DhKeyCheck or list.len(s.dhkey) != 32 or s.check_sent
         return None
     if s.method == Method.NumericComparison and not s.numeric_confirmed
         return None
@@ -553,13 +550,13 @@ fn try_e_check(var s: SmpInitState) -> ?SmpInitStep
 @satisfies("REQ-BLE-SMP-026")
 @satisfies("REQ-BLE-SMP-033")
 fn on_dhkey_check(var s: SmpInitState, pdu: [u8]) -> SmpInitStep
-    if s.phase != Phase.DhKeyCheck or not s.check_sent or list.len(s.dhkey) != 32
+    if s.pairing.state != LinkPairingState.DhKeyCheck or not s.check_sent or list.len(s.dhkey) != 32
         return fail(var s, Reason.UnspecifiedReason)
     let keys = smp_core.sc_keys_of(s)
     if not smp_keys.equal_ct(smp_core.dhkey_check_b(s, keys), smp.field_bytes(pdu, 1, 16))
         return fail(var s, Reason.DhKeyCheckFailed)
     s.session_key = smp_keys.mask_key(keys.ltk, s.key_size)
-    s.phase = Phase.Encryption
+    smp_core.step(var s, LinkPairingEvent.Checked)
     finish(s, Some(StartEncryption(s.session_key, 0, smp_keys.zeros(8))))
 
 fn send_e_check_or_wait(var s: SmpInitState) -> SmpInitStep
@@ -574,7 +571,7 @@ fn send_e_check_or_wait(var s: SmpInitState) -> SmpInitStep
 // the responder's or complete.
 fn start_key_distribution(var s: SmpInitState) -> SmpInitStep
     smp_core.send_local_keys(var s)
-    s.phase = Phase.KeyDistribution
+    smp_core.step(var s, LinkPairingEvent.Distribute)
     smp_core.expect_distribution(var s)
     next_expected(var s)
 
@@ -609,7 +606,7 @@ fn on_command(var s: SmpInitState, command: Command, pdu: [u8]) -> SmpInitStep
         // The Peripheral asks for security (Section 3.6.7): the pairing
         // starts at the level its AuthReq asks for, and a request that
         // arrives while a pairing runs is ignored.
-        if s.phase != Phase.Idle
+        if is_pairing(s)
             return finish(s, None)
         let auth = pdu[1] as Int
         let level = if smp.auth_req_mitm(auth)
@@ -620,25 +617,25 @@ fn on_command(var s: SmpInitState, command: Command, pdu: [u8]) -> SmpInitStep
     if command == Command.PairingRequest
         // Only the initiating device sends one (Section 3.5.1).
         return reject(var s, Reason.CommandNotSupported)
-    let p = s.phase
-    if p == Phase.PairingResponse and command == Command.PairingResponse
+    let p = s.pairing.state
+    if p == LinkPairingState.PairingResponse and command == Command.PairingResponse
         return on_pairing_response(var s, pdu)
     // LP_CONFIRM_R counts only after LP_CONFIRM_I has gone out (Figure
     // 2.2): taking it earlier would send LP_RAND_I with no confirm
     // before it, and a peer holding both could search the passkey.
-    if p == Phase.LegacyConfirm and command == Command.PairingConfirm and list.len(s.peer_confirm) == 0 and legacy_confirm_possible(s)
+    if p == LinkPairingState.LegacyConfirm and command == Command.PairingConfirm and list.len(s.peer_confirm) == 0 and legacy_confirm_possible(s)
         return on_legacy_confirm(var s, pdu)
-    if p == Phase.LegacyRandom and command == Command.PairingRandom
+    if p == LinkPairingState.LegacyRandom and command == Command.PairingRandom
         return on_legacy_random(var s, pdu)
-    if p == Phase.PublicKeyExchange and command == Command.PairingPublicKey
+    if p == LinkPairingState.PublicKeyExchange and command == Command.PairingPublicKey
         return on_public_key(var s, pdu)
-    if p == Phase.ScConfirm and command == Command.PairingConfirm and list.len(s.peer_confirm) == 0
+    if p == LinkPairingState.ScConfirm and command == Command.PairingConfirm and list.len(s.peer_confirm) == 0
         return on_sc_confirm(var s, pdu)
-    if p == Phase.ScRandom and command == Command.PairingRandom
+    if p == LinkPairingState.ScRandom and command == Command.PairingRandom
         return on_sc_random(var s, pdu)
-    if p == Phase.DhKeyCheck and command == Command.PairingDhKeyCheck and s.check_sent
+    if p == LinkPairingState.DhKeyCheck and command == Command.PairingDhKeyCheck and s.check_sent
         return on_dhkey_check(var s, pdu)
-    if p == Phase.KeyDistribution or p == Phase.Encryption and s.expecting
+    if p == LinkPairingState.KeyDistribution or p == LinkPairingState.Encryption and s.expecting
         return on_distributed_key(var s, pdu)
     reject(var s, Reason.UnspecifiedReason)
 
@@ -646,11 +643,11 @@ fn on_command(var s: SmpInitState, command: Command, pdu: [u8]) -> SmpInitStep
 
 @satisfies("REQ-BLE-SMP-033")
 fn on_encryption_changed(var s: SmpInitState, enabled: Bool) -> SmpInitStep
-    if s.phase == Phase.Encryption
+    if s.pairing.state == LinkPairingState.Encryption
         if enabled
             return start_key_distribution(var s)
         return fail(var s, Reason.UnspecifiedReason)
-    if s.phase == Phase.Idle and s.encrypting_with_bond
+    if not is_pairing(s) and s.encrypting_with_bond
         s.encrypting_with_bond = false
         if enabled
             return finish(s, Some(SecurityEstablished(smp_core.bond_encryption_established(var s))))
@@ -662,7 +659,7 @@ fn on_encryption_changed(var s: SmpInitState, enabled: Bool) -> SmpInitStep
         // another encryption attempt with a key the peer no longer has
         // (GAP/SEC/SEM/BV-45-C is the case that measures it: its Lower
         // Tester fails the encryption and the IUT pairs again).
-        s.timer.step(SmpTimerEvent.Stop, s.now)
+        smp_core.step(var s, LinkPairingEvent.End)
         s.requested_level = 0
         let lost = s.bond!
         s.bond = None
@@ -757,7 +754,7 @@ pub fn handle(state: SmpInitState, input: SmpInitInput, now_ms: Int) -> SmpInitS
             smp_core.reseed(var s, seed)
             finish(s, None)
         Cancel                                                          =>
-            if s.phase == Phase.Idle
+            if not is_pairing(s)
                 return finish(s, None)
             fail(var s, Reason.UnspecifiedReason)
 

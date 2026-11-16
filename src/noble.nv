@@ -846,13 +846,53 @@ enum Request
 // ── The call in flight ──────────────────────────────────────────────
 // HCI allows one command at a time and the GATT client one ATT transaction per
 // bearer, so the Host takes one call at a time and answers a second with
-// E_BUSY.  `Op` is the record of that call: `begin` sets `busy`, the engine
-// sets `done` and `status` when the call ends, and `result` reads them and
-// clears the record.  `conn` and `chan` are what a call that makes a link or a
+// E_BUSY.  `Op` is the record of that call: `begin` accepts the call into the
+// machine `CallLife`, the engine ends it and sets `status`, and `result` reads
+// the status and clears the record.  A call is pending in every state but Idle.  `conn` and `chan` are what a call that makes a link or a
 // channel answers.
+// The life of the call in flight.
+//   Idle       no call; the next `begin` is accepted
+//   Accepted   `begin` took the call and the next `poll` starts it
+//   Running    the call's first step is sent and its answers are awaited
+//   Done       the call ended and its status waits for `result`
+//
+// `internal` is a call the Host made for itself (the restart of advertising): no application waits for its status, so
+// the row that ends it goes to Idle and not to Done.
+state_machine CallLife
+    fields
+        var internal: Bool = false
+    states
+        Idle
+        Accepted
+        Running
+        Done
+    events
+        // `begin` accepted a call; `internal` says the Host made it for itself.
+        Accept(internal: Bool)
+        // `poll` sent the first step of the call.
+        Kick
+        // The engine ended the call, with success or without.
+        Finish
+        // `result` read the status of a call that ended.
+        Take
+        // The product gave the call up.
+        Abandon
+    transitions
+        (Idle, Accept(own)) =>
+            self.internal = own
+            Accepted
+        (Accepted, Kick)                          => Running
+        (Accepted, Finish) if self.internal       => Idle
+        (Running, Finish) if self.internal        => Idle
+        (Accepted, Finish)                        => Done
+        (Running, Finish)                         => Done
+        (Done, Take)                              => Idle
+        (_, Abandon)                              => Idle
+    enter Idle
+        self.internal = false
+
 pub struct Op
-    var busy: Bool
-    var done: Bool
+    var call: CallLife
     var status: Status
     var conn: ConnId
     var chan: u8
@@ -894,7 +934,7 @@ fn from_client_uuid(u: gatt_client.Uuid) -> Uuid
 
 // The record of no call.  `Op` is a plain struct, made once with the `Host`.
 fn idle_op() -> Op
-    Op { busy: false, done: false, status: ok(), conn: no_conn(), chan: 0, value: Vec.new() }
+    Op { call: CallLife.new(), status: ok(), conn: no_conn(), chan: 0, value: Vec.new() }
 
 // The larger of `n` and 1: a table whose key is 0 keeps one record.
 @tier(embedded)
@@ -1026,8 +1066,6 @@ pub struct Api
     var adv_interval: Int
     // The advertising the Host restarts by itself (`ADVERTISE_*`, the same as `advertise` but kept until the restart runs).
     var adv_again: Int
-    // A call the Host started for itself (the restart above): it holds `op.busy` but no application waits for it.
-    var internal: Bool
     // Scanning: the filter the Host applies to each report, and whether the Controller scans.
     var scan_f: ScanFilter
     var scan_p: ScanParams
@@ -1094,7 +1132,7 @@ pub fn api_new(max_links: Int) -> Api
         attempts: 0, due_ms: -1, reconnecting: false, advertise: 0, coc_psm: 0, coc_mtu: 0, coc_need: Security.Open,
         bondable: true, sc_only: false, min_key_size: 7, seed: Vec.new(), own_kind: 0, ask: ask, ans: ans,
         adv_valid: false, adv_on: false, adv_ext: false, adv_periodic: false, adv_set: 0, adv_p: adv_legacy(),
-        adv_data: Vec.new(), adv_rsp: Vec.new(), adv_interval: 0, adv_again: 0, internal: false,
+        adv_data: Vec.new(), adv_rsp: Vec.new(), adv_interval: 0, adv_again: 0,
         scan_f: scan_all(), scan_p: scan_passive(), scan_on: false, sync_handle: -1, r_sid: 0, r_skip: 0, r_timeout: 0,
         r_attr: Attr { handle: 0, props: 0, cccd: 0 }, r_data: Vec.new(), r_svc: uuid16(0), r_mode: 0, r_response: true,
         r_cursor: 0, r_phase: 0, svc_count: 0, pend: pend, pend_attr: pend_attr, pend_off: pend_off, pend_ms: pend_ms,

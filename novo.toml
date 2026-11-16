@@ -1,6 +1,6 @@
 [package]
 name        = "noble"
-version     = "0.2.2"
+version     = "0.3.0"
 description = "The Host of the noble Bluetooth Low Energy stack, written to Core 6.3: the HCI session, the link table, L2CAP and credit based channels, ATT, the GATT server and client, GAP and the advertisers, the Security Manager and bonding, privacy, and the isochronous transport.  Talks to a Controller only through the noble-hci seam."
 license     = "Apache-2.0"
 stability   = "experimental"
@@ -38,9 +38,9 @@ sibling_check = "warn"
 coverage_floor = 0
 
 [dependencies]
-noble-hci = { path = "../noble-hci" }
+noble-hci = "^0.1.2"
 # The software AES-128, AES-CMAC and P-256 the Security Manager and the Database Hash use.
-crypto-ble-ecc = { path = "../crypto-ble-ecc" }
+crypto-ble-ecc = "^0.1.0"
 
 # Package configuration (docs/config.md).  One [config.<key>] table for each limit of the Host core, with the `device` profile
 # as the default.  A consumer writes a [noble] section in its config file; the generated module is `noble.CONFIG`, read in the

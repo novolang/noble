@@ -1273,13 +1273,9 @@ fn from_profile_error(e: profile_builder.ProfileError) -> Status
 // An `Adapter` holds a Host, the transport, the product's policy and its bond store, so a program does not thread four values
 // through every call.  Its methods start a call with `begin`, run the Host until the call ends or the timeout passes, and answer
 // the `Status`.  A method that can wait carries `[async]`: the task parks in the transport's `park` (by default
-// a wait on the waker of the task, `core.rt.park`) between two turns of the Host.  Nothing in this layer reads a clock but through the transport's `now_ms`.
+// a wait on the waker of the task, `core.rt.park`) between two turns of the Host, for as long as the call has left or until the nearest
+// timer of the Host that names its own time falls due (`host_api.next_due_ms`).  Nothing in this layer reads a clock but through the transport's `now_ms`.
 // planning/NOBLE-HOST-API-SKETCH.md sections 3.5, 3.6, 3.10 and 3.13 are the design.
-
-// The longest a turn of the Adapter parks, in milliseconds: the timers of the Host (the ATT transaction timeout, the supervision
-// of a pairing, a reconnection that is due) advance at the turns, so a transport that returns from `park` only when a packet
-// arrives still turns the Host at least this often.
-const PARK_SLICE_MS = 50
 
 // What `connect` and `connect_listed` answer: the outcome, and the name of the link they made.
 pub @value
@@ -1353,11 +1349,12 @@ impl Adapter
             match host_api.result(var self.host)
                 Some(done) => return done
                 None => ()
-            let waited = self.io.now_ms() - t0
+            let now = self.io.now_ms()
+            let waited = now - t0
             if waited >= timeout_ms
                 host_api.abandon(var self.host)
                 return failed(LAYER_LOCAL, E_TIMEOUT)
-            self.io.park(park_for(timeout_ms - waited))
+            self.io.park(park_for(timeout_ms - waited, host_api.next_due_ms(var self.host), now))
         ok()
 
     // Bring the Controller up: reset, the event masks, the buffer sizes, the random seed and the address.  `Event.Ready` is queued
@@ -1375,20 +1372,26 @@ impl Adapter
             match host_api.next_event(var self.host)
                 Some(ev) => return Some(ev)
                 None => ()
-            let waited = self.io.now_ms() - t0
+            let now = self.io.now_ms()
+            let waited = now - t0
             if waited >= timeout_ms
                 return None
-            self.io.park(park_for(timeout_ms - waited))
+            self.io.park(park_for(timeout_ms - waited, host_api.next_due_ms(var self.host), now))
         None
 
+// How long a turn of the Adapter parks, in milliseconds: until the call ends (`remaining_ms`) or the nearest timer of the Host falls
+// due (`due_ms`, from `host_api.next_due_ms`, on the clock `now_ms`; -1 for none), whichever is first, and at least 1.  The timers of
+// the Host (the supervision of a pairing, a reconnection that is due, the protocol clean-ups of 30 s) advance at the turns, so a
+// transport that returns from `park` only when a packet arrives still turns the Host when a pairing or a reconnection is due.
 @tier(embedded)
-fn park_for(remaining_ms: Int) -> Int
-    if remaining_ms > PARK_SLICE_MS
-        PARK_SLICE_MS
-    else if remaining_ms < 1
+fn park_for(remaining_ms: Int, due_ms: Int, now_ms: Int) -> Int
+    var ms = remaining_ms
+    if due_ms >= 0 and due_ms - now_ms < ms
+        ms = due_ms - now_ms
+    if ms < 1
         1
     else
-        remaining_ms
+        ms
 
 // ── GAP: advertising data ───────────────────────────────────────────
 

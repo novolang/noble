@@ -2514,3 +2514,40 @@ fn layer_b_timers<P: HostPolicy[f], B: BondStore[g]>(var h: Host, var p: P, var 
                     finish(var h, noble.ok())
     if h.api.advertise != 0 and h.api.adv_valid and h.api.op.call.state == CallLifeState.Idle and h.api.ready
         restart_advertising(var h)
+
+// ── The next deadline ───────────────────────────────────────────────
+
+// The earlier of two times on the clock of the Host, where -1 stands for none.
+fn sooner(a: Int, b: Int) -> Int
+    if a < 0
+        b
+    else if b < 0 or a <= b
+        a
+    else
+        b
+
+// The deadline of the pairing machine of a link (`after 30 s` on every waiting phase, the Security Request's `Requested` among
+// them), -1 while none is armed.
+fn pairing_due(s: smp_core.PairingState) -> Int
+    s.pairing.deadline()
+
+// The deadline of the pairing on the connection in `slot`, in the half that its role runs.  The state of the active connection is the
+// Host's own; with more than one connection the others are parked.
+fn pairing_due_of(h: Host, slot: Int, central: Bool) -> Int
+    if noble.CONFIG.MAX_CONNECTIONS > 1
+        if slot != h.active
+            let session = h.parked[slot]
+            return pairing_due(if central then session.smp_central else session.smp)
+    pairing_due(if central then h.smp_central else h.smp)
+
+// The time, on the clock of the Host, at which the nearest of the timers that name their own time falls due, or -1 when none is
+// running: the reconnection the policy asked for (`Action.Reconnect`) and the Security Manager Timer of a pairing.  The Adapter parks
+// no longer than until this time (`noble.park_for`).  The protocol clean-ups of 30 s (the ATT transaction timeout, the signaling
+// request of a link, a read or write held for the application) are advanced at every turn, and a turn comes at the latest when the
+// call that waits runs out; they ask for no turn of their own, which keeps this function, in every Host image, to a few hundred bytes.
+pub fn next_due_ms(var h: Host) -> Int
+    var due = h.api.due_ms
+    for slot in 0..le_link.le_links_slots(h.le)
+        if h.api.conns[slot].live
+            due = sooner(due, pairing_due_of(h, slot, h.le.slots[slot].central))
+    due

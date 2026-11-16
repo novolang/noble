@@ -25,6 +25,7 @@ use noble.{ Action, Adapter, Addr, Bond, BondStore, ConnId, ConnParams, DefaultP
 use noble.CONFIG
 use profile_builder
 use smp
+use smp_core
 
 // ── The Controller ──────────────────────────────────────────────────
 
@@ -50,13 +51,16 @@ struct ScriptLink
     var confirm: Bool
     var sync: Int
     var refuse_phy: Bool
+    var parks: [Int]
+    var drift: Int
 
+// `parks` holds the milliseconds of each `park` the Adapter asked for; `drift` is the milliseconds the clock moves each time it is read.
 // `credit` makes the Controller return the buffer of each ACL packet it is given.  `serve` makes the Controller carry the ATT requests the Host writes to a GATT server of its own (`srv`) and bring the answers
 // back, as the peer of a Central would; `confirm` makes it confirm each indication it is given; `sync` is the status of the LE
 // Periodic Advertising Sync Established event that answers a Create Sync (-1 for none).
 fn script_link() -> ScriptLink
     ScriptLink { inbox: [], sent: [], now: 0, handle: 0x40, connect_status: 0, mute: false, commands: [], acl: [], cmdlog: [], seed: 1, addr: 0xA1,
-        serve: false, credit: false, srv: gatt_server.new_server([], 247), confirm: false, sync: -1, refuse_phy: false }
+        serve: false, credit: false, srv: gatt_server.new_server([], 247), confirm: false, sync: -1, refuse_phy: false, parks: [], drift: 0 }
 
 // An HCI event packet, H4 indicator first.
 fn event_packet(code: Int, params: [u8]) -> [u8]
@@ -224,10 +228,15 @@ impl HciLink[mutate] for ScriptLink
         Some(p)
 
     fn now_ms(var self) -> Int [mutate, time]
-        self.now
+        let t = self.now
+        self.now = self.now + self.drift
+        t
 
+    // A packet that is waiting ends the park at once, as a byte on the UART does; otherwise the clock runs for `ms`.
     fn park(var self, ms: Int) [mutate, async]
-        self.now = self.now + ms
+        list.push(self.parks, ms)
+        if list.len(self.inbox) == 0
+            self.now = self.now + ms
 
 // The ATT request in the ACL packet `pkt` is answered by the server of the link, and the Controller returns the buffer.
 fn serve_att(var l: ScriptLink, pkt: [u8])
@@ -2299,6 +2308,128 @@ fn test_a_client_that_subscribes_is_an_event_and_notify_reaches_it_only_then_and
     var t17 = value_of_byte(1)
     test.assert(ble.notify(conn, hrm.attr, noble.Security.Open, var t17).is(noble.LAYER_LOCAL, noble.E_STALE))
 
+// ── The next deadline of the Host ───────────────────────────────────
+
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_host_with_no_timer_running_has_no_deadline()
+    var ble = new_ble()
+    test.assert_eq(host_api.next_due_ms(var ble.host), -1)
+    let _ = peripheral_up(var ble)
+    test.assert_eq(host_api.next_due_ms(var ble.host), -1)
+
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_reconnection_the_policy_asked_for_is_a_deadline_and_the_protocol_clean_ups_are_not()
+    var ble = new_ble()
+    let _ = peripheral_up(var ble)
+    ble.host.api.due_ms = 900
+    test.assert_eq(host_api.next_due_ms(var ble.host), 900)
+    ble.host.api.due_ms = -1
+    test.assert_eq(host_api.next_due_ms(var ble.host), -1)
+    // The signaling request of the link, an indication a bearer waits for and a request held for the application run at the turns.
+    ble.host.le.slots[0].update_identifier = 5
+    ble.host.le.slots[0].update_deadline_ms = 4000
+    ble.host.le.slots[0].att.bearers[0].indicating = 1
+    ble.host.le.slots[0].att.bearers[0].deadline_ms = 700
+    var pend = ble.host.api.pend
+    pend[0] = 1
+    ble.host.api.pend = pend
+    test.assert_eq(host_api.next_due_ms(var ble.host), -1)
+
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
+@test
+fn test_the_security_manager_timer_gives_a_deadline_only_while_a_pairing_runs_and_for_the_role_of_the_link()
+    var ble = new_ble()
+    let _ = peripheral_up(var ble)
+    // The Peripheral half: the pairing machine arms its deadline only when a row enters a waiting phase; in Idle none is armed.
+    test.assert_eq(host_api.next_due_ms(var ble.host), -1)
+    var half = ble.host.smp
+    half.pairing.step(smp_core.LinkPairingEvent.Features(false), 1000)
+    ble.host.smp = half
+    test.assert_eq(host_api.next_due_ms(var ble.host), 31000)
+    // A Central link reads the other half.
+    ble.host.le.slots[0].central = true
+    test.assert_eq(host_api.next_due_ms(var ble.host), -1)
+    var other = ble.host.smp_central
+    other.pairing.step(smp_core.LinkPairingEvent.Features(false), 2000)
+    ble.host.smp_central = other
+    test.assert_eq(host_api.next_due_ms(var ble.host), 32000)
+    // The nearer of a reconnection and a pairing wins, in either order.
+    ble.host.api.due_ms = 31000
+    test.assert_eq(host_api.next_due_ms(var ble.host), 31000)
+    ble.host.api.due_ms = 33000
+    test.assert_eq(host_api.next_due_ms(var ble.host), 32000)
+
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
+@test
+fn test_the_security_manager_timer_of_a_parked_link_gives_its_deadline()
+    var ble = new_ble()
+    let _ = peripheral_up(var ble)
+    // The link in slot 0 is live and parked: the Host works on slot 1, and the state of slot 0 sits in `parked`.
+    var session = ble.host.parked[0]
+    var half = session.smp
+    half.pairing.step(smp_core.LinkPairingEvent.Features(false), 500)
+    session.smp = half
+    var sessions = ble.host.parked
+    sessions[0] = session
+    ble.host.parked = sessions
+    ble.host.active = 1
+    test.assert_eq(host_api.next_due_ms(var ble.host), 30500)
+
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
+@test
+fn test_the_adapter_parks_for_the_whole_wait_when_no_timer_runs()
+    var ble = new_ble()
+    test.assert(ble.start().is_ok())
+    test.assert_eq(wait_kind(var ble, 0), 0)
+    ble.io.parks = []
+    test.assert_eq(wait_kind(var ble, 1000), -1)
+    test.assert_eq(list.len(ble.io.parks), 1)
+    test.assert_eq(ble.io.parks[0], 1000)
+
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
+@test
+fn test_the_adapter_parks_until_the_nearest_timer_of_the_host_and_then_for_the_rest()
+    var ble = new_ble()
+    test.assert(ble.start().is_ok())
+    test.assert_eq(wait_kind(var ble, 0), 0)
+    ble.io.parks = []
+    ble.host.api.due_ms = ble.io.now + 300
+    test.assert_eq(wait_kind(var ble, 1000), -1)
+    test.assert_eq(list.len(ble.io.parks), 2)
+    test.assert_eq(ble.io.parks[0], 300)
+    test.assert_eq(ble.io.parks[1], 700)
+
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
+@test
+fn test_the_adapter_parks_one_millisecond_for_a_timer_that_fell_due_after_the_turn_and_not_for_nothing()
+    var ble = new_ble()
+    test.assert(ble.start().is_ok())
+    test.assert_eq(wait_kind(var ble, 0), 0)
+    ble.io.parks = []
+    // The clock moves one millisecond each time it is read: the call starts at `t`, the turn runs at `t + 1`, the timer falls due at
+    // `t + 2`, and the park reads `t + 2`.
+    ble.io.drift = 1
+    ble.host.api.due_ms = ble.io.now + 2
+    test.assert_eq(wait_kind(var ble, 1000), -1)
+    test.assert_eq(ble.io.parks[0], 1)
+    test.assert(ble.io.parks[1] > 1)
+
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
+@test
+fn test_an_indication_nobody_confirms_costs_the_adapter_a_few_parks_and_not_one_in_fifty_milliseconds()
+    var ble = new_ble()
+    test.assert(ble.add_service(noble.uuid16(0x180D)).svc == 0)
+    let ind = ble.add_char(noble.uuid16(0x2A38), noble.PROP_INDICATE, noble.Permissions { read: noble.Access.Denied, write: noble.Access.Denied }, noble.Access.Open, 2)
+    let conn = peripheral_up(var ble)
+    central_sends(var ble, [0x12, (ind.attr.cccd & 255) as u8, (ind.attr.cccd >> 8) as u8, 2, 0])
+    test.assert_eq(wait_kind(var ble, 10), EV_SUBSCRIBED)
+    ble.io.parks = []
+    var v = value_of_byte(8)
+    test.assert(ble.indicate(conn, ind.attr, var v).is(noble.LAYER_LOCAL, noble.E_TIMEOUT))
+    test.assert(list.len(ble.io.parks) <= 3)
+
 // A value of `n` octets.
 fn value_of_length(n: Int) -> noble.Value
     var v: noble.Value = Vec.new()
@@ -2680,10 +2811,11 @@ fn test_on_start_answering_begin_runs_the_role_and_its_packets_reach_the_control
     let stopper = Stopper { pol: pol, after: 6, ticks: 0 }
     var svcs: [dyn Service] = [a, r, stopper]
     test.assert(ble.plug(var svcs).is_ok())
+    ble.io.now = 40
     test.assert(ble.serve(50).is_ok())
     // `begin` ran once, on the second element, with the clock.
     test.assert_eq(r.began, 1)
-    test.assert(r.begin_ms > 0)
+    test.assert(r.begin_ms >= 40)
     test.assert(a.ticks >= 1)
     // The command it queued reached the Controller (LE Set Event Mask is sent twice: once by the start, once by the role); the Command
     // Complete came back through `on_hci`, and the answer to it, a second command, reached the Controller too.

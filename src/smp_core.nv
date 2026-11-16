@@ -20,9 +20,6 @@ use smp_keys.{ PublicKey, KeyPair, SmpRandom, ScKeys }
 
 // ── Constants ───────────────────────────────────────────────────────
 
-// The Security Manager Timer ([Vol 3] Part H, Section 3.4).
-const SMP_TIMEOUT_MS = 30000
-
 // Steps 3 to 8 of Passkey Entry repeat 20 times (Section 2.3.5.6.3).
 const PASSKEY_ROUNDS = 20
 
@@ -33,6 +30,39 @@ const MAX_HELD_KEYS = 5
 
 // Devices remembered for repeated attempts.
 const ATTEMPT_RECORDS = 4
+
+// ── The Security Manager Timer ──────────────────────────────────────
+//
+// [Vol 3] Part H, Section 3.4: the timer starts with a Pairing Request or a
+// Security Request, restarts each time a command is queued or a Keypress
+// Notification arrives, stops when the pairing ends, and when it runs out no
+// SMP command is sent on the connection again until the next one.  A machine
+// of its own, so the deadline is armed by the row that enters `Running` and
+// cancelled by the row that leaves it; the handler reads `deadline()` and
+// calls `expire` when it has passed.  `now` is the handler's clock.
+state_machine SmpTimer
+    states
+        Stopped
+        Running
+        TimedOut
+    events
+        Start
+        Touch
+        Stop
+        Timeout
+        Reset
+    transitions
+        (Stopped, Start)   => Running after 30 s Timeout
+        (Running, Start)   => Running after 30 s Timeout
+        (Running, Touch)   => Running after 30 s Timeout
+        (Running, Stop)    => Stopped
+        (Running, Timeout) => TimedOut
+        (_, Reset)         => Stopped
+        (Stopped, Touch)   => _
+        (TimedOut, Touch)  => _
+        (Stopped, Stop)    => _
+        (TimedOut, Stop)   => _
+        (TimedOut, Start)  => _
 
 // ── Roles and phases of one pairing ─────────────────────────────────
 
@@ -269,8 +299,7 @@ struct PairingState
     var peer_address: [u8]
     var bond: ?SmpBond
     var encrypting_with_bond: Bool
-    var timer_deadline: Int
-    var timed_out: Bool
+    var timer: SmpTimer
     var requested_level: Int
     var legacy_oob_tk: [u8]
     var peer_oob_r: [u8]
@@ -329,7 +358,7 @@ fn new_pairing_state(role: Role, config: SmpConfig, key_pair: KeyPair, seed: [u8
         role: role, config: config, key_pair: key_pair, rng: smp_keys.random_from_seed(seed), now: 0, outbox: [],
         own_address_type: 0, own_address: smp_keys.zeros(6), peer_address_type: 0,
         peer_address: smp_keys.zeros(6), bond: None, encrypting_with_bond: false,
-        timer_deadline: -1, timed_out: false, requested_level: 0, legacy_oob_tk: [],
+        timer: SmpTimer.new(), requested_level: 0, legacy_oob_tk: [],
         peer_oob_r: [], peer_oob_c: [], local_oob_r: [],
         phase: Phase.Idle, preq: [], pres: [], sc: false, method: Method.JustWorks, key_size: 16,
         bonding: false, keypress: false, init_dist: 0, resp_dist: 0, tk: [], passkey: -1,
@@ -346,8 +375,8 @@ fn copy(s: PairingState) -> PairingState
         role: s.role, config: s.config, key_pair: s.key_pair, rng: s.rng, now: s.now, outbox: [],
         own_address_type: s.own_address_type, own_address: s.own_address[:],
         peer_address_type: s.peer_address_type, peer_address: s.peer_address[:], bond: s.bond,
-        encrypting_with_bond: s.encrypting_with_bond, timer_deadline: s.timer_deadline,
-        timed_out: s.timed_out, requested_level: s.requested_level, legacy_oob_tk: s.legacy_oob_tk[:],
+        encrypting_with_bond: s.encrypting_with_bond, timer: s.timer,
+        requested_level: s.requested_level, legacy_oob_tk: s.legacy_oob_tk[:],
         peer_oob_r: s.peer_oob_r[:], peer_oob_c: s.peer_oob_c[:], local_oob_r: s.local_oob_r[:],
         phase: s.phase, preq: s.preq[:], pres: s.pres[:], sc: s.sc, method: s.method, key_size: s.key_size,
         bonding: s.bonding, keypress: s.keypress, init_dist: s.init_dist, resp_dist: s.resp_dist,
@@ -365,7 +394,7 @@ fn copy(s: PairingState) -> PairingState
 // Clear the fields of one pairing and stop the timer.
 fn end_pairing(var s: PairingState)
     s.phase = Phase.Idle
-    s.timer_deadline = -1
+    s.timer.step(SmpTimerEvent.Stop, s.now)
     s.preq = []
     s.pres = []
     s.tk = []
@@ -448,15 +477,21 @@ fn has(bits: Int, bit: Int) -> Bool
 // Queue `pdu`; queuing a command resets a running timer (Section 3.4).
 fn send(var s: PairingState, pdu: [u8])
     list.push(s.outbox, pdu[:])
-    if s.timer_deadline >= 0
-        s.timer_deadline = s.now + SMP_TIMEOUT_MS
+    s.timer.step(SmpTimerEvent.Touch, s.now)
 
 fn start_timer(var s: PairingState)
-    s.timer_deadline = s.now + SMP_TIMEOUT_MS
+    s.timer.step(SmpTimerEvent.Start, s.now)
+
+fn stop_timer(var s: PairingState)
+    s.timer.step(SmpTimerEvent.Stop, s.now)
 
 // True when the Security Manager Timer has run out.
 fn timer_due(s: PairingState) -> Bool
-    s.timer_deadline >= 0 and s.now >= s.timer_deadline
+    s.timer.deadline() >= 0 and s.now >= s.timer.deadline()
+
+// True from the moment the timer ran out until the next connection.
+fn timed_out(s: PairingState) -> Bool
+    s.timer.state == SmpTimerState.TimedOut
 
 fn draw(var s: PairingState) -> [u8]
     let d = smp_keys.random_draw(s.rng)
@@ -490,7 +525,7 @@ fn decline(var s: PairingState, reason: Reason)
 // The Security Manager Timer ran out: no SMP command is sent on this
 // connection again (Section 3.4).
 fn expire(var s: PairingState)
-    s.timed_out = true
+    s.timer.expire(s.now)
     s.failures = s.failures + (if s.phase != Phase.Idle then 1 else 0)
     end_pairing(var s)
 
@@ -499,7 +534,7 @@ fn expire(var s: PairingState)
 fn link_up(var s: PairingState, own_type: Int, own_address: [u8], peer_type: Int,
            peer_address: [u8], bond: ?SmpBond)
     end_pairing(var s)
-    s.timed_out = false
+    s.timer.step(SmpTimerEvent.Reset, s.now)
     s.encrypting_with_bond = false
     s.own_address_type = own_type
     s.own_address = own_address[:]
@@ -514,7 +549,7 @@ fn link_down(var s: PairingState) -> Bool
     if was_pairing
         s.failures = s.failures + 1
     end_pairing(var s)
-    s.timed_out = false
+    s.timer.step(SmpTimerEvent.Reset, s.now)
     s.encrypting_with_bond = false
     s.bond = None
     was_pairing
@@ -596,7 +631,7 @@ fn is_blocked(s: PairingState) -> Bool
 // Keypress Notification received during Passkey Entry resets the timer
 // (Section 3.4).
 fn classify(var s: PairingState, pdu: [u8]) -> Received
-    if s.timed_out or list.len(pdu) == 0
+    if timed_out(s) or list.len(pdu) == 0
         return Received.Ignore
     let known = smp.command_of(pdu[0] as Int)
     if known == None
@@ -619,8 +654,7 @@ fn classify(var s: PairingState, pdu: [u8]) -> Received
             return Received.Refuse(Reason.InvalidParameters)
         return Received.Fail(Reason.InvalidParameters)
     if command == Command.PairingKeypressNotification
-        if s.timer_deadline >= 0
-            start_timer(var s)
+        s.timer.step(SmpTimerEvent.Touch, s.now)
         return Received.Ignore
     Received.Handle(command)
 
@@ -1060,7 +1094,7 @@ fn conclude(var s: PairingState) -> PairingResult
 // one was sent, is answered (Section 3.4).  Answers the level of the
 // bond.
 fn bond_encryption_established(var s: PairingState) -> Int
-    s.timer_deadline = -1
+    s.timer.step(SmpTimerEvent.Stop, s.now)
     s.requested_level = 0
     smp_bond.security_level(s.bond!)
 

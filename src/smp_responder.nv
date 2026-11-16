@@ -596,7 +596,7 @@ fn stage2_or_wait(var s: SmpState) -> SmpStep
 // capability allows Passkey Entry or out of band data is held.
 @satisfies("REQ-BLE-SMP-014")
 fn on_request_security(var s: SmpState, level: Int) -> SmpStep
-    if s.phase != Phase.Idle or s.encrypting_with_bond or s.timed_out
+    if s.phase != Phase.Idle or s.encrypting_with_bond or smp_core.timed_out(s)
         return finish(s, None)
     let can_mitm = s.config.io_capability != smp.SMP_IO_CAP_NO_INPUT_NO_OUTPUT or list.len(s.legacy_oob_tk) == 16 or list.len(s.peer_oob_c) == 16
     let wanted = if level >= 3 and not can_mitm
@@ -637,7 +637,7 @@ pub fn handle(state: SmpState, input: SmpInput, now_ms: Int) -> SmpStep
     s.now = now_ms
     // The timer runs out before any later input of the connection is
     // looked at.
-    if s.timer_deadline >= 0 and now_ms >= s.timer_deadline and not is_link_event(input)
+    if smp_core.timer_due(s) and not is_link_event(input)
         return on_tick(var s)
     match input
         Connected(own_type, own_address, peer_type, peer_address, bond) =>

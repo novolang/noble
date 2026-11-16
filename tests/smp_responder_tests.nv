@@ -556,7 +556,7 @@ fn test_keypress_notifications_only_when_both_set_keypress()
     test.assert_eq(list.len(handle(without.state, SendKeypress(0), 5).pdus), 0)
     // A received notification restarts the timer (Section 3.4).
     let k = handle(with.state, Pdu(smp.build_keypress_notification(1)), 20000)
-    test.assert_eq(k.state.timer_deadline, 50000)
+    test.assert_eq(k.state.timer.deadline(), 50000)
 
 @test
 fn test_method_selection_tables()
@@ -1114,7 +1114,7 @@ fn test_connection_events_pass_an_expired_timer()
     let r = handle(s, Pdu(preq_of(3, 0, 1, 16, 0, 0)), 0)
     let d = handle(r.state, Disconnected, 40000)
     test.assert_eq(action_name(d), "failed")
-    test.assert(not d.state.timed_out)
+    test.assert(not smp_core.timed_out(d.state))
     let c = handle(r.state, Connected(1, own_address(), 0, peer_address(), None), 40000)
     test.assert_eq(action_name(c), "none")
     test.assert(not is_pairing(c.state))

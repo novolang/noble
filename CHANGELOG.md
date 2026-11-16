@@ -6,6 +6,8 @@ consumer deciding whether to upgrade can read.
 
 ## Unreleased
 
+2026-11-16: the Security Manager Timer of the pairing is a `state_machine`, `SmpTimer` in `smp_core.nv`, where it was a deadline, a flag and four hand-kept updates of them: the row that enters `Running` arms `after 30 s Timeout` and the row that leaves it cancels the deadline.  The behaviour is the specification's (started by a request, restarted by each command queued or keypress, stopped when the pairing ends, run out after 30 s, not started again until the next connection) and every test of the three halves passes unchanged apart from the lines that read the deadline.  `PairingState.timer_deadline` and `timed_out` are gone for `timer` (read `timer.deadline()` and `smp_core.timed_out(s)`), and `SMP_TIMEOUT_MS` is gone with them.  This version needs a toolchain with the extended `state_machine` (SPEC 11.12).
+
 2026-11-15: `HciLink.park` waits on the waker of the task (`core.rt.park`, which answers at once outside a task) where it yielded, and `UartHci.park` parks the task on the UART's receive interrupt for `ms` milliseconds: a Host that runs as a task of the scheduler halts the core between the events of the Controller and the turns of the Host, where it polled the UART.  `UartHci` holds the Future the interrupt resolves, made by `uart_hci()`.  A Host that runs in `main` has no waker, and its `park` yields as before.  This version needs a toolchain with `core.rt.waker` and `core.rt.park`.
 
 This version needs `noble-hci` with the PHY codecs (`opcode_le_set_phy`, `build_le_set_phy`, `le_phy_update_complete`, `LE_EVENT_MASK_PHY_UPDATE_COMPLETE`; the next version of that package).

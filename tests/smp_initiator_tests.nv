@@ -971,17 +971,17 @@ fn test_sc_distributes_no_ltk_and_completes_on_the_responders_keys()
 fn test_timeout_silences_the_channel_until_the_next_connection()
     let s = connected(config_legacy(3), no_key_pair())
     let r = handle(s, StartPairing(2), 0)
-    let late = handle(r.state, Tick, smp_core.SMP_TIMEOUT_MS + 1)
+    let late = handle(r.state, Tick, 30000 + 1)
     test.assert_eq(action_name(late), "timeout")
     test.assert(not is_pairing(late.state))
     // Nothing is answered on this connection again.
-    test.assert_eq(list.len(handle(late.state, Pdu(smp.build_pairing_response(3, 0, 1, 16, 0, 0)), smp_core.SMP_TIMEOUT_MS + 2).pdus),
+    test.assert_eq(list.len(handle(late.state, Pdu(smp.build_pairing_response(3, 0, 1, 16, 0, 0)), 30000 + 2).pdus),
         0)
-    test.assert_eq(action_name(handle(late.state, StartPairing(2), smp_core.SMP_TIMEOUT_MS + 3)), "none")
+    test.assert_eq(action_name(handle(late.state, StartPairing(2), 30000 + 3)), "none")
     // A new connection clears it.
-    let again = handle(late.state, Connected(1, own_address(), 0, peer_address(), None), smp_core.SMP_TIMEOUT_MS + 4)
-    test.assert_eq(action_name(handle(again.state, StartPairing(2), smp_core.SMP_TIMEOUT_MS + 4)), "none")
-    test.assert_eq(list.len(handle(again.state, StartPairing(2), smp_core.SMP_TIMEOUT_MS + 4).pdus), 1)
+    let again = handle(late.state, Connected(1, own_address(), 0, peer_address(), None), 30000 + 4)
+    test.assert_eq(action_name(handle(again.state, StartPairing(2), 30000 + 4)), "none")
+    test.assert_eq(list.len(handle(again.state, StartPairing(2), 30000 + 4).pdus), 1)
 
 @test
 fn test_cancel_sends_pairing_failed()

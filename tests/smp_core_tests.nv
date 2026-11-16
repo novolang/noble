@@ -7,7 +7,8 @@ use smp
 use smp.{ Command, Reason }
 use smp_keys
 use smp_keys.{ KeyPair }
-use smp_core.{ KeyResult, Method, PairingState, Phase, Received, Role, SMP_TIMEOUT_MS, SmpConfig, abort, address_a, address_b, classify, copy, decline, default_config, empty_key, expect_distribution, expected_key, feature_fault, first_expected_code, is_pairing, key_size_too_small, local_distribution, local_user_types, negotiated_key_size, new_pairing_state, nonce_a, nonce_b, pairing_bond, peer_distribution, required_level, sc_missing, take_distributed_key }
+use smp_core
+use smp_core.{ KeyResult, Method, PairingState, Phase, Received, Role, SmpConfig, SmpTimerEvent, smptimer_state_name, abort, address_a, address_b, classify, copy, decline, default_config, empty_key, expect_distribution, expected_key, feature_fault, first_expected_code, is_pairing, key_size_too_small, local_distribution, local_user_types, negotiated_key_size, new_pairing_state, nonce_a, nonce_b, pairing_bond, peer_distribution, required_level, sc_missing, take_distributed_key }
 
 // ── Tests ───────────────────────────────────────────────────────────
 
@@ -67,7 +68,7 @@ fn core_state(role: Role) -> PairingState
 fn test_a_new_state_is_idle_and_has_no_timer()
     let s = core_state(Role.Responder)
     test.assert(not is_pairing(s))
-    test.assert_eq(s.timer_deadline, -1)
+    test.assert_eq(s.timer.deadline(), -1)
     test.assert_eq(s.role == Role.Responder, true)
     test.assert_eq(core_state(Role.Initiator).role == Role.Initiator, true)
 
@@ -137,10 +138,10 @@ fn test_classify_reads_the_code_and_the_length()
 fn test_a_keypress_notification_only_resets_the_timer()
     var s = core_state(Role.Initiator)
     s.now = 100
-    s.timer_deadline = 500
+    s.timer.step(SmpTimerEvent.Start, 500 - 30000)
     test.assert_eq(received_text(classify(var s, smp.build_keypress_notification(smp.SMP_KEYPRESS_DIGIT_ENTERED))),
         received_text(Received.Ignore))
-    test.assert_eq(s.timer_deadline, 100 + SMP_TIMEOUT_MS)
+    test.assert_eq(s.timer.deadline(), 100 + 30000)
 
 @test
 fn test_a_device_that_does_not_pair_refuses_every_command_but_pairing_failed()
@@ -208,3 +209,42 @@ fn test_the_bond_of_a_pairing_is_laid_out_for_the_role()
     test.assert_eq(pairing_bond(p).peer_ediv, 3)
     c.sc = true
     test.assert_eq(pairing_bond(c).ediv, 0)
+
+// The Security Manager Timer is a machine (SmpTimer): started by a Start,
+// restarted by a Touch, stopped by a Stop, run out after 30 s, and not
+// started again until the next connection.
+fn timer_name(s: PairingState) -> Str
+    smptimer_state_name(s.timer.state)
+
+@test
+fn test_the_timer_runs_30_seconds_from_the_start_and_a_touch_restarts_it()
+    var s = core_state(Role.Responder)
+    s.now = 1000
+    smp_core.start_timer(var s)
+    test.assert_eq(timer_name(s), "Running")
+    test.assert_eq(s.timer.deadline(), 31000)
+    s.now = 5000
+    s.timer.step(SmpTimerEvent.Touch, s.now)
+    test.assert_eq(s.timer.deadline(), 35000)
+
+@test
+fn test_a_stopped_timer_is_not_restarted_by_a_queued_command()
+    var s = core_state(Role.Responder)
+    s.now = 1000
+    smp_core.send(var s, [1, 2, 3])
+    test.assert_eq(timer_name(s), "Stopped")
+    test.assert_eq(s.timer.deadline(), -1)
+
+@test
+fn test_the_timer_that_ran_out_stays_out_until_a_connection_resets_it()
+    var s = core_state(Role.Responder)
+    s.now = 0
+    smp_core.start_timer(var s)
+    s.now = 30000
+    test.assert(smp_core.timer_due(s))
+    smp_core.expire(var s)
+    test.assert(smp_core.timed_out(s))
+    smp_core.start_timer(var s)
+    test.assert(smp_core.timed_out(s))
+    smp_core.link_up(var s, 0, smp_keys.zeros(6), 0, smp_keys.zeros(6), None)
+    test.assert(not smp_core.timed_out(s))

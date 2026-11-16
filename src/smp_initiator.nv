@@ -276,7 +276,7 @@ fn local_oob_flag(s: SmpInitState, sc: Bool) -> Bool
 @satisfies("REQ-BLE-SMP-014")
 @satisfies("REQ-BLE-SMP-032")
 fn start_pairing(var s: SmpInitState, level: Int) -> SmpInitStep
-    if s.phase != Phase.Idle or s.timed_out
+    if s.phase != Phase.Idle or smp_core.timed_out(s)
         return finish(s, None)
     match s.bond
         Some(b) =>
@@ -662,7 +662,7 @@ fn on_encryption_changed(var s: SmpInitState, enabled: Bool) -> SmpInitStep
         // another encryption attempt with a key the peer no longer has
         // (GAP/SEC/SEM/BV-45-C is the case that measures it: its Lower
         // Tester fails the encryption and the IUT pairs again).
-        s.timer_deadline = -1
+        s.timer.step(SmpTimerEvent.Stop, s.now)
         s.requested_level = 0
         let lost = s.bond!
         s.bond = None
@@ -725,7 +725,7 @@ pub fn handle(state: SmpInitState, input: SmpInitInput, now_ms: Int) -> SmpInitS
     s.now = now_ms
     // The timer runs out before any later input of the connection is
     // looked at.
-    if s.timer_deadline >= 0 and now_ms >= s.timer_deadline and not is_link_event(input)
+    if smp_core.timer_due(s) and not is_link_event(input)
         return on_tick(var s)
     match input
         Connected(own_type, own_address, peer_type, peer_address, bond) =>

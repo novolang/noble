@@ -19,6 +19,7 @@
 //
 
 use std.test
+use std.math
 use att
 use gatt_db
 use gatt_server
@@ -231,6 +232,10 @@ fn acl_on(handle: Int, data: [u8]) -> [u8]
 fn payload(pkt: [u8]) -> [u8]
     pkt[9:]
 
+// The ATT_MTU a link agrees when the client offers `client`: the smaller of that and the Server Rx MTU of the link table.
+fn agreed(client: Int) -> Int
+    math.min(client, le_link.ATT_SERVER_RX_MTU)
+
 @test
 fn test_two_links_serve_one_database_and_keep_their_own_bearers()
     var first = le_link.new_link(le_link.test_db())
@@ -241,10 +246,11 @@ fn test_two_links_serve_one_database_and_keep_their_own_bearers()
     le_link.connect(var second, 0x0041, false)
     test.assert(not links.same_link(first.id, second.id))
     test.assert_eq(second.id.slot, 1)
-    // An MTU exchange on the first link leaves the second at the default.
+    // An MTU exchange on the first link leaves the second at the default.  The ATT_MTU a link agrees is the smaller of the client's and
+    // the Server Rx MTU, which is the key `max_att_mtu`; a configuration with a small value leaves nothing above the default to agree.
     let rx = le_link.receive_acl(var first, acl_on(0x0040, l2cap.build_b_frame(l2cap.CID_ATT, [0x02, 0x30, 0x00])), 0)
     test.assert_eq(list.len(rx), 1)
-    test.assert_eq(gatt_server.mtu_of(first.att, 0), 0x30)
+    test.assert_eq(gatt_server.mtu_of(first.att, 0), agreed(0x30))
     test.assert_eq(gatt_server.mtu_of(second.att, 0), gatt_server.ATT_DEFAULT_MTU)
     // A service added through the first link's database is read over the
     // second link.
@@ -260,4 +266,4 @@ fn test_two_links_serve_one_database_and_keep_their_own_bearers()
     let _ = le_link.receive_acl(var second, acl_on(0x0041, l2cap.build_b_frame(l2cap.CID_ATT, [0x02, 0x20, 0x00])), 0)
     le_link.disconnect(var first)
     test.assert_eq(gatt_server.mtu_of(first.att, 0), gatt_server.ATT_DEFAULT_MTU)
-    test.assert_eq(gatt_server.mtu_of(second.att, 0), 0x20)
+    test.assert_eq(gatt_server.mtu_of(second.att, 0), agreed(0x20))

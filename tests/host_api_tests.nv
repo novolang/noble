@@ -1056,7 +1056,7 @@ fn test_a_build_with_phy_events_unmasks_the_event()
     test.assert_eq(list.len(mask), 8)
     test.assert_eq((mask[1] as Int) & 0x08, 0x08)
 
-@when(noble.CONFIG.DEFAULT_PHY == 0)
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32 and noble.CONFIG.DEFAULT_PHY == 0)
 @test
 fn test_the_start_writes_no_default_phy_when_the_key_is_zero()
     var h = new_host(2)

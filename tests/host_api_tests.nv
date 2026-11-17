@@ -21,7 +21,7 @@ use hci_transport
 use gatt_server
 use le_link
 use noble
-use noble.{ Action, Adapter, Addr, Bond, BondStore, ConnId, ConnParams, DefaultPolicy, Event, HostPolicy, IoCap, RamBonds, Request, Role, Security, Service, Status }
+use noble.{ Action, Adapter, Addr, Bond, BondStore, ConnId, ConnParams, DefaultPolicy, Event, HostPolicy, IoCap, RamBonds, Request, Role, Security, Service, ServeLifeState, Status }
 use noble.CONFIG
 use profile_builder
 use smp
@@ -2710,6 +2710,152 @@ fn test_serve_answers_the_status_of_a_start_that_failed_and_does_not_ask_on_star
     test.assert(ble.serve(50).is(noble.LAYER_LOCAL, noble.E_TIMEOUT))
     test.assert_eq(pol.start_asked, 0)
     test.assert_eq(stopper.ticks, 0)
+
+// ── serve_turn: the serve loop of a program that never waits ───────
+
+// `n` turns of the serve loop that never waits.
+fn turns(var ble: Adapter<ScriptLink, TestPolicy, RamBonds>, n: Int)
+    for _ in 0..n
+        ble.serve_turn()
+
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
+@test
+fn test_serve_turn_brings_the_controller_up_asks_on_start_once_and_then_turns_the_pump()
+    let pol = test_policy()
+    var ble = ble_with(pol)
+    let stopper = Stopper { pol: pol, after: 1000, ticks: 0 }
+    var svcs: [dyn Service] = [stopper]
+    test.assert(ble.plug(var svcs).is_ok())
+    test.assert(ble.life.state == ServeLifeState.Down)
+    ble.serve_turn()
+    test.assert(ble.life.state != ServeLifeState.Down)
+    test.assert_eq(stopper.ticks, 0)
+    turns(var ble, 20)
+    test.assert(ble.life.state == ServeLifeState.Up)
+    // The services are turned only once the bring-up is complete; the policy was asked once, whatever the number of turns.
+    test.assert(stopper.ticks >= 1)
+    test.assert_eq(pol.start_asked, 1)
+    test.assert(ble.host.api.ready)
+    test.assert_eq(times_sent(ble.io, hci_commands.opcode_le_set_advertising_enable()), 0)
+
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
+@test
+fn test_serve_turn_advertises_when_on_start_asks_and_gives_events_to_the_services()
+    var pol = test_policy()
+    pol.start_adv = true
+    var ble = ble_with(pol)
+    let a = switch_service(0xFFA0)
+    var svcs: [dyn Service] = [a]
+    test.assert(ble.plug(var svcs).is_ok())
+    turns(var ble, 20)
+    test.assert(ble.life.state == ServeLifeState.Up)
+    test.assert_eq(times_sent(ble.io, hci_commands.opcode_le_set_advertising_parameters()), 1)
+    test.assert_eq(times_sent(ble.io, hci_commands.opcode_le_set_advertising_data()), 1)
+    test.assert_eq(times_sent(ble.io, hci_commands.opcode_le_set_advertising_enable()), 2)
+    test.assert(ble.host.api.adv_on)
+    // A link event reaches the service, and an attribute write reaches its owner, in the turns that follow.
+    list.push(ble.io.inbox, connection_complete(0, 0x41, 1, peer_octets(0x31)))
+    turns(var ble, 2)
+    test.assert_eq(a.linked, 1)
+    list.push(ble.io.inbox, att_packet(0x41, write_request(a.attr.handle, 1)))
+    turns(var ble, 2)
+    test.assert_eq(a.seen, 1)
+
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
+@test
+fn test_serve_turn_gives_up_a_start_nobody_answered_after_five_seconds_and_begins_again_on_request()
+    let pol = test_policy()
+    var ble = ble_with(pol)
+    ble.io.mute = true
+    turns(var ble, 3)
+    test.assert(ble.life.state == ServeLifeState.Starting)
+    test.assert_eq(ble.due_ms(), 5000)
+    // The five seconds pass: the step ends with E_TIMEOUT, the call is given up, and the policy is not asked.
+    ble.io.now = 5000
+    ble.serve_turn()
+    test.assert(ble.life.state == ServeLifeState.Failed)
+    test.assert(ble.life.failure.is(noble.LAYER_LOCAL, noble.E_TIMEOUT))
+    test.assert_eq(pol.start_asked, 0)
+    test.assert_eq(ble.due_ms(), -1)
+    // A turn in `Failed` does nothing more; the Controller comes up and the program asks again.
+    ble.io.mute = false
+    turns(var ble, 3)
+    test.assert(ble.life.state == ServeLifeState.Failed)
+    ble.serve_begin(ble.io.now)
+    turns(var ble, 20)
+    test.assert(ble.life.state == ServeLifeState.Up)
+    test.assert_eq(pol.start_asked, 1)
+
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
+@test
+fn test_serve_turn_runs_a_role_the_policy_begins_and_fails_with_the_status_of_one_that_refuses()
+    var pol = test_policy()
+    pol.start_begin = 0
+    var ble = ble_with(pol)
+    let r = probe()
+    var svcs: [dyn Service] = [r]
+    test.assert(ble.plug(var svcs).is_ok())
+    ble.io.now = 40
+    turns(var ble, 20)
+    test.assert(ble.life.state == ServeLifeState.Up)
+    test.assert_eq(r.began, 1)
+    test.assert(r.begin_ms >= 40)
+    test.assert(ble.host.api.tap)
+    test.assert_eq(times_sent(ble.io, hci_commands.opcode_le_set_random_address()), 1)
+    // A role that refuses ends the step with its status, and an index outside the list is a bad argument.
+    var pol2 = test_policy()
+    pol2.start_begin = 0
+    var ble2 = ble_with(pol2)
+    var r2 = probe()
+    r2.refuse = true
+    var svcs2: [dyn Service] = [r2]
+    test.assert(ble2.plug(var svcs2).is_ok())
+    turns(var ble2, 20)
+    test.assert(ble2.life.state == ServeLifeState.Failed)
+    test.assert(ble2.life.failure.is(noble.LAYER_LOCAL, noble.E_REFUSED))
+    var pol3 = test_policy()
+    pol3.start_begin = 3
+    var ble3 = ble_with(pol3)
+    var svcs3: [dyn Service] = [probe()]
+    test.assert(ble3.plug(var svcs3).is_ok())
+    turns(var ble3, 20)
+    test.assert(ble3.life.failure.is(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
+
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
+@test
+fn test_serve_turn_ends_a_step_the_host_refuses_at_once_and_due_ms_names_the_nearest_deadline()
+    let pol = test_policy()
+    var ble = ble_with(pol)
+    // A call already in flight refuses the Start: the step fails with E_BUSY and the machine says so.
+    test.assert(ble.start().is_ok())
+    let _ = host_api.begin(var ble.host, Request.ScanStop)
+    ble.serve_turn()
+    test.assert(ble.life.state == ServeLifeState.Failed)
+    test.assert(ble.life.failure.is(noble.LAYER_LOCAL, noble.E_BUSY))
+    // The clock of the Host decides: a bring-up step is due at its own deadline, and a Host with no timer names none.
+    var other = ble_with(test_policy())
+    test.assert_eq(other.due_ms(), -1)
+    other.serve_begin(100)
+    test.assert_eq(other.due_ms(), 5100)
+
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
+@test
+fn test_a_call_of_the_program_runs_in_the_turns_after_the_bring_up_and_its_outcome_is_the_programs()
+    let pol = test_policy()
+    var ble = ble_with(pol)
+    turns(var ble, 20)
+    test.assert(ble.life.state == ServeLifeState.Up)
+    // The turn of the serve loop does not read the outcome of a call that is not the bring-up's.
+    test.assert(ble.call(Request.ScanStop).is_ok())
+    test.assert(ble.call_done() == None)
+    turns(var ble, 2)
+    match ble.call_done()
+        Some(st) => test.assert(st.is_ok())
+        None => test.fail("the call ended in the turns after it was begun")
+    test.assert(ble.life.state == ServeLifeState.Up)
+    // A second call while one is in flight is refused, as `begin` refuses it.
+    test.assert(ble.call(Request.ScanStop).is_ok())
+    test.assert(ble.call(Request.ScanStop).is(noble.LAYER_LOCAL, noble.E_BUSY))
 
 // ── Roles: services that own no attributes ──────────────────────────
 

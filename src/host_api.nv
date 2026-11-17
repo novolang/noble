@@ -352,7 +352,6 @@ fn finish(var h: Host, st: Status)
     h.api.op.call.step(CallLifeEvent.Finish)
     h.api.op.status = st
     h.api.kind = noble.R_NONE
-    h.api.step = 0
 
 // Give up the call in flight.  The commands it queued and the Controller has not been given are dropped.  The
 // Controller may still answer the command that was sent for it; the answer reaches the next call, which takes only
@@ -361,7 +360,6 @@ pub fn abandon(var h: Host)
     h.queued = []
     h.api.op.call.step(CallLifeEvent.Abandon)
     h.api.kind = noble.R_NONE
-    h.api.step = 0
 
 // The outcome of the call in flight: None until it has ended.  Reading it frees the Host for the
 // next call.
@@ -566,7 +564,6 @@ pub fn begin(var h: Host, req: Request) -> Status
     h.api.op.call.step(CallLifeEvent.Accept(false))
     h.api.op.status = noble.ok()
     h.api.kind = kind
-    h.api.step = 0
     noble.ok()
 
 // The connection parameters the specification allows ([Vol 4] Part E, Section 7.8.18).
@@ -652,12 +649,12 @@ pub fn poll<T: HciLink[e], P: HostPolicy[f], B: BondStore[g]>(var h: Host, var t
 
 // Start the call that `begin` accepted: its first step needs the policy and the store.
 fn kick<P: HostPolicy[f], B: BondStore[g]>(var h: Host, var p: P, var b: B) [f, g, mutate]
-    if h.api.kind == noble.R_NONE or h.api.step != 0
+    if h.api.kind == noble.R_NONE or h.api.op.call.state != CallLifeState.Accepted
         return
     let kind = h.api.kind
-    h.api.step = 1
     h.api.op.call.step(CallLifeEvent.Kick)
     if kind == noble.R_START
+        h.api.step = 1
         send_cmd(var h, hci_commands.opcode_hci_reset(), [])
     else if kind == noble.R_CONNECT
         start_connect(var h, var p)
@@ -880,8 +877,6 @@ fn command_answered<P: HostPolicy[f], B: BondStore[g]>(var h: Host, opcode: Int,
         if opcode == hci_commands.opcode_le_create_connection()
             if status != 0
                 finish(var h, noble.failed(noble.LAYER_HCI, status))
-            else
-                h.api.step = 2
     else if kind == noble.R_CANCEL
         if opcode == hci_commands.opcode_le_create_connection_cancel()
             finish(var h, if status == 0 then noble.ok() else noble.failed(noble.LAYER_HCI, status))
@@ -889,20 +884,14 @@ fn command_answered<P: HostPolicy[f], B: BondStore[g]>(var h: Host, opcode: Int,
         if opcode == hci_commands.opcode_hci_disconnect()
             if status != 0
                 finish(var h, noble.failed(noble.LAYER_HCI, status))
-            else
-                h.api.step = 2
     else if kind == noble.R_UPDATE
         if opcode == hci_commands.opcode_le_connection_update()
             if status != 0
                 finish(var h, noble.failed(noble.LAYER_HCI, status))
-            else
-                h.api.step = 2
     else if noble.CONFIG.PHY_EVENTS != 0 and kind == noble.R_PHY
         if opcode == hci_commands.opcode_le_set_phy()
             if status != 0
                 finish(var h, noble.failed(noble.LAYER_HCI, status))
-            else
-                h.api.step = 2
     else if kind == noble.R_SECURE
         if opcode == hci_commands.opcode_le_start_encryption() and status != 0
             finish(var h, noble.failed(noble.LAYER_HCI, status))
@@ -2031,7 +2020,6 @@ fn restart_advertising(var h: Host)
     h.api.op.call.step(CallLifeEvent.Accept(true))
     h.api.op.status = noble.ok()
     h.api.kind = noble.R_ADV_START
-    h.api.step = 0
 
 // ── Scan filter ─────────────────────────────────────────────────────
 

@@ -150,6 +150,14 @@ and answers the `Status` that ended it.  A product that has work of its own betw
 `plug`, `pump` and `serve` are methods of the Adapter; `plug_module` is the method for one service that the product holds itself and routes by
 `bind_function` (`pc/battery_product.nv`).
 
+A program that is driven by events and must not wait in a handler (an `active` object of a device program) turns the Host by `ble.serve_turn()`
+instead of `serve`: one call does what `serve` and `pump` do between two waits, and never waits.  It brings the Controller up and asks the policy
+(the machine `ServeLife`: `Down`, `Starting`, `Opening`, `Up`, `Failed`, the five and the two seconds of `start` and `adv_start` as `after` rows),
+and from `Up` gives the Host's events to the services, then the roles' packets and the ticks.  `ble.due_ms()` answers the clock time at which the
+Host or the bring-up next needs a turn (-1 for none), for the program to arm its one deadline with; `ble.call(request)` begins a call of the
+program's and `ble.call_done()` answers its outcome at a later turn.  A step that ended in `Failed` is begun again by `ble.serve_begin(now)`.
+`pc/device_sensors_active.nv` of `noble-examples` is the program that does this; its filing says why it does not build with every toolchain yet.
+
 ```novo
 use noble
 

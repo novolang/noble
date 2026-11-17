@@ -1306,12 +1306,50 @@ struct ServiceResult
 // A device name, at most `max_name` octets.
 pub alias Name = String[noble.CONFIG.MAX_NAME]
 
+// The life of `serve` for a Host that is driven by turns and never waits (`Adapter.serve_turn`): the bring-up of the Controller, then
+// the first action of the policy, then the pump.  The two steps that wait on the Controller carry the time that `Adapter.start` (5 s) and
+// `Adapter.adv_start` (2 s) gave them as a call, here as the `after` of the row that enters them; the status of the step that failed is
+// kept for the program.
+//   Down      nothing has been asked
+//   Starting  the call `Start` is in flight
+//   Opening   the policy's first action (`on_start`) is in flight: advertising, or nothing
+//   Up        the pump runs
+//   Failed    a step ended without success, or was not answered in time; `Go` begins again
+state_machine ServeLife
+    fields
+        var failure: Status = Status { layer: 0, code: 0 }
+    states
+        Down
+        Starting
+        Opening
+        Up
+        Failed
+    events
+        // The program asks for the bring-up.
+        Go
+        // The call in flight ended, with this status, or `begin` refused it.
+        Ended(st: Status)
+        // The time allowed for a step passed.
+        Late
+    transitions
+        (Down | Failed, Go) => Starting after 5000 ms Late
+        (Starting, Ended(st)) if st.is_ok() => Opening after 2000 ms Late
+        (Opening, Ended(st)) if st.is_ok() => Up
+        (Starting | Opening, Ended(st)) =>
+            self.failure = st
+            Failed
+        (Starting | Opening, Late) =>
+            self.failure = failed(LAYER_LOCAL, E_TIMEOUT)
+            Failed
+
 // A Host with its transport, the policy of the product and its bond store, so that a program does not thread four values through every call.
 pub struct Adapter<T: HciLink[e], P: HostPolicy[f], B: BondStore[g]>
     var io: T
     var policy: P
     var bonds: B
     var host: Host
+    // Where `serve_turn` is in the bring-up.
+    var life: ServeLife
     // The product's services (`plug`), and the first and last attribute handle each one added to the database: `pump` finds the
     // owner of an attribute event by its handle.  At most `noble.CONFIG.MAX_SERVICES` entries (the key `max_services`).
     var services: [dyn Service]
@@ -1323,7 +1361,7 @@ pub struct Adapter<T: HciLink[e], P: HostPolicy[f], B: BondStore[g]>
 pub @tier(embedded)
 fn adapter<T: HciLink[e], P: HostPolicy[f], B: BondStore[g]>(io: T, policy: P, bonds: B) -> Adapter<T, P, B>
     Adapter { io: io, policy: policy, bonds: bonds, host: host_blank(host_config(noble.CONFIG.MAX_CONNECTIONS, ['n', 'o', 'b', 'l', 'e'])),
-        services: [], owner_first: Vec.new(), owner_last: Vec.new() }
+        life: ServeLife.new(), services: [], owner_first: Vec.new(), owner_last: Vec.new() }
 
 impl Adapter
     // One turn of the Host at the current clock.
@@ -1844,21 +1882,31 @@ impl Adapter
     fn pump(var self, wait_ms: Int) [e, f, g, hw, async, time, mutate]
         var out: Outbox = Vec.new()
         match self.wait_event(wait_ms)
-            Some(ev) =>
-                match attr_of(ev)
-                    Some(attr) =>
-                        let i = owner_of(self.owner_first, self.owner_last, attr)
-                        if i < 0
-                            refuse(ev, var out)
-                        else if not self.services[i].on_event(ev, var out)
-                            refuse(ev, var out)
-                    None =>
-                        let all = reaches_all(ev)
-                        for i in 0..self.services.len()
-                            if self.services[i].on_event(ev, var out) and not all
-                                break
+            Some(ev) => self.deliver_event(ev, var out)
             None => ()
-        // The packets of the Controller that the roles read, then the services' ticks, each followed by what they queued.
+        self.deliver_tail(var out)
+
+    // Give one event of the Host to the services, as `pump` does: an attribute event to its owner, a link event to every service.
+    // Nothing in it waits.
+    @tier(embedded)
+    fn deliver_event(var self, ev: Event, var out: Outbox) [e, f, g, hw, mutate]
+        match attr_of(ev)
+            Some(attr) =>
+                let i = owner_of(self.owner_first, self.owner_last, attr)
+                if i < 0
+                    refuse(ev, var out)
+                else if not self.services[i].on_event(ev, var out)
+                    refuse(ev, var out)
+            None =>
+                let all = reaches_all(ev)
+                for i in 0..self.services.len()
+                    if self.services[i].on_event(ev, var out) and not all
+                        break
+
+    // What `pump` does after its event: the packets of the Controller that the roles read, then the services' ticks, each followed by
+    // what they queued.  Nothing in it waits.
+    @tier(embedded)
+    fn deliver_tail(var self, var out: Outbox) [e, f, g, hw, async, time, mutate]
         let raw = self.host.api.raw_in
         self.host.api.raw_in = []
         for k in 0..raw.len()
@@ -1944,6 +1992,86 @@ impl Adapter
         while self.policy.keep_serving()
             self.pump(wait_ms)
         ok()
+
+impl Adapter
+    // One turn of `serve` for a program that is driven by events and never waits (the active object of a device program): the
+    // bring-up of the Controller, the policy's first action, and then what `pump` does after its wait: the events the Host queued go
+    // to the services, then the roles' packets and the ticks, and what the services queued is applied.  The life of the bring-up is
+    // `ServeLife`; a step that waits for the Controller is a call begun here, whose end is read at a later turn, and the time it
+    // may take is the `after` of a row of the machine (`due_ms` names the nearest deadline).
+    @tier(embedded)
+    fn serve_turn(var self) [e, f, g, hw, async, time, mutate]
+        let now = self.io.now_ms()
+        if self.life.state == ServeLifeState.Down
+            self.serve_begin(now)
+        self.step()
+        // While the bring-up runs the call in flight is its own; once it is up the calls are the program's (`call`, `call_done`).
+        if self.life.state == ServeLifeState.Starting or self.life.state == ServeLifeState.Opening
+            match host_api.result(var self.host)
+                Some(st) =>
+                    self.life.step(ServeLifeEvent.Ended(st), now)
+                    if self.life.state == ServeLifeState.Opening
+                        self.serve_first(now)
+                None => ()
+        let was = self.life.state
+        self.life.expire(now)
+        if was != ServeLifeState.Failed and self.life.state == ServeLifeState.Failed
+            host_api.abandon(var self.host)
+        if self.life.state != ServeLifeState.Up
+            return
+        var out: Outbox = Vec.new()
+        for _ in 0..noble.CONFIG.EVENT_QUEUE
+            match host_api.next_event(var self.host)
+                Some(ev) => self.deliver_event(ev, var out)
+                None => break
+        self.deliver_tail(var out)
+
+    // Begin the bring-up: from `Down` the first time, from `Failed` to try again (a Controller that was not listening when the first
+    // `Start` was asked answers a second).  `serve_turn` does it from `Down` by itself.
+    @tier(embedded)
+    fn serve_begin(var self, now: Int) [e, f, g, time, mutate]
+        self.life.step(ServeLifeEvent.Go, now)
+        self.serve_call(Request.Start, now)
+
+    // Begin `req` for the bring-up; a call the Host refuses ends the step at once.
+    @tier(embedded)
+    fn serve_call(var self, req: Request, now: Int) [e, f, g, time, mutate]
+        let st = host_api.begin(var self.host, req)
+        if not st.is_ok()
+            self.life.step(ServeLifeEvent.Ended(st), now)
+
+    // The policy's first action, as `serve` takes it: advertising is a call whose end a later turn reads, the start of a role ends at
+    // once, and any other answer is nothing to do.
+    @tier(embedded)
+    fn serve_first(var self, now: Int) [e, f, g, hw, async, time, mutate]
+        var pol = self.policy
+        let first = pol.on_start()
+        self.policy = pol
+        match first
+            Action.Advertise(set, params, data, scan_rsp) => self.serve_call(Request.AdvStart(set, params, data, scan_rsp), now)
+            Action.Begin(index) => self.life.step(ServeLifeEvent.Ended(self.begin(index)), now)
+            _ => self.life.step(ServeLifeEvent.Ended(ok()), now)
+
+    // Begin a call of the program's without waiting for it: the answer says at once whether the Host took it (`host_api.begin`), and
+    // `call_done` gives its outcome at a later turn.  `run` is `call` and a loop of `step` and `call_done`.
+    @tier(embedded)
+    fn call(var self, req: Request) -> Status
+        host_api.begin(var self.host, req)
+
+    // The outcome of the call `call` began: None until it has ended.
+    @tier(embedded)
+    fn call_done(var self) -> ?Status
+        host_api.result(var self.host)
+
+    // The time, on the clock of the transport, at which the Host or the bring-up next needs a turn; -1 for none.  A program that is
+    // driven by events arms its deadline with it.
+    @tier(embedded)
+    fn due_ms(var self) -> Int [e, f, g, time, mutate]
+        var due = host_api.next_due_ms(var self.host)
+        let d = self.life.deadline()
+        if d >= 0 and (due < 0 or d < due)
+            due = d
+        due
 
 // The refusal of an attribute request that no service took.
 @tier(embedded)

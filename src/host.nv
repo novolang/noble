@@ -267,7 +267,7 @@ pub fn host_activate(var host: Host, slot: Int)
     host.active = slot
     host.link = host.le.slots[slot]
 
-// Give the Host what pairing needs: at least 16 octets of `seed` from an entropy source of the
+// Give the Host what pairing needs: at least 16 octets of `seed` (a shorter seed is ignored) from an entropy source of the
 // program's (the operating system on a PC, the Controller's LE Rand command on a device), and the
 // local Identity Resolving Key `irk`, least significant octet first, empty for none.  The P-256
 // private key of the public key exchange ([Vol 3] Part H, Section 2.3.5.6.1) and the random number
@@ -278,6 +278,10 @@ pub fn host_activate(var host: Host, slot: Int)
 // private key is 32 random octets with the most significant bit cleared, which keeps it below the
 // order of the curve's base point.
 pub fn host_seed(var host: Host, seed: [u8], irk: [u8])
+    // A seed of fewer than 16 octets makes an AES-128 key of fewer than 16 octets, which the key expansion reads past the end of: it seeds nothing
+    // and the Host stays not ready for pairing.
+    if list.len(seed) < 16
+        return
     let first = smp_keys.random_draw(smp_keys.random_from_seed(seed))
     let second = smp_keys.random_draw(first.random)
     let third = smp_keys.random_draw(second.random)

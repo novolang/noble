@@ -950,10 +950,18 @@ fn start_answered(var h: Host, opcode: Int, status: Int, rp: [u8])
             None => ()
         send_cmd(var h, hci_commands.opcode_le_rand(), [])
     else if step == 5
+        // An LE Rand answer holds eight octets of random number.  One cut short on the wire would leave a seed of fewer than 16 octets,
+        // and the AES-128 key of the Security Manager's generator made from it would be shorter than 16 octets and panic the key expansion.
+        if list.len(rp) < 8
+            finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
+            return
         h.api.seed = Vec.new()
         take_seed(var h, rp)
         send_cmd(var h, hci_commands.opcode_le_rand(), [])
     else if step == 6
+        if list.len(rp) < 8
+            finish(var h, noble.failed(noble.LAYER_LOCAL, noble.E_BAD_ARGUMENT))
+            return
         take_seed(var h, rp)
         send_cmd(var h, hci_commands.opcode_read_bd_addr(), [])
     else if step == 7

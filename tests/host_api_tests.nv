@@ -15,7 +15,7 @@
 use std.test
 use hci_codec
 use hci_commands
-use host.{ Host, host_blank, host_config }
+use host.{ Host, host_blank, host_config, host_seed }
 use host_api
 use hci_transport
 use gatt_server
@@ -26,6 +26,7 @@ use noble.CONFIG
 use profile_builder
 use smp
 use smp_core
+use smp_keys
 
 // ── The Controller ──────────────────────────────────────────────────
 
@@ -53,14 +54,17 @@ struct ScriptLink
     var refuse_phy: Bool
     var parks: [Int]
     var drift: Int
+    var short_draw: Int
 
+// `short_draw` is the number of the LE Rand draw (1 is the first) the Controller answers with three octets of the random number, as a
+// packet cut short on the wire does; 0 for none.
 // `parks` holds the milliseconds of each `park` the Adapter asked for; `drift` is the milliseconds the clock moves each time it is read.
 // `credit` makes the Controller return the buffer of each ACL packet it is given.  `serve` makes the Controller carry the ATT requests the Host writes to a GATT server of its own (`srv`) and bring the answers
 // back, as the peer of a Central would; `confirm` makes it confirm each indication it is given; `sync` is the status of the LE
 // Periodic Advertising Sync Established event that answers a Create Sync (-1 for none).
 fn script_link() -> ScriptLink
     ScriptLink { inbox: [], sent: [], now: 0, handle: 0x40, connect_status: 0, mute: false, commands: [], acl: [], cmdlog: [], seed: 1, addr: 0xA1,
-        serve: false, credit: false, srv: gatt_server.new_server([], 247), confirm: false, sync: -1, refuse_phy: false, parks: [], drift: 0 }
+        serve: false, credit: false, srv: gatt_server.new_server([], 247), confirm: false, sync: -1, refuse_phy: false, parks: [], drift: 0, short_draw: 0 }
 
 // An HCI event packet, H4 indicator first.
 fn event_packet(code: Int, params: [u8]) -> [u8]
@@ -162,7 +166,11 @@ fn answer(var l: ScriptLink, opcode: Int, params: [u8])
     else if opcode == hci_commands.opcode_le_read_buffer_size()
         list.push(l.inbox, complete(opcode, ok_status, [251, 0, 4]))
     else if opcode == hci_commands.opcode_le_rand()
-        list.push(l.inbox, complete(opcode, ok_status, [l.seed as u8, 2, 3, 4, 5, 6, 7, 8]))
+        if l.seed == l.short_draw
+            // An answer cut short: three octets of the random number instead of eight.
+            list.push(l.inbox, complete(opcode, ok_status, [l.seed as u8, 2, 3]))
+        else
+            list.push(l.inbox, complete(opcode, ok_status, [l.seed as u8, 2, 3, 4, 5, 6, 7, 8]))
         l.seed = l.seed + 1
     else if opcode == hci_commands.opcode_read_bd_addr()
         // `addr` below zero is a Controller with no public address, as the SoftDevice Controller reads.
@@ -370,6 +378,46 @@ fn test_start_takes_a_static_random_address_when_the_controller_has_no_public_on
     let sent = l.cmdlog[8]
     for i in 0..6
         test.assert_eq(sent[4 + i] as Int, h.own_address[i] as Int)
+
+// An LE Rand answer with fewer than eight octets of the random number (a packet cut short on the wire, the first Start after a bridge
+// to the Controller was opened) leaves the seed under 16 octets, and the AES-128 key of the Security Manager's generator made from it
+// under 16 octets: the key expansion read an octet past the end of it and the Host panicked "index 11 out of bounds for list of length
+// 11".  The Start ends with a failure instead and the Host is not ready, so a second Start can try again.
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
+@test
+fn test_start_ends_in_failure_on_an_lerand_answer_cut_short_and_does_not_seed_the_generator()
+    // The first draw cut short, then the second.
+    for draw in 1..3
+        var h = new_host(2)
+        var l = script_link()
+        l.short_draw = draw
+        var p = DefaultPolicy { placeholder: 0 }
+        var b = RamBonds { rows: Vec.new() }
+        let st = call(var h, var l, var p, var b, Request.Start)
+        test.assert_eq(st.is_ok(), false)
+        test.assert(not h.api.ready)
+        test.assert(not h.security.ready)
+        // The draw cut short was the last command: the bring-up stopped there.
+        test.assert_eq(l.commands[list.len(l.commands) - 1], hci_commands.opcode_le_rand())
+        test.assert_eq(list.len(l.commands), 4 + draw)
+        // A Start asked again, with the Controller answering in full, brings the Host up.
+        l.short_draw = 0
+        l.seed = 10
+        started(var h, var l, var p, var b)
+        test.assert(h.api.ready)
+        test.assert(h.security.ready)
+        test.assert_eq(h.api.seed.len(), 16)
+
+// A seed of fewer than 16 octets given to the Host directly seeds nothing: the Host is not ready for pairing and no key is made from it.
+@test
+fn test_host_seed_with_fewer_than_sixteen_octets_seeds_nothing()
+    var h = new_host(2)
+    host_seed(var h, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], [])
+    test.assert(not h.security.ready)
+    test.assert_eq(list.len(h.key_pair.private_key), 0)
+    host_seed(var h, smp_keys.zeros(16), [])
+    test.assert(h.security.ready)
+    test.assert_eq(list.len(h.key_pair.private_key), 32)
 
 // ── A policy that records its calls and answers as a test says ──────
 

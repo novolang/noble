@@ -390,6 +390,16 @@ pub fn conn_info(h: Host, conn: ConnId) -> ?ConnInfo
         return Some(info)
     Some(ConnInfo { role: info.role, peer: info.peer, params: info.params, mtu: link.att.bearers[0].mtu as u16, level: info.level, bonded: info.bonded })
 
+// How many ATT packets of the connection wait for a buffer of the Controller, the Host's own credits: a notification or a write the
+// Host has taken and the Controller has not yet room for.  Each packet the Controller completes (the Number Of Completed Packets event)
+// frees a buffer and the next waits less.  0 for a name that is stale.  A service that streams octets queues a piece only while this
+// stays under a few, so that the queue of a slow link does not grow.
+pub fn tx_backlog(h: Host, conn: ConnId) -> Int
+    let s = slot_of(h, conn)
+    if s < 0
+        return 0
+    list.len(h.le.slots[s].tx_queue)
+
 // Start `req`.  The answer says at once whether it was accepted: E_NOT_READY before `Start`
 // ended, E_BUSY while another call is in flight, E_STALE for a connection that is gone,
 // E_BAD_ARGUMENT for an argument the specification refuses or a request Layer A does not serve,

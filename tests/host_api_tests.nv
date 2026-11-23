@@ -2292,6 +2292,39 @@ fn test_an_event_bound_characteristic_queues_the_request_and_respond_answers_it(
     var t7 = value_of_byte(1)
     test.assert(ble.respond(conn, c.attr.handle, 0, var t7).is(noble.LAYER_LOCAL, noble.E_BUSY))
 
+// The Host's credits: each notification takes a buffer of the Controller until the Controller completes it, and the ones that find none wait.
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
+@test
+fn test_the_backlog_of_a_link_counts_the_packets_that_wait_for_a_buffer_of_the_controller()
+    var ble = new_ble()
+    test.assert(ble.add_service(noble.uuid16(0x180D)).svc == 0)
+    let hrm = ble.add_char(noble.uuid16(0x2A37), noble.PROP_NOTIFY, noble.Permissions { read: noble.Access.Denied, write: noble.Access.Denied }, noble.Access.Open, 2)
+    let conn = peripheral_up(var ble)
+    // The Controller returns no buffer until the test says so.
+    ble.io.credit = false
+    central_sends(var ble, [0x12, (hrm.attr.cccd & 255) as u8, (hrm.attr.cccd >> 8) as u8, 1, 0])
+    test.assert_eq(ble.tx_backlog(conn), 0)
+
+    test.case("notifications past the buffers the Controller gave wait, and the Controller's completions free them")
+    var worst = 0
+    for i in 0..12
+        var v = value_of_byte(i)
+        test.assert(ble.notify(conn, hrm.attr, noble.Security.Open, var v).is_ok())
+        ble.step()
+        if ble.tx_backlog(conn) > worst
+            worst = ble.tx_backlog(conn)
+    test.assert(worst > 0)
+    let held = ble.tx_backlog(conn)
+    test.assert(held > 0)
+    ble.io.credit = true
+    for _k in 0..held + 1
+        list.push(ble.io.inbox, event_packet(0x13, [1, 0x41, 0, 1, 0]))
+        ble.step()
+    test.assert_eq(ble.tx_backlog(conn), 0)
+
+    test.case("a name that is stale has no backlog")
+    test.assert_eq(ble.tx_backlog(noble.no_conn()), 0)
+
 @when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
 @test
 fn test_a_client_that_subscribes_is_an_event_and_notify_reaches_it_only_then_and_at_the_security_asked()

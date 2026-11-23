@@ -1589,6 +1589,12 @@ impl Adapter
     fn conn_info(self, conn: ConnId) -> ?ConnInfo
         host_api.conn_info(self.host, conn)
 
+    // The ATT packets of `conn` that wait for a buffer of the Controller (`host_api.tx_backlog`): the Host's credits are used up while
+    // it is more than 0.  A service that streams octets queues a piece only while it is small.
+    @tier(embedded)
+    fn tx_backlog(self, conn: ConnId) -> Int
+        host_api.tx_backlog(self.host, conn)
+
     // How many connections are live, in either role.
     @tier(embedded)
     fn link_count(self) -> Int

@@ -6,6 +6,8 @@ consumer deciding whether to upgrade can read.
 
 ## Unreleased
 
+2026-11-23: the key `default_data_length` of the [noble] section (0 by default, 27 to 251 otherwise): the start writes LE Write Suggested Default Data Length with it after the bring-up, so that a Controller starts the Data Length Update procedure on each connection it makes or accepts, and a long ATT value goes in one Link Layer PDU and not in ten of 27 octets.  Without it a link keeps the 27 octets of Bluetooth 4.0: a 244-octet notification measured on the air as ten Link Layer fragments (Ellisys capture of 2026-11-23).  A Controller that refuses the command has come up all the same.
+
 2026-11-23: `Adapter.tx_backlog(conn)` and `host_api.tx_backlog(h, conn)` answer how many ATT packets of a connection wait for a buffer of the Controller, the Host's credits: a notification or a write the Host has taken and the Controller has not yet room for.  A service that streams octets (`stream_gatt` of noble-services) queues a piece only while it is small, so that the queue of a slow link does not grow.  The Host held such packets in the link's queue before and showed no count.  `tests/host_api_tests.nv` has the case, under `configs/layer_a.toml`.
 
 ## 0.3.1 — 2026-11-18

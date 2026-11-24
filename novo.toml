@@ -81,6 +81,14 @@ min     = 0
 max     = 7
 doc     = "the PHYs written with LE Set Default PHY at start, as a mask (1 LE 1M, 2 LE 2M, 4 LE Coded); 0 writes nothing and leaves the Controller's own default"
 
+[config.default_data_length]
+type    = "int"
+default = 0
+min     = 0
+max     = 251
+unit    = "bytes"
+doc     = "the payload length written with LE Write Suggested Default Data Length at start (27 to 251, with the time that carries it at LE 1M); the Controller then starts the Data Length Update procedure on a connection, so that an ATT packet of a long value is one Link Layer PDU and not several of 27 octets; 0 writes nothing and a link keeps 27 octets unless the Host sets the length itself"
+
 [config.max_att_mtu]
 type    = "int"
 default = 247

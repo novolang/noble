@@ -930,6 +930,8 @@ fn start_step_opcode(step: Int) -> Int
         return hci_commands.opcode_read_bd_addr()
     if step == START_PHY_STEP
         return hci_commands.opcode_le_set_default_phy()
+    if noble.CONFIG.DEFAULT_DATA_LENGTH != 0 and step == START_DLE_STEP
+        return hci_commands.opcode_le_write_default_data_length()
     hci_commands.opcode_le_set_random_address()
 
 fn start_answered(var h: Host, opcode: Int, status: Int, rp: [u8])
@@ -938,6 +940,10 @@ fn start_answered(var h: Host, opcode: Int, status: Int, rp: [u8])
         return
     if noble.CONFIG.DEFAULT_PHY != 0 and h.api.step == START_PHY_STEP
         // A Controller that refuses the preference (a PHY it lacks) has come up all the same.
+        start_data_length(var h)
+        return
+    if noble.CONFIG.DEFAULT_DATA_LENGTH != 0 and h.api.step == START_DLE_STEP
+        // The same for a length it cannot take.
         start_done(var h)
         return
     if status != 0
@@ -1010,6 +1016,19 @@ fn start_phy(var h: Host)
     if noble.CONFIG.DEFAULT_PHY != 0
         h.api.step = START_PHY_STEP
         send_cmd(var h, hci_commands.opcode_le_set_default_phy(), hci_commands.build_le_set_default_phy(noble.CONFIG.DEFAULT_PHY, noble.CONFIG.DEFAULT_PHY))
+    else
+        start_data_length(var h)
+
+// The step of the bring-up that waits for the answer to LE Write Suggested Default Data Length.
+const START_DLE_STEP = 101
+
+// The payload length the Controller starts the Data Length Update procedure with on each connection, written at the end of the bring-up when the
+// key `default_data_length` of the [noble] section is not 0.  Both ends of a link need it: a Controller that is not asked keeps the 27 octets of
+// a link that has no Data Length Extension, and a 244-octet notification then crosses the air as ten PDUs.  With 0 the Host sends nothing.
+fn start_data_length(var h: Host)
+    if noble.CONFIG.DEFAULT_DATA_LENGTH != 0
+        h.api.step = START_DLE_STEP
+        send_cmd(var h, hci_commands.opcode_le_write_default_data_length(), hci_commands.build_le_write_default_data_length(noble.CONFIG.DEFAULT_DATA_LENGTH))
     else
         start_done(var h)
 

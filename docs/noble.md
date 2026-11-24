@@ -108,7 +108,7 @@ The schema is the `[config.<key>]` tables of `novo.toml`: 43 keys (`max_connecti
 `max_pairing`, `max_cis`, `max_big`, `max_bis`, `iso_sdu_octets`, `iso_buffers`,
 `sequenced_slots`, `hci_buffer_octets`, `hci_rx_flow_control` and the GATT client
 engine's `max_client_links`, `client_bearers`, `client_cache_records`,
-`client_queue` and `client_value_bytes`, `phy_events`, 1 to serve `set_phy` and report `PhyUpdated`, and `default_phy`, the mask LE Set Default PHY writes at the start, 0 for none) and the six of the Host API (`event_queue`, the events the queue holds, 0 in the
+`client_queue` and `client_value_bytes`, `phy_events`, 1 to serve `set_phy` and report `PhyUpdated`, `default_phy`, the mask LE Set Default PHY writes at the start, 0 for none, and `default_data_length`, the payload length LE Write Suggested Default Data Length writes at the start, 27 to 251 or 0 for none) and the six of the Host API (`event_queue`, the events the queue holds, 0 in the
 default so that a Host that does not use the API pays for none; `att_value_bytes`, the octets of one value or SDU a call or an
 event carries; `max_adv_data`, the octets of the advertising data of a report; `max_name`, the octets of a device name `ad_name` writes, and `outbox`, the commands a service queues in one turn of `pump`, both values on the caller's stack and no storage of the Host; and `max_services`, the services a product's list holds, which sizes the owner table of the Adapter, 48 B at the default of 4).  The ranges are the bounds of the
 Core Specification where it states one, and a relation between keys is a field

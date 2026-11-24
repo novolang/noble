@@ -52,6 +52,7 @@ struct ScriptLink
     var confirm: Bool
     var sync: Int
     var refuse_phy: Bool
+    var refuse_dle: Bool
     var parks: [Int]
     var drift: Int
     var short_draw: Int
@@ -64,7 +65,7 @@ struct ScriptLink
 // Periodic Advertising Sync Established event that answers a Create Sync (-1 for none).
 fn script_link() -> ScriptLink
     ScriptLink { inbox: [], sent: [], now: 0, handle: 0x40, connect_status: 0, mute: false, commands: [], acl: [], cmdlog: [], seed: 1, addr: 0xA1,
-        serve: false, credit: false, srv: gatt_server.new_server([], 247), confirm: false, sync: -1, refuse_phy: false, parks: [], drift: 0, short_draw: 0 }
+        serve: false, credit: false, srv: gatt_server.new_server([], 247), confirm: false, sync: -1, refuse_phy: false, refuse_dle: false, parks: [], drift: 0, short_draw: 0 }
 
 // An HCI event packet, H4 indicator first.
 fn event_packet(code: Int, params: [u8]) -> [u8]
@@ -197,6 +198,8 @@ fn answer(var l: ScriptLink, opcode: Int, params: [u8])
         list.push(l.inbox, status_event(opcode, ok_status))
         let handle = (params[0] as Int) | ((params[1] as Int) << 8)
         list.push(l.inbox, update_complete(handle, (params[2] as Int) | ((params[3] as Int) << 8), (params[6] as Int) | ((params[7] as Int) << 8), (params[8] as Int) | ((params[9] as Int) << 8)))
+    else if opcode == hci_commands.opcode_le_write_default_data_length() and l.refuse_dle
+        list.push(l.inbox, complete(opcode, 0x11, []))
     else if opcode == hci_commands.opcode_le_set_default_phy() and l.refuse_phy
         list.push(l.inbox, complete(opcode, 0x11, []))
     else if opcode == hci_commands.opcode_le_set_phy()
@@ -284,6 +287,13 @@ fn default_phy_commands() -> Int
     else
         0
 
+// The commands the bring-up sends for the key `default_data_length`: LE Write Suggested Default Data Length when it is not 0.
+fn default_data_length_commands() -> Int
+    if noble.CONFIG.DEFAULT_DATA_LENGTH != 0
+        1
+    else
+        0
+
 // A Host that has started: the Controller answered the bring-up commands.
 fn started<P: HostPolicy[f], B: BondStore[g]>(var h: Host, var l: ScriptLink, var p: P, var b: B) [f, g, mutate]
     let st = call(var h, var l, var p, var b, Request.Start)
@@ -310,7 +320,7 @@ fn test_start_brings_the_controller_up_and_queues_ready()
     test.assert(h.api.ready)
     // Reset first, then the masks, the buffers, two draws of the seed and the address.
     test.assert_eq(l.commands[0], hci_commands.opcode_hci_reset())
-    test.assert_eq(list.len(l.commands), 7 + default_phy_commands())
+    test.assert_eq(list.len(l.commands), 7 + default_phy_commands() + default_data_length_commands())
     test.assert(h.security.ready)
     test.assert_eq(h.own_address[0] as Int, 0xA1)
 
@@ -333,7 +343,7 @@ fn test_a_start_asked_again_after_one_nobody_answered_brings_the_controller_up()
     started(var h, var l, var p, var b)
     test.assert(h.api.ready)
     test.assert_eq(h.own_address[0] as Int, 0xA1)
-    test.assert_eq(l.commands[list.len(l.commands) - 1 - default_phy_commands()], hci_commands.opcode_read_bd_addr())
+    test.assert_eq(l.commands[list.len(l.commands) - 1 - default_phy_commands() - default_data_length_commands()], hci_commands.opcode_read_bd_addr())
 
 @when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32)
 @test
@@ -367,7 +377,7 @@ fn test_start_takes_a_static_random_address_when_the_controller_has_no_public_on
     var b = RamBonds { rows: Vec.new() }
     started(var h, var l, var p, var b)
     test.assert(h.api.ready)
-    test.assert_eq(list.len(l.commands), 9 + default_phy_commands())
+    test.assert_eq(list.len(l.commands), 9 + default_phy_commands() + default_data_length_commands())
     test.assert_eq(l.commands[7], hci_commands.opcode_le_rand())
     test.assert_eq(l.commands[8], hci_commands.opcode_le_set_random_address())
     test.assert_eq(h.api.own_kind, 1)
@@ -1122,6 +1132,36 @@ fn test_the_start_writes_no_default_phy_when_the_key_is_zero()
     var b = new_store()
     started(var h, var l, var p, var b)
     test.assert_eq(times_sent(l, hci_commands.opcode_le_set_default_phy()), 0)
+
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32 and noble.CONFIG.DEFAULT_DATA_LENGTH != 0)
+@test
+fn test_the_start_asks_for_the_data_length_of_the_configuration_and_comes_up_when_the_controller_refuses_it()
+    var h = new_host(2)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    test.assert_eq(times_sent(l, hci_commands.opcode_le_write_default_data_length()), 1)
+    let sent = last_parameters(l, hci_commands.opcode_le_write_default_data_length())
+    test.assert_eq(list.len(sent), 4)
+    test.assert_eq((sent[0] as Int) | ((sent[1] as Int) << 8), noble.CONFIG.DEFAULT_DATA_LENGTH)
+    test.assert_eq((sent[2] as Int) | ((sent[3] as Int) << 8), (noble.CONFIG.DEFAULT_DATA_LENGTH + 14) * 8)
+    // A Controller that answers the command with an error has come up all the same.
+    var h2 = new_host(2)
+    var l2 = script_link()
+    l2.refuse_dle = true
+    started(var h2, var l2, var p, var b)
+    test.assert(h2.api.ready)
+
+@when(noble.CONFIG.EVENT_QUEUE == 4 and noble.CONFIG.ATT_VALUE_BYTES >= 32 and noble.CONFIG.DEFAULT_DATA_LENGTH == 0)
+@test
+fn test_the_start_writes_no_data_length_when_the_key_is_zero()
+    var h = new_host(2)
+    var l = script_link()
+    var p = test_policy()
+    var b = new_store()
+    started(var h, var l, var p, var b)
+    test.assert_eq(times_sent(l, hci_commands.opcode_le_write_default_data_length()), 0)
 
 // ── One call at a time ──────────────────────────────────────────────
 

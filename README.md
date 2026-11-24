@@ -124,7 +124,7 @@ A Peripheral asks the Central for another interval with `update_params` and for 
 answered, with the status it refused with.  A Central owns both choices: BlueZ asks for LE 2M by itself soon after the connection, and refuses a request made in the first
 events of the connection with Unknown Connection Identifier (0x02), so a Peripheral waits the 5 s of TGAP(conn_pause_peripheral) and asks again when it is answered 0x0C
 (the Controller's own procedure is under way).  The PHY code is left out of an image unless the key `phy_events` is 1, which serves `set_phy` and queues `Event.PhyUpdated(conn, tx, rx)` for every change
-of a link's PHY (about 1 KB of flash in a Host image).  The key `default_phy` (a mask, 0 by default) writes LE Set Default PHY at the end of the start; with 0 the Host sends nothing and the
+of a link's PHY (about 1 KB of flash in a Host image).  The key `default_data_length` (27 to 251, 0 by default) writes LE Write Suggested Default Data Length at the end of the start, so that a Controller starts the Data Length Update procedure on every link: a link that is not asked keeps 27 octets of payload and a 244-octet notification crosses the air as ten PDUs.  The key `default_phy` (a mask, 0 by default) writes LE Set Default PHY at the end of the start; with 0 the Host sends nothing and the
 Controller keeps its own default.
 
 Events: `Advert`, `Connected`, `Disconnected`, `Written` (a stored characteristic was written), `Subscribed(conn, attr, mode)` (a client

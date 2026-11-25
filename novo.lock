@@ -11,4 +11,4 @@ path = "../noble-hci"
 [config.main]
 sha256 = "66e4cc40c5534c20d9b410aea02248efc2459baba1133075c44cb55e3373f143"
 file = "configs/layer_a.toml"
-schemas = "noble 0.3.1"
+schemas = "noble 0.3.2"

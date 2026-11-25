@@ -4,7 +4,7 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
-## Unreleased
+## 0.3.2 — 2026-11-25
 
 2026-11-23: the key `default_data_length` of the [noble] section (0 by default, 27 to 251 otherwise): the start writes LE Write Suggested Default Data Length with it after the bring-up, so that a Controller starts the Data Length Update procedure on each connection it makes or accepts, and a long ATT value goes in one Link Layer PDU and not in ten of 27 octets.  Without it a link keeps the 27 octets of Bluetooth 4.0: a 244-octet notification measured on the air as ten Link Layer fragments (Ellisys capture of 2026-11-23).  A Controller that refuses the command has come up all the same.
 

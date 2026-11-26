@@ -5,8 +5,11 @@ source = "path"
 path = "../crypto-ble-ecc"
 
 [noble-hci]
-source = "path"
-path = "../noble-hci"
+source = "registry"
+url = "https://registry.novo-lang.org"
+req = "^0.1.3"
+version = "0.1.3"
+hash = "e970b4c667f0a3facf7e6fb32a1545f5a805d8edf3a636012d83a5ee123f5d01"
 
 [config.main]
 sha256 = "66e4cc40c5534c20d9b410aea02248efc2459baba1133075c44cb55e3373f143"
